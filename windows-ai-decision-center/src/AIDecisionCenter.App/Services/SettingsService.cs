@@ -5,8 +5,6 @@ namespace AIDecisionCenter.App.Services;
 
 public sealed class SettingsService
 {
-    private const string LegacyRecentOnlyQuery = "subject:\"[ChatGPTTask]\" newer_than:14d";
-
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -31,28 +29,14 @@ public sealed class SettingsService
             return defaults;
         }
 
-        AppSettings settings;
-        await using (var stream = File.OpenRead(_paths.SettingsPath))
+        var json = await File.ReadAllTextAsync(_paths.SettingsPath, cancellationToken).ConfigureAwait(false);
+        var settings = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions) ?? new AppSettings();
+        using var document = JsonDocument.Parse(json);
+        if (document.RootElement.TryGetProperty("Gmail", out _) || document.RootElement.TryGetProperty("Polling", out _))
         {
-            settings = await JsonSerializer.DeserializeAsync<AppSettings>(stream, JsonOptions, cancellationToken).ConfigureAwait(false)
-                ?? new AppSettings();
+            await SaveAsync(settings, cancellationToken).ConfigureAwait(false);
         }
-        if (!string.Equals(settings.Gmail.Query, LegacyRecentOnlyQuery, StringComparison.Ordinal))
-        {
-            return settings;
-        }
-
-        var migrated = new AppSettings
-        {
-            Gmail = new GmailSettings
-            {
-                Query = new GmailSettings().Query,
-                MaxMessagesPerSync = settings.Gmail.MaxMessagesPerSync
-            },
-            Polling = settings.Polling
-        };
-        await SaveAsync(migrated, cancellationToken).ConfigureAwait(false);
-        return migrated;
+        return settings;
     }
 
     public async Task SaveAsync(AppSettings settings, CancellationToken cancellationToken = default)

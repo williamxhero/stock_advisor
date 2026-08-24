@@ -9,8 +9,11 @@ public sealed class AppPaths
             "AIDecisionCenter");
         SettingsPath = Path.Combine(DataDirectory, "appsettings.json");
         DatabasePath = Path.Combine(DataDirectory, "decision-center.db");
-        OAuthClientPath = Path.Combine(DataDirectory, "oauth-client.json");
-        TokenDirectory = Path.Combine(DataDirectory, "tokens");
+        InboxRoot = Path.Combine(DataDirectory, "inbox");
+        PendingDirectory = Path.Combine(InboxRoot, "pending");
+        ProcessingDirectory = Path.Combine(InboxRoot, "processing");
+        ProcessedDirectory = Path.Combine(InboxRoot, "processed");
+        DeadLetterDirectory = Path.Combine(InboxRoot, "dead-letter");
     }
 
     public string DataDirectory { get; }
@@ -19,13 +22,22 @@ public sealed class AppPaths
 
     public string DatabasePath { get; }
 
-    public string OAuthClientPath { get; }
+    public string InboxRoot { get; }
 
-    public string TokenDirectory { get; }
+    public string PendingDirectory { get; }
+
+    public string ProcessingDirectory { get; }
+
+    public string ProcessedDirectory { get; }
+
+    public string DeadLetterDirectory { get; }
 
     public void EnsureDirectories()
     {
         Directory.CreateDirectory(DataDirectory);
-        Directory.CreateDirectory(TokenDirectory);
+        Directory.CreateDirectory(PendingDirectory);
+        Directory.CreateDirectory(ProcessingDirectory);
+        Directory.CreateDirectory(ProcessedDirectory);
+        Directory.CreateDirectory(DeadLetterDirectory);
     }
 }

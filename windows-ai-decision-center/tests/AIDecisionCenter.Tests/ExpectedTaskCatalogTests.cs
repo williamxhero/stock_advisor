@@ -5,16 +5,14 @@ namespace AIDecisionCenter.Tests;
 public sealed class ExpectedTaskCatalogTests
 {
     [Fact]
-    public void AShareTasksUseTheProductionSchedule()
+    public void DailyBoardUsesTaskKeysFromScheduleRegistry()
     {
-        var tasks = ExpectedTaskCatalog.AShareTasks;
-
         Assert.Collection(
-            tasks,
-            task => Assert.Equal((new TimeOnly(9, 0), "盘前机会发现"), (task.Slot, task.Name)),
-            task => Assert.Equal((new TimeOnly(9, 45), "开盘异常发现"), (task.Slot, task.Name)),
-            task => Assert.Equal((new TimeOnly(10, 30), "趋势确认"), (task.Slot, task.Name)),
-            task => Assert.Equal((new TimeOnly(14, 30), "操作决策"), (task.Slot, task.Name)),
-            task => Assert.Equal((new TimeOnly(15, 20), "收盘复盘"), (task.Slot, task.Name)));
+            ExpectedTaskCatalog.AShareTasks,
+            task => Assert.Equal(("daily.opportunity.0900", new TimeOnly(9, 0)), (task.TaskKey, task.Slot)),
+            task => Assert.Equal(("daily.execution.0945", new TimeOnly(9, 45)), (task.TaskKey, task.Slot)),
+            task => Assert.Equal(("daily.execution.1030", new TimeOnly(10, 30)), (task.TaskKey, task.Slot)),
+            task => Assert.Equal(("daily.execution.1430", new TimeOnly(14, 30)), (task.TaskKey, task.Slot)),
+            task => Assert.Equal(("daily.review.1520", new TimeOnly(15, 20)), (task.TaskKey, task.Slot)));
     }
 }

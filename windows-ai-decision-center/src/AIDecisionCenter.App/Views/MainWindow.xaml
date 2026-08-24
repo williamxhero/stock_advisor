@@ -25,6 +25,7 @@
             <StackPanel>
                 <TextBlock Text="A股 AI Decision Center" FontSize="25" FontWeight="SemiBold" />
                 <TextBlock Text="{Binding TodayText}" Foreground="{StaticResource SecondaryTextBrush}" FontSize="13" Margin="0,6,0,0" />
+                <TextBlock Text="{Binding LatestReplyText}" Foreground="{StaticResource SecondaryTextBrush}" FontSize="12" Margin="0,6,0,0" TextTrimming="CharacterEllipsis" />
             </StackPanel>
             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                 <Border Background="#152F32" BorderBrush="#285D56" BorderThickness="1" CornerRadius="16" Padding="12,6" Margin="0,0,10,0">
@@ -33,8 +34,8 @@
                         <TextBlock Text="{Binding ConnectionText}" Foreground="{StaticResource AccentBrush}" FontSize="12" />
                     </StackPanel>
                 </Border>
-                <Button Content="立即同步" Command="{Binding SyncCommand}" Margin="0,0,8,0" />
-                <Button Content="配置目录" Command="{Binding OpenConfigCommand}" />
+                <Button Content="立即扫描" Command="{Binding ScanCommand}" Margin="0,0,8,0" />
+                <Button Content="运行目录" Command="{Binding OpenConfigCommand}" />
             </StackPanel>
         </Grid>
 
@@ -139,29 +140,50 @@
                                 <Run Text="历史消息  " /><Run Text="{Binding HistoryCount, Mode=OneWay}" />
                             </TextBlock>
                         </TabItem.Header>
-                        <ListBox Margin="0,14,0,0" ItemsSource="{Binding History}" SelectedItem="{Binding SelectedHistory}"
-                                 Background="Transparent" BorderThickness="0" ItemContainerStyle="{StaticResource RecordListItemStyle}"
-                                 ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-                            <ListBox.ItemTemplate>
-                                <DataTemplate>
-                                    <Grid>
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="*" />
-                                            <ColumnDefinition Width="Auto" />
-                                        </Grid.ColumnDefinitions>
-                                        <StackPanel>
-                                            <TextBlock Text="{Binding TaskType}" FontSize="14" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
-                                            <TextBlock Text="{Binding CategoryText}" Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,5,0,0" />
-                                        </StackPanel>
-                                        <StackPanel Grid.Column="1" Orientation="Horizontal" Margin="10,0,0,0" VerticalAlignment="Center">
-                                            <Ellipse Width="7" Height="7" Fill="{StaticResource BlueBrush}" Margin="0,0,7,0"
-                                                     Visibility="{Binding IsUnread, Converter={StaticResource BoolToVisibility}}" />
-                                            <TextBlock Text="{Binding ReceivedAtText}" Foreground="{StaticResource SecondaryTextBrush}" FontSize="10" />
-                                        </StackPanel>
-                                    </Grid>
-                                </DataTemplate>
-                            </ListBox.ItemTemplate>
-                        </ListBox>
+                        <Grid Margin="0,14,0,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+                            <TextBox Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}" ToolTip="搜索任务、摘要、正文、备注或task_key" />
+                            <StackPanel Grid.Row="1" Margin="0,8,0,8">
+                                <ComboBox ItemsSource="{Binding StatusFilters}" SelectedItem="{Binding SelectedStatusFilter}" Padding="6" />
+                                <WrapPanel Margin="0,6,0,0">
+                                    <CheckBox Content="仅未读" IsChecked="{Binding UnreadOnly}" Margin="0,0,12,0" />
+                                    <CheckBox Content="仅收藏" IsChecked="{Binding StarredOnly}" Margin="0,0,12,0" />
+                                    <CheckBox Content="含归档" IsChecked="{Binding IncludeArchived}" />
+                                </WrapPanel>
+                            </StackPanel>
+                            <ListBox Grid.Row="2" ItemsSource="{Binding History}" SelectedItem="{Binding SelectedHistory}"
+                                     Background="Transparent" BorderThickness="0" ItemContainerStyle="{StaticResource RecordListItemStyle}"
+                                     ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel>
+                                                <StackPanel Orientation="Horizontal">
+                                                    <TextBlock Text="{Binding TaskType}" FontSize="14" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                                                    <TextBlock Text="  ★" FontSize="14" Foreground="#E6B85C"
+                                                               Visibility="{Binding IsStarred, Converter={StaticResource BoolToVisibility}}" />
+                                                </StackPanel>
+                                                <TextBlock Text="{Binding Summary}" Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,4,0,0" TextTrimming="CharacterEllipsis" />
+                                                <TextBlock Text="{Binding CategoryText}" Foreground="{StaticResource SecondaryTextBrush}" FontSize="10" Margin="0,4,0,0" />
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="1" Orientation="Horizontal" Margin="10,0,0,0" VerticalAlignment="Center">
+                                                <Ellipse Width="7" Height="7" Fill="{StaticResource BlueBrush}" Margin="0,0,7,0"
+                                                         Visibility="{Binding IsUnread, Converter={StaticResource BoolToVisibility}}" />
+                                                <TextBlock Text="{Binding ReceivedAtText}" Foreground="{StaticResource SecondaryTextBrush}" FontSize="10" />
+                                            </StackPanel>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                        </Grid>
                     </TabItem>
                 </TabControl>
             </Border>
@@ -173,6 +195,7 @@
                         <RowDefinition Height="1" />
                         <RowDefinition Height="18" />
                         <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
                     <Grid>
@@ -186,13 +209,25 @@
                                 <TextBlock Text="{Binding DetailCategoryText}" Foreground="{StaticResource SecondaryTextBrush}" />
                             </StackPanel>
                         </StackPanel>
-                        <Button Content="标为已读" Command="{Binding MarkReadCommand}" HorizontalAlignment="Right" VerticalAlignment="Top" />
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top">
+                            <Button Content="{Binding ReadButtonText}" Command="{Binding ToggleReadCommand}" Margin="0,0,6,0" Padding="10,6" />
+                            <Button Content="{Binding StarButtonText}" Command="{Binding ToggleStarredCommand}" Margin="0,0,6,0" Padding="10,6" />
+                            <Button Content="{Binding ArchiveButtonText}" Command="{Binding ToggleArchivedCommand}" Margin="0,0,6,0" Padding="10,6" />
+                            <Button Content="导出" Command="{Binding ExportCommand}" Padding="10,6" />
+                        </StackPanel>
                     </Grid>
                     <Border Grid.Row="1" Background="{StaticResource BorderBrush}" />
                     <FlowDocumentScrollViewer x:Name="MarkdownViewer" Grid.Row="3" Background="Transparent" BorderThickness="0"
                                               VerticalScrollBarVisibility="Auto" IsSelectionEnabled="True" />
-                    <TextBlock Grid.Row="4" Text="每封消息作为独立记录保存在本地 SQLite，正文保持 Markdown。"
-                               Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,14,0,0" />
+                    <StackPanel Grid.Row="4" Margin="0,14,0,0">
+                        <TextBlock Text="个人备注（不会改写AI原文）" Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" />
+                        <DockPanel Margin="0,6,0,0">
+                            <Button DockPanel.Dock="Right" Content="保存备注" Command="{Binding SaveNoteCommand}" Margin="8,0,0,0" Padding="10,6" />
+                            <TextBox Text="{Binding NoteText, UpdateSourceTrigger=PropertyChanged}" MinHeight="34" />
+                        </DockPanel>
+                    </StackPanel>
+                    <TextBlock Grid.Row="5" Text="AI原文不可编辑；已读、收藏、归档和备注保存在Decision Center本地SQLite。"
+                               Foreground="{StaticResource SecondaryTextBrush}" FontSize="11" Margin="0,10,0,0" />
                 </Grid>
             </Border>
         </Grid>

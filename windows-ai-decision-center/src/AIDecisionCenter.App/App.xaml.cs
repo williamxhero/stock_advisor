@@ -9,7 +9,7 @@ public partial class App : System.Windows.Application, IDisposable
 {
     private readonly CancellationTokenSource _shutdown = new();
     private DesktopNotificationService? _notifications;
-    private GmailMessageSource? _gmail;
+    private LocalInboxService? _inbox;
     private bool _disposed;
 
     protected override async void OnStartup(StartupEventArgs e)
@@ -19,8 +19,7 @@ public partial class App : System.Windows.Application, IDisposable
         var paths = new AppPaths();
         var settings = await new SettingsService(paths).LoadAsync().ConfigureAwait(true);
         var store = new SqliteTaskMessageStore(paths);
-        _gmail = new GmailMessageSource(paths);
-        var sync = new TaskSyncService(_gmail, store);
+        _inbox = new LocalInboxService(paths, store, settings);
 
         MainWindow? window = null;
         _notifications = new DesktopNotificationService(() =>
@@ -35,12 +34,13 @@ public partial class App : System.Windows.Application, IDisposable
             window.Activate();
         });
 
-        var viewModel = new MainViewModel(store, sync, _notifications, paths, settings);
+        var viewModel = new MainViewModel(store, _inbox, _notifications, paths, settings);
         window = new MainWindow(viewModel);
         MainWindow = window;
         window.Show();
         await viewModel.InitializeAsync().ConfigureAwait(true);
-        _ = PollAsync(viewModel, _shutdown.Token);
+        _ = RunInboxAsync(viewModel, _inbox, _shutdown.Token);
+        _ = RefreshClockAsync(viewModel, _shutdown.Token);
     }
 
     protected override void OnExit(ExitEventArgs e)
@@ -59,35 +59,48 @@ public partial class App : System.Windows.Application, IDisposable
         _disposed = true;
         _shutdown.Cancel();
         _notifications?.Dispose();
-        _gmail?.Dispose();
+        _inbox?.Dispose();
         _shutdown.Dispose();
         GC.SuppressFinalize(this);
     }
 
-    private static async Task PollAsync(MainViewModel viewModel, CancellationToken cancellationToken)
+    private static async Task RunInboxAsync(
+        MainViewModel viewModel,
+        LocalInboxService inbox,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await inbox.RunAsync(
+                batch => Current.Dispatcher.InvokeAsync(
+                    () => viewModel.HandleImportBatchAsync(batch),
+                    System.Windows.Threading.DispatcherPriority.Background,
+                    cancellationToken).Task.Unwrap(),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            await Current.Dispatcher.InvokeAsync(
+                () => viewModel.ReportInboxFailure(exception),
+                System.Windows.Threading.DispatcherPriority.Background,
+                cancellationToken);
+        }
+    }
+
+    private static async Task RefreshClockAsync(MainViewModel viewModel, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                var delay = await Current.Dispatcher
-                    .InvokeAsync(
-                        () => viewModel.GetNextPollDelay(DateTime.Now),
-                        System.Windows.Threading.DispatcherPriority.Background,
-                        cancellationToken)
-                    .Task
-                    .ConfigureAwait(false);
-                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
-                if (delay > TimeSpan.Zero)
-                {
-                    continue;
-                }
-
-                await Current.Dispatcher
-                    .InvokeAsync(viewModel.PollOnceAsync, System.Windows.Threading.DispatcherPriority.Background, cancellationToken)
-                    .Task
-                    .Unwrap()
-                    .ConfigureAwait(false);
+                await Task.Delay(TimeSpan.FromMinutes(1), cancellationToken).ConfigureAwait(false);
+                await Current.Dispatcher.InvokeAsync(
+                    () => viewModel.RefreshTaskStatuses(DateTime.Now),
+                    System.Windows.Threading.DispatcherPriority.Background,
+                    cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {

@@ -1,14 +1,15 @@
 # Periodic Review Protocol
 
-Protocol ID: `PeriodicReview-v1.1`  
-Version: 1.1  
-Last Updated: 2026-08-21  
+Protocol ID: `PeriodicReview-v1.2`  
+Version: 1.2  
+Last Updated: 2026-08-24  
 Scope: Monthly Review、Quarterly Review、Annual Review
 
 ## Change Log
 
 - v1.0（2026-08-21）：将月度、季度、年度Schedule中的统计、归因、反事实分析、规则维护和文件写入逻辑集中到本文件。
 - v1.1（2026-08-21）：纳入全市场机会发现、题材生命周期、股票角色、龙头地位、候选淘汰和弱换强的统计验证。
+- v1.2（2026-08-24）：所有有效周期任务写入本地ResultStore并投递AI Decision Center，统一正文、摘要与状态语义。
 
 ---
 
@@ -85,7 +86,7 @@ Scope: Monthly Review、Quarterly Review、Annual Review
 - 可按周期原地维护`docs/research/03_CASEBOOK.md`、`docs/research/04_HYPOTHESES.md`、`data/logs/05_DECISION_LOG.csv`；禁止创建同名副本。
 - `data/portfolio/01_CURRENT_PORTFOLIO.md`默认禁止修改；只有用户在当前聊天明确报告尚未写入且信息完整的真实成交时才可更新。
 - 不得把研究结论、建议或推测写成真实成交。
-- 不得改写Decision Log历史样本的`protocol_version`；周期报告记录自身`PeriodicReview-v1.1`，并比较不同Daily Execution与Opportunity Discovery版本。
+- 不得改写Decision Log历史样本的`protocol_version`；周期报告记录自身`PeriodicReview-v1.2`，并比较不同Daily Execution与Opportunity Discovery版本。
 - `data/state/10_THEME_STATE.csv`和`data/state/11_STOCK_STATE.csv`是当前分析状态；周期复盘可以校正当前状态，但不得删除或改写`data/logs/12_OPPORTUNITY_LOG.csv`中的历史发现、拒绝和当时证据。
 - 文件身份不明、版本冲突或写入失败时停止对应写入并报告，不得创建替代副本。
 
@@ -122,7 +123,7 @@ Scope: Monthly Review、Quarterly Review、Annual Review
 ### 2.3 输出与写入
 
 - 原地更新有价值的Casebook、Hypotheses和Decision Log。
-- 生成`reports/periodic/07_MONTHLY_SUMMARY_YYYY-MM.md`，顶部记录`PeriodicReview-v1.1`和纳入分析的Daily Execution/Opportunity Discovery版本。
+- 生成`reports/periodic/07_MONTHLY_SUMMARY_YYYY-MM.md`，顶部记录`PeriodicReview-v1.2`和纳入分析的Daily Execution/Opportunity Discovery版本。
 - 优先输出3—5个重要发现、支持/反证假说、异常模式、规则候选、下月观察项和实际修改文件。
 
 ---
@@ -145,7 +146,7 @@ Scope: Monthly Review、Quarterly Review、Annual Review
 ### 3.3 输出与写入
 
 - 原地维护Casebook、Hypotheses和Decision Log。
-- 生成`reports/periodic/08_QUARTERLY_REVIEW_YYYYQX.md`，顶部记录`PeriodicReview-v1.1`和纳入分析的Daily Execution/Opportunity Discovery版本。
+- 生成`reports/periodic/08_QUARTERLY_REVIEW_YYYYQX.md`，顶部记录`PeriodicReview-v1.2`和纳入分析的Daily Execution/Opportunity Discovery版本。
 - 输出3—5个核心发现、支持/证伪假说、需升级/降级规则、下一季度验证计划和实际修改文件。
 
 ---
@@ -168,6 +169,14 @@ Scope: Monthly Review、Quarterly Review、Annual Review
 ### 4.3 输出与写入
 
 - 原地维护Casebook、Hypotheses和Decision Log。
-- 生成`reports/periodic/09_ANNUAL_REVIEW_YYYY.md`，顶部记录`PeriodicReview-v1.1`和全年使用过的Daily Execution/Opportunity Discovery版本。
+- 生成`reports/periodic/09_ANNUAL_REVIEW_YYYY.md`，顶部记录`PeriodicReview-v1.2`和全年使用过的Daily Execution/Opportunity Discovery版本。
 - 输出全年最重要发现、规则贡献排名、主要错误模式、系统是否需要重构、下一年度研究重点和实际修改文件。
 - 目标是删除无效复杂度，而不是为了完整感增加规则。
+
+---
+
+## 5. 结果保存与投递
+
+- 所有有效周期任务最终必须遵守`automations/15_RESULT_DELIVERY.md`；完整报告正文先保存到ResultStore，再原样作为Codex任务最终回复。
+- 报告期尚未结束或按协议无需生成报告时使用`skipped`；协议、数据或文件异常使用`failed`；正常报告使用`succeeded`。
+- 月度、季度和年度消息由Decision Center写入历史与通知，不加入每日五节点。

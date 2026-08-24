@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "project_root": "D:\\WILL\\STOCK\\stock_advisor",
+  "work_threads": {
+    "daily_intraday": {
+      "title": "每日盘中操作",
+      "thread_id": "01a0321b-27af-7e52-8df8-d9e18470a2e1"
+    },
+    "daily_open_close": {
+      "title": "每日盘前盘后",
+      "thread_id": "01a0321b-334b-7461-bf91-85900d79d4f3"
+    },
+    "periodic_review": {
+      "title": "月季年复盘",
+      "thread_id": "01a0321b-3f91-74b0-831f-049baf39ccd3"
+    }
+  },
+  "trigger_threads": {
+    "daily.opportunity.0900": {
+      "title": "A股 09:00 盘前机会发现",
+      "automation_id": "a-09-00",
+      "thread_id": "01a0328f-f5d4-7143-b8e2-97ad96785bef",
+      "destination_key": "daily_open_close"
+    },
+    "daily.execution.0945": {
+      "title": "A股 09:45 异常发现",
+      "automation_id": "a-09-45",
+      "thread_id": "01a03290-1072-73d3-abc9-978f8c5686a0",
+      "destination_key": "daily_intraday"
+    },
+    "daily.execution.1030": {
+      "title": "A股 10:30 趋势确认",
+      "automation_id": "a-10-30",
+      "thread_id": "01a03290-2c20-7720-8243-2cd625e2ea98",
+      "destination_key": "daily_intraday"
+    },
+    "daily.execution.1430": {
+      "title": "A股 14:30 操作决策",
+      "automation_id": "a-14-30",
+      "thread_id": "01a03290-4257-7332-92ac-00a55b0034f7",
+      "destination_key": "daily_intraday"
+    },
+    "daily.review.1520": {
+      "title": "A股 15:20 收盘复盘",
+      "automation_id": "a-15-20",
+      "thread_id": "01a03290-52db-7690-b913-b96e11816a11",
+      "destination_key": "daily_open_close"
+    },
+    "periodic.monthly": {
+      "title": "A股月度复盘",
+      "automation_id": "a",
+      "thread_id": "01a03290-69eb-7a31-a90a-fcf21bfd9005",
+      "destination_key": "periodic_review"
+    },
+    "periodic.quarterly": {
+      "title": "A股季度复盘",
+      "automation_id": "a-2",
+      "thread_id": "01a03290-8029-7100-9ffa-d17d1ddb75f1",
+      "destination_key": "periodic_review"
+    },
+    "periodic.annual": {
+      "title": "A股年度复盘",
+      "automation_id": "a-3",
+      "thread_id": "01a03290-9955-7951-a803-601b536c4ee7",
+      "destination_key": "periodic_review"
+    }
+  }
+}

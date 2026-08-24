@@ -46,7 +46,13 @@ public sealed class TaskRowViewModel : ObservableObject
     public bool IsPassed => Message is null
         && _statusAsOf >= _statusAsOf.Date.Add(Expected.Slot.ToTimeSpan()).Add(_nodeTimeout);
 
-    public string StatusText => IsComplete ? "已完成" : IsPassed ? "PASS" : "等待";
+    public string StatusText => Message?.Status switch
+    {
+        TaskMessageStatus.Succeeded => "已完成",
+        TaskMessageStatus.Skipped => "已跳过",
+        TaskMessageStatus.Failed => "失败",
+        _ => IsPassed ? "PASS" : "等待"
+    };
 
     public string ReceivedAtText => Message is null
         ? string.Empty

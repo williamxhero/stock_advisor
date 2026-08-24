@@ -2,27 +2,21 @@ namespace AIDecisionCenter.App.Services;
 
 public sealed class AppSettings
 {
-    public GmailSettings Gmail { get; init; } = new();
+    public InboxSettings Inbox { get; init; } = new();
 
-    public PollingSettings Polling { get; init; } = new();
+    public DisplaySettings Display { get; init; } = new();
 }
 
-public sealed class GmailSettings
+public sealed class InboxSettings
 {
-    public string Query { get; init; } = "subject:\"[ChatGPTTask]\"";
+    public int ScanIntervalSeconds { get; init; } = 30;
 
-    public int MaxMessagesPerSync { get; init; } = 50;
+    public int DebounceMilliseconds { get; init; } = 300;
+
+    public int MaxMessageBytes { get; init; } = 10 * 1024 * 1024;
 }
 
-public sealed class PollingSettings
+public sealed class DisplaySettings
 {
-    public int ActiveSeconds { get; init; } = 30;
-
     public int NodeTimeoutMinutes { get; init; } = 20;
-
-    public int IdleSeconds { get; init; } = 300;
-
-    public TimeOnly ActiveFrom { get; init; } = new(7, 50);
-
-    public TimeOnly ActiveUntil { get; init; } = new(15, 40);
 }

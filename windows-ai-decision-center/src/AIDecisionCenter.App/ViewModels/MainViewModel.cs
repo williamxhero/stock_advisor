@@ -9,36 +9,45 @@ namespace AIDecisionCenter.App.ViewModels;
 public sealed class MainViewModel : ObservableObject
 {
     private readonly ITaskMessageStore _store;
-    private readonly TaskSyncService _syncService;
+    private readonly LocalInboxService _inbox;
     private readonly DesktopNotificationService _notifications;
     private readonly AppPaths _paths;
     private readonly AppSettings _settings;
-    private DateTime? _lastCheckAt;
-    private DateOnly _tasksDate;
+    private readonly List<TaskMessage> _allHistory = [];
     private TaskRowViewModel? _selectedTask;
     private HistoryRecordViewModel? _selectedHistory;
     private int _selectedSectionIndex;
     private string _statusText = "正在启动…";
     private bool _isBusy;
     private bool _startupEnabled;
+    private string _searchText = string.Empty;
+    private string _selectedStatusFilter = "全部状态";
+    private bool _unreadOnly;
+    private bool _starredOnly;
+    private bool _includeArchived;
+    private string _noteText = string.Empty;
 
     public MainViewModel(
         ITaskMessageStore store,
-        TaskSyncService syncService,
+        LocalInboxService inbox,
         DesktopNotificationService notifications,
         AppPaths paths,
         AppSettings settings)
     {
         _store = store;
-        _syncService = syncService;
+        _inbox = inbox;
         _notifications = notifications;
         _paths = paths;
         _settings = settings;
         _startupEnabled = StartupRegistrationService.IsEnabled();
         TodayText = DateTime.Today.ToString("yyyy 年 M 月 d 日 · dddd", CultureInfo.GetCultureInfo("zh-CN"));
 
-        SyncCommand = new AsyncCommand(SyncAsync, () => !IsBusy);
-        MarkReadCommand = new AsyncCommand(MarkSelectedReadAsync, () => SelectedMessage is { IsRead: false });
+        ScanCommand = new AsyncCommand(ScanAsync, () => !IsBusy);
+        ToggleReadCommand = new AsyncCommand(ToggleReadAsync, () => SelectedMessage is not null);
+        ToggleStarredCommand = new AsyncCommand(ToggleStarredAsync, () => SelectedMessage is not null);
+        ToggleArchivedCommand = new AsyncCommand(ToggleArchivedAsync, () => SelectedMessage is not null);
+        SaveNoteCommand = new AsyncCommand(SaveNoteAsync, () => SelectedMessage is not null);
+        ExportCommand = new AsyncCommand(ExportAsync, () => SelectedMessage is not null);
         OpenConfigCommand = new AsyncCommand(OpenConfigFolderAsync);
         ToggleStartupCommand = new AsyncCommand(ToggleStartupAsync);
     }
@@ -47,12 +56,15 @@ public sealed class MainViewModel : ObservableObject
 
     public ObservableCollection<HistoryRecordViewModel> History { get; } = [];
 
-    public AsyncCommand SyncCommand { get; }
+    public IReadOnlyList<string> StatusFilters { get; } = ["全部状态", "正常", "已跳过", "失败"];
 
-    public AsyncCommand MarkReadCommand { get; }
-
+    public AsyncCommand ScanCommand { get; }
+    public AsyncCommand ToggleReadCommand { get; }
+    public AsyncCommand ToggleStarredCommand { get; }
+    public AsyncCommand ToggleArchivedCommand { get; }
+    public AsyncCommand SaveNoteCommand { get; }
+    public AsyncCommand ExportCommand { get; }
     public AsyncCommand OpenConfigCommand { get; }
-
     public AsyncCommand ToggleStartupCommand { get; }
 
     public TaskRowViewModel? SelectedTask
@@ -60,12 +72,9 @@ public sealed class MainViewModel : ObservableObject
         get => _selectedTask;
         set
         {
-            if (SetProperty(ref _selectedTask, value))
+            if (SetProperty(ref _selectedTask, value) && SelectedSectionIndex == 0)
             {
-                if (SelectedSectionIndex == 0)
-                {
-                    NotifySelectionChanged();
-                }
+                NotifySelectionChanged();
             }
         }
     }
@@ -94,25 +103,84 @@ public sealed class MainViewModel : ObservableObject
         }
     }
 
-    public TaskMessage? SelectedMessage => SelectedSectionIndex == 1
-        ? SelectedHistory?.Message
-        : SelectedTask?.Message;
+    public TaskMessage? SelectedMessage => SelectedSectionIndex == 1 ? SelectedHistory?.Message : SelectedTask?.Message;
 
-    public string DetailTitle => SelectedSectionIndex == 1
-        ? SelectedHistory?.TaskType ?? "历史消息"
-        : SelectedTask?.Name ?? "任务详情";
+    public string SearchText
+    {
+        get => _searchText;
+        set
+        {
+            if (SetProperty(ref _searchText, value))
+            {
+                ApplyHistoryFilter();
+            }
+        }
+    }
 
-    public string DetailSlotText => SelectedSectionIndex == 1
-        ? SelectedHistory?.Message.Slot.ToString("HH:mm", CultureInfo.InvariantCulture) ?? string.Empty
-        : SelectedTask?.TimeText ?? string.Empty;
+    public string SelectedStatusFilter
+    {
+        get => _selectedStatusFilter;
+        set
+        {
+            if (SetProperty(ref _selectedStatusFilter, value))
+            {
+                ApplyHistoryFilter();
+            }
+        }
+    }
 
-    public string DetailReceivedAtText => SelectedSectionIndex == 1
-        ? SelectedHistory?.ReceivedAtText ?? string.Empty
-        : SelectedTask?.ReceivedAtText ?? string.Empty;
+    public bool UnreadOnly
+    {
+        get => _unreadOnly;
+        set
+        {
+            if (SetProperty(ref _unreadOnly, value))
+            {
+                ApplyHistoryFilter();
+            }
+        }
+    }
 
-    public string DetailCategoryText => SelectedMessage is null
-        ? string.Empty
-        : $"{SelectedMessage.Project} · {SelectedMessage.TaskType}";
+    public bool StarredOnly
+    {
+        get => _starredOnly;
+        set
+        {
+            if (SetProperty(ref _starredOnly, value))
+            {
+                ApplyHistoryFilter();
+            }
+        }
+    }
+
+    public bool IncludeArchived
+    {
+        get => _includeArchived;
+        set
+        {
+            if (SetProperty(ref _includeArchived, value))
+            {
+                ApplyHistoryFilter();
+            }
+        }
+    }
+
+    public string NoteText
+    {
+        get => _noteText;
+        set => SetProperty(ref _noteText, value);
+    }
+
+    public string DetailTitle => SelectedMessage?.TaskType ?? "任务详情";
+    public string DetailSlotText => SelectedMessage?.ScheduledFor.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture) ?? string.Empty;
+    public string DetailReceivedAtText => SelectedMessage?.CompletedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) ?? string.Empty;
+    public string DetailCategoryText => SelectedMessage is null ? string.Empty : $"{SelectedMessage.Project} · {StatusTextFor(SelectedMessage.Status)} · {SelectedMessage.Source}";
+    public string ReadButtonText => SelectedMessage?.IsRead == true ? "标为未读" : "标为已读";
+    public string StarButtonText => SelectedMessage?.IsStarred == true ? "取消收藏" : "收藏";
+    public string ArchiveButtonText => SelectedMessage?.IsArchived == true ? "恢复归档" : "归档";
+    public string LatestReplyText => _allHistory.FirstOrDefault(message => !message.IsArchived) is { } latest
+        ? $"最新回复：{latest.TaskType} · {latest.CompletedAt.ToLocalTime():MM-dd HH:mm} · {latest.Summary}"
+        : "最新回复：暂无";
 
     public string StatusText
     {
@@ -127,27 +195,18 @@ public sealed class MainViewModel : ObservableObject
         {
             if (SetProperty(ref _isBusy, value))
             {
-                SyncCommand.RaiseCanExecuteChanged();
+                ScanCommand.RaiseCanExecuteChanged();
             }
         }
     }
 
-    public bool IsGmailConfigured => _syncService.IsConfigured;
-
-    public bool IsGmailAuthorized => _syncService.IsAuthorized;
-
-    public string ConnectionText => _syncService.ConfigurationError is not null && File.Exists(_paths.OAuthClientPath)
-        ? "OAuth 配置无效"
-        : IsGmailConfigured
-        ? IsGmailAuthorized ? "Gmail 已连接" : "Gmail 待授权"
-        : "Gmail 未配置";
+    public string ConnectionText => _inbox.GetDeadLetterCount() is var count && count > 0
+        ? $"本地 Inbox · {count} 条死信"
+        : "本地 Inbox 已连接";
 
     public string TodayText { get; }
-
     public int CompletedCount => Tasks.Count(task => task.IsComplete);
-
     public int UnreadCount => Tasks.Count(task => task.IsUnread);
-
     public int HistoryCount => History.Count;
 
     public bool StartupEnabled
@@ -167,80 +226,62 @@ public sealed class MainViewModel : ObservableObject
     public async Task InitializeAsync()
     {
         await _store.InitializeAsync().ConfigureAwait(true);
+        var batch = await _inbox.ImportAvailableAsync().ConfigureAwait(true);
         await RefreshAsync().ConfigureAwait(true);
-        StatusText = _syncService.ConfigurationError is { } configurationError && File.Exists(_paths.OAuthClientPath)
-            ? configurationError
-            : IsGmailConfigured
-            ? IsGmailAuthorized
-                ? "已就绪；节点到达后每 30 秒检查，最多持续 20 分钟"
-                : "Gmail OAuth 已配置；点击“立即同步”完成首次浏览器授权"
-            : $"未配置 Gmail。把 oauth-client.json 放到 {_paths.DataDirectory}";
+        StatusText = batch.Added.Count > 0 ? $"启动时补收 {batch.Added.Count} 条消息" : "本地 Inbox 已就绪";
+        OnPropertyChanged(nameof(ConnectionText));
     }
 
-    public async Task PollOnceAsync()
+    public async Task HandleImportBatchAsync(InboxImportBatch batch)
     {
-        if (!IsGmailAuthorized || IsBusy)
+        var latestId = batch.Added.Count > 0 ? batch.Added[batch.Added.Count - 1].Id : (long?)null;
+        await RefreshAsync(selectMessageId: latestId).ConfigureAwait(true);
+        OnPropertyChanged(nameof(ConnectionText));
+        if (batch.Added.Count > 3)
         {
-            _lastCheckAt = DateTime.Now;
-            return;
+            _notifications.Show("AI Decision Center", $"已补收 {batch.Added.Count} 条定时回复");
         }
-
-        await SyncAsync().ConfigureAwait(true);
+        else
+        {
+            foreach (var message in batch.Added)
+            {
+                _notifications.Show(message.TaskType, message.Summary);
+            }
+        }
+        StatusText = batch.DeadLetterCount > 0
+            ? $"导入 {batch.Added.Count} 条；{batch.DeadLetterCount} 条进入 dead-letter"
+            : $"已导入 {batch.Added.Count} 条新消息";
     }
 
-    public TimeSpan GetNextPollDelay(DateTime now)
+    public void ReportInboxFailure(Exception exception) => StatusText = $"Inbox后台处理失败：{exception.Message}";
+
+    public void RefreshTaskStatuses(DateTime now)
     {
         foreach (var task in Tasks)
         {
             task.RefreshStatus(now);
         }
-
-        var completedSlots = Tasks
-            .Where(task => task.IsComplete)
-            .Select(task => task.Expected.Slot);
-        var retrySeconds = Math.Max(1, _settings.Polling.ActiveSeconds);
-        var nodeTimeoutMinutes = Math.Max(1, _settings.Polling.NodeTimeoutMinutes);
-        return TaskPollingSchedule.GetDelay(
-            now,
-            _tasksDate,
-            completedSlots,
-            _lastCheckAt,
-            TimeSpan.FromSeconds(retrySeconds),
-            TimeSpan.FromMinutes(nodeTimeoutMinutes));
     }
 
-    private async Task SyncAsync()
+    private async Task ScanAsync()
     {
-        _lastCheckAt = DateTime.Now;
-        if (!IsGmailConfigured)
-        {
-            StatusText = _syncService.ConfigurationError is { } configurationError && File.Exists(_paths.OAuthClientPath)
-                ? configurationError
-                : "尚未配置 Gmail OAuth；请打开配置目录，放入 oauth-client.json。";
-            OpenConfigFolder();
-            return;
-        }
-
         IsBusy = true;
-        StatusText = "正在检查 Gmail…";
+        StatusText = "正在扫描本地 Inbox…";
         try
         {
-            var added = await _syncService.SyncAsync(_settings).ConfigureAwait(true);
-            OnPropertyChanged(nameof(IsGmailAuthorized));
-            OnPropertyChanged(nameof(ConnectionText));
-            await RefreshAsync().ConfigureAwait(true);
-            StatusText = added.Count == 0
-                ? $"{DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture)} 已同步，没有新任务"
-                : $"已保存 {added.Count} 条新消息";
-            var today = DateOnly.FromDateTime(DateTime.Today);
-            foreach (var task in added.Where(task => task.ScheduledDate == today))
+            var batch = await _inbox.ImportAvailableAsync().ConfigureAwait(true);
+            if (batch.Added.Count > 0 || batch.DeadLetterCount > 0)
             {
-                _notifications.Show(task.TaskType, task.BodyMarkdown.Length > 120 ? task.BodyMarkdown[..120] + "…" : task.BodyMarkdown);
+                await HandleImportBatchAsync(batch).ConfigureAwait(true);
+            }
+            else
+            {
+                StatusText = $"{DateTime.Now:HH:mm:ss} 已扫描，没有新消息";
             }
         }
         catch (Exception exception)
         {
-            StatusText = $"同步失败：{exception.Message}";
+            StatusText = $"扫描失败：{exception.Message}";
         }
         finally
         {
@@ -248,21 +289,58 @@ public sealed class MainViewModel : ObservableObject
         }
     }
 
-    private async Task MarkSelectedReadAsync()
+    private async Task ToggleReadAsync()
     {
-        if (SelectedMessage is not { } message)
-        {
-            return;
-        }
+        if (SelectedMessage is not { } message) return;
+        await _store.SetReadAsync(message.Id, !message.IsRead).ConfigureAwait(true);
+        await RefreshAsync(selectMessageId: message.Id).ConfigureAwait(true);
+    }
 
-        await _store.MarkReadAsync(message.Id).ConfigureAwait(true);
-        await RefreshAsync(message.Slot, message.Id).ConfigureAwait(true);
-        StatusText = "已标为已读";
+    private async Task ToggleStarredAsync()
+    {
+        if (SelectedMessage is not { } message) return;
+        await _store.SetStarredAsync(message.Id, !message.IsStarred).ConfigureAwait(true);
+        await RefreshAsync(selectMessageId: message.Id).ConfigureAwait(true);
+    }
+
+    private async Task ToggleArchivedAsync()
+    {
+        if (SelectedMessage is not { } message) return;
+        await _store.SetArchivedAsync(message.Id, !message.IsArchived).ConfigureAwait(true);
+        await RefreshAsync(selectMessageId: message.Id).ConfigureAwait(true);
+        StatusText = message.IsArchived ? "已恢复归档" : "已归档";
+    }
+
+    private async Task SaveNoteAsync()
+    {
+        if (SelectedMessage is not { } message) return;
+        await _store.SaveNoteAsync(message.Id, NoteText).ConfigureAwait(true);
+        await RefreshAsync(selectMessageId: message.Id).ConfigureAwait(true);
+        StatusText = "备注已保存";
+    }
+
+    private Task ExportAsync()
+    {
+        if (SelectedMessage is not { } message) return Task.CompletedTask;
+        var invalid = Path.GetInvalidFileNameChars();
+        var taskName = new string(message.TaskType.Select(character => invalid.Contains(character) ? '_' : character).ToArray());
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            Filter = "Markdown (*.md)|*.md",
+            FileName = $"{message.ScheduledFor:yyyyMMdd-HHmm}_{taskName}_{message.ExternalId[..Math.Min(8, message.ExternalId.Length)]}.md"
+        };
+        if (dialog.ShowDialog() == true)
+        {
+            File.WriteAllText(dialog.FileName, message.BodyMarkdown, System.Text.Encoding.UTF8);
+            StatusText = $"已导出：{dialog.FileName}";
+        }
+        return Task.CompletedTask;
     }
 
     private Task OpenConfigFolderAsync()
     {
-        OpenConfigFolder();
+        _paths.EnsureDirectories();
+        Process.Start(new ProcessStartInfo("explorer.exe", _paths.DataDirectory) { UseShellExecute = true });
         return Task.CompletedTask;
     }
 
@@ -274,57 +352,94 @@ public sealed class MainViewModel : ObservableObject
         return Task.CompletedTask;
     }
 
-    private async Task RefreshAsync(TimeOnly? selectSlot = null, long? selectMessageId = null)
+    private async Task RefreshAsync(long? selectMessageId = null)
     {
-        _tasksDate = DateOnly.FromDateTime(DateTime.Today);
-        var messages = await _store.GetForDateAsync(_tasksDate).ConfigureAwait(true);
-        var historyMessages = await _store.GetAllAsync().ConfigureAwait(true);
-        var latestBySlot = messages
-            .GroupBy(message => message.Slot)
-            .ToDictionary(group => group.Key, group => group.OrderByDescending(message => message.ReceivedAt).First());
+        var today = DateOnly.FromDateTime(DateTime.Today);
+        var todayMessages = await _store.GetForDateAsync(today).ConfigureAwait(true);
+        var all = await _store.GetAllAsync().ConfigureAwait(true);
+        _allHistory.Clear();
+        _allHistory.AddRange(all);
 
-        var slotToSelect = selectSlot ?? SelectedTask?.Expected.Slot;
-        var nodeTimeout = TimeSpan.FromMinutes(Math.Max(1, _settings.Polling.NodeTimeoutMinutes));
+        var previousTaskKey = SelectedTask?.Expected.TaskKey;
         Tasks.Clear();
         foreach (var expected in ExpectedTaskCatalog.AShareTasks)
         {
-            latestBySlot.TryGetValue(expected.Slot, out var message);
-            Tasks.Add(new TaskRowViewModel(expected, message, nodeTimeout));
+            var message = todayMessages
+                .Where(candidate => string.Equals(candidate.TaskKey, expected.TaskKey, StringComparison.Ordinal) ||
+                                    candidate.TaskKey is null && candidate.Slot == expected.Slot)
+                .OrderByDescending(candidate => candidate.CompletedAt)
+                .FirstOrDefault();
+            Tasks.Add(new TaskRowViewModel(
+                expected,
+                message,
+                TimeSpan.FromMinutes(Math.Max(1, _settings.Display.NodeTimeoutMinutes))));
         }
-
+        SelectedTask = Tasks.FirstOrDefault(task => task.Expected.TaskKey == previousTaskKey)
+            ?? Tasks.FirstOrDefault(task => task.IsUnread)
+            ?? Tasks.FirstOrDefault(task => task.IsComplete)
+            ?? Tasks.FirstOrDefault();
+        ApplyHistoryFilter(selectMessageId);
         OnPropertyChanged(nameof(CompletedCount));
         OnPropertyChanged(nameof(UnreadCount));
+        OnPropertyChanged(nameof(LatestReplyText));
+    }
 
-        SelectedTask = Tasks.FirstOrDefault(row => row.Expected.Slot == slotToSelect)
-            ?? Tasks.FirstOrDefault(row => row.IsUnread)
-            ?? Tasks.FirstOrDefault(row => row.IsComplete)
-            ?? Tasks.FirstOrDefault();
+    private void ApplyHistoryFilter(long? selectMessageId = null)
+    {
+        var previousId = selectMessageId ?? SelectedHistory?.Message.Id;
+        IEnumerable<TaskMessage> query = _allHistory;
+        if (!IncludeArchived) query = query.Where(message => !message.IsArchived);
+        if (UnreadOnly) query = query.Where(message => !message.IsRead);
+        if (StarredOnly) query = query.Where(message => message.IsStarred);
+        query = SelectedStatusFilter switch
+        {
+            "正常" => query.Where(message => message.Status == TaskMessageStatus.Succeeded),
+            "已跳过" => query.Where(message => message.Status == TaskMessageStatus.Skipped),
+            "失败" => query.Where(message => message.Status == TaskMessageStatus.Failed),
+            _ => query
+        };
+        if (!string.IsNullOrWhiteSpace(SearchText))
+        {
+            query = query.Where(message =>
+                message.TaskType.Contains(SearchText, StringComparison.OrdinalIgnoreCase) ||
+                message.Summary.Contains(SearchText, StringComparison.OrdinalIgnoreCase) ||
+                message.BodyMarkdown.Contains(SearchText, StringComparison.OrdinalIgnoreCase) ||
+                message.Note.Contains(SearchText, StringComparison.OrdinalIgnoreCase) ||
+                (message.TaskKey?.Contains(SearchText, StringComparison.OrdinalIgnoreCase) ?? false));
+        }
 
-        var historyIdToSelect = selectMessageId ?? SelectedHistory?.Message.Id;
         History.Clear();
-        foreach (var message in historyMessages)
+        foreach (var message in query)
         {
             History.Add(new HistoryRecordViewModel(message));
         }
-
+        SelectedHistory = History.FirstOrDefault(item => item.Message.Id == previousId) ?? History.FirstOrDefault();
         OnPropertyChanged(nameof(HistoryCount));
-        SelectedHistory = History.FirstOrDefault(row => row.Message.Id == historyIdToSelect)
-            ?? History.FirstOrDefault();
     }
 
     private void NotifySelectionChanged()
     {
+        NoteText = SelectedMessage?.Note ?? string.Empty;
         OnPropertyChanged(nameof(SelectedMessage));
         OnPropertyChanged(nameof(DetailTitle));
         OnPropertyChanged(nameof(DetailSlotText));
         OnPropertyChanged(nameof(DetailReceivedAtText));
         OnPropertyChanged(nameof(DetailCategoryText));
-        MarkReadCommand.RaiseCanExecuteChanged();
+        OnPropertyChanged(nameof(ReadButtonText));
+        OnPropertyChanged(nameof(StarButtonText));
+        OnPropertyChanged(nameof(ArchiveButtonText));
+        ToggleReadCommand.RaiseCanExecuteChanged();
+        ToggleStarredCommand.RaiseCanExecuteChanged();
+        ToggleArchivedCommand.RaiseCanExecuteChanged();
+        SaveNoteCommand.RaiseCanExecuteChanged();
+        ExportCommand.RaiseCanExecuteChanged();
     }
 
-    private void OpenConfigFolder()
+    private static string StatusTextFor(TaskMessageStatus status) => status switch
     {
-        _paths.EnsureDirectories();
-        Process.Start(new ProcessStartInfo("explorer.exe", _paths.DataDirectory) { UseShellExecute = true });
-    }
+        TaskMessageStatus.Succeeded => "正常",
+        TaskMessageStatus.Skipped => "已跳过",
+        TaskMessageStatus.Failed => "失败",
+        _ => string.Empty
+    };
 }

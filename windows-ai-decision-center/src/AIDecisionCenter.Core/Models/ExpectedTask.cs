@@ -1,3 +1,3 @@
 namespace AIDecisionCenter.Core.Models;
 
-public sealed record ExpectedTask(TimeOnly Slot, string Name);
+public sealed record ExpectedTask(string TaskKey, TimeOnly Slot, string Name);

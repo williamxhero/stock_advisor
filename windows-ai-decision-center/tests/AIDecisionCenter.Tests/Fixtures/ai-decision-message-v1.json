@@ -1,0 +1,20 @@
+{
+  "contract": "ai-decision-message/v1",
+  "message_id": "stock-advisor:11111111-2222-4333-8444-555555555555",
+  "source": "stock_advisor",
+  "run_id": "11111111-2222-4333-8444-555555555555",
+  "project": "A股",
+  "task_key": "daily.execution.1430",
+  "task_type": "操作决策",
+  "scheduled_for": "2026-08-24T14:30:00+08:00",
+  "completed_at": "2026-08-24T14:36:12+08:00",
+  "status": "succeeded",
+  "registry_id": "ScheduleRegistry-local-v1.4",
+  "protocol_id": "DailyExecution-v1.5",
+  "summary": "保持仓位，等待进一步确认。",
+  "body_markdown": "# 操作决策\n\n保持仓位。\n",
+  "payload": {
+    "actions": []
+  },
+  "response_sha256": "d489fd590fda6748b47becf45f0baafb7067de79b2d6ef6bff1df1ba3952cb94"
+}

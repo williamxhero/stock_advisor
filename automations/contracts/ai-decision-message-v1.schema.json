@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ai-decision-message/v1",
+  "title": "AI Decision Center local message",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "message_id",
+    "source",
+    "run_id",
+    "project",
+    "task_key",
+    "task_type",
+    "scheduled_for",
+    "completed_at",
+    "status",
+    "registry_id",
+    "protocol_id",
+    "summary",
+    "body_markdown",
+    "payload",
+    "response_sha256"
+  ],
+  "properties": {
+    "contract": { "const": "ai-decision-message/v1" },
+    "message_id": { "type": "string", "pattern": "^stock-advisor:[0-9a-f-]{36}$" },
+    "source": { "const": "stock_advisor" },
+    "run_id": { "type": "string", "format": "uuid" },
+    "project": { "type": "string", "minLength": 1 },
+    "task_key": { "type": "string", "minLength": 1 },
+    "task_type": { "type": "string", "minLength": 1 },
+    "scheduled_for": { "type": "string", "format": "date-time" },
+    "completed_at": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["succeeded", "skipped", "failed"] },
+    "registry_id": { "type": "string", "minLength": 1 },
+    "protocol_id": { "type": "string", "minLength": 1 },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 240 },
+    "body_markdown": { "type": "string", "minLength": 1 },
+    "payload": { "type": "object" },
+    "response_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

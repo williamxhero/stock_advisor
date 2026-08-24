@@ -1,7 +1,7 @@
 # Daily Execution Protocol
 
-Protocol ID: `DailyExecution-v1.4`  
-Version: 1.4  
+Protocol ID: `DailyExecution-v1.5`  
+Version: 1.5  
 Last Updated: 2026-08-24  
 Scope: 09:00盘前机会发现衔接、09:45异常发现、10:30趋势确认、14:30操作决策、15:20收盘复盘
 
@@ -12,6 +12,7 @@ Scope: 09:00盘前机会发现衔接、09:45异常发现、10:30趋势确认、1
 - v1.2（2026-08-21）：建立面向新股票与现有持仓的统一龙头视角；接入全市场机会发现、题材状态、股票角色与机会日志；新增新开仓、弱换强、生命周期与资金语义规则。
 - v1.3（2026-08-21）：将全市场机会发现改为交易日08:00盘前执行；明确08:00形成观察池，09:45依据竞价与开盘反应验证，避免盘前发现与盘中决策重复。
 - v1.4（2026-08-24）：将全市场机会发现由交易日08:00调整为09:00；同步09:45任务的候选池基线和增量信息窗口。
+- v1.5（2026-08-24）：所有有效任务按Registry统一写入本地ResultStore并投递AI Decision Center；正文、摘要和状态成为运行契约。
 
 ---
 
@@ -142,7 +143,7 @@ Scope: 09:00盘前机会发现衔接、09:45异常发现、10:30趋势确认、1
 
 ### 1.11 日志与状态写入
 
-- 形成正式结论时原地追加`data/logs/05_DECISION_LOG.csv`，当前`protocol_version=DailyExecution-v1.4`。
+- 形成正式结论时原地追加`data/logs/05_DECISION_LOG.csv`，当前`protocol_version=DailyExecution-v1.5`。
 - 新字段尽量填写：`event_id`、`theme_id`、`portfolio_role`、`stock_role`、`lifecycle_state`、`leadership_change`、`flow_evidence`、`attention_evidence`、`crowding_evidence`、`price_impact`、`next_buyer`、`invalidation`、`opportunity_action`。
 - `advice`记录建议；`actual_action`等实际字段只有用户确认成交后填写。
 - 新机会首次进入、升级、淘汰或产生弱换强建议时，追加`data/logs/12_OPPORTUNITY_LOG.csv`；被拒绝的高关注机会保留关键拒绝原因，避免选择偏差。
@@ -359,7 +360,7 @@ Decision Log只记录本时点建议，实际成交等待用户确认。
 5. 文件维护结果；
 6. 待用户确认成交；
 7. 次日最重要的3项观察；
-8. 当前Protocol ID `DailyExecution-v1.4`。
+8. 当前Protocol ID `DailyExecution-v1.5`。
 
 ---
 
@@ -368,3 +369,11 @@ Decision Log只记录本时点建议，实际成交等待用户确认。
 - 本文件、`docs/protocols/09_OPPORTUNITY_DISCOVERY_PROTOCOL.md`、`docs/governance/13_DATA_SEMANTICS.md`缺失、版本不明或与Guide/Playbook冲突时，报告异常，不得用旧Schedule长Prompt、历史聊天或Memory替代。
 - 文件身份不明、版本冲突或写入失败时，停止对应写入并如实报告；不得创建同名替代文件。
 - Guide与Playbook的高层边界和正式规则优先；冲突内容留待人工修订Protocol。
+
+---
+
+## 7. 结果保存与投递
+
+- 所有有效任务最终必须遵守`automations/15_RESULT_DELIVERY.md`；本协议只定义业务正文，不复制ResultStore或Inbox实现细节。
+- 完整正文必须先保存到ResultStore，再原样作为Codex任务最终回复；两份正文必须语义一致。
+- 非交易日正文状态为`skipped`；本协议异常正文状态为`failed`；正常分析为`succeeded`。

@@ -1,0 +1,9 @@
+**/bin/
+**/obj/
+artifacts/
+config/oauth-client.json
+*.user
+*.suo
+*.db
+*.db-shm
+*.db-wal

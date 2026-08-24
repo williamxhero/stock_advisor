@@ -1,0 +1,6 @@
+# Local migration archives retained only for provenance.
+/archive/snapshots/
+/archive/source-packages/
+
+# Local Codex project state, if generated later.
+/.codex/

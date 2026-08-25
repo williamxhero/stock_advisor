@@ -6,7 +6,10 @@
 /.codex/
 
 # Local runtime state. These files are authoritative on the workstation, not in Git.
-/data/runtime/
+/dist/
+/archive/local/
+**/bin/
+**/obj/
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal

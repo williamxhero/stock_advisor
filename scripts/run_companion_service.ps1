@@ -7,13 +7,24 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
-$mutex = [System.Threading.Mutex]::new($false, 'Local\StockAdvisorCompanionService')
+$env:AI_TRADING_COMPANION_INSTALL_ROOT = $root
+if (-not $env:AI_TRADING_COMPANION_HOME) {
+    $env:AI_TRADING_COMPANION_HOME = Join-Path $env:LOCALAPPDATA 'AITradingCompanion'
+}
+$runtimePackageRoot = if (Test-Path -LiteralPath (Join-Path $root 'src\runtime')) {
+    Join-Path $root 'src\runtime'
+}
+else {
+    Join-Path $root 'runtime'
+}
+$env:PYTHONPATH = "$runtimePackageRoot" + $(if ($env:PYTHONPATH) { ";$env:PYTHONPATH" } else { "" })
+$mutex = [System.Threading.Mutex]::new($false, 'Local\AITradingCompanionRuntime')
 if (-not $mutex.WaitOne(0)) {
     Write-Host 'Companion service is already running.'
     exit 0
 }
-$logPath = Join-Path $root 'data\runtime\companion\service-errors.log'
-$heartbeatPath = Join-Path $root 'data\runtime\companion\service-heartbeat.json'
+$logPath = Join-Path $env:AI_TRADING_COMPANION_HOME 'runtime\logs\service-errors.log'
+$heartbeatPath = Join-Path $env:AI_TRADING_COMPANION_HOME 'runtime\service-heartbeat.json'
 
 function Write-ServiceState([string]$State, [string]$ErrorText = '') {
     $directory = Split-Path -Parent $heartbeatPath
@@ -33,7 +44,9 @@ function Write-ServiceError([string]$Message) {
 }
 
 function Invoke-Companion([string[]]$Arguments) {
-    $output = & py scripts/companion.py @Arguments 2>&1
+    $runtimePython = Join-Path $env:AI_TRADING_COMPANION_HOME 'runtime\python\Scripts\python.exe'
+    $python = if (Test-Path -LiteralPath $runtimePython) { $runtimePython } else { 'py' }
+    $output = & $python -m ai_trading_companion @Arguments 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-ServiceError ($output -join [Environment]::NewLine)
     }

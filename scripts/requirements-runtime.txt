@@ -1,0 +1,3 @@
+# The installed product uses the locally installed Python interpreter.  The
+# installer checks these modules before enabling the scheduler.
+exchange-calendars==4.13.2

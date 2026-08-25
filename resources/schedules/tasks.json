@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "timezone": "Asia/Shanghai",
+  "catch_up_minutes": 15,
+  "daily": [
+    {"task_key": "daily.opportunity.0900", "at": "09:00", "lead_minutes": 30},
+    {"task_key": "daily.execution.0945", "at": "09:45", "lead_minutes": 0},
+    {"task_key": "daily.execution.1030", "at": "10:30", "lead_minutes": 0},
+    {"task_key": "daily.execution.1430", "at": "14:30", "lead_minutes": 0},
+    {"task_key": "daily.review.1520", "at": "15:20", "lead_minutes": 0}
+  ],
+  "periodic": [
+    {"task_key": "periodic.monthly", "months": "*", "day": 1, "at": "19:00"},
+    {"task_key": "periodic.quarterly", "months": [1, 4, 7, 10], "day": 2, "at": "19:30"},
+    {"task_key": "periodic.annual", "months": [1], "day": 3, "at": "20:00"}
+  ]
+}

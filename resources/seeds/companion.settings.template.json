@@ -1,0 +1,20 @@
+{
+  "backup": {
+    "external_path": "D:/replace-with-your-backup-location",
+    "retention": { "daily": 14, "weekly": 8, "monthly": 12 }
+  },
+  "embedding": {
+    "enabled": false,
+    "base_url": "https://example.invalid/v1",
+    "model": "configured-embedding-model",
+    "api_key": "put-local-key-here-never-commit",
+    "max_concurrency": 1,
+    "timeout_seconds": 20,
+    "max_attempts_per_record": 3
+  },
+  "experiments": {
+    "material_quality_uplift": 0.1,
+    "one_sided_alpha": 0.1,
+    "fdr": 0.1
+  }
+}

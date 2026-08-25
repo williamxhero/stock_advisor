@@ -1,8 +1,8 @@
 # Daily Execution Protocol
 
-Protocol ID: `DailyExecution-v1.5`  
-Version: 1.5  
-Last Updated: 2026-08-24  
+Protocol ID: `DailyExecution-v1.6`
+Version: 1.6
+Last Updated: 2026-08-25
 Scope: 09:00盘前机会发现衔接、09:45异常发现、10:30趋势确认、14:30操作决策、15:20收盘复盘
 
 ## Change Log
@@ -13,6 +13,7 @@ Scope: 09:00盘前机会发现衔接、09:45异常发现、10:30趋势确认、1
 - v1.3（2026-08-21）：将全市场机会发现改为交易日08:00盘前执行；明确08:00形成观察池，09:45依据竞价与开盘反应验证，避免盘前发现与盘中决策重复。
 - v1.4（2026-08-24）：将全市场机会发现由交易日08:00调整为09:00；同步09:45任务的候选池基线和增量信息窗口。
 - v1.5（2026-08-24）：所有有效任务按Registry统一写入本地ResultStore并投递AI Decision Center；正文、摘要和状态成为运行契约。
+- v1.6（2026-08-25）：落实R-017个人卖出执行纪律；普通减仓/清仓只在14:30—15:00执行，前一交易日建议收盘失效，09:45/10:30只形成风险预警与14:30条件。
 
 ---
 
@@ -141,9 +142,18 @@ Scope: 09:00盘前机会发现衔接、09:45异常发现、10:30趋势确认、1
 
 所有清仓或大幅减仓仍必须执行R-004 Counterfactual Check；二元仓位执行R-005；卖飞后执行R-006。
 
+#### 普通卖出执行窗口
+
+- 遵守Playbook R-017：除突发重大风险或用户当日明确临时指令外，普通减仓与清仓只在14:30—15:00执行；
+- 09:45和10:30可以标记风险、地位下降和失效候选，但卖出建议股数必须为0，并把具体卖出比较留到14:30；
+- 14:30卖出建议只在当日收盘前有效。未执行的建议于15:00失效，不得跨日带到下一交易日早盘；
+- 下一交易日即使开盘继续弱，也必须重新经过当日09:45、10:30观察，并等待14:30形成新的卖出决策；
+- 实际卖出股数不得高于最新建议；扩大减仓强度或由减仓变清仓必须取得新的14:30决策或用户当日明确指令；
+- 例外必须在Decision Log的`notes`中记录`early_sell_exception=<原因>`、可见证据与实际股数。
+
 ### 1.11 日志与状态写入
 
-- 形成正式结论时原地追加`data/logs/05_DECISION_LOG.csv`，当前`protocol_version=DailyExecution-v1.5`。
+- 形成正式结论时原地追加`data/logs/05_DECISION_LOG.csv`，当前`protocol_version=DailyExecution-v1.6`。
 - 新字段尽量填写：`event_id`、`theme_id`、`portfolio_role`、`stock_role`、`lifecycle_state`、`leadership_change`、`flow_evidence`、`attention_evidence`、`crowding_evidence`、`price_impact`、`next_buyer`、`invalidation`、`opportunity_action`。
 - `advice`记录建议；`actual_action`等实际字段只有用户确认成交后填写。
 - 新机会首次进入、升级、淘汰或产生弱换强建议时，追加`data/logs/12_OPPORTUNITY_LOG.csv`；被拒绝的高关注机会保留关键拒绝原因，避免选择偏差。
@@ -238,6 +248,7 @@ Scope: 09:00盘前机会发现衔接、09:45异常发现、10:30趋势确认、1
 - `invalidated`：撤销买入条件，必要时降低已持有跟随股暴露；
 - 分歧后重新回流核心：优先研究核心，不在后排无差别补涨；
 - 原持仓地位下降且替代核心明确：建立14:30弱换强比较，不急于盘中情绪切换。
+- 对持仓形成卖出风险时只记录14:30待执行条件，普通卖出建议股数为0；不得在10:30直接执行或把前一交易日卖出建议带到早盘。
 
 ### 3.4 固定输出
 
@@ -360,7 +371,7 @@ Decision Log只记录本时点建议，实际成交等待用户确认。
 5. 文件维护结果；
 6. 待用户确认成交；
 7. 次日最重要的3项观察；
-8. 当前Protocol ID `DailyExecution-v1.5`。
+8. 当前Protocol ID `DailyExecution-v1.6`。
 
 ---
 

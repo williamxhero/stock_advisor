@@ -35,7 +35,15 @@ public partial class App : System.Windows.Application, IDisposable
         });
 
         var viewModel = new MainViewModel(store, _inbox, _notifications, paths, settings);
-        window = new MainWindow(viewModel);
+        try
+        {
+            CompanionRuntimeService.EnsureStarted();
+        }
+        catch (Exception exception)
+        {
+            viewModel.ReportInboxFailure(exception);
+        }
+        window = new MainWindow(viewModel, paths);
         MainWindow = window;
         window.Show();
         await viewModel.InitializeAsync().ConfigureAwait(true);

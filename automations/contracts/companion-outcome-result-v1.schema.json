@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["as_of", "checkpoint_ready", "target_session_date", "next_check_at", "verification_status", "summary", "observations", "data_gaps", "market_regime"],
+  "properties": {
+    "as_of": {"type": "string"},
+    "checkpoint_ready": {"type": "boolean"},
+    "target_session_date": {"type": ["string", "null"]},
+    "next_check_at": {"type": ["string", "null"]},
+    "verification_status": {
+      "enum": ["correct", "incorrect", "partial", "direction_right_timing_wrong", "mechanism_right_outcome_luck", "superseded", "unverified", "excluded_data_missing"]
+    },
+    "summary": {"type": "string", "minLength": 1},
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["subject", "reference_price", "current_price", "absolute_return", "benchmark_return", "excess_return", "mfe", "mae", "data_quality", "sources"],
+        "properties": {
+          "subject": {"type": "string"},
+          "reference_price": {"type": ["number", "null"]},
+          "current_price": {"type": ["number", "null"]},
+          "absolute_return": {"type": ["number", "null"]},
+          "benchmark_return": {"type": ["number", "null"]},
+          "excess_return": {"type": ["number", "null"]},
+          "mfe": {"type": ["number", "null"]},
+          "mae": {"type": ["number", "null"]},
+          "data_quality": {"type": "string"},
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["url", "as_of", "role"],
+              "properties": {
+                "url": {"type": "string"},
+                "as_of": {"type": "string"},
+                "role": {"enum": ["price", "benchmark", "cross_check"]}
+              }
+            }
+          }
+        }
+      }
+    },
+    "data_gaps": {"type": "array", "items": {"type": "string"}},
+    "market_regime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index_trend", "breadth", "turnover_change", "volatility", "data_quality"],
+      "properties": {
+        "index_trend": {"type": ["number", "null"]},
+        "breadth": {"type": ["number", "null"]},
+        "turnover_change": {"type": ["number", "null"]},
+        "volatility": {"type": ["number", "null"]},
+        "data_quality": {"type": "string"}
+      }
+    }
+  }
+}

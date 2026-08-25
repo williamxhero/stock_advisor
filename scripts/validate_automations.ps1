@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$CheckInstalled
 )
@@ -109,7 +109,7 @@ foreach ($relativePath in $requiredFiles) {
 
 $registryPath = Join-Path $projectRoot 'automations/14_SCHEDULE_REGISTRY.md'
 if (Test-Path -LiteralPath $registryPath) {
-    $registry = Get-Content -LiteralPath $registryPath -Raw
+    $registry = Get-Content -LiteralPath $registryPath -Raw -Encoding UTF8
     Assert-Condition ($registry -match 'Registry ID: `ScheduleRegistry-local-v1\.5`') 'Registry ID 不是v1.5本地身份'
     Assert-Condition ($registry -match '\| `local_outbox` \|') 'Registry 未启用local_outbox投递策略'
     Assert-Condition ($registry -match 'automations/15_RESULT_DELIVERY\.md') 'Registry 未引用统一结果投递规范'
@@ -128,7 +128,7 @@ if (Test-Path -LiteralPath $registryPath) {
 
 $triggerHandoffPath = Join-Path $projectRoot 'automations/prompts/trigger-handoff.md'
 if (Test-Path -LiteralPath $triggerHandoffPath) {
-    $triggerHandoff = Get-Content -LiteralPath $triggerHandoffPath -Raw
+    $triggerHandoff = Get-Content -LiteralPath $triggerHandoffPath -Raw -Encoding UTF8
     Assert-Condition ($triggerHandoff -match 'D:\\WILL\\STOCK\\stock_advisor') '公共转交规则缺少固定本地根目录'
     Assert-Condition ($triggerHandoff -match 'automations/thread-map\.local\.json') '公共转交规则未引用本地task/thread映射'
     Assert-Condition ($triggerHandoff -match 'automations/prompts/run-registered-task\.md') '公共转交规则未引用统一工作入口'
@@ -139,7 +139,7 @@ if (Test-Path -LiteralPath $triggerHandoffPath) {
 
 $runnerPath = Join-Path $projectRoot 'automations/prompts/run-registered-task.md'
 if (Test-Path -LiteralPath $runnerPath) {
-    $runner = Get-Content -LiteralPath $runnerPath -Raw
+    $runner = Get-Content -LiteralPath $runnerPath -Raw -Encoding UTF8
     Assert-Condition ($runner -match 'D:\\WILL\\STOCK\\stock_advisor') '统一工作入口缺少固定本地根目录'
     Assert-Condition ($runner -match 'automations/14_SCHEDULE_REGISTRY\.md') '统一工作入口未引用Registry'
     Assert-Condition ($runner -match 'automations/15_RESULT_DELIVERY\.md') '统一工作入口未引用结果投递规范'
@@ -153,7 +153,7 @@ foreach ($entry in $triggerDefinitions.GetEnumerator()) {
         continue
     }
 
-    $descriptor = Get-Content -LiteralPath $descriptorPath -Raw
+    $descriptor = Get-Content -LiteralPath $descriptorPath -Raw -Encoding UTF8
     $taskKeyCount = ([regex]::Matches($descriptor, [regex]::Escape("``$($entry.Key)``"))).Count
     Assert-Condition ($taskKeyCount -eq 1) "Trigger descriptor中task_key数量异常: $($entry.Key) ($taskKeyCount)"
     Assert-Condition ($descriptor.Contains("task_title: ``$($entry.Value.Title)``")) "Trigger descriptor标题异常: $($entry.Key)"
@@ -177,7 +177,7 @@ $threadMap = $null
 $threadMapPath = Join-Path $projectRoot 'automations/thread-map.local.json'
 if (Test-Path -LiteralPath $threadMapPath) {
     try {
-        $threadMap = Get-Content -LiteralPath $threadMapPath -Raw | ConvertFrom-Json
+        $threadMap = Get-Content -LiteralPath $threadMapPath -Raw -Encoding UTF8 | ConvertFrom-Json
     }
     catch {
         Assert-Condition $false "本地task/thread映射不是合法JSON: $($_.Exception.Message)"
@@ -228,7 +228,7 @@ if ($CheckInstalled) {
         $installedProjectConfigs = @(Get-ChildItem -LiteralPath $automationRoot -Directory | ForEach-Object {
             $configPath = Join-Path $_.FullName 'automation.toml'
             if (Test-Path -LiteralPath $configPath) {
-                $raw = Get-Content -LiteralPath $configPath -Raw
+                $raw = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
                 if ($raw -match 'stock_advisor') {
                     [pscustomobject]@{ Id = $_.Name; Path = $configPath; Raw = $raw }
                 }
@@ -268,8 +268,19 @@ if ($CheckInstalled) {
         }
     }
 
-    $activeProjectConfigs = @($installedProjectConfigs | Where-Object { $_.Raw -match '(?m)^status = "ACTIVE"$' })
-    Assert-Condition ($activeProjectConfigs.Count -eq 8) "活动项目自动化数量异常: $($activeProjectConfigs.Count)"
+    # Read-only health monitors may also mention stock_advisor. Count only the
+    # eight registered business automations governed by this registry.
+    $registeredAutomationIds = if ($null -ne $threadMap) {
+        @($triggerDefinitions.Keys | ForEach-Object { $threadMap.trigger_threads.PSObject.Properties[$_].Value.automation_id })
+    }
+    else { @() }
+    $activeProjectConfigs = @($installedProjectConfigs | Where-Object {
+        $_.Raw -match '(?m)^status = "ACTIVE"$' -and (
+            ($registeredAutomationIds.Count -gt 0 -and $registeredAutomationIds -contains $_.Id) -or
+            ($registeredAutomationIds.Count -eq 0 -and $triggerDefinitions.Values.Title -contains ([regex]::Match($_.Raw, '(?m)^name = "(.*)"$').Groups[1].Value))
+        )
+    })
+    Assert-Condition ($activeProjectConfigs.Count -eq 8) "活动业务自动化数量异常: $($activeProjectConfigs.Count)"
 }
 
 if ($failures.Count -gt 0) {

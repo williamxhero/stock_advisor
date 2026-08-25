@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["statement_type", "changes"],
+  "properties": {
+    "statement_type": {"enum": ["executed", "current_state", "planned", "advice", "unrelated", "ambiguous"]},
+    "changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action", "code", "name", "shares", "price", "occurred_at", "average_cost", "total_assets", "evidence"],
+        "properties": {
+          "action": {"enum": ["buy", "sell", "sell_all", "position_correction", "asset_correction"]},
+          "code": {"type": ["string", "null"]},
+          "name": {"type": ["string", "null"]},
+          "shares": {"type": ["integer", "null"]},
+          "price": {"type": ["number", "null"]},
+          "occurred_at": {"type": ["string", "null"]},
+          "average_cost": {"type": ["number", "null"]},
+          "total_assets": {"type": ["number", "null"]},
+          "evidence": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["instrument", "action", "shares", "price", "average_cost", "total_assets"],
+            "properties": {
+              "instrument": {"type": ["string", "null"]},
+              "action": {"type": ["string", "null"]},
+              "shares": {"type": ["string", "null"]},
+              "price": {"type": ["string", "null"]},
+              "average_cost": {"type": ["string", "null"]},
+              "total_assets": {"type": ["string", "null"]}
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,5 +1,9 @@
 # stock_advisor 项目规则
 
+## 产品原则
+
+- 修改伴生研判、LLM、持仓、评测、工作流或 UI 前，必须读取并遵守 `docs/architecture/APP_DEVELOPMENT_PRINCIPLES.md`。它是独立 AI 判断、风险、认知预算、进化和自然对话的 canonical 产品约束。
+
 ## 本地边界
 
 - 本项目的运行、修改和定时任务只允许使用 `D:\WILL\STOCK\stock_advisor` 内的本地文件。

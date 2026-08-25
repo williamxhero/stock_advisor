@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["contract","event_id","cycle_id","type","created_at","payload"],"properties":{"contract":{"const":"companion-client-event/v1"},"event_id":{"type":"string"},"cycle_id":{"type":"string"},"type":{"type":"string"},"created_at":{"type":"string"},"payload":{"type":"object"}}}

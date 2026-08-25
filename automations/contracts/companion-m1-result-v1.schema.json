@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["m1_markdown", "judgment_qualified", "blocking_reason", "snapshot"],
+  "properties": {
+    "m1_markdown": {"type": "string", "minLength": 1},
+    "judgment_qualified": {"type": "boolean"},
+    "blocking_reason": {"type": ["string", "null"]},
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subjects", "direction", "horizon", "reference_at", "triggers", "invalidations", "confidence", "benchmark", "qualified", "original_claims", "claims"],
+      "properties": {
+        "subjects": {"type": "array", "items": {"type": "string"}},
+        "direction": {"enum": ["bullish", "bearish", "neutral", "avoid", "unqualified", "unknown"]},
+        "horizon": {"type": ["string", "null"]},
+        "reference_at": {"type": "string"},
+        "triggers": {"type": "array", "items": {"type": "string"}},
+        "invalidations": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": ["string", "null"]},
+        "benchmark": {"type": ["string", "null"]},
+        "qualified": {"type": "boolean"},
+        "original_claims": {"type": "array", "items": {"type": "string"}},
+        "claims": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["subjects", "direction", "horizon", "triggers", "invalidations", "confidence", "benchmark", "original_text"],
+            "properties": {
+              "subjects": {"type": "array", "items": {"type": "string"}},
+              "direction": {"enum": ["bullish", "bearish", "neutral", "avoid", "unqualified", "unknown"]},
+              "horizon": {"type": ["string", "null"]},
+              "triggers": {"type": "array", "items": {"type": "string"}},
+              "invalidations": {"type": "array", "items": {"type": "string"}},
+              "confidence": {"type": ["string", "null"]},
+              "benchmark": {"type": ["string", "null"]},
+              "original_text": {"type": "string"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

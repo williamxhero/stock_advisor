@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["reply_markdown", "needs_fresh_search", "public_search_request", "judgment_revision", "workflow_proposal", "proposal_decision"],
+  "properties": {
+    "reply_markdown": {"type": "string", "minLength": 1},
+    "needs_fresh_search": {"type": "boolean"},
+    "public_search_request": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["topics", "questions"],
+          "properties": {
+            "topics": {"type": "array", "items": {"type": "string"}},
+            "questions": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      ]
+    },
+    "judgment_revision": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["revises_artifact_id", "revision_markdown"],
+          "properties": {
+            "revises_artifact_id": {"type": "string"},
+            "revision_markdown": {"type": "string", "minLength": 1}
+          }
+        }
+      ]
+    },
+    "workflow_proposal": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["category", "title", "problem", "change", "evidence", "policy_patch"],
+          "properties": {
+            "category": {"enum": ["workflow_efficiency", "search_coverage", "investment_method"]},
+            "title": {"type": "string"},
+            "problem": {"type": "string"},
+            "change": {"type": "string"},
+            "evidence": {"type": "array", "items": {"type": "string"}},
+            "policy_patch": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["add_categories", "add_standing_questions", "add_counterevidence_questions", "add_method_hypotheses"],
+              "properties": {
+                "add_categories": {"type": "array", "items": {"type": "string"}},
+                "add_standing_questions": {"type": "array", "items": {"type": "string"}},
+                "add_counterevidence_questions": {"type": "array", "items": {"type": "string"}},
+                "add_method_hypotheses": {"type": "array", "items": {"type": "string"}}
+              }
+            }
+          }
+        }
+      ]
+    },
+    "proposal_decision": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["proposal_id", "action", "note"],
+          "properties": {
+            "proposal_id": {"type": ["string", "null"]},
+            "action": {"enum": ["approve", "reject", "rollback"]},
+            "note": {"type": "string"}
+          }
+        }
+      ]
+    }
+  }
+}

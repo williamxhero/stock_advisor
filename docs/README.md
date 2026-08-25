@@ -5,5 +5,6 @@
 - `protocols/`：各定时任务的完整业务执行协议。
 - `research/`：案例与待验证假说。
 - `templates/`：标准输出模板。
+- `architecture/`：运行时、LLM、Decision Center 与持久知识的架构研究和实施设计。
 
 所有路径引用都以项目根目录为基准。

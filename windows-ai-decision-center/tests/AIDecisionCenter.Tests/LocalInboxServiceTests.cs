@@ -60,6 +60,28 @@ public sealed class LocalInboxServiceTests : IDisposable
         Assert.Single(Directory.EnumerateFiles(paths.DeadLetterDirectory, "*.error.txt"));
     }
 
+    [Fact]
+    public async Task ReconcilesProcessedMessageMissingFromDatabase()
+    {
+        var paths = new AppPaths(_directory);
+        paths.EnsureDirectories();
+        var store = new SqliteTaskMessageStore(paths);
+        await store.InitializeAsync();
+        using var inbox = new LocalInboxService(paths, store, new AppSettings());
+        var runId = Guid.NewGuid().ToString();
+        var archive = Path.Combine(paths.ProcessedDirectory, "2026-08-25");
+        Directory.CreateDirectory(archive);
+        var processed = Path.Combine(archive, $"{runId}.json");
+        await File.WriteAllTextAsync(processed, TestMessageFactory.CreateEnvelope(runId));
+
+        var batch = await inbox.ImportAvailableAsync();
+
+        Assert.Single(batch.Added);
+        Assert.Equal(1, batch.RecoveredCount);
+        Assert.Single(await store.GetAllAsync());
+        Assert.True(File.Exists(processed));
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_directory)) Directory.Delete(_directory, recursive: true);

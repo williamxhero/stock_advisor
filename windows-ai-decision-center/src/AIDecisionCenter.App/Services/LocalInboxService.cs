@@ -10,6 +10,7 @@ public sealed class LocalInboxService : IDisposable
     private readonly AppSettings _settings;
     private readonly SemaphoreSlim _scanLock = new(1, 1);
     private readonly SemaphoreSlim _signal = new(0, 1);
+    private readonly HashSet<string> _reconciledProcessedFiles = new(StringComparer.OrdinalIgnoreCase);
     private FileSystemWatcher? _watcher;
     private bool _disposed;
 
@@ -35,7 +36,7 @@ public sealed class LocalInboxService : IDisposable
         _watcher.Renamed += OnInboxChanged;
 
         var initial = await ImportAvailableAsync(cancellationToken).ConfigureAwait(false);
-        if (initial.Added.Count > 0 || initial.DeadLetterCount > 0)
+        if (initial.Added.Count > 0 || initial.DeadLetterCount > 0 || initial.ReconciliationErrorCount > 0)
         {
             await onImported(initial).ConfigureAwait(false);
         }
@@ -58,7 +59,7 @@ public sealed class LocalInboxService : IDisposable
             }
 
             var batch = await ImportAvailableAsync(cancellationToken).ConfigureAwait(false);
-            if (batch.Added.Count > 0 || batch.DeadLetterCount > 0)
+            if (batch.Added.Count > 0 || batch.DeadLetterCount > 0 || batch.ReconciliationErrorCount > 0)
             {
                 await onImported(batch).ConfigureAwait(false);
             }
@@ -74,6 +75,8 @@ public sealed class LocalInboxService : IDisposable
             var added = new List<AIDecisionCenter.Core.Models.TaskMessage>();
             var duplicates = 0;
             var deadLetters = 0;
+            var recovered = 0;
+            var reconciliationErrors = 0;
 
             var processingFiles = Directory.EnumerateFiles(_paths.ProcessingDirectory, "*.json")
                 .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
@@ -127,7 +130,8 @@ public sealed class LocalInboxService : IDisposable
                     {
                         added.Add(saved);
                     }
-                    MoveProcessed(file, incoming.CompletedAt);
+                    var processed = MoveProcessed(file, incoming.CompletedAt);
+                    _reconciledProcessedFiles.Add(processed);
                 }
                 catch (Exception exception) when (exception is not OperationCanceledException)
                 {
@@ -136,7 +140,40 @@ public sealed class LocalInboxService : IDisposable
                 }
             }
 
-            return new InboxImportBatch(added, duplicates, deadLetters);
+            foreach (var file in Directory.EnumerateFiles(_paths.ProcessedDirectory, "*.json", SearchOption.AllDirectories)
+                         .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+            {
+                if (!_reconciledProcessedFiles.Add(file))
+                {
+                    continue;
+                }
+                try
+                {
+                    var info = new FileInfo(file);
+                    if (info.Length > Math.Clamp(_settings.Inbox.MaxMessageBytes, 1024, 100 * 1024 * 1024))
+                    {
+                        throw new InvalidDataException($"归档消息超过大小限制：{info.Length} bytes");
+                    }
+                    var json = await File.ReadAllTextAsync(file, cancellationToken).ConfigureAwait(false);
+                    if (!DecisionMessageParser.TryParse(json, DateTimeOffset.UtcNow, out var incoming, out var error) || incoming is null)
+                    {
+                        throw new InvalidDataException(error ?? "归档消息契约无效");
+                    }
+                    var saved = await _store.AddAsync(incoming, cancellationToken).ConfigureAwait(false);
+                    if (saved is not null)
+                    {
+                        added.Add(saved);
+                        recovered++;
+                    }
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
+                {
+                    _reconciledProcessedFiles.Remove(file);
+                    reconciliationErrors++;
+                }
+            }
+
+            return new InboxImportBatch(added, duplicates, deadLetters, recovered, reconciliationErrors);
         }
         finally
         {
@@ -179,13 +216,13 @@ public sealed class LocalInboxService : IDisposable
         }
     }
 
-    private void MoveProcessed(string file, DateTimeOffset completedAt)
+    private string MoveProcessed(string file, DateTimeOffset completedAt)
     {
         var dateDirectory = Path.Combine(
             _paths.ProcessedDirectory,
             completedAt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
         Directory.CreateDirectory(dateDirectory);
-        MoveWithoutOverwrite(file, dateDirectory);
+        return MoveWithoutOverwrite(file, dateDirectory);
     }
 
     private void MoveDeadLetter(string file, string error)

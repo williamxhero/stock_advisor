@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "event_id", "type", "created_at", "payload"],
+  "properties": {
+    "contract": {"const": "portfolio-client-event/v1"},
+    "event_id": {"type": "string"},
+    "type": {"enum": ["portfolio.snapshot.ready", "portfolio.interpretation.started", "portfolio.change.applied", "portfolio.change.needs_input", "portfolio.change.rejected", "portfolio.change.reverted"]},
+    "created_at": {"type": "string"},
+    "payload": {"type": "object"},
+    "sha256": {"type": "string"}
+  }
+}

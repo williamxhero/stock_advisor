@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["reflection_markdown", "memory_tags", "workflow_proposal"],
+  "properties": {
+    "reflection_markdown": {"type": "string", "minLength": 1},
+    "memory_tags": {"type": "array", "items": {"type": "string"}},
+    "workflow_proposal": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["category", "title", "problem", "change", "evidence", "policy_patch"],
+          "properties": {
+            "category": {"enum": ["workflow_efficiency", "search_coverage", "investment_method"]},
+            "title": {"type": "string"},
+            "problem": {"type": "string"},
+            "change": {"type": "string"},
+            "evidence": {"type": "array", "items": {"type": "string"}},
+            "policy_patch": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["add_categories", "add_standing_questions", "add_counterevidence_questions", "add_method_hypotheses"],
+              "properties": {
+                "add_categories": {"type": "array", "items": {"type": "string"}},
+                "add_standing_questions": {"type": "array", "items": {"type": "string"}},
+                "add_counterevidence_questions": {"type": "array", "items": {"type": "string"}},
+                "add_method_hypotheses": {"type": "array", "items": {"type": "string"}}
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["as_of", "spoken_summary", "sources", "critical_gaps", "conflicts", "high_impact_events"],
+  "properties": {
+    "as_of": {"type": "string"},
+    "spoken_summary": {"type": "string", "minLength": 1},
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["url", "title", "published_or_retrieved_at", "excerpt", "factual_reliability", "market_propagation"],
+        "properties": {
+          "url": {"type": "string"},
+          "title": {"type": "string"},
+          "published_or_retrieved_at": {"type": "string"},
+          "excerpt": {"type": "string"},
+          "factual_reliability": {"type": ["string", "null"]},
+          "market_propagation": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "critical_gaps": {"type": "array", "items": {"type": "string"}},
+    "conflicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim", "competing_evidence", "materiality"],
+        "properties": {
+          "claim": {"type": "string"},
+          "competing_evidence": {"type": "array", "items": {"type": "string"}},
+          "materiality": {"enum": ["low", "medium", "high"]}
+        }
+      }
+    },
+    "high_impact_events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary", "scope", "materiality", "evidence_urls"],
+        "properties": {
+          "summary": {"type": "string"},
+          "scope": {"enum": ["market", "theme", "portfolio"]},
+          "materiality": {"enum": ["low", "medium", "high"]},
+          "evidence_urls": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}

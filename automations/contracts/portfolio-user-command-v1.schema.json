@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "command_id", "type"],
+  "properties": {
+    "contract": {"const": "portfolio-user-command/v1"},
+    "command_id": {"type": "string", "minLength": 1},
+    "type": {"enum": ["request_snapshot", "revert_transaction", "cancel_pending_proposal"]},
+    "proposal_id": {"type": "string"},
+    "sha256": {"type": "string"}
+  }
+}

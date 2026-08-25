@@ -17,7 +17,7 @@ public sealed class MainViewModel : ObservableObject
     private TaskRowViewModel? _selectedTask;
     private HistoryRecordViewModel? _selectedHistory;
     private int _selectedSectionIndex;
-    private string _statusText = "正在启动…";
+    private string _statusText = string.Empty;
     private bool _isBusy;
     private bool _startupEnabled;
     private string _searchText = string.Empty;
@@ -55,6 +55,7 @@ public sealed class MainViewModel : ObservableObject
     public ObservableCollection<TaskRowViewModel> Tasks { get; } = [];
 
     public ObservableCollection<HistoryRecordViewModel> History { get; } = [];
+    public ObservableCollection<HistoryDateGroupViewModel> HistoryByDate { get; } = [];
 
     public IReadOnlyList<string> StatusFilters { get; } = ["全部状态", "正常", "已跳过", "失败"];
 
@@ -228,7 +229,11 @@ public sealed class MainViewModel : ObservableObject
         await _store.InitializeAsync().ConfigureAwait(true);
         var batch = await _inbox.ImportAvailableAsync().ConfigureAwait(true);
         await RefreshAsync().ConfigureAwait(true);
-        StatusText = batch.Added.Count > 0 ? $"启动时补收 {batch.Added.Count} 条消息" : "本地 Inbox 已就绪";
+        StatusText = batch.ReconciliationErrorCount > 0
+            ? $"归档对账失败 {batch.ReconciliationErrorCount} 条"
+            : batch.RecoveredCount > 0
+                ? $"启动时从归档补收 {batch.RecoveredCount} 条消息"
+                : batch.Added.Count > 0 ? $"启动时补收 {batch.Added.Count} 条消息" : string.Empty;
         OnPropertyChanged(nameof(ConnectionText));
     }
 
@@ -248,9 +253,13 @@ public sealed class MainViewModel : ObservableObject
                 _notifications.Show(message.TaskType, message.Summary);
             }
         }
-        StatusText = batch.DeadLetterCount > 0
+        StatusText = batch.ReconciliationErrorCount > 0
+            ? $"导入 {batch.Added.Count} 条；归档对账失败 {batch.ReconciliationErrorCount} 条"
+            : batch.DeadLetterCount > 0
             ? $"导入 {batch.Added.Count} 条；{batch.DeadLetterCount} 条进入 dead-letter"
-            : $"已导入 {batch.Added.Count} 条新消息";
+            : batch.RecoveredCount > 0
+                ? $"已从归档补收 {batch.RecoveredCount} 条消息"
+                : $"已导入 {batch.Added.Count} 条新消息";
     }
 
     public void ReportInboxFailure(Exception exception) => StatusText = $"Inbox后台处理失败：{exception.Message}";
@@ -261,7 +270,10 @@ public sealed class MainViewModel : ObservableObject
         {
             task.RefreshStatus(now);
         }
+        OnPropertyChanged(nameof(CompletedCount));
     }
+
+    public void RefreshCompanionSummary() => OnPropertyChanged(nameof(CompletedCount));
 
     private async Task ScanAsync()
     {
@@ -270,7 +282,7 @@ public sealed class MainViewModel : ObservableObject
         try
         {
             var batch = await _inbox.ImportAvailableAsync().ConfigureAwait(true);
-            if (batch.Added.Count > 0 || batch.DeadLetterCount > 0)
+            if (batch.Added.Count > 0 || batch.DeadLetterCount > 0 || batch.ReconciliationErrorCount > 0)
             {
                 await HandleImportBatchAsync(batch).ConfigureAwait(true);
             }
@@ -374,9 +386,9 @@ public sealed class MainViewModel : ObservableObject
                 message,
                 TimeSpan.FromMinutes(Math.Max(1, _settings.Display.NodeTimeoutMinutes))));
         }
+        var currentSlot = TimeOnly.FromDateTime(DateTime.Now);
         SelectedTask = Tasks.FirstOrDefault(task => task.Expected.TaskKey == previousTaskKey)
-            ?? Tasks.FirstOrDefault(task => task.IsUnread)
-            ?? Tasks.FirstOrDefault(task => task.IsComplete)
+            ?? Tasks.LastOrDefault(task => task.Expected.Slot <= currentSlot)
             ?? Tasks.FirstOrDefault();
         ApplyHistoryFilter(selectMessageId);
         OnPropertyChanged(nameof(CompletedCount));
@@ -412,6 +424,11 @@ public sealed class MainViewModel : ObservableObject
         foreach (var message in query)
         {
             History.Add(new HistoryRecordViewModel(message));
+        }
+        HistoryByDate.Clear();
+        foreach (var group in History.GroupBy(item => DateOnly.FromDateTime(item.Message.ReceivedAt.LocalDateTime)).OrderByDescending(group => group.Key))
+        {
+            HistoryByDate.Add(new HistoryDateGroupViewModel(group.Key, group));
         }
         SelectedHistory = History.FirstOrDefault(item => item.Message.Id == previousId) ?? History.FirstOrDefault();
         OnPropertyChanged(nameof(HistoryCount));

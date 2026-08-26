@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Local schedule management command",
+  "type": "object",
+  "required": ["contract", "command_id", "type"],
+  "properties": {
+    "contract": {"const": "schedule-user-command/v1"},
+    "command_id": {"type": "string", "minLength": 1},
+    "type": {"enum": ["schedule.list", "schedule.preview", "schedule.create", "schedule.update", "schedule.pause", "schedule.resume", "schedule.archive", "schedule.history", "schedule.restore_defaults"]},
+    "schedule_id": {"type": "string"},
+    "expected_version": {"type": "integer", "minimum": 1},
+    "config": {"type": "object"}
+  },
+  "additionalProperties": true
+}

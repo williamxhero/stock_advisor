@@ -50,6 +50,8 @@
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
                 <TextBlock Text="{Binding StatusText}" Foreground="{StaticResource SecondaryTextBrush}" FontSize="12"
                            VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="260" />
+                <Button Content="运行配置" Click="ProviderSettingsButton_Click" Padding="12,6" Margin="12,0,0,0" />
+                <Button Content="任务管理" Click="TaskButton_Click" Padding="12,6" Margin="12,0,0,0" />
                 <Button Content="持仓" Click="PortfolioButton_Click" Padding="12,6" Margin="12,0,0,0" />
                 <Button Command="{Binding ToggleStartupCommand}" Padding="12,6" Margin="12,0,0,0">
                     <TextBlock><Run Text="开机启动：" /><Run Text="{Binding StartupStateText, Mode=OneWay}" /></TextBlock>
@@ -173,7 +175,8 @@
                         <Button x:Name="ReadAloudButton" Content="朗读" Click="ReadAloudButton_Click" Padding="10,6" HorizontalAlignment="Right" />
                     </Grid>
                     <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,10,0,10">
-                        <Button Content="M0" Tag="m0" Click="AiAnchor_Click" Padding="9,4" />
+                        <Button Content="盘前" Tag="premarket" Click="AiAnchor_Click" Padding="9,4" />
+                        <Button Content="M0" Tag="m0" Click="AiAnchor_Click" Padding="9,4" Margin="7,0,0,0" />
                         <Button Content="M1" Tag="m1" Click="AiAnchor_Click" Padding="9,4" Margin="7,0,0,0" />
                         <Button Content="M2" Tag="m2" Click="AiAnchor_Click" Padding="9,4" Margin="7,0,0,0" />
                         <Button Content="最新" Tag="latest" Click="AiAnchor_Click" Padding="9,4" Margin="7,0,0,0" />

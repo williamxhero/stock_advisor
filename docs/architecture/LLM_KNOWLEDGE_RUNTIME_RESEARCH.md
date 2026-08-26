@@ -14,7 +14,7 @@
 4. **语义检索**只是从上述权威内容派生的索引，命中后必须回到原始版本核验；
 5. LLM 只提出受 schema 约束的“变更意图”，本地程序负责校验、提交、生成 Markdown/CSV、投递和恢复。
 
-这也直接解决当前的效率问题：一个正式执行任务先用一次 `bootstrap` 工具得到一个紧凑的、已选择好的状态包；完成研究后只调用一次 `commit_changes`。它不再逐层读 trigger、handoff、registry、协议、多个全文文件，也不让模型自行决定怎样落盘。与当前 `automations/15_RESULT_DELIVERY.md` 的 SQLite ResultStore 是同一路径：把确定性控制流和持久化留在程序中，把不可确定的投资研究留给 LLM。
+这也直接解决当前的效率问题：一个正式执行任务先用一次 `bootstrap` 工具得到一个紧凑的、已选择好的状态包；完成研究后只调用一次 `commit_changes`。它不再逐层读 trigger、handoff、registry、协议、多个全文文件，也不让模型自行决定怎样落盘。与当前 `本地运行时事件投影` 的 SQLite ResultStore 是同一路径：把确定性控制流和持久化留在程序中，把不可确定的投资研究留给 LLM。
 
 建议的目标不是“无 Markdown”，而是**Markdown 从权威可写数据库变为受控投影和人类可审阅的政策文档**。`02_TRADING_PLAYBOOK.md`、Protocol、治理文档仍是 Git 管理、人工优先的规范；Casebook、Hypotheses、状态表、机会/决策日志等运行知识则逐步转为结构化权威记录，并由渲染器生成兼容的 `.md` / `.csv` 视图。
 
@@ -36,9 +36,9 @@ Git 的对象模型和历史非常适合保存政策、协议和可审阅的长�
 
 因此应保留 Markdown 的长处，而不是把它当作高频可变状态的唯一源：
 
-- `docs/governance/`、`docs/protocols/`、`docs/strategy/02_TRADING_PLAYBOOK.md`：人工审阅、Git 版本化的规范；LLM 只能提出变更候选，不能直接提升正式规则。
+- `resources/governance/`、`resources/protocols/`、`resources/knowledge/02_TRADING_PLAYBOOK.md`：人工审阅、Git 版本化的规范；LLM 只能提出变更候选，不能直接提升正式规则。
 - `reports/`：每次运行的不可变叙述快照，可直接链接 `run_id` 和输入/输出 hash。
-- `docs/research/03_CASEBOOK.md`、`04_HYPOTHESES.md` 与状态/日志 CSV：迁移后是由数据库渲染的阅读视图；过渡期可继续保留现有路径，避免打破 Protocol。
+- `resources/knowledge/03_CASEBOOK.md`、`resources/knowledge/04_HYPOTHESES.md` 与工作区状态/日志 CSV：均由数据库事实和确定性 renderer 管理。
 
 ### 2. 结构化事务库：权威事实、当前状态和校验的正常落点
 
@@ -109,8 +109,8 @@ heartbeat ──确定性──► automation_runtime bootstrap
 
 | 数据 | 权威位置 | 对外/人类视图 | 谁能写 |
 |---|---|---|---|
-| 调度、run、结果正文、Outbox | 现有 `data/runtime/stock_advisor.sqlite3` | `body_path` 与 Decision Center inbox | `automation_results.py` / runtime |
-| 当前主题、股票、候选、证据、假说、案例、决策事实 | 同一 SQLite 的新业务表（或 schema/attached DB） | 生成的 `data/state/*.csv`、`docs/research/*.md` | `knowledge_runtime` 事务接口 |
+| 调度、run、结果正文、Outbox | `%LOCALAPPDATA%\\AITradingCompanion\\data\\trading-companion.sqlite3` | `body_path` 与 AI交易伙伴 Exchange | `ai_trading_companion` runtime |
+| 当前主题、股票、候选、证据、假说、案例、决策事实 | 同一 SQLite 的新业务表（或 schema/attached DB） | 生成的 `workspace/state/*.csv`、`workspace/logs/*.csv` 与记忆投影 | `knowledge_runtime` 事务接口 |
 | 每次 ChangeSet、校验结果、渲染结果、失败 | `knowledge_command` / `knowledge_event` append-only 表 | 审计查询、可选报告附录 | runtime，禁止修改历史 |
 | 原始长文本证据与报告 | content-addressed 文件或 `knowledge_document_revision` | `reports/`、Casebook 视图 | runtime 在提交时固化 |
 | Protocol、治理、正式 Playbook | Git workspace Markdown | 原文件 | 人工；LLM 只产生 proposal |

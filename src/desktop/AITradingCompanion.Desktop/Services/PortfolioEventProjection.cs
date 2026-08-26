@@ -17,7 +17,16 @@ public sealed record PortfolioTransaction(string TransactionId, string Action, s
 {
     public string Summary => Action == "asset_correction"
         ? $"{OccurredAt} · 总资产修正为 {Price:N2} 元"
-        : $"{OccurredAt} · {Action switch { "buy" => "买入", "sell" => "卖出", "position_correction" => "持仓修正", _ => Action }} {Name} {Shares}股 @ {Price:g}{(ReversalOf is null ? string.Empty : " · 撤销事件")}";
+        : $"{OccurredAt} · {ActionText(Action)} {Name} {Shares}股 @ {Price:g}{(ReversalOf is null ? string.Empty : " · 撤销事件")}";
+
+    private static string ActionText(string action) => action switch
+    {
+        "buy" => "买入",
+        "sell" => "卖出",
+        "position_correction" => "持仓修正",
+        "asset_correction" => "资产修正",
+        _ => "操作待确认",
+    };
 }
 
 public sealed record PortfolioWorkspaceProjection(IReadOnlyList<PortfolioPosition> Positions, IReadOnlyList<PortfolioTransaction> Transactions, IReadOnlyDictionary<string, string> StatusByArtifactId, double? TotalAssets, string? UpdatedAt);

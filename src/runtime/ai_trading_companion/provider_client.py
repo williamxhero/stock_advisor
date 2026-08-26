@@ -1,0 +1,405 @@
+"""OpenAI-compatible Chat Completions client with local research tools."""
+from __future__ import annotations
+
+import json
+import random
+import re
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+from .credentials import read_secret
+from .research_tools import ResearchTools, ResearchToolError
+from .secret_guard import assert_safe
+
+
+class ProviderError(RuntimeError):
+    def __init__(self, message: str, *, category: str = "provider_error", request_id: str | None = None, status: int | None = None, retry_after: float | None = None, retry_attempts: int = 1) -> None:
+        super().__init__(message)
+        self.category, self.request_id, self.status = category, request_id, status
+        self.retry_after, self.retry_attempts = retry_after, retry_attempts
+
+    def __str__(self) -> str:
+        suffix = f" (attempts={self.retry_attempts})" if self.retry_attempts > 1 else ""
+        return f"{self.category}: {super().__str__()}{suffix}"
+
+
+class CurrentInformationUnavailable(ProviderError):
+    pass
+
+
+@dataclass(frozen=True)
+class ProviderResult:
+    text: str
+    response_id: str | None
+    events: list[dict[str, Any]]
+    usage: dict[str, Any]
+    request_id: str | None
+    tool_trace: list[dict[str, Any]]
+
+
+@dataclass
+class _CircuitState:
+    failures: int = 0
+    open_until: float = 0.0
+
+
+class ProviderClient:
+    _circuits: dict[str, _CircuitState] = {}
+    _circuit_lock = threading.Lock()
+
+    def __init__(self, provider: dict[str, Any], research: dict[str, Any], home: Path) -> None:
+        self.provider, self.research, self.home = provider, research, home
+
+    def probe(self) -> dict[str, Any]:
+        """Verify the Chat Completions subset used by the runtime."""
+        fast = self._model("fast")
+        timeout = int(self._retry_settings()["probe_timeout_seconds"])
+        normal = self._request(self._payload("Reply with OK.", fast["id"], "medium"), timeout)
+        streamed, deltas = self._request_stream(self._payload("Reply with OK.", fast["id"], "medium", stream=True), timeout, lambda _delta: None)
+        if not deltas and not _message_content(streamed):
+            raise ProviderError("provider capability probe did not return streamed output", category="capability_missing")
+        structured_payload = self._payload("Return the requested object.", fast["id"], "medium")
+        structured_payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "capability_probe", "strict": True, "schema": {"type": "object", "additionalProperties": False, "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}},
+        }
+        structured = self._request(structured_payload, timeout)
+        function = {"type": "function", "function": {"name": "capability_probe", "description": "Return a fixed probe value.", "parameters": {"type": "object", "additionalProperties": False, "properties": {}}}}
+        called_payload = self._payload("Call capability_probe.", fast["id"], "medium")
+        called_payload.update({"tools": [function], "tool_choice": {"type": "function", "function": {"name": "capability_probe"}}})
+        called = self._request(called_payload, timeout)
+        calls = _tool_calls(called)
+        if not calls:
+            raise ProviderError("provider capability probe did not return a tool call", category="capability_missing")
+        continuation = self._payload_from_messages([
+            {"role": "user", "content": "Call capability_probe."},
+            {"role": "assistant", "tool_calls": [calls[0]]},
+            {"role": "tool", "tool_call_id": calls[0]["id"], "content": "{\"ok\":true}"},
+        ], fast["id"], "medium")
+        continuation["tools"] = [function]
+        self._request(continuation, timeout)
+        return {"available": True, "base_url": self._base_url(), "response_id": normal.get("id"), "stream_response_id": streamed.get("id"), "structured_response_id": structured.get("id"), "function_response_id": called.get("id")}
+
+    def run(self, prompt: str, schema: Path | None, *, slot: str, effort: str, search: bool, timeout: int, on_delta: Callable[[str], None] | None = None) -> ProviderResult:
+        assert_safe(prompt, boundary="Provider input")
+        started = time.monotonic()
+        tools = ResearchTools(self.home, self.research) if search else None
+        trace: list[dict[str, Any]] = []
+        seen_tool_calls: set[str] = set()
+        model = self._model(slot)
+        messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+        deltas: list[str] = []
+        while True:
+            remaining = max(1, timeout - int(time.monotonic() - started))
+            # CPA accepts tools and JSON Schema independently, but its upstream
+            # translation rejects the combination. Keep the research loop in
+            # ordinary Chat Completions mode, then make one schema-only pass.
+            payload_schema = schema if tools is None else None
+            payload = self._payload_from_messages(messages, model["id"], effort or model.get("effort") or "medium", schema=payload_schema, tools=tools, stream=on_delta is not None)
+            response, new_deltas = self._request_stream(payload, remaining, on_delta) if on_delta else (self._request(payload, remaining), [])
+            deltas.extend(new_deltas)
+            calls = _tool_calls(response)
+            if not calls:
+                text = _message_content(response) or "".join(deltas)
+                if schema is not None and tools is not None:
+                    messages.extend([
+                        {"role": "assistant", "content": text},
+                        {"role": "user", "content": "将以上研究结果整理为要求的结构化 JSON。只返回 JSON，不要添加 Markdown 或解释。"},
+                    ])
+                    tools = None
+                    deltas = []
+                    continue
+                assert_safe(text, boundary="Provider output")
+                return ProviderResult(text, response.get("id"), [], response.get("usage") or {}, _request_id(response), trace)
+            if tools is None:
+                raise ProviderError("Provider attempted an unavailable tool", category="tool_policy", request_id=_request_id(response))
+            messages.append(_assistant_message(response))
+            usable_tool_result = False
+            for call in calls:
+                name = str(call.get("function", {}).get("name") or "")
+                call_id = str(call.get("id") or "")
+                try:
+                    arguments = json.loads(str(call.get("function", {}).get("arguments") or "{}"))
+                    if not isinstance(arguments, dict):
+                        raise ValueError("tool arguments must be an object")
+                    fingerprint = _hash_json({"tool": name, "arguments": arguments})
+                    if fingerprint in seen_tool_calls:
+                        raise ResearchToolError("provider repeated an identical research tool call")
+                    seen_tool_calls.add(fingerprint)
+                    result = tools.call(name, arguments)
+                    usable_tool_result = usable_tool_result or bool(result.get("results") or result.get("text") or result.get("content_sha256"))
+                    trace.append({"tool": name, "ok": True, "arguments": arguments, "result_sha256": _hash_json(result)})
+                except (ValueError, ResearchToolError) as exc:
+                    result = {"error": str(exc), "backend": name}
+                    trace.append({"tool": name, "ok": False, "error": str(exc)})
+                messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, ensure_ascii=False)})
+            if not usable_tool_result and trace and all(not item.get("ok") for item in trace):
+                raise CurrentInformationUnavailable("all configured current-information backends failed", category="current_information_unavailable", request_id=_request_id(response))
+
+    def _payload(self, prompt: str, model: str, effort: str, *, stream: bool = False) -> dict[str, Any]:
+        return self._payload_from_messages([{"role": "user", "content": prompt}], model, effort, stream=stream)
+
+    def _payload_from_messages(self, messages: list[dict[str, Any]], model: str, effort: str, *, schema: Path | None = None, tools: ResearchTools | None = None, stream: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {"model": model, "messages": messages, "reasoning_effort": effort}
+        if stream:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+        if schema:
+            payload["response_format"] = {"type": "json_schema", "json_schema": {"name": _schema_name(schema), "strict": True, "schema": json.loads(schema.read_text(encoding="utf-8"))}}
+        if tools:
+            payload["tools"] = tools.definitions()
+            payload["parallel_tool_calls"] = False
+        return payload
+
+    def _model(self, slot: str) -> dict[str, Any]:
+        models = self.provider.get("models") if isinstance(self.provider.get("models"), dict) else {}
+        model = models.get(slot) if isinstance(models.get(slot), dict) else {}
+        if not model.get("id"):
+            raise ProviderError(f"Provider model slot is not configured: {slot}", category="provider_not_configured")
+        return model
+
+    def _base_url(self) -> str:
+        value = str(self.provider.get("base_url") or "").rstrip("/")
+        if not value:
+            raise ProviderError("Provider URL is not configured", category="provider_not_configured")
+        return value
+
+    def _request(self, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
+        idempotency_key = str(uuid.uuid4())
+        return self._with_retries(lambda attempt_timeout: self._request_once(payload, attempt_timeout, idempotency_key=idempotency_key), timeout)
+
+    def _request_once(self, payload: dict[str, Any], timeout: int, *, idempotency_key: str | None = None) -> dict[str, Any]:
+        request = self._request_object(payload, idempotency_key=idempotency_key)
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+                if isinstance(result, dict):
+                    result.setdefault("_request_id", _response_request_id(response.headers))
+                    return result
+        except HTTPError as exc:
+            raise ProviderError(_http_error_message(exc), category=_http_category(exc.code), request_id=_response_request_id(exc.headers), status=exc.code, retry_after=_retry_after(exc.headers.get("Retry-After"))) from exc
+        except TimeoutError as exc:
+            raise ProviderError("Provider request timed out", category="provider_timeout") from exc
+        except (URLError, ConnectionError) as exc:
+            raise ProviderError("Provider network request failed", category="provider_network") from exc
+        except json.JSONDecodeError as exc:
+            raise ProviderError("Provider returned invalid JSON", category="invalid_response") from exc
+        raise ProviderError("Provider returned an invalid response", category="invalid_response")
+
+    def _request_stream(self, payload: dict[str, Any], timeout: int, on_delta: Callable[[str], None]) -> tuple[dict[str, Any], list[str]]:
+        published = False
+        idempotency_key = str(uuid.uuid4())
+
+        def guarded_delta(delta: str) -> None:
+            nonlocal published
+            published = True
+            on_delta(delta)
+
+        return self._with_retries(lambda attempt_timeout: self._request_stream_once(payload, attempt_timeout, guarded_delta, idempotency_key=idempotency_key), timeout, can_retry=lambda: not published)
+
+    def _request_stream_once(self, payload: dict[str, Any], timeout: int, on_delta: Callable[[str], None], *, idempotency_key: str | None = None) -> tuple[dict[str, Any], list[str]]:
+        request = self._request_object(payload, idempotency_key=idempotency_key)
+        response_data: dict[str, Any] = {"object": "chat.completion", "choices": [{"index": 0, "message": {"role": "assistant", "content": None}, "finish_reason": None}]}
+        content: list[str] = []
+        tool_calls: dict[int, dict[str, Any]] = {}
+        usage: dict[str, Any] = {}
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                for raw in response:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        continue
+                    event = json.loads(data)
+                    response_data["id"] = event.get("id") or response_data.get("id")
+                    choice = (event.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    text = delta.get("content")
+                    if text:
+                        text = str(text)
+                        assert_safe(text, boundary="Provider stream output")
+                        content.append(text)
+                        on_delta(text)
+                    for call_delta in delta.get("tool_calls") or []:
+                        index = int(call_delta.get("index", 0))
+                        call = tool_calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                        call["id"] = call["id"] or str(call_delta.get("id") or "")
+                        function = call_delta.get("function") or {}
+                        call["function"]["name"] += str(function.get("name") or "")
+                        call["function"]["arguments"] += str(function.get("arguments") or "")
+                    if choice.get("finish_reason") is not None:
+                        response_data["choices"][0]["finish_reason"] = choice["finish_reason"]
+                    if isinstance(event.get("usage"), dict):
+                        usage = event["usage"]
+                response_data.setdefault("_request_id", _response_request_id(response.headers))
+        except HTTPError as exc:
+            raise ProviderError(_http_error_message(exc), category=_http_category(exc.code), request_id=_response_request_id(exc.headers), status=exc.code, retry_after=_retry_after(exc.headers.get("Retry-After"))) from exc
+        except TimeoutError as exc:
+            raise ProviderError("Provider streaming request timed out", category="provider_timeout") from exc
+        except (URLError, ConnectionError) as exc:
+            raise ProviderError("Provider streaming request failed", category="provider_network") from exc
+        except json.JSONDecodeError as exc:
+            raise ProviderError("Provider stream returned invalid JSON", category="invalid_response") from exc
+        if not response_data.get("id") or response_data["choices"][0].get("finish_reason") is None:
+            raise ProviderError("Provider stream ended without a completed response", category="incomplete_response")
+        message = response_data["choices"][0]["message"]
+        message["content"] = "".join(content) or None
+        if tool_calls:
+            message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+        if usage:
+            response_data["usage"] = usage
+        return response_data, content
+
+    def _with_retries(self, operation: Callable[[int], Any], timeout: int, *, can_retry: Callable[[], bool] | None = None) -> Any:
+        self._assert_circuit_closed()
+        settings = self._retry_settings()
+        started = time.monotonic()
+        last_error: ProviderError | None = None
+        for attempt in range(1, settings["max_attempts"] + 1):
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                break
+            try:
+                result = operation(max(1, int(remaining)))
+                self._record_circuit_success()
+                return result
+            except ProviderError as exc:
+                last_error = exc
+                retry_allowed = _is_retryable(exc) and attempt < settings["max_attempts"] and (can_retry is None or can_retry())
+                if not retry_allowed:
+                    break
+                cap = min(settings["max_backoff_seconds"], settings["initial_backoff_seconds"] * (2 ** (attempt - 1)))
+                delay = exc.retry_after if exc.retry_after is not None else random.uniform(0, cap)
+                if delay >= timeout - (time.monotonic() - started):
+                    break
+                if delay > 0:
+                    time.sleep(delay)
+        if last_error is None:
+            last_error = ProviderError("Provider request timed out", category="provider_timeout")
+        last_error.retry_attempts = attempt if "attempt" in locals() else 0
+        if _is_retryable(last_error):
+            self._record_circuit_failure(settings)
+        raise last_error
+
+    def _retry_settings(self) -> dict[str, float | int]:
+        raw = self.provider.get("retry") if isinstance(self.provider.get("retry"), dict) else {}
+        return {"max_attempts": max(1, int(raw.get("max_attempts", 5))), "initial_backoff_seconds": max(0.0, float(raw.get("initial_backoff_seconds", 1))), "max_backoff_seconds": max(0.0, float(raw.get("max_backoff_seconds", 8))), "circuit_breaker_failures": max(1, int(raw.get("circuit_breaker_failures", 5))), "circuit_breaker_cooldown_seconds": max(1.0, float(raw.get("circuit_breaker_cooldown_seconds", 30))), "probe_timeout_seconds": max(30, int(raw.get("probe_timeout_seconds", 180)))}
+
+    def _assert_circuit_closed(self) -> None:
+        key, current = self._base_url(), time.monotonic()
+        with self._circuit_lock:
+            state = self._circuits.setdefault(key, _CircuitState())
+            if state.open_until > current:
+                raise ProviderError("Provider is temporarily unavailable; retry after the circuit-breaker cooldown", category="provider_circuit_open")
+            if state.open_until:
+                state.open_until, state.failures = 0.0, 0
+
+    def _record_circuit_success(self) -> None:
+        with self._circuit_lock:
+            self._circuits[self._base_url()] = _CircuitState()
+
+    def _record_circuit_failure(self, settings: dict[str, float | int]) -> None:
+        key = self._base_url()
+        with self._circuit_lock:
+            state = self._circuits.setdefault(key, _CircuitState())
+            state.failures += 1
+            if state.failures >= int(settings["circuit_breaker_failures"]):
+                state.open_until = time.monotonic() + float(settings["circuit_breaker_cooldown_seconds"])
+
+    def _request_object(self, payload: dict[str, Any], *, idempotency_key: str | None = None) -> Request:
+        key = read_secret(str(self.provider.get("credential_target") or ""))
+        if not key:
+            raise ProviderError("Provider API key is not configured in Windows Credential Manager", category="provider_not_configured")
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "Accept": "text/event-stream" if payload.get("stream") else "application/json", "User-Agent": "AITradingCompanion/1.0 (Windows; x64)"}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        return Request(f"{self._base_url()}/chat/completions", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
+
+
+def _assistant_message(response: dict[str, Any]) -> dict[str, Any]:
+    message = dict((response.get("choices") or [{}])[0].get("message") or {})
+    message.setdefault("role", "assistant")
+    return message
+
+
+def _tool_calls(response: dict[str, Any]) -> list[dict[str, Any]]:
+    calls = (response.get("choices") or [{}])[0].get("message", {}).get("tool_calls") or []
+    return [call for call in calls if isinstance(call, dict) and call.get("id") and isinstance(call.get("function"), dict)]
+
+
+def _message_content(response: dict[str, Any]) -> str:
+    content = (response.get("choices") or [{}])[0].get("message", {}).get("content")
+    return str(content or "")
+
+
+def _request_id(response: dict[str, Any]) -> str | None:
+    return response.get("_request_id") if isinstance(response.get("_request_id"), str) else None
+
+
+def _response_request_id(headers: Any) -> str | None:
+    for name in ("x-request-id", "request-id", "openai-request-id", "x-cpa-trace-id"):
+        value = headers.get(name)
+        if value:
+            return str(value)
+    return None
+
+
+def _http_category(status: int) -> str:
+    return "provider_auth" if status in {401, 403} else "provider_rate_limited" if status == 429 else "provider_quota" if status == 402 else "provider_http"
+
+
+def _http_error_message(error: HTTPError) -> str:
+    """Keep useful provider diagnostics without retaining arbitrary response bodies."""
+    try:
+        raw = error.read(64 * 1024).decode("utf-8", errors="replace")
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            detail = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+            if isinstance(detail, dict):
+                message = detail.get("message") or detail.get("type")
+                if message:
+                    return f"Provider HTTP {error.code}: {str(message)[:500]}"
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    return f"Provider HTTP {error.code}"
+
+
+def _is_retryable(error: ProviderError) -> bool:
+    if error.category in {"provider_network", "provider_timeout", "provider_rate_limited", "incomplete_response"}:
+        return True
+    if error.category != "provider_http":
+        return False
+    if error.status in {408, 425, 500, 502, 503, 504}:
+        return True
+    # CPA can surface a transient upstream Responses/WebSocket failure as a
+    # 400 even though the request itself is valid. Do not retry ordinary 400s.
+    message = str(error).lower()
+    return error.status == 400 and ("upstream request failed" in message or "upstream_error" in message)
+
+
+def _retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return None
+
+
+def _hash_json(value: dict[str, Any]) -> str:
+    import hashlib
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _schema_name(schema: Path) -> str:
+    """CPA accepts only OpenAI schema names made from alphanumerics, '_' and '-'."""
+    name = re.sub(r"[^A-Za-z0-9_-]", "_", schema.stem)
+    return name or "structured_output"

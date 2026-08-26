@@ -5,12 +5,33 @@
   },
   "embedding": {
     "enabled": false,
-    "base_url": "https://example.invalid/v1",
     "model": "configured-embedding-model",
-    "api_key": "put-local-key-here-never-commit",
     "max_concurrency": 1,
     "timeout_seconds": 20,
     "max_attempts_per_record": 3
+  },
+  "provider": {
+    "enabled": false,
+    "base_url": "http://yosef-server:8317/v1",
+    "credential_target": "AITradingCompanion/CPA",
+    "store": true,
+    "retry": {
+      "max_attempts": 5,
+      "initial_backoff_seconds": 1,
+      "max_backoff_seconds": 8,
+      "circuit_breaker_failures": 5,
+      "circuit_breaker_cooldown_seconds": 30,
+      "probe_timeout_seconds": 180
+    },
+    "models": {
+      "research": { "id": "gpt-5.6-terra", "effort": "medium" },
+      "judgment": { "id": "gpt-5.6-sol", "effort": "medium" },
+      "fast": { "id": "gpt-5.6-terra", "effort": "medium" }
+    }
+  },
+  "research": {
+    "searxng": { "base_url": "http://yosef-server:8801", "timeout_seconds": 20 },
+    "playwright": { "edge_profile": "Profile 2", "profile_directory": "browser-profile", "download_limit_mb": 50 }
   },
   "experiments": {
     "material_quality_uplift": 0.1,

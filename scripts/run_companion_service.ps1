@@ -52,12 +52,34 @@ function Invoke-Companion([string[]]$Arguments) {
     }
 }
 
+function Start-ScheduledWorkers {
+    $runtimePython = Join-Path $env:AI_TRADING_COMPANION_HOME 'runtime\python\Scripts\python.exe'
+    $python = if (Test-Path -LiteralPath $runtimePython) { $runtimePython } else { 'py' }
+    $raw = & $python -m ai_trading_companion claim-scheduled-workers 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-ServiceError ($raw -join [Environment]::NewLine)
+        return
+    }
+    try { $cycles = (($raw -join "`n") | ConvertFrom-Json).cycles } catch {
+        Write-ServiceError "Cannot parse scheduled worker claims: $raw"
+        return
+    }
+    foreach ($cycleId in @($cycles)) {
+        $arguments = @('-m', 'ai_trading_companion', 'run-scheduled-cycle', '--cycle-id', $cycleId)
+        if ($Execute) { $arguments += '--execute' }
+        # Workers have already made an atomic SQLite claim.  Hidden independent
+        # processes let the scheduler continue to materialise later tasks.
+        Start-Process -FilePath $python -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+    }
+}
+
 try {
     Write-Host "Companion service started. Execute=$Execute; poll=${PollSeconds}s. Ctrl+C stops it."
     while ($true) {
         try {
             if ($Execute) { Invoke-Companion -Arguments @('run-schedule', '--execute') }
             else { Invoke-Companion -Arguments @('run-schedule') }
+            Start-ScheduledWorkers
             if ($Execute) { Invoke-Companion -Arguments @('run-due', '--execute') }
             else { Invoke-Companion -Arguments @('run-due') }
             if ($Execute) { Invoke-Companion -Arguments @('consume-command', '--execute') }

@@ -175,7 +175,7 @@ public sealed class MainViewModel : ObservableObject
     public string DetailTitle => SelectedMessage?.TaskType ?? "任务详情";
     public string DetailSlotText => SelectedMessage?.ScheduledFor.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture) ?? string.Empty;
     public string DetailReceivedAtText => SelectedMessage?.CompletedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) ?? string.Empty;
-    public string DetailCategoryText => SelectedMessage is null ? string.Empty : $"{SelectedMessage.Project} · {StatusTextFor(SelectedMessage.Status)} · {SelectedMessage.Source}";
+    public string DetailCategoryText => SelectedMessage is null ? string.Empty : $"{SelectedMessage.Project} · {StatusTextFor(SelectedMessage.Status)} · {SourceTextFor(SelectedMessage.Source)}";
     public string ReadButtonText => SelectedMessage?.IsRead == true ? "标为未读" : "标为已读";
     public string StarButtonText => SelectedMessage?.IsStarred == true ? "取消收藏" : "收藏";
     public string ArchiveButtonText => SelectedMessage?.IsArchived == true ? "恢复归档" : "归档";
@@ -458,5 +458,12 @@ public sealed class MainViewModel : ObservableObject
         TaskMessageStatus.Skipped => "已跳过",
         TaskMessageStatus.Failed => "失败",
         _ => string.Empty
+    };
+
+    private static string SourceTextFor(string source) => source switch
+    {
+        "stock_advisor" => "本地研判服务",
+        "gmail-legacy" => "历史导入",
+        _ => "本地记录",
     };
 }

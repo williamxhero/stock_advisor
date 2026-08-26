@@ -56,7 +56,7 @@ public sealed class TaskRowViewModel : ObservableObject
 
     public string StatusText => _companionState switch
     {
-        "queued" => "已排队",
+        "queued" => "可输入盘前消息",
         "researching" or "researching_m0" => "AI 研究中",
         "awaiting_h0" or "voice_grace" => "等待提交 H0",
         "h0_locked" or "researching_m1" or "judging_m1" or "m1_retry_wait" => "正在生成 M1",

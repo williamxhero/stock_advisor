@@ -7,15 +7,18 @@ public static class WindowStateService
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     public static SavedWindowSize? Load(AppPaths paths)
+        => Load(paths.WindowStatePath);
+
+    public static SavedWindowSize? Load(string path)
     {
-        if (!File.Exists(paths.WindowStatePath))
+        if (!File.Exists(path))
         {
             return null;
         }
 
         try
         {
-            var state = JsonSerializer.Deserialize<SavedWindowSize>(File.ReadAllText(paths.WindowStatePath), JsonOptions);
+            var state = JsonSerializer.Deserialize<SavedWindowSize>(File.ReadAllText(path), JsonOptions);
             return state is { Width: >= 1, Height: >= 1 } &&
                    double.IsFinite(state.Width) && double.IsFinite(state.Height) &&
                    (state.Left is null || double.IsFinite(state.Left.Value)) &&
@@ -34,6 +37,9 @@ public static class WindowStateService
     }
 
     public static void Save(AppPaths paths, double width, double height, double? left = null, double? top = null)
+        => Save(paths.WindowStatePath, width, height, left, top);
+
+    public static void Save(string path, double width, double height, double? left = null, double? top = null)
     {
         if (!double.IsFinite(width) || !double.IsFinite(height) || width < 1 || height < 1 ||
             (left is not null && !double.IsFinite(left.Value)) ||
@@ -42,13 +48,13 @@ public static class WindowStateService
             return;
         }
 
-        paths.EnsureDirectories();
-        var temporaryPath = paths.WindowStatePath + ".tmp";
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var temporaryPath = path + ".tmp";
         File.WriteAllText(
             temporaryPath,
             JsonSerializer.Serialize(new SavedWindowSize(width, height, left, top), JsonOptions),
             System.Text.Encoding.UTF8);
-        File.Move(temporaryPath, paths.WindowStatePath, overwrite: true);
+        File.Move(temporaryPath, path, overwrite: true);
     }
 }
 

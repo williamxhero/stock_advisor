@@ -8,8 +8,10 @@ public sealed class AppPaths
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "AITradingCompanion");
         var uiDirectory = Path.Combine(DataDirectory, "ui");
+        RuntimeSettingsPath = Path.Combine(DataDirectory, "config", "settings.local.json");
         SettingsPath = Path.Combine(uiDirectory, "settings.json");
         WindowStatePath = Path.Combine(uiDirectory, "window-state.json");
+        TaskWindowStatePath = Path.Combine(uiDirectory, "task-window-state.json");
         CompanionDraftsPath = Path.Combine(uiDirectory, "drafts.json");
         DatabasePath = Path.Combine(uiDirectory, "legacy-message-cache.sqlite3");
         InboxRoot = Path.Combine(DataDirectory, "legacy-inbox");
@@ -27,8 +29,10 @@ public sealed class AppPaths
     public string DataDirectory { get; }
 
     public string SettingsPath { get; }
+    public string RuntimeSettingsPath { get; }
 
     public string WindowStatePath { get; }
+    public string TaskWindowStatePath { get; }
     public string CompanionDraftsPath { get; }
 
     public string DatabasePath { get; }
@@ -52,6 +56,7 @@ public sealed class AppPaths
     {
         Directory.CreateDirectory(DataDirectory);
         Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(RuntimeSettingsPath)!);
         Directory.CreateDirectory(PendingDirectory);
         Directory.CreateDirectory(ProcessingDirectory);
         Directory.CreateDirectory(ProcessedDirectory);

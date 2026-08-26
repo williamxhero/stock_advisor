@@ -63,8 +63,11 @@ class PortfolioService:
         with self.store.connection() as connection:
             if connection.execute("SELECT 1 FROM portfolio_meta WHERE key='baseline_imported'").fetchone():
                 return
-        text = self.portfolio_path.read_text(encoding="utf-8-sig")
-        section = text.split("## 当前持仓", 1)[1].split("## 最近清仓", 1)[0]
+        # A new local installation has no user projection yet.  Treat that as
+        # an explicit empty factual baseline rather than preventing runtime
+        # startup (and therefore every future schedule) from working.
+        text = self.portfolio_path.read_text(encoding="utf-8-sig") if self.portfolio_path.exists() else ""
+        section = text.split("## 当前持仓", 1)[1].split("## 最近清仓", 1)[0] if "## 当前持仓" in text and "## 最近清仓" in text else ""
         rows = []
         for line in section.splitlines():
             if not line.lstrip().startswith("|") or "---" in line or "代码" in line:

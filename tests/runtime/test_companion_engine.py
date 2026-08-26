@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ai_trading_companion.engine import CompanionEngine, iso, parse
+from ai_trading_companion.__main__ import run_pending_premarket_reply
 from ai_trading_companion.memory import MemoryQuery, SqliteMemoryRetriever
 from ai_trading_companion.packet_builder import RuntimePacketBuilder
 from ai_trading_companion.scheduler import load_schedules, run_daily_schedule, run_periodic_schedule
@@ -75,6 +76,27 @@ class CompanionEngineTests(unittest.TestCase):
         self.assertEqual("researching_m1", result["cycle"]["state"])
         self.assertFalse(result["has_h0"])
         self.assertIsNone(self.store.latest_artifact(self.cycle["cycle_id"], "h0"))
+
+    def test_diagnostic_rerun_isolated_from_original_cycle_and_reuses_frozen_inputs(self):
+        ready = self.ready()
+        self.stage("rerun-h0", "保留原来的独立判断边界")
+        self.engine.command({
+            "command_id": "rerun-commit", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0",
+        })
+        original = self.store.get_cycle(self.cycle["cycle_id"])
+
+        rerun = self.engine.start_diagnostic_rerun(original["cycle_id"])
+
+        self.assertNotEqual(original["cycle_id"], rerun["cycle_id"])
+        self.assertEqual("researching_m1", rerun["state"])
+        self.assertEqual(original["task_key"], rerun["task_key"])
+        self.assertNotEqual(original["scheduled_for"], rerun["scheduled_for"])
+        snapshot = json.loads(rerun["schedule_snapshot_json"])
+        self.assertTrue(snapshot["diagnostic_rerun"])
+        self.assertEqual(original["cycle_id"], snapshot["diagnostic_rerun_of"])
+        self.assertIsNotNone(self.store.latest_artifact(rerun["cycle_id"], "m0"))
+        self.assertIsNotNone(self.store.latest_artifact(rerun["cycle_id"], "h0"))
+        self.assertEqual("researching_m1", self.store.get_cycle(original["cycle_id"])["state"])
 
     def test_deadline_auto_submits_only_staged_messages_once(self):
         ready = self.ready()
@@ -191,6 +213,21 @@ class CompanionEngineTests(unittest.TestCase):
         self.assertIn("输出格式配置错误", payload["reason"])
         self.assertNotIn("C:\\Users", payload["reason"])
 
+    def test_provider_http_failure_has_explicit_user_category(self):
+        self.ready()
+        self.engine.command({"command_id": "commit-http", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0"})
+
+        self.engine.m1_failed(
+            self.cycle["cycle_id"],
+            "provider_http: Provider HTTP 400: Upstream request failed",
+            retryable=False,
+        )
+
+        events = [event for event in self.store.pending_events() if event["event_type"] == "m1.failed"]
+        payload = json.loads(events[-1]["payload_json"])
+        self.assertEqual("provider_http", payload["diagnostic_code"])
+        self.assertIn("Provider 返回了 HTTP 错误", payload["reason"])
+
     def test_chat_batch_is_separate_from_frozen_h0(self):
         self.ready()
         self.stage("h0", "H0内容")
@@ -272,6 +309,104 @@ class CompanionEngineTests(unittest.TestCase):
         self.assertEqual(["legacy_message"], [item["kind"] for item in projection["ai_messages"]])
         self.assertEqual("迁移保留的盘中 AI 消息", projection["ai_messages"][0]["text"])
 
+    def test_pre_m0_messages_freeze_at_research_start_and_shape_m0_context(self):
+        cycle = self.engine.start_cycle(
+            "daily.opportunity.0900", "2026-08-25T09:00:00+08:00", "2026-08-24T16:05:00Z"
+        )
+        projection = self.engine.command({
+            "command_id": "pre-m0-stage",
+            "cycle_id": cycle["cycle_id"],
+            "type": "stage_message",
+            "text": "机器人板块昨晚讨论明显升温，帮我重点核实传播源头。",
+        })
+
+        self.assertEqual("pre_m0", projection["user_messages"][0]["phase"])
+        self.assertEqual("staged", projection["user_messages"][0]["state"])
+
+        started = self.engine.research_started(cycle["cycle_id"])
+        frozen = self.store.messages(cycle["cycle_id"], state="submitted", phase="pre_m0")
+        artifact = self.store.latest_artifact(cycle["cycle_id"], "pre_m0")
+        builder = RuntimePacketBuilder(PROJECT_ROOT / "resources", PROJECT_ROOT / "data", self.store)
+        public_packet = builder.build(started, "m0_research")
+        compose_packet = builder.build(started, "m0_compose", evidence={"sources": []})
+
+        self.assertEqual(1, len(frozen))
+        self.assertEqual("机器人板块昨晚讨论明显升温，帮我重点核实传播源头。", artifact["body_markdown"])
+        self.assertIn("机器人板块昨晚讨论明显升温", json.dumps(public_packet, ensure_ascii=False))
+        self.assertIn("pre_m0", [item["kind"] for item in compose_packet["artifacts"]])
+        self.assertFalse(started["has_h0"])
+
+    def test_pre_m0_messages_can_be_submitted_in_batches_before_research(self):
+        cycle = self.engine.start_cycle(
+            "daily.opportunity.0900", "2026-08-25T09:00:00+08:00", "2026-08-24T16:05:00Z"
+        )
+        self.engine.command({
+            "command_id": "pre-m0-stage-first",
+            "cycle_id": cycle["cycle_id"],
+            "type": "stage_message",
+            "text": "先核实机器人板块的传播源头。",
+        })
+
+        submitted = self.engine.command({
+            "command_id": "pre-m0-submit-first",
+            "cycle_id": cycle["cycle_id"],
+            "type": "commit_pre_m0",
+        })
+
+        self.assertEqual("queued", submitted["cycle"]["state"])
+        self.assertEqual("submitted", submitted["user_messages"][0]["state"])
+        self.assertEqual("pre_m0", submitted["user_messages"][0]["phase"])
+        submission = self.store.latest_artifact(cycle["cycle_id"], "pre_m0_submission")
+        self.assertEqual("先核实机器人板块的传播源头。", submission["body_markdown"])
+
+        self.engine.command({
+            "command_id": "pre-m0-stage-second",
+            "cycle_id": cycle["cycle_id"],
+            "type": "stage_message",
+            "text": "也看看政策端有没有新的催化。",
+        })
+        started = self.engine.research_started(cycle["cycle_id"])
+        artifact = self.store.latest_artifact(cycle["cycle_id"], "pre_m0")
+        builder = RuntimePacketBuilder(PROJECT_ROOT / "resources", PROJECT_ROOT / "data", self.store)
+        public_packet = builder.build(started, "m0_research")
+
+        self.assertIn("先核实机器人板块", artifact["body_markdown"])
+        self.assertIn("也看看政策端", artifact["body_markdown"])
+        self.assertIn("先核实机器人板块", json.dumps(public_packet, ensure_ascii=False))
+        self.assertIn("也看看政策端", json.dumps(public_packet, ensure_ascii=False))
+
+    def test_submitted_pre_m0_batch_can_receive_a_first_class_premarket_reply(self):
+        cycle = self.engine.start_cycle(
+            "daily.opportunity.0900", "2026-08-25T09:00:00+08:00", "2026-08-24T16:05:00Z"
+        )
+        self.engine.command({
+            "command_id": "pre-chat-stage",
+            "cycle_id": cycle["cycle_id"],
+            "type": "stage_message",
+            "text": "早上先聊聊机器人板块。",
+        })
+        submitted = self.engine.command({
+            "command_id": "pre-chat-submit",
+            "cycle_id": cycle["cycle_id"],
+            "type": "commit_pre_m0",
+        })
+
+        first = run_pending_premarket_reply(
+            self.engine, self.store, None, cycle["cycle_id"], False
+        )
+        second = run_pending_premarket_reply(
+            self.engine, self.store, None, cycle["cycle_id"], False
+        )
+
+        projection = self.engine._projection(self.store.get_cycle(cycle["cycle_id"]))
+        reply = next(message for message in projection["ai_messages"] if message["kind"] == "premarket_chat")
+        self.assertIn("已收到这批消息", reply["text"])
+        events = [event["event_type"] for event in self.store.pending_events()]
+        self.assertIn("premarket.reply.ready", events)
+        self.assertEqual("replied", first["action"])
+        self.assertEqual("already_replied", second["action"])
+        self.assertEqual(submitted["committed_batch_id"], first["batch_id"])
+
     def test_scheduler_starts_due_cycle_once(self):
         completed: list[str] = []
 
@@ -302,6 +437,26 @@ class CompanionEngineTests(unittest.TestCase):
         premarket = next(item for item in results if item["task_key"] == "daily.opportunity.0900")
         self.assertEqual("started", premarket["action"])
         self.assertEqual("2026-08-25T09:00:00+08:00", completed[0])
+
+    def test_premarket_cycle_is_prepared_before_0830_without_starting_research(self):
+        completed: list[str] = []
+        before_lead = datetime(2026, 8, 24, 23, 15, tzinfo=timezone.utc)
+
+        first = run_daily_schedule(
+            self.engine, self.store, before_lead,
+            lambda cycle: completed.append(cycle["cycle_id"]),
+        )
+        second = run_daily_schedule(
+            self.engine, self.store, before_lead + timedelta(seconds=5),
+            lambda cycle: completed.append(cycle["cycle_id"]),
+        )
+
+        prepared = [item for item in first if item["task_key"] == "daily.opportunity.0900"]
+        self.assertEqual("prepared", prepared[0]["action"])
+        self.assertEqual([], completed)
+        self.assertEqual([], second)
+        cycle = self.store.find_cycle("daily.opportunity.0900", "2026-08-25T09:00:00+08:00")
+        self.assertEqual("queued", cycle["state"])
 
     def test_scheduler_records_late_cycle_as_missed_without_running_research(self):
         at = datetime(2026, 8, 25, 3, 0, tzinfo=timezone.utc)

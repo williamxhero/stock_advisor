@@ -6,15 +6,17 @@ import argparse
 import hashlib
 import json
 import os
-import subprocess
+import sqlite3
 import time
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .codex_runner import CodexCliRunner, CodexResult
 from .backup import BackupManager
-from .config import load_settings
+from .config import load_settings, save_provider_settings
+from .credentials import write_secret
+from .provider_client import CurrentInformationUnavailable, ProviderClient, ProviderError, ProviderResult
 from .engine import CompanionEngine, iso
 from .exchange import LocalExchange
 from .governance import RouterGovernance, classify_regime
@@ -25,8 +27,10 @@ from .packet_builder import RuntimePacketBuilder
 from .paths import RuntimePaths
 from .portfolio import PortfolioService, explicit_fixture_extraction, is_portfolio_statement
 from .projection import LearningProjectionRenderer
-from .scheduler import SHANGHAI, load_schedules, run_daily_schedule, run_periodic_schedule
+from .scheduler import SHANGHAI, ensure_registered_policy, run_registry_schedule
+from .schedule_registry import ScheduleRegistry
 from .router import CognitiveRouter
+from .research_tools import ResearchTools
 from .store import CompanionStore
 from .trading_calendar import XshgTradingCalendar
 
@@ -45,8 +49,12 @@ def exchange_root() -> Path:
 
 def runtime() -> tuple[CompanionEngine, CompanionStore, LocalExchange, PortfolioService]:
     PATHS.ensure()
+    _backup_before_schedule_migration()
     store = CompanionStore(DB)
     store.initialize()
+    registry = _schedule_registry(store)
+    registry.seed(json.loads((PATHS.resources / "schedules" / "tasks.json").read_text(encoding="utf-8")))
+    registry.validate_or_repair()
     store.risk_doctrine()
     engine = CompanionEngine(store)
     JudgmentLifecycle(store).backfill()
@@ -55,6 +63,30 @@ def runtime() -> tuple[CompanionEngine, CompanionStore, LocalExchange, Portfolio
     portfolio = PortfolioService(WORKSPACE, store)
     portfolio.reconcile()
     return engine, store, exchange, portfolio
+
+
+def _backup_before_schedule_migration() -> None:
+    """Schema upgrades never become the first destructive recovery boundary."""
+    if not DB.exists():
+        return
+    source = sqlite3.connect(DB)
+    try:
+        version = source.execute("PRAGMA user_version").fetchone()[0]
+        if version >= 10:
+            return
+        target = RUNTIME / "backups" / "migrations" / f"before-provider-v10-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sqlite3"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        destination = sqlite3.connect(target)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        source.close()
+
+
+def _schedule_registry(store: CompanionStore) -> ScheduleRegistry:
+    return ScheduleRegistry(store, XshgTradingCalendar(PATHS.home / "config" / "xshg-calendar-overrides.json"))
 
 
 def flush(store: CompanionStore, exchange: LocalExchange) -> int:
@@ -82,11 +114,27 @@ def flush(store: CompanionStore, exchange: LocalExchange) -> int:
         exchange.send("to-client", event["event_id"], payload)
         store.mark_portfolio_event_delivered(event["event_id"])
         count += 1
+    for event in store.pending_schedule_events():
+        payload = {
+            "contract": "schedule-client-event/v1", "event_id": event["event_id"],
+            "type": event["event_type"], "created_at": event["created_at"],
+            "payload": json.loads(event["payload_json"]),
+        }
+        exchange.send("to-client", event["event_id"], payload)
+        store.mark_schedule_event_delivered(event["event_id"])
+        count += 1
     return count
 
 
 def render_learning(store: CompanionStore) -> None:
     LearningProjectionRenderer(WORKSPACE, store).render()
+
+
+def provider_client() -> ProviderClient:
+    settings = load_settings(PATHS.home)
+    if not settings.provider_enabled:
+        raise ProviderError("Provider is not enabled", category="provider_not_configured")
+    return ProviderClient(settings.provider, settings.research, PATHS.home)
 
 
 def _call_stage(
@@ -98,8 +146,9 @@ def _call_stage(
     *,
     search: bool,
     timeout: int,
-) -> tuple[dict[str, Any], CodexResult]:
-    router = CognitiveRouter()
+) -> tuple[dict[str, Any], ProviderResult]:
+    settings = load_settings(PATHS.home)
+    router = CognitiveRouter(settings.provider)
     preliminary = router.plan(stage, packet, timeout, search)
     cell = store.router_policy_cell(
         preliminary.profile.cell_key, preliminary.baseline.as_json(),
@@ -116,22 +165,14 @@ def _call_stage(
         model=decision.model, reasoning_effort=decision.reasoning_effort,
         search_enabled=decision.search, timeout_seconds=decision.timeout_seconds,
         routing_reason=decision.reason, route_decision_id=decision_id,
-        runner_fingerprint="codex-cli-output-schema-v1",
+        runner_fingerprint="chat-completions-v1",
     )
-    workspace_kind = "public" if search else "local"
-    run_dir = RUNTIME / "runs" / cycle["cycle_id"] / workspace_kind / f"{stage}-{attempt['attempt_number']}"
-    output = run_dir / "output" / f"{stage}.json"
     started = time.monotonic()
     try:
-        result = CodexCliRunner().run(
-            RuntimePacketBuilder.prompt(packet),
-            run_dir,
-            SCHEMAS / schema_name,
-            output,
+        result = provider_client().run(
+            RuntimePacketBuilder.prompt(packet), SCHEMAS / schema_name,
             timeout=decision.timeout_seconds,
-            search=decision.search,
-            model=decision.model,
-            reasoning_effort=decision.reasoning_effort,
+            search=decision.search, slot=decision.model_slot, effort=decision.reasoning_effort,
         )
         data = json.loads(result.text)
         verifier = router.verify(stage, packet, data)
@@ -139,7 +180,8 @@ def _call_stage(
             attempt["attempt_id"],
             "succeeded",
             output_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(),
-            usage=result.usage, verifier=verifier,
+            usage=result.usage, verifier=verifier, provider_response_id=result.response_id,
+            provider_request_id=result.request_id, tool_trace=result.tool_trace,
         )
         if plan.mode == "shadow" and plan.candidate and verifier["passed"]:
             store.queue_router_shadow(
@@ -148,8 +190,11 @@ def _call_stage(
             )
         return data, result
     except Exception as exc:
-        status = "timed_out" if isinstance(exc, (subprocess.TimeoutExpired, TimeoutError)) else "failed"
-        store.finish_attempt(attempt["attempt_id"], status, error=str(exc))
+        status = "timed_out" if isinstance(exc, TimeoutError) else "failed"
+        store.finish_attempt(
+            attempt["attempt_id"], status, error=str(exc),
+            provider_request_id=exc.request_id if isinstance(exc, ProviderError) else None,
+        )
         # A promoted major XHigh route has a deliberately reserved Medium hedge
         # window.  It is sequential (not a duplicate parallel opinion), uses
         # the identical frozen packet, and is only used after the first run
@@ -162,20 +207,22 @@ def _call_stage(
                 model=hedge.model, reasoning_effort=hedge.reasoning_effort,
                 search_enabled=hedge.search, timeout_seconds=remaining,
                 routing_reason="XHigh 未在预留窗口内完成，使用冻结同包 Medium 回退",
-                route_decision_id=decision_id, runner_fingerprint="codex-cli-output-schema-v1",
+                route_decision_id=decision_id, runner_fingerprint="chat-completions-v1",
             )
             try:
-                result = CodexCliRunner().run(
-                    RuntimePacketBuilder.prompt(packet), run_dir.parent / f"{stage}-hedge-{hedge_attempt['attempt_number']}",
-                    SCHEMAS / schema_name, output.with_name(f"{stage}-hedge.json"), timeout=remaining,
-                    search=hedge.search, model=hedge.model, reasoning_effort=hedge.reasoning_effort,
+                result = provider_client().run(
+                    RuntimePacketBuilder.prompt(packet), SCHEMAS / schema_name, timeout=remaining,
+                    search=hedge.search, slot=hedge.model_slot, effort=hedge.reasoning_effort,
                 )
                 data = json.loads(result.text); verifier = router.verify(stage, packet, data)
                 store.finish_attempt(hedge_attempt["attempt_id"], "succeeded", output_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(), usage=result.usage, verifier=verifier)
                 return data, result
             except Exception as hedge_error:
-                hedge_status = "timed_out" if isinstance(hedge_error, (subprocess.TimeoutExpired, TimeoutError)) else "failed"
-                store.finish_attempt(hedge_attempt["attempt_id"], hedge_status, error=str(hedge_error))
+                hedge_status = "timed_out" if isinstance(hedge_error, TimeoutError) else "failed"
+                store.finish_attempt(
+                    hedge_attempt["attempt_id"], hedge_status, error=str(hedge_error),
+                    provider_request_id=hedge_error.request_id if isinstance(hedge_error, ProviderError) else None,
+                )
         raise
 
 
@@ -202,25 +249,22 @@ def run_router_shadow(store: CompanionStore, job: dict[str, Any], execute: bool)
         model=candidate["model"], reasoning_effort=candidate["reasoning_effort"],
         search_enabled=bool(candidate["search"]), timeout_seconds=int(candidate["timeout_seconds"]),
         routing_reason=candidate["reason"], route_decision_id=job["decision_id"], is_shadow=True,
-        runner_fingerprint="codex-cli-output-schema-v1",
+        runner_fingerprint="chat-completions-v1",
     )
-    run_dir = RUNTIME / "shadow-runs" / job["job_id"]
-    output = run_dir / "output" / f"{job['stage']}.json"
     try:
-        result = CodexCliRunner().run(
-            RuntimePacketBuilder.prompt(packet), run_dir, SCHEMAS / job["schema_name"], output,
-            timeout=int(candidate["timeout_seconds"]), search=bool(candidate["search"]),
-            model=candidate["model"], reasoning_effort=candidate["reasoning_effort"],
+        result = provider_client().run(
+            RuntimePacketBuilder.prompt(packet), SCHEMAS / job["schema_name"], timeout=int(candidate["timeout_seconds"]),
+            search=bool(candidate["search"]), slot=str(candidate.get("model_slot") or "judgment"), effort=candidate["reasoning_effort"],
         )
         data = json.loads(result.text)
-        verifier = CognitiveRouter().verify(job["stage"], packet, data)
+        verifier = CognitiveRouter(load_settings(PATHS.home).provider).verify(job["stage"], packet, data)
         store.finish_attempt(
             attempt["attempt_id"], "succeeded", output_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(),
             usage=result.usage, verifier=verifier,
         )
         store.finish_router_shadow(job["job_id"], output=data, verifier=verifier)
     except Exception as exc:
-        status = "timed_out" if isinstance(exc, (subprocess.TimeoutExpired, TimeoutError)) else "failed"
+        status = "timed_out" if isinstance(exc, TimeoutError) else "failed"
         store.finish_attempt(attempt["attempt_id"], status, error=str(exc))
         store.finish_router_shadow(job["job_id"], error=str(exc))
 
@@ -521,7 +565,10 @@ def run_chat_research(
         )
     store.finish_research_job(job["job_id"])
     source_metadata = json.loads(source.get("metadata_json") or "{}")
-    engine.chat_ready(cycle["cycle_id"], reply, reply_to_batch_id=source_metadata.get("batch_id"))
+    reply_kind = "premarket_chat" if source["kind"] == "pre_m0_submission" else "ai_chat"
+    engine.chat_ready(
+        cycle["cycle_id"], reply, reply_to_batch_id=source_metadata.get("batch_id"), kind=reply_kind
+    )
     return evidence
 
 
@@ -586,27 +633,32 @@ def _foreground_busy(store: CompanionStore) -> bool:
 
 def _seconds_until_next_schedule(at: datetime | None = None) -> int:
     current = (at or datetime.now(timezone.utc)).astimezone(SHANGHAI)
-    daily, periodic = load_schedules(PATHS.resources)
-    candidates: list[datetime] = []
-    for day_offset in range(0, 370):
-        day = current.date() + timedelta(days=day_offset)
-        if day.weekday() < 5:
-            candidates.extend(datetime.combine(day, item.at, SHANGHAI) for item in daily)
-        for item in periodic:
-            if day.day == item.day and (item.months is None or day.month in item.months):
-                candidates.append(datetime.combine(day, item.at, SHANGHAI))
+    _, store, _, _ = runtime()
+    candidates = [datetime.fromisoformat(value.replace("Z", "+00:00")) for row in _schedule_registry(store).list(current) for value in row["next_targets"]]
     future = [candidate for candidate in candidates if candidate > current]
     return max(0, int((min(future) - current).total_seconds())) if future else 24 * 60 * 60
 
 
 def run_schedules(engine: CompanionEngine, store: CompanionStore, at: datetime, execute: bool, exchange: LocalExchange) -> list[dict[str, Any]]:
-    daily, periodic = load_schedules(PATHS.resources)
-    calendar = XshgTradingCalendar(PATHS.home / "config" / "xshg-calendar-overrides.json")
-    execute_cycle = lambda cycle: run_research(engine, store, cycle, execute, lambda: flush(store, exchange))
-    return [
-        *run_daily_schedule(engine, store, at, execute_cycle, schedules=daily, trading_calendar=calendar),
-        *run_periodic_schedule(engine, store, at, execute_cycle, schedules=periodic),
-    ]
+    # Materialisation intentionally does not call an LLM.  The service launches
+    # bounded workers from the resulting queued cycles, so later tasks are not
+    # held behind a long earlier judgment.
+    return run_registry_schedule(engine, store, _schedule_registry(store), at)
+
+
+def run_scheduled_cycle(engine: CompanionEngine, store: CompanionStore, exchange: LocalExchange, portfolio: PortfolioService, cycle_id: str, execute: bool) -> dict[str, Any]:
+    cycle = store.get_cycle(cycle_id)
+    try:
+        if cycle["state"] != "queued":
+            return cycle
+        snapshot = json.loads(cycle.get("schedule_snapshot_json") or "{}")
+        if snapshot:
+            ensure_registered_policy(cycle["task_key"], snapshot, datetime.fromisoformat(cycle["scheduled_for"]))
+        result = run_research(engine, store, cycle, execute, lambda: flush(store, exchange))
+        _process_portfolio_artifact(portfolio, store.latest_artifact(cycle_id, "h0"), execute)
+        return result
+    finally:
+        store.finish_scheduled_worker(cycle_id)
 
 
 def run_background(
@@ -686,17 +738,14 @@ def run_background(
 def _interpret_portfolio(portfolio: PortfolioService, source: dict[str, Any], execute: bool) -> dict[str, Any]:
     if not execute:
         return explicit_fixture_extraction(source["body_markdown"])
-    run_dir = RUNTIME / "portfolio-runs" / source["artifact_id"]
     prompt = (
         "只解释用户是否明确报告了已经发生的真实成交或当前持仓事实。不要搜索互联网，不给投资建议，不修改文件。"
         "计划、建议、条件句不是成交。只提取原文明确出现的股票、方向、股数、价格和时间；缺失字段必须为 null，并逐字段给出原文 evidence。\n\n"
         + json.dumps({"user_text": source["body_markdown"], "current_portfolio": portfolio.snapshot()["positions"]}, ensure_ascii=False, indent=2)
     )
-    result = CodexCliRunner().run(
-        prompt, run_dir, SCHEMAS / "portfolio-interpretation-result-v1.schema.json",
-        run_dir / "output" / "interpretation.json", timeout=45, search=False,
-        model=os.environ.get("STOCK_ADVISOR_CODEX_FAST_MODEL", "gpt-5.6-luna"),
-        reasoning_effort="medium",
+    result = provider_client().run(
+        prompt, SCHEMAS / "portfolio-interpretation-result-v1.schema.json", timeout=45, search=False,
+        slot="fast", effort=str(load_settings(PATHS.home).provider.get("models", {}).get("fast", {}).get("effort") or "medium"),
     )
     return json.loads(result.text)
 
@@ -718,48 +767,77 @@ def run_chat(
     cycle_id: str,
     batch_id: str,
     execute: bool,
+    *,
+    source_kind: str = "chat_human",
+    reply_kind: str = "ai_chat",
+    on_progress: Any = None,
 ) -> dict[str, Any]:
     cycle = store.get_cycle(cycle_id)
-    source = store.latest_artifact(cycle_id, "chat_human")
+    phase = "pre_m0" if source_kind == "pre_m0_submission" else "chat"
+    batches = store.pending_message_batches(cycle_id, phase)
+    batch_ids = [str(item["batch_id"]) for item in batches]
+    messages = store.messages_for_batches(batch_ids)
+    source = store.latest_artifact(cycle_id, source_kind)
     _process_portfolio_artifact(portfolio, source, execute)
-    if not source:
-        raise RuntimeError("chat batch artifact missing")
+    if not messages:
+        raise RuntimeError("no unresponded submitted messages")
     if not execute:
-        return engine.chat_ready(cycle_id, "Fixture 模式：已收到这批消息。", reply_to_batch_id=batch_id)
-    packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store).build(cycle, "chat", message_batch=source["body_markdown"])
-    data, _ = _call_stage(
-        store, cycle, "chat", packet, "companion-chat-result-v1.schema.json",
-        search=False, timeout=int(TASK_POLICIES[cycle["task_key"]].m1_timeout.total_seconds()),
-    )
-    if data.get("judgment_revision"):
-        revision = data["judgment_revision"]
-        engine.judgment_revision_ready(
-            cycle_id, str(revision["revision_markdown"]), str(revision["revises_artifact_id"]),
+        return engine.chat_ready(
+            cycle_id, "Fixture 模式：已收到这批消息。", reply_to_batch_id=batch_id,
+            reply_to_batch_ids=batch_ids, kind=reply_kind,
         )
-    evolution = WorkflowEvolution(store)
-    source_artifact_id = source["artifact_id"]
-    if data.get("needs_fresh_search") and data.get("public_search_request"):
-        store.queue_research_job(cycle_id, source_artifact_id, data["public_search_request"])
-        data["reply_markdown"] += "\n\n这部分需要当下公开信息，我已经把脱敏后的问题排进补查；不会把你的私人消息交给联网步骤。"
-    if data.get("workflow_proposal"):
-        proposal = evolution.propose(cycle_id, data["workflow_proposal"], source_artifact_id=source_artifact_id)
-        data["reply_markdown"] += f"\n\n我已经把这个改进记成待审核提案（{proposal['proposal_id'][:8]}）。它不会自行改代码、权限或扩大调用。"
-    if data.get("proposal_decision"):
-        decision = data["proposal_decision"]
-        try:
-            if decision["action"] == "rollback":
-                rolled_back = evolution.rollback()
-                action = "回滚到上一版本" if rolled_back else "保持现状，因为没有可回滚版本"
-            else:
-                applied = evolution.decide(
-                    str(decision["proposal_id"]), decision["action"] == "approve",
-                    note=str(decision.get("note") or ""),
-                )
-                action = "采用并保留了可回滚版本" if applied["state"] == "applied" else "不采用"
-            data["reply_markdown"] += f"\n\n这个工作流提案我已按你的意思{action}。"
-        except ValueError as exc:
-            data["reply_markdown"] += f"\n\n这个提案现在还不能启用：{exc}。我会继续收集结果，不会强行套用。"
-    return engine.chat_ready(cycle_id, data["reply_markdown"], reply_to_batch_id=batch_id)
+    message_batch = "\n\n".join(str(message["body_text"]) for message in messages)
+    packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store).build(
+        cycle, "chat", message_batch=message_batch, as_of=iso(datetime.now(timezone.utc))
+    )
+    stream = engine.chat_stream_started(cycle_id, batch_ids, reply_kind)
+    if on_progress:
+        on_progress()
+    try:
+        settings = load_settings(PATHS.home)
+        result = provider_client().run(
+            RuntimePacketBuilder.prompt(packet), None, slot="fast",
+            effort=str(settings.provider.get("models", {}).get("fast", {}).get("effort") or "medium"),
+            search=True, timeout=int(TASK_POLICIES[cycle["task_key"]].m1_timeout.total_seconds()),
+            on_delta=lambda delta: (engine.chat_stream_delta(cycle_id, stream["stream_id"], delta), on_progress() if on_progress else None),
+        )
+        completed = store.finish_stream_message(stream["stream_id"])
+        if not completed["text"].strip():
+            raise RuntimeError("Provider completed an empty chat response")
+        return engine.chat_ready(
+            cycle_id, completed["text"], reply_to_batch_id=batch_id, reply_to_batch_ids=batch_ids,
+            stream_id=stream["stream_id"], kind=reply_kind,
+        )
+    except Exception as exc:
+        engine.chat_stream_failed(cycle_id, stream["stream_id"], str(exc))
+        if on_progress:
+            on_progress()
+        raise
+
+
+def run_pending_premarket_reply(
+    engine: CompanionEngine,
+    store: CompanionStore,
+    portfolio: PortfolioService | None,
+    cycle_id: str,
+    execute: bool,
+) -> dict[str, Any]:
+    source = store.latest_artifact(cycle_id, "pre_m0_submission")
+    if not source:
+        return {"action": "no_submission"}
+    metadata = json.loads(source.get("metadata_json") or "{}")
+    batch_id = str(metadata.get("batch_id") or "")
+    for artifact in store.artifacts(cycle_id):
+        if artifact["kind"] != "premarket_chat":
+            continue
+        reply_metadata = json.loads(artifact.get("metadata_json") or "{}")
+        if reply_metadata.get("reply_to_batch_id") == batch_id:
+            return {"action": "already_replied", "batch_id": batch_id}
+    run_chat(
+        engine, store, portfolio, cycle_id, batch_id, execute,
+        source_kind="pre_m0_submission", reply_kind="premarket_chat",
+    )
+    return {"action": "replied", "batch_id": batch_id}
 
 
 def _portfolio_command(store: CompanionStore, portfolio: PortfolioService, command: dict[str, Any]) -> dict[str, Any]:
@@ -784,6 +862,42 @@ def _portfolio_command(store: CompanionStore, portfolio: PortfolioService, comma
     return result
 
 
+def _schedule_command(store: CompanionStore, command: dict[str, Any]) -> dict[str, Any]:
+    """Exchange adapter only; validation and persistence stay in ScheduleRegistry."""
+    command_id = str(command.get("command_id") or "")
+    typ = str(command.get("type") or "")
+    if not command_id or not typ:
+        raise ValueError("任务命令需要 command_id 和 type")
+    existing = store.receipt(command_id, command)
+    if existing is not None:
+        return existing
+    registry = _schedule_registry(store)
+    if typ == "schedule.list":
+        result = {"schedules": registry.list()}
+    elif typ == "schedule.preview":
+        result = registry.preview(dict(command.get("config") or {}))
+    elif typ == "schedule.create":
+        result = {"schedule": registry.create(dict(command.get("config") or {}))}
+    elif typ == "schedule.update":
+        result = {"schedule": registry.update(str(command.get("schedule_id") or ""), int(command.get("expected_version")), dict(command.get("config") or {}))}
+    elif typ == "schedule.pause":
+        result = {"schedule": registry.pause(str(command.get("schedule_id") or ""), int(command.get("expected_version")))}
+    elif typ == "schedule.resume":
+        result = {"schedule": registry.resume(str(command.get("schedule_id") or ""), int(command.get("expected_version")))}
+    elif typ == "schedule.archive":
+        result = {"schedule": registry.archive(str(command.get("schedule_id") or ""), int(command.get("expected_version")))}
+    elif typ == "schedule.history":
+        result = {"history": store.schedule_history(str(command.get("schedule_id") or ""))}
+    elif typ == "schedule.restore_defaults":
+        registry.seed(json.loads((PATHS.resources / "schedules" / "tasks.json").read_text(encoding="utf-8")))
+        result = {"schedules": registry.list(), "action": "defaults_restored"}
+    else:
+        raise ValueError("不支持的任务命令")
+    store.save_receipt(command_id, None, typ, command, result)
+    store.queue_schedule_event("schedule.result", {"command_id": command_id, **result})
+    return result
+
+
 def consume(
     engine: CompanionEngine,
     store: CompanionStore,
@@ -794,8 +908,24 @@ def consume(
     results: list[dict[str, Any]] = []
     for path, command in exchange.receive("to-runtime"):
         try:
+            if command.get("contract") == "schedule-user-command/v1":
+                result = _schedule_command(store, command)
+                exchange.acknowledge("to-runtime", path)
+                results.append(result)
+                continue
             if command.get("contract") == "portfolio-user-command/v1":
                 result = _portfolio_command(store, portfolio, command)
+                exchange.acknowledge("to-runtime", path)
+                results.append(result)
+                continue
+            if command.get("contract") == "companion-user-command/v1" and command.get("type") == "provider.probe":
+                try:
+                    result = {"configured": True, "probe": provider_client().probe()}
+                    exchange.send("to-client", str(command.get("command_id")), {"contract": "provider-client-event/v1", "event_id": str(command.get("command_id")), "type": "provider.probe.succeeded", "created_at": iso(datetime.now(timezone.utc)), "payload": result})
+                except Exception as exc:
+                    category = exc.category if isinstance(exc, ProviderError) else "provider_error"
+                    result = {"configured": False, "error_category": category}
+                    exchange.send("to-client", str(command.get("command_id")), {"contract": "provider-client-event/v1", "event_id": str(command.get("command_id")), "type": "provider.probe.failed", "created_at": iso(datetime.now(timezone.utc)), "payload": result})
                 exchange.acknowledge("to-runtime", path)
                 results.append(result)
                 continue
@@ -810,8 +940,10 @@ def consume(
                 if store.get_cycle(cycle_id)["state"] in {"researching_m1", "m1_retry_wait"}:
                     result = run_m1(engine, store, portfolio, cycle_id, execute)
                 _process_portfolio_artifact(portfolio, store.latest_artifact(cycle_id, "h0"), execute)
+            elif cycle_id and typ == "commit_pre_m0":
+                run_pending_premarket_reply(engine, store, portfolio, cycle_id, execute)
             elif cycle_id and typ == "commit_chat_batch":
-                result = run_chat(engine, store, portfolio, cycle_id, str(result.get("committed_batch_id") or ""), execute)
+                result = run_chat(engine, store, portfolio, cycle_id, str(result.get("committed_batch_id") or ""), execute, on_progress=lambda: flush(store, exchange))
             results.append(result)
         except Exception as exc:
             exchange.reject("to-runtime", path, str(exc))
@@ -839,9 +971,19 @@ def main() -> int:
     schedule = sub.add_parser("run-schedule")
     schedule.add_argument("--at")
     schedule.add_argument("--execute", action="store_true")
+    scheduled_cycle = sub.add_parser("run-scheduled-cycle")
+    scheduled_cycle.add_argument("--cycle-id", required=True)
+    scheduled_cycle.add_argument("--execute", action="store_true")
+    diagnostic_rerun = sub.add_parser("diagnostic-rerun")
+    diagnostic_rerun.add_argument("--cycle-id", required=True)
+    diagnostic_rerun.add_argument("--execute", action="store_true")
+    sub.add_parser("claim-scheduled-workers")
     consume_parser = sub.add_parser("consume-command")
     consume_parser.add_argument("--execute", action="store_true")
     background = sub.add_parser("run-background")
+    premarket_reply = sub.add_parser("reply-premarket")
+    premarket_reply.add_argument("--cycle-id", required=True)
+    premarket_reply.add_argument("--execute", action="store_true")
     backup = sub.add_parser("backup")
     backup.add_argument("--verify", action="store_true")
     migration = sub.add_parser("migrate-legacy")
@@ -850,6 +992,15 @@ def main() -> int:
     sub.add_parser("dispatch")
     sub.add_parser("status")
     sub.add_parser("probe")
+    provider_config = sub.add_parser("configure-provider")
+    provider_config.add_argument("--base-url")
+    provider_config.add_argument("--credential-target")
+    provider_config.add_argument("--research-model")
+    provider_config.add_argument("--judgment-model")
+    provider_config.add_argument("--fast-model")
+    provider_config.add_argument("--api-key-stdin", action="store_true")
+    browser_bootstrap = sub.add_parser("bootstrap-browser-profile")
+    browser_bootstrap.add_argument("--source-user-data", type=Path)
     args = parser.parse_args()
     if args.cmd == "migrate-legacy":
         sources = LegacySources.defaults(INSTALL_ROOT)
@@ -866,9 +1017,29 @@ def main() -> int:
             )
         print(json.dumps(LegacyMigrator(PATHS, sources).run(), ensure_ascii=False, indent=2))
         return 0
+    if args.cmd == "configure-provider":
+        settings = load_settings(PATHS.home)
+        candidate = json.loads(json.dumps(settings.provider))
+        candidate["enabled"] = True
+        for key, value in (("base_url", args.base_url), ("credential_target", args.credential_target)):
+            if value:
+                candidate[key] = value.rstrip("/")
+        for slot, value in (("research", args.research_model), ("judgment", args.judgment_model), ("fast", args.fast_model)):
+            if value:
+                candidate.setdefault("models", {}).setdefault(slot, {})["id"] = value
+        if args.api_key_stdin:
+            write_secret(str(candidate["credential_target"]), sys.stdin.read().strip())
+        probe = ProviderClient(candidate, settings.research, PATHS.home).probe()
+        save_provider_settings(PATHS.home, candidate, settings.research)
+        print(json.dumps({"configured": True, "probe": probe}, ensure_ascii=False, indent=2))
+        return 0
+    if args.cmd == "bootstrap-browser-profile":
+        settings = load_settings(PATHS.home)
+        print(json.dumps(ResearchTools(PATHS.home, settings.research).bootstrap_browser_profile(args.source_user_data), ensure_ascii=False, indent=2))
+        return 0
     engine, store, exchange, portfolio = runtime()
     if args.cmd == "probe":
-        print(json.dumps(CodexCliRunner().probe(), ensure_ascii=False, indent=2))
+        print(json.dumps(provider_client().probe(), ensure_ascii=False, indent=2))
         return 0
     if args.cmd == "backup":
         _, store, _, _ = runtime()
@@ -910,6 +1081,36 @@ def main() -> int:
         flush(store, exchange)
         print(json.dumps(changed, ensure_ascii=False))
         return 0
+    if args.cmd == "run-scheduled-cycle":
+        changed = run_scheduled_cycle(engine, store, exchange, portfolio, args.cycle_id, args.execute)
+        flush(store, exchange)
+        render_learning(store)
+        print(json.dumps(changed, ensure_ascii=False))
+        return 0
+    if args.cmd == "diagnostic-rerun":
+        changed = engine.start_diagnostic_rerun(args.cycle_id)
+        try:
+            if args.execute:
+                changed = run_m1(engine, store, portfolio, changed["cycle_id"], True)
+        except Exception as exc:
+            failed_cycle = store.get_cycle(changed["cycle_id"])
+            flush(store, exchange)
+            render_learning(store)
+            error_category = exc.category if isinstance(exc, ProviderError) else "runtime_error"
+            print(json.dumps({
+                "status": "failed",
+                "cycle": failed_cycle,
+                "error_category": error_category,
+                "diagnostic_code": CompanionEngine._diagnostic_code(str(exc)),
+            }, ensure_ascii=False))
+            return 2
+        flush(store, exchange)
+        render_learning(store)
+        print(json.dumps(changed, ensure_ascii=False))
+        return 0
+    if args.cmd == "claim-scheduled-workers":
+        print(json.dumps({"cycles": [row["cycle_id"] for row in store.claim_scheduled_workers(limit=2)]}, ensure_ascii=False))
+        return 0
     if args.cmd == "consume-command":
         print(json.dumps(consume(engine, store, exchange, portfolio, args.execute), ensure_ascii=False))
         return 0
@@ -917,6 +1118,15 @@ def main() -> int:
         result = run_background(engine, store, args.execute)
         flush(store, exchange)
         if result.get("action") not in {"idle", "deferred"}:
+            render_learning(store)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    if args.cmd == "reply-premarket":
+        result = run_pending_premarket_reply(
+            engine, store, portfolio, args.cycle_id, args.execute
+        )
+        flush(store, exchange)
+        if result.get("action") == "replied":
             render_learning(store)
         print(json.dumps(result, ensure_ascii=False))
         return 0

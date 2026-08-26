@@ -5,7 +5,7 @@ import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -113,6 +113,20 @@ class CompanionStore:
               occurred_at TEXT NOT NULL, known_at TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS ix_companion_message_cycle_state
               ON companion_message(cycle_id, state, staged_at);
+            CREATE TABLE IF NOT EXISTS companion_message_batch (
+              batch_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              phase TEXT NOT NULL, state TEXT NOT NULL, submitted_at TEXT NOT NULL,
+              completed_at TEXT, response_artifact_id TEXT);
+            CREATE INDEX IF NOT EXISTS ix_companion_message_batch_pending
+              ON companion_message_batch(cycle_id, phase, state, submitted_at);
+            CREATE TABLE IF NOT EXISTS companion_stream_message (
+              stream_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              batch_ids_json TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+              created_at TEXT NOT NULL, completed_at TEXT, error TEXT);
+            CREATE TABLE IF NOT EXISTS companion_stream_chunk (
+              stream_id TEXT NOT NULL REFERENCES companion_stream_message(stream_id),
+              sequence INTEGER NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL,
+              PRIMARY KEY(stream_id, sequence));
             CREATE TABLE IF NOT EXISTS llm_attempt (
               attempt_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               stage TEXT NOT NULL, attempt_number INTEGER NOT NULL, status TEXT NOT NULL,
@@ -196,12 +210,27 @@ class CompanionStore:
               spec_json TEXT NOT NULL, state TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
               evidence_json TEXT NOT NULL, regime_json TEXT NOT NULL, created_at TEXT NOT NULL,
               completed_at TEXT, replaced_by TEXT);
+            CREATE TABLE IF NOT EXISTS schedule_template (
+              schedule_id TEXT PRIMARY KEY, task_key TEXT NOT NULL UNIQUE,
+              status TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+              current_revision INTEGER NOT NULL, created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL, status_reason TEXT);
+            CREATE TABLE IF NOT EXISTS schedule_revision (
+              schedule_id TEXT NOT NULL REFERENCES schedule_template(schedule_id),
+              revision INTEGER NOT NULL, config_json TEXT NOT NULL,
+              created_at TEXT NOT NULL, PRIMARY KEY(schedule_id, revision));
+            CREATE TABLE IF NOT EXISTS schedule_outbox (
+              event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, payload_json TEXT NOT NULL,
+              created_at TEXT NOT NULL, delivered_at TEXT);
+            CREATE TABLE IF NOT EXISTS schedule_worker_claim (
+              cycle_id TEXT PRIMARY KEY REFERENCES companion_cycle(cycle_id), claimed_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_schedule_template_status ON schedule_template(status, updated_at);
             CREATE TABLE IF NOT EXISTS legacy_import_record (
               source_name TEXT NOT NULL, source_id TEXT NOT NULL,
               imported_artifact_id TEXT, imported_at TEXT NOT NULL,
               detail_json TEXT NOT NULL,
               PRIMARY KEY(source_name, source_id));
-            PRAGMA user_version = 8;
+            PRAGMA user_version = 10;
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
@@ -219,6 +248,14 @@ class CompanionStore:
             }.items():
                 if name not in cycle_columns:
                     c.execute(f"ALTER TABLE companion_cycle ADD COLUMN {name} {declaration}")
+            attempt_columns = {row[1] for row in c.execute("PRAGMA table_info(llm_attempt)")}
+            for name, declaration in {
+                "provider_response_id": "TEXT",
+                "provider_request_id": "TEXT",
+                "tool_trace_json": "TEXT",
+            }.items():
+                if name not in attempt_columns:
+                    c.execute(f"ALTER TABLE llm_attempt ADD COLUMN {name} {declaration}")
             artifact_columns = {row[1] for row in c.execute("PRAGMA table_info(narrative_artifact)")}
             if "occurred_at" not in artifact_columns:
                 c.execute("ALTER TABLE narrative_artifact ADD COLUMN occurred_at TEXT")
@@ -234,6 +271,17 @@ class CompanionStore:
                 if name not in evidence_columns:
                     c.execute(f"ALTER TABLE evidence_ledger_entry ADD COLUMN {name} {declaration}")
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_evidence_content ON evidence_ledger_entry(trading_date,source_url,content_sha256)")
+            c.execute(
+                """INSERT OR IGNORE INTO companion_message_batch(batch_id,cycle_id,phase,state,submitted_at,completed_at,response_artifact_id)
+                   SELECT m.batch_id,m.cycle_id,m.phase,
+                     CASE WHEN m.phase!='chat' OR EXISTS (
+                       SELECT 1 FROM narrative_artifact a WHERE a.cycle_id=m.cycle_id AND a.kind IN ('ai_chat','premarket_chat')
+                         AND a.metadata_json LIKE '%\"reply_to_batch_id\": \"' || m.batch_id || '\"%'
+                     ) THEN 'completed' ELSE 'pending' END,
+                     MIN(COALESCE(m.submitted_at,m.staged_at)),NULL,NULL
+                   FROM companion_message m WHERE m.state='submitted' AND m.batch_id IS NOT NULL
+                   GROUP BY m.batch_id,m.cycle_id,m.phase"""
+            )
             snapshot_columns = {row[1] for row in c.execute("PRAGMA table_info(judgment_snapshot)")}
             if "verification_status" not in snapshot_columns:
                 c.execute("ALTER TABLE judgment_snapshot ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'")
@@ -284,18 +332,184 @@ class CompanionStore:
                 c.execute("ALTER TABLE portfolio_transaction ADD COLUMN position_before INTEGER")
             if "position_after" not in transaction_columns:
                 c.execute("ALTER TABLE portfolio_transaction ADD COLUMN position_after INTEGER")
+            cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
+            for name, declaration in {
+                "schedule_id": "TEXT",
+                "schedule_revision": "INTEGER",
+                "schedule_snapshot_json": "TEXT",
+            }.items():
+                if name not in cycle_columns:
+                    c.execute(f"ALTER TABLE companion_cycle ADD COLUMN {name} {declaration}")
             # v8 migration/backfill: existing immutable facts predate intents.
             # Deterministic IDs make this safe on every startup and avoid losing
             # the user's historical formal reasoning after the physical split.
             c.execute("""INSERT OR IGNORE INTO memory_index_intent(intent_id,origin_type,origin_id,content_sha256,known_at,state,created_at)
                          SELECT 'artifact:' || artifact_id || ':' || body_sha256,'artifact',artifact_id,body_sha256,COALESCE(known_at,sealed_at),'pending',?
                          FROM narrative_artifact
-                         WHERE kind IN ('h0','m0','m1','m2','outcome','reflection','chat_human','ai_chat')""", (now(),))
+                         WHERE kind IN ('pre_m0','h0','m0','m1','m2','outcome','reflection','chat_human','ai_chat','premarket_chat')""", (now(),))
             c.execute("""INSERT OR IGNORE INTO memory_index_intent(intent_id,origin_type,origin_id,content_sha256,known_at,state,created_at)
                          SELECT 'evidence:' || evidence_id || ':' || COALESCE(content_sha256,''),'evidence',evidence_id,COALESCE(content_sha256,''),known_at,'pending',?
                          FROM evidence_ledger_entry""", (now(),))
+            # v9 migration/backfill: historical cycles were created before
+            # templates had identities.  Default template keys deliberately
+            # retain the former task keys, which makes this deterministic and
+            # preserves the user's existing run history in the new UI.
+            c.execute(
+                """UPDATE companion_cycle
+                   SET schedule_id=(SELECT t.schedule_id FROM schedule_template t WHERE t.task_key=companion_cycle.task_key),
+                       schedule_revision=(SELECT t.current_revision FROM schedule_template t WHERE t.task_key=companion_cycle.task_key),
+                       schedule_snapshot_json=(SELECT r.config_json FROM schedule_template t JOIN schedule_revision r
+                         ON r.schedule_id=t.schedule_id AND r.revision=t.current_revision WHERE t.task_key=companion_cycle.task_key)
+                   WHERE schedule_id IS NULL AND EXISTS (SELECT 1 FROM schedule_template t WHERE t.task_key=companion_cycle.task_key)"""
+            )
 
-    def create_cycle(self, task_key: str, scheduled_for: str, as_of: str) -> dict[str, Any]:
+    def _schedule_snapshot(self) -> None:
+        """Keep a small checksummed recovery aid after every schedule mutation."""
+        with self.connection() as c:
+            rows = [dict(row) for row in c.execute(
+                """SELECT t.schedule_id,t.task_key,t.status,t.version,t.current_revision,r.config_json
+                   FROM schedule_template t JOIN schedule_revision r
+                     ON r.schedule_id=t.schedule_id AND r.revision=t.current_revision
+                   ORDER BY t.schedule_id"""
+            )]
+        raw = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        target = self.database.parent.parent / "runtime" / "schedule-snapshots" / "current.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"sha256": digest(raw), "schedules": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(target)
+
+    def repair_schedule_registry(self) -> bool:
+        """Repair only current template projections from a verified local snapshot."""
+        target = self.database.parent.parent / "runtime" / "schedule-snapshots" / "current.json"
+        if not target.exists():
+            return False
+        payload = json.loads(target.read_text(encoding="utf-8")); rows = payload.get("schedules")
+        raw = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if not isinstance(rows, list) or payload.get("sha256") != digest(raw):
+            return False
+        with self.connection() as c:
+            for row in rows:
+                c.execute(
+                    """INSERT INTO schedule_template(schedule_id,task_key,status,version,current_revision,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?) ON CONFLICT(schedule_id) DO UPDATE SET
+                         task_key=excluded.task_key,status=excluded.status,version=excluded.version,
+                         current_revision=excluded.current_revision,updated_at=excluded.updated_at""",
+                    (row["schedule_id"], row["task_key"], row["status"], row["version"], row["current_revision"], now(), now()),
+                )
+                c.execute(
+                    "INSERT OR REPLACE INTO schedule_revision(schedule_id,revision,config_json,created_at) VALUES(?,?,?,?)",
+                    (row["schedule_id"], row["current_revision"], row["config_json"], now()),
+                )
+        return True
+
+    def seed_schedule(self, schedule_id: str, task_key: str, config: dict[str, Any]) -> None:
+        """Install a default only once; upgrades never overwrite user changes."""
+        self.initialize()
+        at = now()
+        with self.connection() as c:
+            existing = c.execute("SELECT 1 FROM schedule_template WHERE schedule_id=?", (schedule_id,)).fetchone()
+            if existing:
+                return
+            raw = json.dumps(config, ensure_ascii=False, sort_keys=True)
+            c.execute("INSERT INTO schedule_template(schedule_id,task_key,status,version,current_revision,created_at,updated_at) VALUES(?,?, 'active',1,1,?,?)", (schedule_id, task_key, at, at))
+            c.execute("INSERT INTO schedule_revision(schedule_id,revision,config_json,created_at) VALUES(?,?,?,?)", (schedule_id, 1, raw, at))
+        self._schedule_snapshot()
+
+    def list_schedules(self, *, include_inactive: bool = True) -> list[dict[str, Any]]:
+        self.initialize()
+        where = "" if include_inactive else "WHERE t.status='active'"
+        with self.connection() as c:
+            return [dict(row) for row in c.execute(
+                f"""SELECT t.schedule_id,t.task_key,t.status,t.version,t.current_revision,t.created_at,t.updated_at,t.status_reason,
+                            r.config_json,r.created_at AS revision_created_at
+                     FROM schedule_template t JOIN schedule_revision r
+                       ON r.schedule_id=t.schedule_id AND r.revision=t.current_revision
+                     {where} ORDER BY t.created_at,t.schedule_id"""
+            )]
+
+    def get_schedule(self, schedule_id: str) -> dict[str, Any]:
+        for row in self.list_schedules():
+            if row["schedule_id"] == schedule_id:
+                return row
+        raise ValueError("任务不存在")
+
+    def create_schedule(self, config: dict[str, Any]) -> dict[str, Any]:
+        self.initialize()
+        schedule_id = str(uuid.uuid4())
+        task_key = f"schedule.{schedule_id}"
+        at = now(); raw = json.dumps(config, ensure_ascii=False, sort_keys=True)
+        with self.connection() as c:
+            c.execute("INSERT INTO schedule_template(schedule_id,task_key,status,version,current_revision,created_at,updated_at) VALUES(?,?, 'active',1,1,?,?)", (schedule_id, task_key, at, at))
+            c.execute("INSERT INTO schedule_revision(schedule_id,revision,config_json,created_at) VALUES(?,?,?,?)", (schedule_id, 1, raw, at))
+        self._schedule_snapshot()
+        return self.get_schedule(schedule_id)
+
+    def update_schedule(self, schedule_id: str, expected_version: int, config: dict[str, Any]) -> dict[str, Any]:
+        self.initialize(); at = now(); raw = json.dumps(config, ensure_ascii=False, sort_keys=True)
+        with self.connection() as c:
+            row = c.execute("SELECT version,current_revision FROM schedule_template WHERE schedule_id=?", (schedule_id,)).fetchone()
+            if not row: raise ValueError("任务不存在")
+            if row["version"] != expected_version: raise ValueError("任务已被其他修改更新，请刷新后再保存")
+            revision = int(row["current_revision"]) + 1
+            c.execute("INSERT INTO schedule_revision(schedule_id,revision,config_json,created_at) VALUES(?,?,?,?)", (schedule_id, revision, raw, at))
+            c.execute("UPDATE schedule_template SET current_revision=?,version=version+1,updated_at=? WHERE schedule_id=?", (revision, at, schedule_id))
+        self._schedule_snapshot()
+        return self.get_schedule(schedule_id)
+
+    def set_schedule_status(self, schedule_id: str, expected_version: int, status: str) -> dict[str, Any]:
+        if status not in {"active", "paused", "archived"}: raise ValueError("不支持的任务状态")
+        self.initialize()
+        with self.connection() as c:
+            row = c.execute("SELECT version FROM schedule_template WHERE schedule_id=?", (schedule_id,)).fetchone()
+            if not row: raise ValueError("任务不存在")
+            if row["version"] != expected_version: raise ValueError("任务已被其他修改更新，请刷新后再保存")
+            c.execute("UPDATE schedule_template SET status=?,version=version+1,updated_at=?,status_reason=? WHERE schedule_id=?", (status, now(), "用户操作", schedule_id))
+        self._schedule_snapshot()
+        return self.get_schedule(schedule_id)
+
+    def schedule_history(self, schedule_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        self.initialize()
+        with self.connection() as c:
+            return [dict(row) for row in c.execute(
+                """WITH ranked_history AS (
+                       SELECT cycle_id,scheduled_for,state,updated_at,
+                              ROW_NUMBER() OVER (
+                                PARTITION BY substr(scheduled_for, 1, 16)
+                                ORDER BY updated_at DESC, cycle_id DESC
+                              ) AS history_rank
+                         FROM companion_cycle
+                        WHERE schedule_id=?
+                   )
+                   SELECT cycle_id,scheduled_for,state,updated_at FROM ranked_history
+                    WHERE history_rank=1
+                    ORDER BY scheduled_for DESC LIMIT ?""", (schedule_id, limit)
+            )]
+
+    def claim_scheduled_workers(self, *, limit: int = 2) -> list[dict[str, Any]]:
+        """Atomically reserve up to the available worker slots for queued cycles."""
+        self.initialize()
+        claimed_at = now()
+        with self.connection() as c:
+            c.execute("BEGIN IMMEDIATE")
+            active = c.execute("SELECT COUNT(*) FROM schedule_worker_claim").fetchone()[0]
+            available = max(0, limit - int(active))
+            due_at = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+            rows = c.execute(
+                """SELECT c.* FROM companion_cycle c LEFT JOIN schedule_worker_claim w ON w.cycle_id=c.cycle_id
+                   WHERE c.state='queued' AND w.cycle_id IS NULL
+                     AND c.scheduled_for <= ?
+                   ORDER BY c.scheduled_for,c.created_at LIMIT ?""", (due_at, available)
+            ).fetchall()
+            for row in rows:
+                c.execute("INSERT INTO schedule_worker_claim(cycle_id,claimed_at) VALUES(?,?)", (row["cycle_id"], claimed_at))
+        return [dict(row) for row in rows]
+
+    def finish_scheduled_worker(self, cycle_id: str) -> None:
+        with self.connection() as c:
+            c.execute("DELETE FROM schedule_worker_claim WHERE cycle_id=?", (cycle_id,))
+
+    def create_cycle(self, task_key: str, scheduled_for: str, as_of: str, *, schedule_id: str | None = None, schedule_revision: int | None = None, schedule_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
         self.initialize(); cycle_id = str(uuid.uuid4()); at = now()
         with self.connection() as c:
             c.execute("BEGIN IMMEDIATE")
@@ -309,9 +523,10 @@ class CompanionStore:
                 else:
                     c.execute(
                         """INSERT INTO companion_cycle(
-                             cycle_id,task_key,scheduled_for,as_of,state,revision,created_at,updated_at
-                           ) VALUES(?,?,?,?, 'queued',1,?,?)""",
-                        (cycle_id, task_key, scheduled_for, as_of, at, at),
+                             cycle_id,task_key,scheduled_for,as_of,state,revision,schedule_id,schedule_revision,schedule_snapshot_json,created_at,updated_at
+                           ) VALUES(?,?,?,?, 'queued',1,?,?,?,?,?)""",
+                        (cycle_id, task_key, scheduled_for, as_of, schedule_id, schedule_revision,
+                         json.dumps(schedule_snapshot, ensure_ascii=False, sort_keys=True) if schedule_snapshot else None, at, at),
                     )
                 c.execute("INSERT INTO companion_schedule_claim(task_key,scheduled_for,cycle_id,claimed_at) VALUES(?,?,?,?)", (task_key, scheduled_for, cycle_id, at))
         return self.get_cycle(cycle_id)
@@ -374,9 +589,57 @@ class CompanionStore:
             if not row: raise ValueError(f"unknown cycle: {cycle_id}")
             return dict(row)
 
+    def create_diagnostic_cycle(self, source_cycle_id: str, *, scheduled_for: str | None = None) -> dict[str, Any]:
+        """Create an isolated rerun without claiming or rewriting a schedule slot."""
+        source = self.get_cycle(source_cycle_id)
+        at = now()
+        rerun_for = scheduled_for or at
+        snapshot = json.loads(source.get("schedule_snapshot_json") or "{}")
+        snapshot.update({
+            "diagnostic_rerun": True,
+            "diagnostic_rerun_of": source_cycle_id,
+            "diagnostic_rerun_created_at": at,
+            "original_scheduled_for": source["scheduled_for"],
+        })
+        cycle_id = str(uuid.uuid4())
+        with self.connection() as c:
+            c.execute(
+                """INSERT INTO companion_cycle(
+                     cycle_id,task_key,scheduled_for,as_of,state,revision,
+                     schedule_id,schedule_revision,schedule_snapshot_json,
+                     h0_locked_at,has_h0,m1_started_at,created_at,updated_at
+                   ) VALUES(?,?,?,?, 'researching_m1',1,?,?,?,?,?,?,?,?)""",
+                (
+                    cycle_id, source["task_key"], rerun_for, source["as_of"],
+                    source.get("schedule_id"), source.get("schedule_revision"),
+                    json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                    source.get("h0_locked_at"), int(source.get("has_h0") or 0), at, at, at,
+                ),
+            )
+
+        copied_artifacts = {}
+        for kind in ("evidence", "m0", "h0"):
+            artifact = self.latest_artifact(source_cycle_id, kind)
+            if not artifact:
+                continue
+            metadata = json.loads(artifact.get("metadata_json") or "{}")
+            metadata.update({"diagnostic_rerun_of": source_cycle_id, "copied_from_artifact_id": artifact["artifact_id"]})
+            copied = self.append_artifact(
+                cycle_id, kind, artifact["actor"], artifact["body_markdown"], artifact["as_of"], metadata,
+                occurred_at=artifact.get("occurred_at"), known_at=artifact.get("known_at"),
+            )
+            copied_artifacts[kind] = copied
+        if copied_artifacts.get("h0"):
+            with self.connection() as c:
+                c.execute(
+                    "UPDATE companion_cycle SET h0_artifact_id=?, updated_at=?, revision=revision+1 WHERE cycle_id=?",
+                    (copied_artifacts["h0"]["artifact_id"], now(), cycle_id),
+                )
+        return self.get_cycle(cycle_id)
+
     def transition(self, cycle_id: str, state: str, **fields: Any) -> dict[str, Any]:
         allowed={
-            "human_deadline","voice_grace_deadline","m0_revealed_at","codex_session_id","packet_hash",
+            "as_of","human_deadline","voice_grace_deadline","m0_revealed_at","codex_session_id","packet_hash",
             "m1_publish_deadline","h0_auto_submit_at","h0_locked_at","h0_artifact_id","has_h0",
             "m1_started_at","m1_completed_at","m2_started_at","m2_completed_at",
             "m1_reserve_seconds","timing_policy_version",
@@ -405,7 +668,7 @@ class CompanionStore:
                  json.dumps(metadata,ensure_ascii=False,sort_keys=True),occurred_at or sealed,known_at or sealed),
             )
             c.execute("INSERT INTO narrative_fts(artifact_id,cycle_id,kind,body_markdown) VALUES(?,?,?,?)", (artifact_id,cycle_id,kind,body))
-            if kind in {"h0", "m1", "m2", "outcome", "reflection", "m0", "chat_human", "ai_chat"}:
+            if kind in {"pre_m0", "h0", "m1", "m2", "outcome", "reflection", "m0", "chat_human", "ai_chat", "premarket_chat"}:
                 c.execute(
                     "INSERT OR REPLACE INTO memory_index_entry(artifact_id,known_at,tags_json,indexed_at) VALUES(?,?,?,?)",
                     (artifact_id, known_at or sealed, json.dumps(metadata.get("memory_tags", []), ensure_ascii=False), sealed),
@@ -434,7 +697,7 @@ class CompanionStore:
             return dict(row) if row else None
 
     def stage_message(self, cycle_id: str, text: str, phase: str, *, message_id: str | None = None) -> dict[str, Any]:
-        if phase not in {"h0", "chat"}:
+        if phase not in {"pre_m0", "h0", "chat"}:
             raise ValueError(f"invalid message phase: {phase}")
         if not text.strip():
             raise ValueError("message text must not be empty")
@@ -456,6 +719,19 @@ class CompanionStore:
             if not row:
                 raise ValueError(f"unknown message: {message_id}")
             return dict(row)
+
+    def update_staged_message(self, cycle_id: str, message_id: str, text: str) -> dict[str, Any]:
+        if not text.strip():
+            raise ValueError("message text must not be empty")
+        assert_safe(text, boundary="staged message")
+        with self.connection() as c:
+            changed = c.execute(
+                "UPDATE companion_message SET body_text=? WHERE cycle_id=? AND message_id=? AND state='staged'",
+                (text.strip(), cycle_id, message_id),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("only pending messages can be edited")
+        return self.get_message(message_id)
 
     def withdraw_message(self, cycle_id: str, message_id: str) -> dict[str, Any]:
         at = now()
@@ -497,9 +773,80 @@ class CompanionStore:
                        WHERE cycle_id=? AND phase=? AND state='staged'""",
                     (batch_id, submitted, submitted, cycle_id, phase),
                 )
+                c.execute(
+                    "INSERT INTO companion_message_batch(batch_id,cycle_id,phase,state,submitted_at) VALUES(?,?,?,'pending',?)",
+                    (batch_id, cycle_id, phase, submitted),
+                )
         for row in rows:
             row.update({"state": "submitted", "batch_id": batch_id, "submitted_at": submitted, "known_at": submitted})
         return batch_id, rows
+
+    def pending_message_batches(self, cycle_id: str, phase: str = "chat") -> list[dict[str, Any]]:
+        with self.connection() as c:
+            return [dict(row) for row in c.execute(
+                "SELECT * FROM companion_message_batch WHERE cycle_id=? AND phase=? AND state='pending' ORDER BY submitted_at,batch_id",
+                (cycle_id, phase),
+            )]
+
+    def messages_for_batches(self, batch_ids: list[str]) -> list[dict[str, Any]]:
+        if not batch_ids:
+            return []
+        placeholders = ",".join("?" for _ in batch_ids)
+        with self.connection() as c:
+            return [dict(row) for row in c.execute(
+                f"SELECT * FROM companion_message WHERE batch_id IN ({placeholders}) ORDER BY submitted_at,staged_at,message_id", batch_ids
+            )]
+
+    def mark_batches_responded(self, batch_ids: list[str], artifact_id: str) -> None:
+        if not batch_ids:
+            return
+        placeholders = ",".join("?" for _ in batch_ids)
+        with self.connection() as c:
+            c.execute(
+                f"UPDATE companion_message_batch SET state='completed',completed_at=?,response_artifact_id=? WHERE batch_id IN ({placeholders}) AND state='pending'",
+                [now(), artifact_id, *batch_ids],
+            )
+
+    def start_stream_message(self, cycle_id: str, batch_ids: list[str], kind: str) -> dict[str, Any]:
+        stream_id = str(uuid.uuid4())
+        with self.connection() as c:
+            c.execute(
+                "INSERT INTO companion_stream_message(stream_id,cycle_id,batch_ids_json,kind,state,created_at) VALUES(?,?,?,?, 'streaming',?)",
+                (stream_id, cycle_id, json.dumps(batch_ids, ensure_ascii=False), kind, now()),
+            )
+        return self.stream_message(stream_id)
+
+    def append_stream_chunk(self, stream_id: str, text: str) -> dict[str, Any]:
+        assert_safe(text, boundary="streamed model message")
+        with self.connection() as c:
+            row = c.execute("SELECT state FROM companion_stream_message WHERE stream_id=?", (stream_id,)).fetchone()
+            if not row or row["state"] != "streaming":
+                raise ValueError("stream is not active")
+            sequence = c.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM companion_stream_chunk WHERE stream_id=?", (stream_id,)).fetchone()[0]
+            c.execute("INSERT INTO companion_stream_chunk(stream_id,sequence,text,created_at) VALUES(?,?,?,?)", (stream_id, sequence, text, now()))
+        return self.stream_message(stream_id)
+
+    def finish_stream_message(self, stream_id: str, *, error: str | None = None) -> dict[str, Any]:
+        with self.connection() as c:
+            c.execute("UPDATE companion_stream_message SET state=?,completed_at=?,error=? WHERE stream_id=? AND state='streaming'", ("failed" if error else "completed", now(), error[-2000:] if error else None, stream_id))
+        return self.stream_message(stream_id)
+
+    def stream_message(self, stream_id: str) -> dict[str, Any]:
+        with self.connection() as c:
+            row = c.execute("SELECT * FROM companion_stream_message WHERE stream_id=?", (stream_id,)).fetchone()
+            if not row:
+                raise ValueError("stream not found")
+            result = dict(row)
+            chunks = c.execute("SELECT * FROM companion_stream_chunk WHERE stream_id=? ORDER BY sequence", (stream_id,)).fetchall()
+        result["batch_ids"] = json.loads(result.pop("batch_ids_json"))
+        result["text"] = "".join(chunk["text"] for chunk in chunks)
+        result["chunks"] = [dict(chunk) for chunk in chunks]
+        return result
+
+    def stream_messages(self, cycle_id: str) -> list[dict[str, Any]]:
+        with self.connection() as c:
+            ids = [row["stream_id"] for row in c.execute("SELECT stream_id FROM companion_stream_message WHERE cycle_id=? ORDER BY created_at", (cycle_id,))]
+        return [self.stream_message(stream_id) for stream_id in ids]
 
     def link_messages_to_artifact(self, message_ids: list[str], artifact_id: str) -> None:
         if not message_ids:
@@ -537,19 +884,21 @@ class CompanionStore:
             )
         return {"attempt_id": attempt_id, "attempt_number": number, "started_at": started}
 
-    def finish_attempt(self, attempt_id: str, status: str, *, output_sha256: str | None = None, error: str | None = None, usage: dict[str, Any] | None = None, verifier: dict[str, Any] | None = None) -> None:
+    def finish_attempt(self, attempt_id: str, status: str, *, output_sha256: str | None = None, error: str | None = None, usage: dict[str, Any] | None = None, verifier: dict[str, Any] | None = None, provider_response_id: str | None = None, provider_request_id: str | None = None, tool_trace: list[dict[str, Any]] | None = None) -> None:
         if status not in {"succeeded", "failed", "timed_out"}:
             raise ValueError(f"invalid attempt status: {status}")
         with self.connection() as c:
             c.execute(
                 """UPDATE llm_attempt SET status=?,completed_at=?,output_sha256=?,error=?,usage_json=?,
                    input_tokens=?,cached_input_tokens=?,output_tokens=?,reasoning_tokens=?,verifier_json=?,
+                   provider_response_id=?,provider_request_id=?,tool_trace_json=?,
                    duration_ms=CAST((julianday(?) - julianday(started_at))*86400000 AS INTEGER) WHERE attempt_id=?""",
                 (status, now(), output_sha256, error[-2000:] if error else None,
                  json.dumps(usage or {}, ensure_ascii=False, sort_keys=True),
                  (usage or {}).get("input_tokens"), (usage or {}).get("cached_input_tokens"),
                  (usage or {}).get("output_tokens"), (usage or {}).get("reasoning_tokens"),
-                 json.dumps(verifier or {}, ensure_ascii=False, sort_keys=True), now(), attempt_id),
+                  json.dumps(verifier or {}, ensure_ascii=False, sort_keys=True), provider_response_id, provider_request_id,
+                  json.dumps(tool_trace or [], ensure_ascii=False, sort_keys=True), now(), attempt_id),
             )
 
     def attempts(self, cycle_id: str) -> list[dict[str, Any]]:
@@ -1016,6 +1365,20 @@ class CompanionStore:
                 (event_id, event_type, json.dumps(payload, ensure_ascii=False, sort_keys=True), now()),
             )
         return event_id
+
+    def queue_schedule_event(self, event_type: str, payload: dict[str, Any]) -> str:
+        event_id = str(uuid.uuid4())
+        with self.connection() as c:
+            c.execute("INSERT INTO schedule_outbox VALUES(?,?,?,?,NULL)", (event_id, event_type, json.dumps(payload, ensure_ascii=False, sort_keys=True), now()))
+        return event_id
+
+    def pending_schedule_events(self) -> list[dict[str, Any]]:
+        with self.connection() as c:
+            return [dict(row) for row in c.execute("SELECT * FROM schedule_outbox WHERE delivered_at IS NULL ORDER BY created_at")]
+
+    def mark_schedule_event_delivered(self, event_id: str) -> None:
+        with self.connection() as c:
+            c.execute("UPDATE schedule_outbox SET delivered_at=? WHERE event_id=?", (now(), event_id))
 
     def pending_portfolio_events(self) -> list[dict[str, Any]]:
         with self.connection() as c:

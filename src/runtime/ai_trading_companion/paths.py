@@ -60,6 +60,14 @@ class RuntimePaths:
     def settings(self) -> Path:
         return self.home / "config" / "settings.local.json"
 
+    @property
+    def evidence(self) -> Path:
+        return self.home / "evidence"
+
+    @property
+    def browser_profile(self) -> Path:
+        return self.home / "browser-profile"
+
     def ensure(self) -> None:
         for directory in (
             self.home / "data", self.workspace / "portfolio", self.workspace / "state",
@@ -67,5 +75,6 @@ class RuntimePaths:
             self.runtime / "logs", self.runtime / "backups", self.exchange / "to-runtime" / "pending",
             self.exchange / "to-client" / "pending", self.home / "ui", self.home / "cache",
             self.home / "migration", self.home / "config",
+            self.evidence, self.runtime / "downloads" / "quarantine",
         ):
             directory.mkdir(parents=True, exist_ok=True)

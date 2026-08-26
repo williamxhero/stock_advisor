@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 import json
 from pathlib import Path
@@ -8,6 +8,8 @@ from typing import Any, Callable, Protocol
 from zoneinfo import ZoneInfo
 
 from .engine import CompanionEngine, iso, parse
+from .models import TASK_POLICIES
+from .schedule_registry import _target_for_day, policy_key
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -66,6 +68,64 @@ def load_schedules(resources_root: Path) -> tuple[tuple[DailySchedule, ...], tup
     return daily, periodic
 
 
+def ensure_registered_policy(task_key: str, config: dict[str, Any], target: datetime) -> None:
+    """Map a user template to an existing, audited workflow policy.
+
+    A template never supplies a prompt or model.  It only selects a constrained
+    workflow and a target time; the policy remains code-owned.
+    """
+    source = TASK_POLICIES[policy_key(config, target)]
+    TASK_POLICIES[task_key] = replace(source, task_key=task_key)
+
+
+def run_registry_schedule(
+    engine: CompanionEngine,
+    store: Any,
+    registry: Any,
+    at: datetime,
+) -> list[dict[str, Any]]:
+    """Materialise due cycles only; workers run research separately.
+
+    This keeps the five-second scheduler responsive even when a prior LLM call
+    is long-running.  A cycle becomes immutable at its first preparation/claim.
+    """
+    if at.tzinfo is None:
+        raise ValueError("scheduler time must be timezone-aware")
+    local_at = at.astimezone(SHANGHAI)
+    results: list[dict[str, Any]] = []
+    for row in registry.list(local_at, include_inactive=False):
+        config = row["config"]
+        if config.get("effective_from") and local_at.date().isoformat() < config["effective_from"]: continue
+        if config.get("effective_until") and local_at.date().isoformat() > config["effective_until"]: continue
+        target = _target_for_day(config, local_at.date())
+        if target is None: continue
+        if config["trigger"]["type"] in {"trading_day_fixed", "market_relative"} and not registry.calendar.is_trading_day(local_at.date()):
+            continue
+        ensure_registered_policy(row["task_key"], config, target)
+        lead = int(config["trigger"].get("lead_minutes", 0))
+        scheduled_for = target.isoformat(timespec="seconds")
+        cycle = store.find_cycle(row["task_key"], scheduled_for)
+        if local_at < target - timedelta(minutes=lead):
+            continue
+        if cycle is None:
+            cycle = engine.start_cycle(
+                row["task_key"], scheduled_for, iso(at), schedule_id=row["schedule_id"],
+                schedule_revision=int(row["current_revision"]), schedule_snapshot=config,
+            )
+            if local_at < target:
+                results.append(_result(row["task_key"], scheduled_for, "prepared", cycle))
+                continue
+        if local_at < target:
+            continue
+        late = local_at > target + CATCH_UP_WINDOW
+        if late and cycle["state"] == "queued":
+            cycle = engine.mark_missed(cycle["cycle_id"], "启动已超过 15 分钟补偿窗口")
+            results.append(_result(row["task_key"], scheduled_for, "missed", cycle))
+        elif cycle["state"] == "queued":
+            results.append(_result(row["task_key"], scheduled_for, "queued", cycle))
+    return results
+
+
 def run_daily_schedule(
     engine: CompanionEngine,
     store: Any,
@@ -85,9 +145,12 @@ def run_daily_schedule(
     results: list[dict[str, Any]] = []
     for item in schedules:
         scheduled = datetime.combine(local_at.date(), item.at, SHANGHAI)
-        if local_at < scheduled - item.lead_time:
-            continue
         scheduled_for = scheduled.isoformat(timespec="seconds")
+        if local_at < scheduled - item.lead_time:
+            if item.task_key == "daily.opportunity.0900" and store.find_cycle(item.task_key, scheduled_for) is None:
+                cycle = engine.start_cycle(item.task_key, scheduled_for, iso(at))
+                results.append(_result(item.task_key, scheduled_for, "prepared", cycle))
+            continue
         cycle = store.find_cycle(item.task_key, scheduled_for)
         late = local_at > scheduled + CATCH_UP_WINDOW
 

@@ -86,6 +86,30 @@ public sealed class CompanionEventProjectionTests
     }
 
     [Fact]
+    public void PreM0MessagesBecomeSubmittedContextWithoutCountingAsH0()
+    {
+        var events = new[]
+        {
+            """{"contract":"companion-client-event/v1","event_id":"created","cycle_id":"pre-1","type":"cycle.created","created_at":"2026-08-25T23:10:00Z","payload":{"cycle_id":"pre-1","task_key":"daily.opportunity.0900","state":"queued","scheduled_for":"2026-08-26T09:00:00+08:00"}}""",
+            """{"contract":"companion-client-event/v1","event_id":"staged","cycle_id":"pre-1","type":"message.staged","created_at":"2026-08-25T23:11:00Z","payload":{"cycle":{"task_key":"daily.opportunity.0900","state":"queued"},"message":{"message_id":"pre-message","body_text":"重点看看机器人消息源","state":"staged","phase":"pre_m0","staged_at":"2026-08-25T23:11:00Z"}}}""",
+            """{"contract":"companion-client-event/v1","event_id":"submitted","cycle_id":"pre-1","type":"pre_m0.submitted","created_at":"2026-08-25T23:12:00Z","payload":{"cycle":{"task_key":"daily.opportunity.0900","state":"queued"},"messages":[{"message_id":"pre-message","body_text":"重点看看机器人消息源","state":"submitted","phase":"pre_m0","submitted_at":"2026-08-25T23:12:00Z"}]}}""",
+            """{"contract":"companion-client-event/v1","event_id":"reply","cycle_id":"pre-1","type":"premarket.reply.ready","created_at":"2026-08-25T23:13:00Z","payload":{"cycle":{"task_key":"daily.opportunity.0900","state":"queued"},"text":"我先记下，等会儿会独立核实传播源头。","source_artifact_id":"pre-ai-1"}}""",
+            """{"contract":"companion-client-event/v1","event_id":"locked","cycle_id":"pre-1","type":"pre_m0.locked","created_at":"2026-08-26T00:30:00Z","payload":{"cycle":{"task_key":"daily.opportunity.0900","state":"queued"},"messages":[{"message_id":"pre-message","body_text":"重点看看机器人消息源","state":"submitted","phase":"pre_m0","submitted_at":"2026-08-26T00:30:00Z"}]}}""",
+        };
+
+        var projection = CompanionEventProjection.Project(events);
+
+        Assert.NotNull(projection);
+        var message = Assert.Single(projection.UserMessages);
+        Assert.Equal("submitted", message.State);
+        Assert.Equal("pre_m0", message.Phase);
+        Assert.False(message.CountsForM1);
+        var reply = Assert.Single(projection.AiMessages);
+        Assert.Equal("premarket", reply.Kind);
+        Assert.Contains("独立核实", reply.Text);
+    }
+
+    [Fact]
     public void ProjectsMissedReasonAsNaturalVisibleFault()
     {
         var events = new[]

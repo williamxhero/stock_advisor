@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict, dataclass
 from typing import Any
+
+from .config import DEFAULT_PROVIDER
 
 
 RESEARCH_STAGES = frozenset({"m0_research", "m1_research", "outcome_research", "chat_research"})
@@ -18,6 +19,7 @@ class RoutingDecision:
     search: bool
     timeout_seconds: int
     reason: str
+    model_slot: str = "fast"
 
     def as_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -50,11 +52,16 @@ class RoutingPlan:
 
 
 class CognitiveRouter:
-    """A deterministic cognitive-budget boundary.
+    """Select configured Provider model slots without a consumption quota."""
 
-    Public search is deliberately fixed at Terra/medium. Only private judgment
-    and synthesis may vary Sol effort; M1 profiling sees only its blind packet.
-    """
+    def __init__(self, provider: dict[str, Any] | None = None) -> None:
+        self.provider = provider or DEFAULT_PROVIDER
+
+    def _slot(self, name: str) -> tuple[str, str]:
+        models = self.provider.get("models") if isinstance(self.provider.get("models"), dict) else {}
+        item = models.get(name) if isinstance(models.get(name), dict) else {}
+        fallback = DEFAULT_PROVIDER["models"][name]
+        return str(item.get("id") or fallback["id"]), str(item.get("effort") or fallback["effort"])
 
     def profile(self, stage: str, packet: dict[str, Any], requested_timeout: int) -> CognitiveTaskProfile:
         evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
@@ -79,23 +86,27 @@ class CognitiveRouter:
     def baseline(self, stage: str, packet: dict[str, Any], requested_timeout: int, search: bool) -> RoutingDecision:
         profile = self.profile(stage, packet, requested_timeout)
         if stage in RESEARCH_STAGES:
-            return RoutingDecision(os.environ.get("STOCK_ADVISOR_CODEX_RESEARCH_MODEL", "gpt-5.6-terra"), "medium", search, profile.deadline_seconds, "公开搜索固定使用 Terra Medium，保持覆盖与成本边界稳定")
+            model, effort = self._slot("research")
+            return RoutingDecision(model, effort, search, profile.deadline_seconds, "使用已配置的研究模型槽", "research")
         if stage in JUDGMENT_STAGES:
-            return RoutingDecision(os.environ.get("STOCK_ADVISOR_CODEX_JUDGMENT_MODEL", "gpt-5.6-sol"), "medium", search, profile.deadline_seconds, "正式判断基线使用 Sol Medium")
-        return RoutingDecision(os.environ.get("STOCK_ADVISOR_CODEX_FAST_MODEL", "gpt-5.6-luna"), "medium", search, profile.deadline_seconds, "自然表达不占用方向判断预算")
+            model, effort = self._slot("judgment")
+            return RoutingDecision(model, effort, search, profile.deadline_seconds, "正式判断基线使用已配置的判断模型槽", "judgment")
+        model, effort = self._slot("fast")
+        return RoutingDecision(model, effort, search, profile.deadline_seconds, "使用已配置的快速表达模型槽", "fast")
 
     def candidate(self, stage: str, packet: dict[str, Any], requested_timeout: int, search: bool) -> RoutingDecision | None:
         profile = self.profile(stage, packet, requested_timeout)
         if stage not in JUDGMENT_STAGES or profile.data_blocked or (stage == "m1_judgment" and not profile.m1_blind):
             return None
+        model, default_effort = self._slot("judgment")
         if profile.major and profile.deadline_seconds >= 240:
             # Reserve a deterministic hedge window.  XHigh is valuable only if
             # it cannot consume the deadline needed to publish a sound Medium
             # result after a timeout or runner failure.
             xhigh_timeout = max(60, int(profile.deadline_seconds * 0.65))
-            return RoutingDecision(os.environ.get("STOCK_ADVISOR_CODEX_JUDGMENT_MODEL", "gpt-5.6-sol"), "xhigh", search, xhigh_timeout, "重大事件或明显证据冲突，候选使用 Sol XHigh 并预留 Medium 回退窗口")
+            return RoutingDecision(model, "xhigh", search, xhigh_timeout, "重大事件或明显证据冲突，使用判断模型槽进行更深复核", "judgment")
         if stage in {"reflection", "workflow_feedback"} or profile.evidence_gaps >= 2 or profile.source_count < 3:
-            return RoutingDecision(os.environ.get("STOCK_ADVISOR_CODEX_JUDGMENT_MODEL", "gpt-5.6-sol"), "high", search, profile.deadline_seconds, "证据缺口、稀疏性或因果复盘需要更强反证")
+            return RoutingDecision(model, "high" if default_effort == "medium" else default_effort, search, profile.deadline_seconds, "证据缺口、稀疏性或因果复盘需要更强反证", "judgment")
         return None
 
     def plan(self, stage: str, packet: dict[str, Any], requested_timeout: int, search: bool, mode: str = "shadow") -> RoutingPlan:
@@ -103,9 +114,6 @@ class CognitiveRouter:
         baseline = self.baseline(stage, packet, requested_timeout, search)
         candidate = self.candidate(stage, packet, requested_timeout, search)
         selected = candidate if mode == "promoted" and candidate else baseline
-        override = os.environ.get(f"STOCK_ADVISOR_{stage.upper()}_EFFORT")
-        if override:
-            selected = RoutingDecision(selected.model, override, selected.search, selected.timeout_seconds, selected.reason + "；使用显式本地覆盖")
         return RoutingPlan(profile, baseline, selected, candidate, mode)
 
     def route(self, stage: str, packet: dict[str, Any], requested_timeout: int, search: bool) -> RoutingDecision:

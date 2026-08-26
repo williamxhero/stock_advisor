@@ -104,9 +104,26 @@ public sealed class UiContractTests
         Assert.Contains("MainSendButton", xaml, StringComparison.Ordinal);
         Assert.Contains("MainCommitButton", xaml, StringComparison.Ordinal);
         Assert.Contains("Text=\"我的消息\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Content=\"盘前\" Tag=\"premarket\"", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("M0Viewer", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("M1Viewer", xaml, StringComparison.Ordinal);
         Assert.Contains("BasedOn=\"{StaticResource ThinScrollBarStyle}\"", xaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void EveryRenderedAiAndUserMessageGetsAnOriginalTextCopyButton()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln")))
+            root = root.Parent;
+        Assert.NotNull(root);
+        var path = Path.Combine(root.FullName!,
+            "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml.cs");
+        var source = File.ReadAllText(path);
+
+        Assert.Contains("CreateCopyButton(message.Text)", source, StringComparison.Ordinal);
+        Assert.Contains("CreateCopyButton(entry.Text)", source, StringComparison.Ordinal);
+        Assert.Contains("Clipboard.SetText(text)", source, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -122,6 +139,47 @@ public sealed class UiContractTests
         Assert.DoesNotContain("AI 状态", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("SelectionChanged=", xaml, StringComparison.Ordinal);
         Assert.Contains("ThinScrollBarStyle", xaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TaskManagementWindowIsNonModalAndKeepsTechnicalDetailsOutOfTheUi()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln"))) root = root.Parent;
+        Assert.NotNull(root);
+        var xaml = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "Views", "TaskManagementWindow.xaml"));
+        var main = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml.cs"));
+        Assert.Contains("任务管理", xaml, StringComparison.Ordinal);
+        Assert.Contains("ThinScrollBarStyle", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("workflow_key", xaml, StringComparison.Ordinal);
+        Assert.Contains("TaskButton_Click", main, StringComparison.Ordinal);
+        Assert.Contains("_taskManagementWindow.Show()", main, StringComparison.Ordinal);
+        Assert.Contains("Content=\"任务管理\"", File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml")), StringComparison.Ordinal);
+        Assert.Contains("ArchiveButton", xaml, StringComparison.Ordinal);
+            Assert.DoesNotContain("运行记录", xaml, StringComparison.Ordinal);
+            Assert.DoesNotContain("<TabControl Grid.Column=\"2\"", xaml, StringComparison.Ordinal);
+            Assert.DoesNotContain("<TextBlock Text=\"设置\"", xaml, StringComparison.Ordinal);
+            Assert.Contains("StackPanel Orientation=\"Horizontal\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("FormatNext", File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "Views", "TaskManagementWindow.xaml.cs")), StringComparison.Ordinal);
+        var taskWindowCode = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "Views", "TaskManagementWindow.xaml.cs"));
+        Assert.Contains("下次触发：", taskWindowCode, StringComparison.Ordinal);
+        Assert.DoesNotContain(": Trigger;", taskWindowCode, StringComparison.Ordinal);
+        Assert.Contains("\"calendar_periodic\" => \"日历周期\"", taskWindowCode, StringComparison.Ordinal);
+        Assert.Contains("\"market_relative\" => \"开收盘相对时间\"", taskWindowCode, StringComparison.Ordinal);
+        Assert.Contains("\"once\" => \"单次任务\"", taskWindowCode, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"HourBox\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"MinuteBox\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"OnceDatePicker\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"StartDatePicker\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("x:Name=\"EndDatePicker\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Style TargetType=\"DatePickerTextBox\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Style TargetType=\"Calendar\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("x:Name=\"TimeBox\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("x:Name=\"StartDateBox\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("SelectedDate", taskWindowCode, StringComparison.Ordinal);
+        var mainViewModel = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "ViewModels", "MainViewModel.cs"));
+        Assert.DoesNotContain("· {SelectedMessage.Source}", mainViewModel, StringComparison.Ordinal);
+        Assert.Contains("SourceTextFor", mainViewModel, StringComparison.Ordinal);
     }
 
     private static IEnumerable<T> Descendants<T>(DependencyObject root) where T : DependencyObject

@@ -104,8 +104,16 @@ public static class CompanionEventProjection
                     if (payload.TryGetProperty("message", out var staged))
                         UpsertUser(users, staged, "staged", item.At);
                     break;
+                case "message.edited":
+                    if (payload.TryGetProperty("message", out var edited))
+                        UpsertUser(users, edited, "staged", item.At);
+                    break;
                 case "message.withdrawn":
                     if (ReadString(payload, "message_id") is { } withdrawn) users.Remove(withdrawn);
+                    break;
+                case "pre_m0.locked":
+                case "pre_m0.submitted":
+                    ReadUserMessages(payload, users, "submitted", "pre_m0", item.At);
                     break;
                 case "human.message_batch.accepted":
                     ReadUserMessages(payload, users, "submitted", "chat", item.At);
@@ -145,7 +153,26 @@ public static class CompanionEventProjection
                         ReadString(payload, "m2"), m2StartedAt, item.At);
                     break;
                 case "chat.ready":
-                    UpsertAi(ai, ReadString(payload, "source_artifact_id"), "chat", item.At,
+                    UpsertAi(ai, ReadString(payload, "stream_id") ?? ReadString(payload, "source_artifact_id"), "chat", item.At,
+                        ReadString(payload, "text"), item.At, item.At);
+                    break;
+                case "chat.stream.delta":
+                    var streamId = ReadString(payload, "stream_id");
+                    if (!string.IsNullOrWhiteSpace(streamId))
+                    {
+                        var existingText = ai.TryGetValue(streamId, out var existing) ? existing.Text : string.Empty;
+                        UpsertAi(ai, streamId, "chat", item.At, existingText + (ReadString(payload, "text") ?? string.Empty), item.At, null);
+                    }
+                    break;
+                case "chat.stream.failed":
+                    var failedStreamId = ReadNestedString(payload, "stream", "stream_id");
+                    var failedText = ReadNestedString(payload, "stream", "text");
+                    if (!string.IsNullOrWhiteSpace(failedStreamId) && !string.IsNullOrWhiteSpace(failedText))
+                        UpsertAi(ai, failedStreamId, "chat_incomplete", item.At, failedText + "\n\n（未完成）", item.At, null);
+                    UpsertAi(ai, ReadString(payload, "source_artifact_id"), "fault", item.At, ReadString(payload, "reason"), item.At, item.At);
+                    break;
+                case "premarket.reply.ready":
+                    UpsertAi(ai, ReadString(payload, "source_artifact_id"), "premarket", item.At,
                         ReadString(payload, "text"), item.At, item.At);
                     break;
                 case "outcome.ready":
@@ -211,7 +238,12 @@ public static class CompanionEventProjection
         {
             foreach (var message in aiMessages.EnumerateArray())
             {
-                var kind = ReadString(message, "kind") ?? "chat";
+                var kind = ReadString(message, "kind") switch
+                {
+                    "premarket_chat" => "premarket",
+                    { } value => value,
+                    _ => "chat",
+                };
                 var at = ReadDate(ReadString(message, "at")) ?? DateTimeOffset.MinValue;
                 var started = kind == "m1" ? projectedM1StartedAt : kind == "m2" ? projectedM2StartedAt : at;
                 var completed = kind == "m1" ? projectedM1CompletedAt : kind == "m2" ? projectedM2CompletedAt : at;
@@ -221,6 +253,19 @@ public static class CompanionEventProjection
         if (payload.TryGetProperty("user_messages", out var userMessages) && userMessages.ValueKind == JsonValueKind.Array)
         {
             foreach (var message in userMessages.EnumerateArray()) UpsertUser(users, message, null, DateTimeOffset.MinValue);
+        }
+        if (payload.TryGetProperty("stream_messages", out var streamMessages) && streamMessages.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var stream in streamMessages.EnumerateArray())
+            {
+                var id = ReadString(stream, "stream_id");
+                var text = ReadString(stream, "text");
+                if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(text)) continue;
+                var state = ReadString(stream, "state");
+                if (state == "failed") text += "\n\n（未完成）";
+                var at = ReadDate(ReadString(stream, "created_at")) ?? DateTimeOffset.MinValue;
+                UpsertAi(ai, id, state == "failed" ? "chat_incomplete" : "chat", at, text, at, state == "completed" ? ReadDate(ReadString(stream, "completed_at")) : null);
+            }
         }
     }
 

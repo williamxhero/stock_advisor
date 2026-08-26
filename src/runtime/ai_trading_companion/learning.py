@@ -167,6 +167,7 @@ class JudgmentLifecycle:
                 "verification_status": result.get("verification_status", "unverified"),
                 "memory_tags": ["outcome", str(result.get("verification_status", "unverified"))],
             },
+            known_at=as_of,
         )
         self.store.complete_outcome(checkpoint["checkpoint_id"], as_of, result, artifact["artifact_id"])
         return artifact

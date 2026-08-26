@@ -13,6 +13,7 @@ using AITradingCompanion.Desktop.ViewModels;
 using Brush = System.Windows.Media.Brush;
 using Brushes = System.Windows.Media.Brushes;
 using Button = System.Windows.Controls.Button;
+using Clipboard = System.Windows.Clipboard;
 using Color = System.Windows.Media.Color;
 using Cursors = System.Windows.Input.Cursors;
 using HorizontalAlignment = System.Windows.HorizontalAlignment;
@@ -40,8 +41,10 @@ public partial class MainWindow : Window, IDisposable
     private CompanionWorkspaceProjection? _companionProjection;
     private PortfolioWorkspaceProjection? _portfolioProjection;
     private PortfolioWindow? _portfolioWindow;
+    private TaskManagementWindow? _taskManagementWindow;
     private string? _activeAiMarkdown;
     private string? _requestedProjectionCycleId;
+    private string? _editingStagedMessageId;
     private DateOnly? _todayProjectionRequestedDate;
     private DateTimeOffset _nextRuntimeHealthCheck = DateTimeOffset.MinValue;
     private VoiceInputState _voiceState;
@@ -130,11 +133,18 @@ public partial class MainWindow : Window, IDisposable
         if (_companionProjection is null) return;
         var text = MainJudgmentInputBox.Text.Trim();
         if (string.IsNullOrWhiteSpace(text)) return;
-        var messageId = Guid.NewGuid().ToString();
-        var phase = IsH0LockedForUi() ? "chat" : "h0";
-        if (!await SendCompanionCommandAsync("stage_message", text, messageId: messageId)) return;
-        LocalStaged().Add(new CompanionTimelineEntry(
+        var messageId = _editingStagedMessageId ?? Guid.NewGuid().ToString();
+        var phase = CompanionInputPolicy.MessagePhase(_companionProjection.State, IsH0LockedForUi());
+        var editing = _editingStagedMessageId is not null;
+        if (!await SendCompanionCommandAsync(editing ? "edit_staged_message" : "stage_message", text, messageId: messageId)) return;
+        if (editing)
+        {
+            var index = LocalStaged().FindIndex(message => message.MessageId == messageId);
+            if (index >= 0) LocalStaged()[index] = LocalStaged()[index] with { Text = text };
+        }
+        else LocalStaged().Add(new CompanionTimelineEntry(
             DateTimeOffset.Now, text, false, null, messageId, "staged", phase));
+        _editingStagedMessageId = null;
         MainJudgmentInputBox.Clear();
         if (_displayedDraftCycleId is not null)
         {
@@ -148,9 +158,13 @@ public partial class MainWindow : Window, IDisposable
     private async void MainCommit_Click(object sender, RoutedEventArgs e)
     {
         if (_companionProjection is null) return;
-        var isH0 = !IsH0LockedForUi();
-        var type = isH0 ? "commit_h0" : "commit_chat_batch";
-        if (!isH0 && !CombinedUserMessages().Any(message => message.State == "staged")) return;
+        var isPreM0 = _companionProjection.State == "queued";
+        var isH0 = !isPreM0 && !IsH0LockedForUi();
+        var staged = CombinedUserMessages().Count(message => message.State == "staged");
+        var h0Locked = IsH0LockedForUi();
+        if (!CompanionInputPolicy.CanCommit(_companionProjection.State, h0Locked, staged)) return;
+        var type = isPreM0 ? "commit_pre_m0" : isH0 ? "commit_h0" : "commit_chat_batch";
+        if (!isH0 && staged == 0) return;
         if (!await SendCompanionCommandAsync(type, null)) return;
         if (isH0) _locallyLockedCycles.Add(_companionProjection.CycleId);
         UpdateInputState();
@@ -166,11 +180,27 @@ public partial class MainWindow : Window, IDisposable
         UpdateInputState();
     }
 
+    private void ProviderSettingsButton_Click(object sender, RoutedEventArgs e)
+    {
+        new ProviderSettingsWindow(_paths, _companionExchange) { Owner = this }.ShowDialog();
+    }
+
+    private void EditStaged_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: CompanionTimelineEntry entry } || entry.MessageId is null) return;
+        _editingStagedMessageId = entry.MessageId;
+        MainJudgmentInputBox.Text = entry.Text;
+        MainJudgmentInputBox.Focus();
+        MainJudgmentInputBox.CaretIndex = MainJudgmentInputBox.Text.Length;
+    }
+
     private async void MainVoice_Click(object sender, RoutedEventArgs e)
     {
         if (_voiceState is VoiceInputState.Idle or VoiceInputState.Error)
         {
-            if (!IsH0LockedForUi() && !await SendCompanionCommandAsync("begin_voice_capture", null)) return;
+            if (_companionProjection?.State != "queued"
+                && !IsH0LockedForUi()
+                && !await SendCompanionCommandAsync("begin_voice_capture", null)) return;
             try
             {
                 var audio = Path.Combine(_paths.CompanionAudioDirectory, $"{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}.wav");
@@ -230,6 +260,7 @@ public partial class MainWindow : Window, IDisposable
             catch (Exception exception) { _viewModel.ReportInboxFailure(exception); }
         }
         var events = _companionExchange.ReadLatestEvents(1000);
+        _taskManagementWindow?.UpdateEvents(events);
         RequestTodayProjectionsAsync();
         _portfolioProjection = PortfolioEventProjection.Project(events);
         _portfolioWindow?.UpdateProjection(_portfolioProjection);
@@ -292,6 +323,7 @@ public partial class MainWindow : Window, IDisposable
                 "m0" => "M0 · 客观观察",
                 "m1" => "M1 · 独立判断",
                 "m2" => "M2 · 伴生综合",
+                "premarket" or "premarket_chat" => "盘前交流",
                 "legacy_message" => "历史 AI 消息",
                 "legacy_model" => "历史独立判断",
                 "legacy_synthesis" => "历史伴生判断",
@@ -305,7 +337,7 @@ public partial class MainWindow : Window, IDisposable
             };
             var labelBrush = message.Kind switch
             {
-                "m0" => (Brush)FindResource("BlueBrush"),
+                "m0" or "premarket" or "premarket_chat" => (Brush)FindResource("BlueBrush"),
                 "m1" or "m2" or "reflection" => (Brush)FindResource("AccentBrush"),
                 "fault" => new SolidColorBrush(Color.FromRgb(255, 123, 139)),
                 _ => (Brush)FindResource("SecondaryTextBrush"),
@@ -321,7 +353,14 @@ public partial class MainWindow : Window, IDisposable
                 Text = MarkdownDocumentBuilder.ToPlainText(message.Text), TextWrapping = TextWrapping.Wrap,
                 FontSize = 15, LineHeight = 24, Margin = new Thickness(0, 10, 0, 0),
             };
-            var content = new StackPanel { Children = { header, timing, body } };
+            var headerRow = new Grid();
+            headerRow.ColumnDefinitions.Add(new ColumnDefinition());
+            headerRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var copy = CreateCopyButton(message.Text);
+            Grid.SetColumn(copy, 1);
+            headerRow.Children.Add(header);
+            headerRow.Children.Add(copy);
+            var content = new StackPanel { Children = { headerRow, timing, body } };
             var card = new Border
             {
                 Background = (Brush)FindResource("CardBrush"), BorderBrush = (Brush)FindResource("BorderBrush"),
@@ -334,7 +373,8 @@ public partial class MainWindow : Window, IDisposable
                 ReadAloudButton.IsEnabled = true;
             };
             AiTimelinePanel.Children.Add(card);
-            if (message.Kind is "m0" or "m1" or "m2") _aiAnchors[message.Kind] = card;
+            if (message.Kind is "premarket" or "premarket_chat" or "m0" or "m1" or "m2")
+                _aiAnchors[message.Kind == "premarket_chat" ? "premarket" : message.Kind] = card;
         }
         if (messages.Count == 0)
         {
@@ -359,6 +399,7 @@ public partial class MainWindow : Window, IDisposable
             var isStaged = entry.State == "staged";
             var headerText = isStaged ? $"待提交 · {entry.At.ToLocalTime():HH:mm}"
                 : entry.Phase == "h0" ? $"H0 · {entry.At.ToLocalTime():HH:mm}"
+                : entry.Phase == "pre_m0" ? $"盘前交流 · {entry.At.ToLocalTime():HH:mm}"
                 : $"我 · {entry.At.ToLocalTime():HH:mm}";
             var header = new TextBlock
             {
@@ -366,7 +407,14 @@ public partial class MainWindow : Window, IDisposable
                 Foreground = isStaged ? (Brush)FindResource("BlueBrush") : (Brush)FindResource("SecondaryTextBrush"),
             };
             var body = new TextBlock { Text = entry.Text, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 5, 0, 0) };
-            var content = new StackPanel { Children = { header, body } };
+            var headerRow = new Grid();
+            headerRow.ColumnDefinitions.Add(new ColumnDefinition());
+            headerRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var copy = CreateCopyButton(entry.Text);
+            Grid.SetColumn(copy, 1);
+            headerRow.Children.Add(header);
+            headerRow.Children.Add(copy);
+            var content = new StackPanel { Children = { headerRow, body } };
             if (entry.ArtifactId is { Length: > 0 } artifactId
                 && _portfolioProjection?.StatusByArtifactId.TryGetValue(artifactId, out var status) == true)
             {
@@ -378,12 +426,21 @@ public partial class MainWindow : Window, IDisposable
             }
             if (isStaged && entry.MessageId is { } messageId)
             {
-                content.Children.Add(new Button
+                var actions = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 7, 0, 0) };
+                var edit = new Button
+                {
+                    Content = "编辑", Tag = entry, Padding = new Thickness(8, 3, 8, 3),
+                };
+                edit.Click += EditStaged_Click;
+                actions.Children.Add(edit);
+                var withdraw = new Button
                 {
                     Content = "撤回", Tag = messageId, HorizontalAlignment = HorizontalAlignment.Right,
-                    Padding = new Thickness(8, 3, 8, 3), Margin = new Thickness(0, 7, 0, 0),
-                });
-                ((Button)content.Children[^1]).Click += WithdrawStaged_Click;
+                    Padding = new Thickness(8, 3, 8, 3), Margin = new Thickness(7, 0, 0, 0),
+                };
+                withdraw.Click += WithdrawStaged_Click;
+                actions.Children.Add(withdraw);
+                content.Children.Add(actions);
             }
             MainJudgmentTimelinePanel.Children.Add(new Border
             {
@@ -395,6 +452,30 @@ public partial class MainWindow : Window, IDisposable
         }
         if (messages.Length == 0)
             MainJudgmentTimelinePanel.Children.Add(new TextBlock { Text = "当前判断还没有你的消息。", Foreground = (Brush)FindResource("SecondaryTextBrush") });
+    }
+
+    private Button CreateCopyButton(string text)
+    {
+        var button = new Button
+        {
+            Content = "复制", Tag = text, FontSize = 11,
+            Padding = new Thickness(7, 2, 7, 2), Margin = new Thickness(8, 0, 0, 0),
+            HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top,
+            ToolTip = "复制消息原文",
+        };
+        button.Click += CopyMessage_Click;
+        return button;
+    }
+
+    private void CopyMessage_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: string text }) return;
+        try { Clipboard.SetText(text); }
+        catch (Exception exception)
+        {
+            MessageBox.Show(this, $"复制失败：{exception.Message}", "AI交易伙伴",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
     }
 
     private IEnumerable<CompanionTimelineEntry> CombinedUserMessages()
@@ -480,6 +561,7 @@ public partial class MainWindow : Window, IDisposable
         if (!_suppressDraftUpdate
             && !string.IsNullOrWhiteSpace(MainJudgmentInputBox.Text)
             && _companionProjection is { } projection
+            && projection.State != "queued"
             && !IsH0LockedForUi()
             && _editGraceRequestedCycles.Add(projection.CycleId))
         {
@@ -530,15 +612,14 @@ public partial class MainWindow : Window, IDisposable
         if (!IsInitialized) return;
         var busy = _voiceState is VoiceInputState.Recording or VoiceInputState.Transcribing;
         var hasCycle = _companionProjection is not null;
-        var supportsMessaging = _companionProjection?.State is
-            "awaiting_h0" or "voice_grace" or "researching_m1" or "judging_m1" or
-            "m1_retry_wait" or "synthesizing_m2" or "m2_deferred" or "complete";
+        var supportsMessaging = CompanionInputPolicy.CanDraft(_companionProjection?.State);
         var h0Locked = IsH0LockedForUi();
         var staged = CombinedUserMessages().Count(message => message.State == "staged");
         MainJudgmentInputBox.IsReadOnly = busy || !supportsMessaging;
         MainSendButton.IsEnabled = !busy && hasCycle && supportsMessaging && !string.IsNullOrWhiteSpace(MainJudgmentInputBox.Text);
-        MainCommitButton.Content = h0Locked ? "提交" : "提交 H0";
-        MainCommitButton.IsEnabled = !busy && hasCycle && supportsMessaging && (!h0Locked || staged > 0);
+        MainCommitButton.Content = CompanionInputPolicy.CommitLabel(_companionProjection?.State, h0Locked);
+        MainCommitButton.IsEnabled = !busy && hasCycle
+            && CompanionInputPolicy.CanCommit(_companionProjection?.State, h0Locked, staged);
         MainVoiceButton.IsEnabled = hasCycle && supportsMessaging && _voiceState != VoiceInputState.Transcribing;
         MainVoiceButton.Content = _voiceState switch
         {
@@ -556,6 +637,10 @@ public partial class MainWindow : Window, IDisposable
         if (_companionProjection is null) return "请选择已经启动的当前判断。";
         if (_companionProjection.State is "model_only_ready" or "joint_ready" or "missed" or "failed")
             return "这是旧链路或未完成周期，仅供查看。";
+        if (_companionProjection.State == "queued")
+            return staged > 0
+                ? $"{staged} 条盘前消息待冻结；M0 开始时会作为待核验线索。"
+                : "现在可以盘前交流；消息可能影响 M0 的搜索重点，但 AI 会独立核验。";
         if (h0Locked)
         {
             if (_companionProjection.State is "researching_m1" or "judging_m1" or "m1_retry_wait")
@@ -659,6 +744,21 @@ public partial class MainWindow : Window, IDisposable
         }
         _portfolioWindow.UpdateProjection(_portfolioProjection);
         await SendPortfolioCommandAsync("request_snapshot");
+    }
+
+    private void TaskButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_taskManagementWindow is null)
+        {
+            _taskManagementWindow = new TaskManagementWindow(_paths, _companionExchange) { Owner = this };
+            _taskManagementWindow.Closed += (_, _) => _taskManagementWindow = null;
+            _taskManagementWindow.Show();
+        }
+        else
+        {
+            if (_taskManagementWindow.WindowState == WindowState.Minimized) _taskManagementWindow.WindowState = WindowState.Normal;
+            _taskManagementWindow.Activate();
+        }
     }
 
     private Task UndoLatestPortfolioChangeAsync() => SendPortfolioCommandAsync("revert_transaction");

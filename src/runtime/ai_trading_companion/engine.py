@@ -28,18 +28,58 @@ class CompanionEngine:
         self.store.initialize()
         self.judgments = JudgmentLifecycle(store)
 
-    def start_cycle(self, task_key: str, scheduled_for: str, as_of: str | None = None) -> dict[str, Any]:
+    def start_cycle(
+        self, task_key: str, scheduled_for: str, as_of: str | None = None, *,
+        schedule_id: str | None = None, schedule_revision: int | None = None,
+        schedule_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if task_key not in TASK_POLICIES:
             raise ValueError(f"unregistered task_key: {task_key}")
-        cycle = self.store.create_cycle(task_key, scheduled_for, as_of or iso(utc_now()))
+        cycle = self.store.create_cycle(
+            task_key, scheduled_for, as_of or iso(utc_now()), schedule_id=schedule_id,
+            schedule_revision=schedule_revision, schedule_snapshot=schedule_snapshot,
+        )
         self.emit(cycle, "cycle.created", cycle)
+        return cycle
+
+    def start_diagnostic_rerun(self, source_cycle_id: str) -> dict[str, Any]:
+        cycle = self.store.create_diagnostic_cycle(source_cycle_id)
+        self.emit(cycle, "cycle.diagnostic_rerun.created", {
+            "cycle": cycle,
+            "source_cycle_id": source_cycle_id,
+        })
         return cycle
 
     def research_started(self, cycle_id: str) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
         if cycle["state"] != "queued":
             raise ValueError(f"cycle is not queued: {cycle['state']}")
-        cycle = self.store.transition(cycle_id, "researching_m0")
+        batch_id, newly_submitted = self.store.commit_staged_messages(cycle_id, "pre_m0")
+        messages = self.store.messages(cycle_id, state="submitted", phase="pre_m0")
+        if messages and (newly_submitted or not self.store.latest_artifact(cycle_id, "pre_m0")):
+            body = "\n\n".join(message["body_text"] for message in messages)
+            artifact = self.store.append_artifact(
+                cycle_id,
+                "pre_m0",
+                "human",
+                body,
+                iso(utc_now()),
+                {
+                    "batch_id": batch_id,
+                    "message_ids": [message["message_id"] for message in messages],
+                    "role": "unverified_companion_context",
+                },
+            )
+            self.store.link_messages_to_artifact(
+                [message["message_id"] for message in messages], artifact["artifact_id"]
+            )
+            self.emit(cycle, "pre_m0.locked", {
+                "cycle": cycle,
+                "batch_id": batch_id,
+                "messages": messages,
+                "source_artifact_id": artifact["artifact_id"],
+            })
+        cycle = self.store.transition(cycle_id, "researching_m0", as_of=iso(utc_now()))
         self.emit(cycle, "m0.started", cycle)
         return cycle
 
@@ -161,10 +201,16 @@ class CompanionEngine:
                 result = self._begin_grace(cycle, typ)
             elif typ == "stage_message":
                 result = self._stage_message(cycle, str(command.get("text", "")), command.get("message_id"))
+            elif typ == "edit_staged_message":
+                message = self.store.update_staged_message(cycle_id, str(command.get("message_id") or ""), str(command.get("text", "")))
+                self.emit(cycle, "message.edited", {"cycle": cycle, "message": message})
+                result = self._projection(cycle)
             elif typ == "withdraw_staged_message":
                 message = self.store.withdraw_message(cycle_id, str(command.get("message_id") or ""))
                 self.emit(cycle, "message.withdrawn", {"cycle": cycle, "message_id": message["message_id"]})
                 result = self._projection(cycle)
+            elif typ == "commit_pre_m0":
+                result = self._commit_pre_m0(cycle)
             elif typ in {"commit_h0", "skip_h0"}:
                 result = self._lock_h0(cycle, "manual")
             elif typ in {"submit_h0", "submit_voice_h0"}:
@@ -192,16 +238,43 @@ class CompanionEngine:
         return {"accepted": False, "reason": "H0 window expired"}
 
     def _stage_message(self, cycle: dict[str, Any], text: str, message_id: str | None, *, emit: bool = True) -> dict[str, Any]:
-        if cycle["state"] in {"queued", "researching_m0", "failed", "missed"}:
+        if cycle["state"] == "queued" and cycle["task_key"] != "daily.opportunity.0900":
+            raise ValueError("pre-M0 messages belong to the daily opportunity cycle")
+        if cycle["state"] in {"researching_m0", "failed", "missed"}:
             raise ValueError("messages can only be staged after M0 is ready")
         # A blocked message is never persisted in a memory candidate or sent to
         # a later research packet.  The user can remove the secret and retry.
         assert_safe(text, boundary="user message storage")
-        phase = "h0" if not cycle.get("h0_locked_at") else "chat"
+        phase = "pre_m0" if cycle["state"] == "queued" else "h0" if not cycle.get("h0_locked_at") else "chat"
         message = self.store.stage_message(cycle["cycle_id"], text, phase, message_id=message_id)
         if emit:
             self.emit(cycle, "message.staged", {"cycle": cycle, "message": message})
         return self._projection(cycle)
+
+    def _commit_pre_m0(self, cycle: dict[str, Any]) -> dict[str, Any]:
+        if cycle["state"] != "queued" or cycle["task_key"] != "daily.opportunity.0900":
+            raise ValueError(f"pre-M0 messages cannot be submitted from state: {cycle['state']}")
+        batch_id, messages = self.store.commit_staged_messages(cycle["cycle_id"], "pre_m0")
+        if not messages:
+            raise ValueError("no staged pre-M0 messages")
+        body = "\n\n".join(message["body_text"] for message in messages)
+        artifact = self.store.append_artifact(
+            cycle["cycle_id"], "pre_m0_submission", "human", body, iso(utc_now()),
+            {"batch_id": batch_id, "message_ids": [message["message_id"] for message in messages]},
+        )
+        self.store.link_messages_to_artifact(
+            [message["message_id"] for message in messages], artifact["artifact_id"]
+        )
+        self.emit(cycle, "pre_m0.submitted", {
+            "cycle": cycle,
+            "batch_id": batch_id,
+            "messages": messages,
+            "source_artifact_id": artifact["artifact_id"],
+        })
+        projection = self._projection(cycle)
+        projection["committed_batch_id"] = batch_id
+        projection["source_artifact_id"] = artifact["artifact_id"]
+        return projection
 
     def _lock_h0(self, cycle: dict[str, Any], reason: str) -> dict[str, Any]:
         if cycle["state"] not in {"awaiting_h0", "voice_grace"}:
@@ -366,16 +439,43 @@ class CompanionEngine:
         })
         return cycle
 
-    def chat_ready(self, cycle_id: str, text: str, *, reply_to_batch_id: str | None = None) -> dict[str, Any]:
+    def chat_ready(
+        self, cycle_id: str, text: str, *, reply_to_batch_id: str | None = None,
+        reply_to_batch_ids: list[str] | None = None, stream_id: str | None = None, kind: str = "ai_chat",
+    ) -> dict[str, Any]:
+        if kind not in {"ai_chat", "premarket_chat"}:
+            raise ValueError(f"unsupported chat artifact kind: {kind}")
         cycle = self.store.get_cycle(cycle_id)
         artifact = self.store.append_artifact(
-            cycle_id, "ai_chat", "model", text, iso(utc_now()), {"reply_to_batch_id": reply_to_batch_id}
+            cycle_id, kind, "model", text, iso(utc_now()), {"reply_to_batch_id": reply_to_batch_id, "stream_id": stream_id}
         )
-        self.emit(cycle, "chat.ready", {
-            "cycle": cycle, "text": text, "reply_to_batch_id": reply_to_batch_id,
+        batch_ids = reply_to_batch_ids or ([reply_to_batch_id] if reply_to_batch_id else [])
+        self.store.mark_batches_responded(batch_ids, artifact["artifact_id"])
+        event_type = "premarket.reply.ready" if kind == "premarket_chat" else "chat.ready"
+        self.emit(cycle, event_type, {
+            "cycle": cycle, "text": text, "reply_to_batch_id": reply_to_batch_id, "stream_id": stream_id,
             "source_artifact_id": artifact["artifact_id"],
         })
         return cycle
+
+    def chat_stream_started(self, cycle_id: str, batch_ids: list[str], kind: str) -> dict[str, Any]:
+        cycle = self.store.get_cycle(cycle_id)
+        stream = self.store.start_stream_message(cycle_id, batch_ids, kind)
+        self.emit(cycle, "chat.stream.started", {"cycle": cycle, "stream": stream})
+        return stream
+
+    def chat_stream_delta(self, cycle_id: str, stream_id: str, text: str) -> dict[str, Any]:
+        cycle = self.store.get_cycle(cycle_id)
+        stream = self.store.append_stream_chunk(stream_id, text)
+        self.emit(cycle, "chat.stream.delta", {"cycle": cycle, "stream_id": stream_id, "text": text, "state": stream["state"]})
+        return stream
+
+    def chat_stream_failed(self, cycle_id: str, stream_id: str, reason: str) -> dict[str, Any]:
+        cycle = self.store.get_cycle(cycle_id)
+        stream = self.store.finish_stream_message(stream_id, error=reason)
+        artifact = self.store.append_artifact(cycle_id, "system_fault", "system", self._user_fault_message(reason, "聊天回复"), iso(utc_now()), {"stream_id": stream_id, "reason_category": self._diagnostic_code(reason)})
+        self.emit(cycle, "chat.stream.failed", {"cycle": cycle, "stream": stream, "reason": self._user_fault_message(reason, "聊天回复"), "source_artifact_id": artifact["artifact_id"]})
+        return stream
 
     def judgment_revision_ready(self, cycle_id: str, text: str, revises_artifact_id: str) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
@@ -399,7 +499,7 @@ class CompanionEngine:
     def _projection(self, cycle: dict[str, Any]) -> dict[str, Any]:
         artifacts = self.store.artifacts(cycle["cycle_id"])
         ai_kinds = {
-            "m0", "m1", "m2", "ai_chat", "judgment_revision", "system_fault",
+            "m0", "m1", "m2", "ai_chat", "premarket_chat", "judgment_revision", "system_fault",
             "outcome", "reflection", "legacy_message",
         }
         ai_messages = [
@@ -434,6 +534,7 @@ class CompanionEngine:
             "m2": latest["m2"]["text"] if latest["m2"] else None,
             "ai_messages": ai_messages,
             "user_messages": user_messages,
+            "stream_messages": self.store.stream_messages(cycle["cycle_id"]),
             "judgments": judgments,
             "has_h0": bool(cycle.get("has_h0")),
         }
@@ -445,9 +546,14 @@ class CompanionEngine:
     def _diagnostic_code(reason: str) -> str:
         lowered = reason.lower()
         if "invalid_json_schema" in lowered: return "output_schema_invalid"
+        if "provider_timeout" in lowered: return "provider_timeout"
         if "timed out" in lowered or "timeout" in lowered: return "timeout"
+        if "current_information_unavailable" in lowered: return "current_information_unavailable"
+        if "provider_not_configured" in lowered: return "provider_not_configured"
+        if "provider_auth" in lowered: return "provider_auth"
+        if "provider_quota" in lowered or "provider_rate_limited" in lowered: return "provider_quota"
+        if "provider_http" in lowered: return "provider_http"
         if "network" in lowered or "connection" in lowered or "dns" in lowered: return "network_unavailable"
-        if "supports_parallel_tool_calls" in lowered: return "codex_model_cache_incompatible"
         return "llm_runtime_error"
 
     @classmethod
@@ -456,7 +562,12 @@ class CompanionEngine:
         return {
             "output_schema_invalid": f"{stage} 因输出格式配置错误中断。这不是市场信息缺失；系统会在修复配置后重新执行。",
             "timeout": f"{stage} 本次运行超时，当前信息可能不完整；系统会在时效窗口内重试。",
+            "current_information_unavailable": f"{stage} 的当前信息后端都没有取得可用资料，系统不会据此生成市场结论。",
+            "provider_not_configured": f"{stage} 尚未配置可用的 Provider，系统没有生成结论。",
+            "provider_auth": f"{stage} 的 Provider 认证失败，系统没有生成结论。",
+            "provider_quota": f"{stage} 的 Provider 当前额度或限流不可用，系统没有生成结论。",
+            "provider_http": f"{stage} 的 Provider 返回了 HTTP 错误，系统没有生成结论；请检查 Provider 上游状态。",
+            "provider_timeout": f"{stage} 的 Provider 在时限内没有返回，系统没有生成结论；请检查 Provider 上游状态。",
             "network_unavailable": f"{stage} 因网络连接异常没能取得当下公开信息，需要先恢复网络后再判断。",
-            "codex_model_cache_incompatible": f"{stage} 因本机 Codex 模型配置不兼容而中断，需要修复本机运行环境。",
             "llm_runtime_error": f"{stage} 遇到技术故障，未能完成。详细诊断已保留在本地审计记录中。",
         }[code]

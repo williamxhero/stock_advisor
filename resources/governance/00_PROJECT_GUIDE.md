@@ -8,10 +8,10 @@
 
 ## 本地运行边界
 
-- 日程唯一来源：`resources/schedules/tasks.json`；交易日由本地 XSHG 日历判定。
-- 每个时点按 `(task_key, scheduled_for)` 幂等执行；超过 15 分钟恢复窗口必须明确标为遗漏。
+- 日程唯一来源：运行时 SQLite 的任务模板注册表；`resources/schedules/tasks.json` 只作为首次安装及“恢复默认任务”时的只读种子，绝不覆盖已有用户配置。交易日由本地 XSHG 日历判定。
+- 每个时点按 `(task_key, scheduled_for)` 幂等执行，并冻结模板版本快照；超过 15 分钟仍未启动必须明确标为遗漏。
 - 桌面端通过 `%LOCALAPPDATA%\AITradingCompanion\exchange` 与运行时交换版本化 JSON；不得使用 Inbox、Codex thread 或聊天记忆传递业务状态。
-- LLM 只接收运行时生成的阶段包。它不能浏览本地文件、修改代码、修改日程、授予权限或直接写持仓/知识库。
+- LLM 只接收运行时生成的阶段包。它不能浏览本地文件、修改代码、修改日程、授予权限或直接写持仓/知识库；任务模板只可由受验证的本地 UI/接口调用修改，尚未向 LLM 开放。
 
 ## 研究与判断
 

@@ -54,6 +54,11 @@ class PortfolioServiceTests(unittest.TestCase):
         self.store = CompanionStore(self.root / "runtime.sqlite3")
         self.service = PortfolioService(self.root, self.store)
 
+    def test_empty_workspace_starts_with_an_empty_portfolio_baseline(self) -> None:
+        root = Path(self.temp.name) / "empty-workspace"
+        service = PortfolioService(root, CompanionStore(Path(self.temp.name) / "empty.sqlite3"))
+        self.assertEqual([], service.snapshot()["positions"])
+
     def tearDown(self) -> None:
         self.temp.cleanup()
 

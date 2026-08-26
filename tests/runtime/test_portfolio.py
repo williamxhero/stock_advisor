@@ -143,6 +143,46 @@ class PortfolioServiceTests(unittest.TestCase):
         self.assertEqual(240000, self.service.snapshot()["total_assets"])
         self.assertNotIn("portfolio_transaction_id", (self.root / "logs/05_DECISION_LOG.csv").read_text(encoding="utf-8"))
 
+    def test_partial_position_table_never_zeros_omitted_holdings(self):
+        extraction = {"statement_type": "current_state", "changes": [{"action": "position_correction", "code": "603179", "name": "新泉股份", "shares": 300, "price": 38.1, "average_cost": 38.1, "occurred_at": None, "evidence": {"instrument": "603179 新泉股份", "action": "持有", "shares": "300股", "price": "38.1", "average_cost": "38.1"}}]}
+
+        self.service.apply_extraction("603179 新泉股份 持有300股，成本38.1", extraction, "cycle", "partial")
+
+        self.assertEqual({"603179", "603993"}, {item["code"] for item in self.service.snapshot()["positions"]})
+
+    def test_explicit_complete_snapshot_atomically_zeros_omitted_holdings(self):
+        changes = [{"action": "position_correction", "code": "603179", "name": "新泉股份", "shares": 300, "price": 38.1, "average_cost": 38.1, "occurred_at": None, "evidence": {"instrument": "603179 新泉股份", "action": "持有", "shares": "300股", "price": "38.1", "average_cost": "38.1", "total_assets": None}}]
+
+        result = self.service.replace_complete_snapshot(
+            "这是全部持仓：603179 新泉股份 300股，成本38.1", changes, "cycle", "complete"
+        )
+
+        self.assertEqual("applied", result["state"])
+        self.assertTrue(result["complete_snapshot"])
+        self.assertEqual(["603179"], [item["code"] for item in self.service.snapshot()["positions"]])
+
+        reverted = self.service.revert_latest()
+        self.assertEqual({"603179", "603993"}, {item["code"] for item in reverted["snapshot"]["positions"]})
+        self.assertEqual(2, len(reverted["reversal_transaction_ids"]))
+
+    def test_complete_snapshot_requires_explicit_scope_marker(self):
+        changes = [{"action": "position_correction", "code": "603179", "name": "新泉股份", "shares": 300, "price": 38.1, "average_cost": 38.1, "occurred_at": None, "evidence": {"instrument": "603179 新泉股份", "action": "持有", "shares": "300股", "price": "38.1", "average_cost": "38.1", "total_assets": None}}]
+
+        result = self.service.replace_complete_snapshot(
+            "603179 新泉股份 300股，成本38.1", changes, "cycle", "not-complete"
+        )
+
+        self.assertEqual("needs_input", result["state"])
+        self.assertEqual({"603179", "603993"}, {item["code"] for item in self.service.snapshot()["positions"]})
+
+    def test_asset_correction_can_be_reverted_from_a_later_conversation(self):
+        extraction = {"statement_type": "current_state", "changes": [{"action": "asset_correction", "code": None, "name": None, "shares": None, "price": None, "total_assets": 240000, "occurred_at": None, "evidence": {"instrument": None, "action": "总资产", "shares": None, "price": None, "total_assets": "24万元"}}]}
+        self.service.apply_extraction("现在总资产是24万元", extraction, "cycle-a", "asset-a")
+
+        reverted = self.service.revert_latest()
+
+        self.assertEqual(230000, reverted["snapshot"]["total_assets"])
+
     def test_new_stock_requires_explicit_code_and_name(self):
         extraction = {"statement_type": "executed", "changes": [{"action": "buy", "code": "600519", "name": "贵州茅台", "shares": 100, "price": 1500, "occurred_at": None, "evidence": {"instrument": "600519贵州茅台", "action": "买入", "shares": "100股", "price": "1500元"}}]}
         result = self.service.apply_extraction("买入600519贵州茅台100股，1500元成交", extraction, "cycle", "artifact")

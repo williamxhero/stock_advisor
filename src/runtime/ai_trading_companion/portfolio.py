@@ -260,6 +260,86 @@ class PortfolioService:
             )
         return self._commit_transactions(source_text, resolved, cycle_id, source_artifact_id)
 
+    def replace_complete_snapshot(
+        self, source_text: str, changes: list[dict[str, Any]], cycle_id: str | None,
+        source_artifact_id: str | None,
+    ) -> dict[str, Any]:
+        """Atomically replace positions only when the user explicitly says the scope is complete."""
+        completeness_markers = ("完整账户", "完整持仓", "全部持仓", "全量持仓", "这是全部", "以下为全部")
+        if not any(marker in source_text for marker in completeness_markers):
+            return self._record_needs_input(
+                source_text, {"statement_type": "current_state", "changes": changes},
+                cycle_id, source_artifact_id, ["明确的完整账户或全部持仓范围"],
+            )
+        current = {row["code"]: row for row in self.snapshot()["positions"]}
+        resolved: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        missing: set[str] = set()
+        for change in changes:
+            if change.get("action") == "asset_correction":
+                try:
+                    total_assets = float(change.get("total_assets"))
+                except (TypeError, ValueError):
+                    total_assets = 0
+                if total_assets <= 0:
+                    missing.add("总资产金额")
+                else:
+                    resolved.append({"action": "asset_correction", "total_assets": total_assets, "occurred_at": change.get("occurred_at") or now()})
+                continue
+            code = str(change.get("code") or "").strip()
+            name = str(change.get("name") or "").strip()
+            try:
+                shares = int(change.get("shares"))
+            except (TypeError, ValueError):
+                shares = -1
+            try:
+                average_cost = float(change.get("average_cost")) if change.get("average_cost") is not None else None
+                price = float(change.get("price")) if change.get("price") is not None else None
+            except (TypeError, ValueError):
+                average_cost, price = None, None
+            evidence = change.get("evidence") or {}
+            if not re.fullmatch(r"\d{6}", code) or not name or shares < 0:
+                missing.add("每项持仓的代码、名称和非负股数")
+                continue
+            if code in seen:
+                missing.add("不重复的股票代码")
+                continue
+            if not evidence.get("instrument") or not evidence.get("shares") or any(
+                str(value) not in source_text for value in (evidence.get("instrument"), evidence.get("shares")) if value
+            ):
+                missing.add("每项持仓的原文证据")
+            if shares > 0 and average_cost is None and price is None and code not in current:
+                missing.add("新持仓的成本价或参考价")
+            seen.add(code)
+            old = current.get(code) or {}
+            resolved.append({
+                "action": "position_correction", "code": code, "name": name, "shares": shares,
+                "price": price or old.get("last_price") or average_cost,
+                "average_cost": average_cost if average_cost is not None else old.get("average_cost"),
+                "occurred_at": change.get("occurred_at") or now(),
+            })
+        if missing:
+            return self._record_needs_input(
+                source_text, {"statement_type": "current_state", "changes": changes},
+                cycle_id, source_artifact_id, sorted(missing),
+            )
+        for code, old in current.items():
+            if code in seen:
+                continue
+            resolved.append({
+                "action": "position_correction", "code": code, "name": old["name"], "shares": 0,
+                "price": old.get("last_price") or old.get("average_cost") or 0,
+                "average_cost": old.get("average_cost"), "occurred_at": now(),
+            })
+        if not resolved:
+            return self._record_needs_input(
+                source_text, {"statement_type": "current_state", "changes": changes},
+                cycle_id, source_artifact_id, ["完整快照内容"],
+            )
+        result = self._commit_transactions(source_text, resolved, cycle_id, source_artifact_id)
+        result["complete_snapshot"] = True
+        return result
+
     def _instrument_map(self) -> dict[str, list[tuple[str, str]]]:
         result: dict[str, list[tuple[str, str]]] = {}
         if self.state_path.exists():
@@ -304,6 +384,8 @@ class PortfolioService:
 
     def _commit_transactions(self, text: str, changes: list[dict[str, Any]], cycle_id: str | None, artifact_id: str | None) -> dict[str, Any]:
         expected_hash = sha256(self.portfolio_path)
+        group_seed = artifact_id or f"{cycle_id or ''}:{hashlib.sha256(text.encode()).hexdigest()}"
+        action_group_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"portfolio-action:{group_seed}"))
         transaction_ids: list[str] = []
         summaries: list[str] = []
         with self.store.connection() as connection:
@@ -324,6 +406,11 @@ class PortfolioService:
                     connection.execute(
                         "INSERT INTO portfolio_transaction(transaction_id,source_artifact_id,source_cycle_id,source_text,action,code,name,shares,price,position_before,position_after,occurred_at,created_at,reversal_of,reverted_by,idempotency_key) VALUES(?,?,?,?,?,'','总资产',0,?,?,?,?,?,NULL,NULL,?)",
                         (transaction_id, artifact_id, cycle_id, text, "asset_correction", change["total_assets"], int(prior_assets) if prior_assets is not None else None, int(change["total_assets"]), change["occurred_at"], now(), idempotency_key),
+                    )
+                    connection.execute(
+                        "UPDATE portfolio_transaction SET action_group_id=?,before_json=?,after_json=? WHERE transaction_id=?",
+                        (action_group_id, json.dumps({"total_assets": prior_assets}, ensure_ascii=False),
+                         json.dumps({"total_assets": change["total_assets"]}, ensure_ascii=False), transaction_id),
                     )
                     connection.execute("INSERT INTO portfolio_meta(key,value) VALUES('total_assets',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(change["total_assets"]),))
                     intent_id = str(uuid.uuid4())
@@ -367,6 +454,16 @@ class PortfolioService:
                     "market_value=excluded.market_value,unrealized_pnl=excluded.unrealized_pnl,updated_at=excluded.updated_at,revision=portfolio_position.revision+1",
                     (change["code"], change["name"], new_shares, new_cost, change["price"],
                      change["occurred_at"], market_value, pnl, change["occurred_at"]),
+                )
+                after_position = {
+                    "code": change["code"], "name": change["name"], "shares": new_shares,
+                    "average_cost": new_cost, "last_price": change["price"], "price_as_of": change["occurred_at"],
+                    "market_value": market_value, "unrealized_pnl": pnl,
+                }
+                connection.execute(
+                    "UPDATE portfolio_transaction SET action_group_id=?,before_json=?,after_json=? WHERE transaction_id=?",
+                    (action_group_id, json.dumps({"position": old if old_shares or change["code"] in positions else None}, ensure_ascii=False, sort_keys=True),
+                     json.dumps({"position": after_position}, ensure_ascii=False, sort_keys=True), transaction_id),
                 )
                 intent_id = str(uuid.uuid4())
                 connection.execute(
@@ -513,6 +610,15 @@ class PortfolioService:
 
     def revert_latest(self) -> dict[str, Any]:
         with self.store.connection() as connection:
+            grouped = connection.execute(
+                """SELECT action_group_id FROM portfolio_transaction
+                   WHERE reversal_of IS NULL AND reverted_by IS NULL AND before_json IS NOT NULL
+                     AND action_group_id IS NOT NULL AND action!='reversal'
+                   ORDER BY created_at DESC LIMIT 1"""
+            ).fetchone()
+        if grouped:
+            return self._revert_action_group(str(grouped["action_group_id"]))
+        with self.store.connection() as connection:
             row = connection.execute(
                 "SELECT * FROM portfolio_transaction WHERE action IN ('buy','sell') AND reversal_of IS NULL AND reverted_by IS NULL ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
@@ -532,6 +638,80 @@ class PortfolioService:
             connection.execute("UPDATE portfolio_transaction SET reversal_of=? WHERE transaction_id=?", (original["transaction_id"], reversal_id))
         self._render_portfolio()
         payload = {"transaction_id": original["transaction_id"], "reversal_transaction_id": reversal_id, "snapshot": self.snapshot()}
+        self.store.queue_portfolio_event("portfolio.change.reverted", payload)
+        return payload
+
+    def _revert_action_group(self, action_group_id: str) -> dict[str, Any]:
+        expected_hash = sha256(self.portfolio_path)
+        reversal_group_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"portfolio-reversal:{action_group_id}"))
+        reversal_ids: list[str] = []
+        with self.store.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            originals = [dict(row) for row in connection.execute(
+                """SELECT * FROM portfolio_transaction
+                   WHERE action_group_id=? AND reversal_of IS NULL AND reverted_by IS NULL
+                   ORDER BY created_at DESC,transaction_id DESC""",
+                (action_group_id,),
+            )]
+            if not originals:
+                raise ValueError("没有可撤销的持仓更新")
+            for original in originals:
+                before = json.loads(original["before_json"])
+                if "total_assets" in before:
+                    if before["total_assets"] is None:
+                        connection.execute("DELETE FROM portfolio_meta WHERE key='total_assets'")
+                    else:
+                        connection.execute(
+                            "INSERT INTO portfolio_meta(key,value) VALUES('total_assets',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (str(before["total_assets"]),),
+                        )
+                else:
+                    position = before.get("position")
+                    if position is None:
+                        connection.execute("DELETE FROM portfolio_position WHERE code=?", (original["code"],))
+                    else:
+                        connection.execute(
+                            """INSERT INTO portfolio_position(
+                                 code,name,shares,average_cost,last_price,price_as_of,market_value,unrealized_pnl,weight,updated_at,revision)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                               ON CONFLICT(code) DO UPDATE SET name=excluded.name,shares=excluded.shares,
+                                 average_cost=excluded.average_cost,last_price=excluded.last_price,
+                                 price_as_of=excluded.price_as_of,market_value=excluded.market_value,
+                                 unrealized_pnl=excluded.unrealized_pnl,weight=excluded.weight,
+                                 updated_at=excluded.updated_at,revision=portfolio_position.revision+1""",
+                            (
+                                position["code"], position["name"], int(position["shares"]), position.get("average_cost"),
+                                position.get("last_price"), position.get("price_as_of"), position.get("market_value"),
+                                position.get("unrealized_pnl"), position.get("weight"), now(), int(position.get("revision") or 1),
+                            ),
+                        )
+                reversal_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"reversal:{original['transaction_id']}"))
+                connection.execute(
+                    """INSERT OR IGNORE INTO portfolio_transaction(
+                         transaction_id,source_artifact_id,source_cycle_id,source_text,action,code,name,shares,price,
+                         position_before,position_after,occurred_at,created_at,reversal_of,reverted_by,idempotency_key,
+                         action_group_id,before_json,after_json)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?)""",
+                    (
+                        reversal_id, None, original["source_cycle_id"], f"撤销动作组 {action_group_id}", "reversal",
+                        original["code"], original["name"], int(original["shares"]), float(original["price"]),
+                        original["position_after"], original["position_before"], now(), now(), original["transaction_id"],
+                        f"revert:{original['transaction_id']}", reversal_group_id, original["after_json"], original["before_json"],
+                    ),
+                )
+                connection.execute("UPDATE portfolio_transaction SET reverted_by=? WHERE transaction_id=?", (reversal_id, original["transaction_id"]))
+                connection.execute(
+                    "INSERT OR IGNORE INTO portfolio_render_intent VALUES(?,?,?, 'pending',?,NULL,NULL)",
+                    (str(uuid.uuid4()), reversal_id, expected_hash, now()),
+                )
+                reversal_ids.append(reversal_id)
+        render_errors = self.reconcile()
+        payload = {
+            "transaction_id": originals[-1]["transaction_id"],
+            "transaction_ids": [item["transaction_id"] for item in originals],
+            "reversal_transaction_id": reversal_ids[-1], "reversal_transaction_ids": reversal_ids,
+            "projection_pending": bool(render_errors), "snapshot": self.snapshot(),
+        }
         self.store.queue_portfolio_event("portfolio.change.reverted", payload)
         return payload
 

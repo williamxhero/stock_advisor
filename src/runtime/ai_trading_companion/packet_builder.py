@@ -50,10 +50,11 @@ class RuntimePacketBuilder:
             packet["public_research_scope"] = self._public_scope(cycle, stage, evidence, context, packet_as_of, memory_cards)
         else:
             packet["protocol"] = self._protocol(cycle)
-            packet["local_inputs"] = self._local_inputs()
+            packet["local_inputs"] = self._local_inputs(cycle, stage)
             packet["evidence"] = evidence or {}
             packet["artifacts"] = self._stage_artifacts(cycle, stage)
             packet["memories"] = memory_cards
+            packet["proposition_memory"] = self._proposition_memory(cycle, stage, packet_as_of)
             packet["active_workflow_policy"] = WorkflowEvolution(self.store).active_policy()
             if message_batch is not None:
                 packet["message_batch"] = message_batch
@@ -223,18 +224,34 @@ class RuntimePacketBuilder:
         text = path.read_text(encoding="utf-8") if path.exists() else "Protocol unavailable. State the material impact naturally."
         return {"path": relative, "text": text[:50000]}
 
-    def _local_inputs(self) -> list[dict[str, str]]:
+    def _local_inputs(self, cycle: dict[str, Any], stage: str) -> list[dict[str, str]]:
         inputs: list[dict[str, str]] = []
-        for relative in (
-            "portfolio/01_CURRENT_PORTFOLIO.md",
+        relatives = [
             "state/11_STOCK_STATE.csv",
             "state/10_THEME_STATE.csv",
             "logs/12_OPPORTUNITY_LOG.csv",
-        ):
+        ]
+        if stage != "m1_judgment":
+            relatives.insert(0, "portfolio/01_CURRENT_PORTFOLIO.md")
+        for relative in relatives:
             path = self.workspace_root / relative
             if path.exists():
                 inputs.append({"path": relative, "text": path.read_text(encoding="utf-8")[:30000]})
+        if stage == "m1_judgment" and cycle.get("private_context_json"):
+            inputs.insert(0, {"path": "runtime://private-context-before-h0", "text": cycle["private_context_json"]})
         return inputs
+
+    def _proposition_memory(self, cycle: dict[str, Any], stage: str, known_at: str) -> list[dict[str, Any]]:
+        rows = self.store.current_propositions(
+            known_at,
+            exclude_cycle_id=cycle["cycle_id"] if stage == "m1_judgment" else None,
+            limit=80,
+        )
+        return [{
+            "proposition_id": row["proposition_id"], "kind": row["proposition_kind"],
+            "subject": row["subject"], "predicate": row["predicate"],
+            "object": json.loads(row["object_json"]), "known_at": row["known_at"],
+        } for row in rows]
 
     def _stage_artifacts(self, cycle: dict[str, Any], stage: str) -> list[dict[str, Any]]:
         allowed = {

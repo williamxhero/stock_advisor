@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .learning import JudgmentLifecycle
 from .models import TASK_POLICIES
@@ -36,9 +37,14 @@ class CompanionEngine:
     ) -> dict[str, Any]:
         if task_key not in TASK_POLICIES:
             raise ValueError(f"unregistered task_key: {task_key}")
+        work_start_at = scheduled_for
+        if schedule_snapshot:
+            lead = int((schedule_snapshot.get("trigger") or {}).get("lead_minutes", 0))
+            work_start_at = (parse(scheduled_for) - timedelta(minutes=lead)).isoformat(timespec="seconds")
         cycle = self.store.create_cycle(
             task_key, scheduled_for, as_of or iso(utc_now()), schedule_id=schedule_id,
             schedule_revision=schedule_revision, schedule_snapshot=schedule_snapshot,
+            work_start_at=work_start_at,
         )
         self.emit(cycle, "cycle.created", cycle)
         return cycle
@@ -176,7 +182,7 @@ class CompanionEngine:
         typ = command["type"]
         cycle_id = command.get("cycle_id")
         if typ == "request_today_projections":
-            scheduled_date = str(command.get("scheduled_date") or utc_now().date().isoformat())
+            scheduled_date = str(command.get("scheduled_date") or utc_now().astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat())
             projections = []
             for current in self.store.latest_cycles_for_date(scheduled_date):
                 projection = self._projection(current)
@@ -218,6 +224,8 @@ class CompanionEngine:
                 result = self._lock_h0(self.store.get_cycle(cycle_id), "legacy_submit")
             elif typ == "commit_chat_batch":
                 result = self._commit_chat(cycle)
+            elif typ == "commit_conversation_batch":
+                result = self._commit_conversation(cycle, reason="manual")
             else:
                 raise ValueError(f"unsupported command: {typ}")
         self.store.save_receipt(command["command_id"], cycle_id, typ, command, result)
@@ -236,6 +244,14 @@ class CompanionEngine:
         return {"accepted": False, "reason": "H0 window expired"}
 
     def _stage_message(self, cycle: dict[str, Any], text: str, message_id: str | None, *, emit: bool = True) -> dict[str, Any]:
+        if cycle.get("kind") == "daily_conversation":
+            if cycle["state"] != "open":
+                raise ValueError("conversation is not open")
+            assert_safe(text, boundary="user message storage")
+            message = self.store.stage_message(cycle["cycle_id"], text, "conversation", message_id=message_id)
+            if emit:
+                self.emit(cycle, "message.staged", {"cycle": cycle, "message": message})
+            return self._projection(cycle)
         if cycle["state"] == "queued" and cycle["task_key"] != "daily.opportunity.0900":
             raise ValueError("pre-M0 messages belong to the daily opportunity cycle")
         if cycle["state"] in {"researching_m0", "failed", "missed"}:
@@ -279,6 +295,11 @@ class CompanionEngine:
             if cycle.get("h0_locked_at"):
                 return self._projection(cycle)
             raise ValueError(f"H0 cannot be locked from state: {cycle['state']}")
+        # This boundary is deliberately before H0 actions.  M1 packets read
+        # only this snapshot, so a secretary-side portfolio update cannot leak
+        # the user's current H0 into the independent strategy judgment.
+        self.store.freeze_private_context(cycle["cycle_id"])
+        cycle = self.store.get_cycle(cycle["cycle_id"])
         batch_id, messages = self.store.commit_staged_messages(cycle["cycle_id"], "h0")
         artifact = None
         if messages:
@@ -332,6 +353,45 @@ class CompanionEngine:
         projection["committed_batch_id"] = batch_id
         projection["source_artifact_id"] = artifact["artifact_id"]
         return projection
+
+    def _commit_conversation(self, cycle: dict[str, Any], *, reason: str) -> dict[str, Any]:
+        if cycle.get("kind") != "daily_conversation" or cycle["state"] != "open":
+            raise ValueError("messages can only be committed in the open daily conversation")
+        batch_id, messages = self.store.commit_staged_messages(cycle["cycle_id"], "conversation")
+        if not messages:
+            raise ValueError("no staged conversation messages")
+        body = "\n\n".join(message["body_text"] for message in messages)
+        artifact = self.store.append_artifact(
+            cycle["cycle_id"], "chat_human", "human", body, iso(utc_now()),
+            {"batch_id": batch_id, "message_ids": [message["message_id"] for message in messages], "reason": reason},
+        )
+        self.store.link_messages_to_artifact([message["message_id"] for message in messages], artifact["artifact_id"])
+        self.emit(cycle, "human.message_batch.accepted", {
+            "cycle": cycle, "batch_id": batch_id, "messages": messages,
+            "source_artifact_id": artifact["artifact_id"], "reason": reason,
+        })
+        projection = self._projection(cycle)
+        projection["committed_batch_id"] = batch_id
+        projection["source_artifact_id"] = artifact["artifact_id"]
+        return projection
+
+    def ensure_daily_conversation(self, at: datetime | None = None) -> dict[str, Any]:
+        current = (at or utc_now()).astimezone(ZoneInfo("Asia/Shanghai"))
+        cycle = self.store.ensure_daily_conversation(current.date().isoformat(), at=at)
+        created = bool(cycle.pop("_created", False))
+        if created:
+            self.emit(cycle, "conversation.opened", {"cycle": cycle})
+        return cycle
+
+    def auto_submit_conversation(self, conversation_cycle_id: str, task_key: str, scheduled_for: str) -> dict[str, Any] | None:
+        cycle = self.store.get_cycle(conversation_cycle_id)
+        if not self.store.messages(conversation_cycle_id, state="staged", phase="conversation"):
+            return None
+        if not self.store.claim_conversation_auto_submit(task_key, scheduled_for, conversation_cycle_id):
+            return None
+        result = self._commit_conversation(cycle, reason=f"before:{task_key}")
+        self.store.complete_conversation_auto_submit(task_key, scheduled_for, result["committed_batch_id"])
+        return result
 
     def run_due(self, at: datetime | None = None) -> list[dict[str, Any]]:
         at = at or utc_now()
@@ -481,7 +541,7 @@ class CompanionEngine:
 
     def background_failed(self, cycle_id: str, stage: str, reason: str) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
-        label = {"chat_research": "公开补查", "outcome": "结果验证", "workflow_feedback": "工作流反馈处理"}.get(stage, stage)
+        label = {"chat_research": "公开补查", "outcome": "结果验证", "workflow_feedback": "工作流反馈处理", "cognition": "消息理解与受控动作"}.get(stage, stage)
         self.emit(cycle, f"{stage}.failed", {
             "cycle": cycle, "reason": self._user_fault_message(reason, label),
             "diagnostic_code": self._diagnostic_code(reason),

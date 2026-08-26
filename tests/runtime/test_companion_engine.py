@@ -11,7 +11,7 @@ from ai_trading_companion.engine import CompanionEngine, iso, parse
 from ai_trading_companion.__main__ import run_pending_premarket_reply
 from ai_trading_companion.memory import MemoryQuery, SqliteMemoryRetriever
 from ai_trading_companion.packet_builder import RuntimePacketBuilder
-from ai_trading_companion.scheduler import load_schedules, run_daily_schedule, run_periodic_schedule
+from ai_trading_companion.scheduler import conversation_auto_submit_at, load_schedules, run_daily_schedule, run_periodic_schedule
 from ai_trading_companion.store import CompanionStore
 
 
@@ -527,6 +527,32 @@ class CompanionEngineTests(unittest.TestCase):
         premarket = next(item for item in results if item["task_key"] == "daily.opportunity.0900")
         self.assertEqual("started", premarket["action"])
         self.assertEqual("2026-08-25T09:00:00+08:00", completed[0])
+
+    def test_conversation_auto_submit_uses_configured_lead_before_actual_work_start(self):
+        target = datetime.fromisoformat("2026-08-25T09:00:00+08:00")
+        config = {"trigger": {"lead_minutes": 30}, "conversation_auto_submit_lead_minutes": None}
+
+        self.assertEqual(
+            datetime.fromisoformat("2026-08-25T08:10:00+08:00"),
+            conversation_auto_submit_at(config, target, 20),
+        )
+        config["conversation_auto_submit_lead_minutes"] = False
+        self.assertIsNone(conversation_auto_submit_at(config, target, 20))
+
+    def test_registered_worker_claims_at_configured_work_start_not_formal_slot(self):
+        cycle = self.engine.start_cycle(
+            "daily.opportunity.0900", "2026-08-25T09:00:00+08:00", "2026-08-25T00:00:00Z",
+            schedule_snapshot={"trigger": {"lead_minutes": 30}},
+        )
+
+        self.assertEqual([], self.store.claim_scheduled_workers(
+            at=datetime.fromisoformat("2026-08-25T08:29:59+08:00")
+        ))
+        claimed = self.store.claim_scheduled_workers(
+            at=datetime.fromisoformat("2026-08-25T08:30:00+08:00")
+        )
+
+        self.assertEqual([cycle["cycle_id"]], [item["cycle_id"] for item in claimed])
 
     def test_premarket_cycle_is_prepared_before_0830_without_starting_research(self):
         completed: list[str] = []

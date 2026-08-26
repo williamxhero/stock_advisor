@@ -2,6 +2,10 @@
   "version": 1,
   "timezone": "Asia/Shanghai",
   "catch_up_minutes": 15,
+  "conversation": {
+    "task_key": "conversation.daily",
+    "auto_submit_lead_minutes": 20
+  },
   "daily": [
     {"task_key": "daily.opportunity.0900", "at": "09:00", "lead_minutes": 30},
     {"task_key": "daily.execution.0945", "at": "09:45", "lead_minutes": 0},

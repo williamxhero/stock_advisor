@@ -9,6 +9,7 @@ public sealed class ExpectedTaskCatalogTests
     {
         Assert.Collection(
             ExpectedTaskCatalog.AShareTasks,
+            task => Assert.Equal(("conversation.daily", new TimeOnly(0, 0)), (task.TaskKey, task.Slot)),
             task => Assert.Equal(("daily.opportunity.0900", new TimeOnly(9, 0)), (task.TaskKey, task.Slot)),
             task => Assert.Equal(("daily.execution.0945", new TimeOnly(9, 45)), (task.TaskKey, task.Slot)),
             task => Assert.Equal(("daily.execution.1030", new TimeOnly(10, 30)), (task.TaskKey, task.Slot)),

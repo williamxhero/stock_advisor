@@ -6,6 +6,7 @@ public sealed class CompanionInputPolicyTests
 {
     [Theory]
     [InlineData("queued", true)]
+    [InlineData("open", true)]
     [InlineData("awaiting_h0", true)]
     [InlineData("researching_m0", false)]
     [InlineData(null, false)]
@@ -23,5 +24,13 @@ public sealed class CompanionInputPolicyTests
         Assert.Equal("提交", CompanionInputPolicy.CommitLabel("queued", h0Locked: false));
         Assert.True(CompanionInputPolicy.CanCommit("awaiting_h0", h0Locked: false, stagedMessages: 0));
         Assert.Equal("提交 H0", CompanionInputPolicy.CommitLabel("awaiting_h0", h0Locked: false));
+    }
+
+    [Fact]
+    public void DailyConversationUsesItsOwnSubmitPhase()
+    {
+        Assert.Equal("conversation", CompanionInputPolicy.MessagePhase("open", h0Locked: false));
+        Assert.True(CompanionInputPolicy.CanCommit("open", h0Locked: false, stagedMessages: 1));
+        Assert.Equal("提交", CompanionInputPolicy.CommitLabel("open", h0Locked: false));
     }
 }

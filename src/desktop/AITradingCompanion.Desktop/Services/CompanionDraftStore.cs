@@ -4,6 +4,7 @@ namespace AITradingCompanion.Desktop.Services;
 
 public static class CompanionDraftStore
 {
+    public const string ConversationDraftKey = "conversation.general";
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
 
     public static Dictionary<string, string> Load(AppPaths paths)

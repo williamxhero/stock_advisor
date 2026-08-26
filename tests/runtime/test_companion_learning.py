@@ -251,6 +251,7 @@ class CompanionLearningTests(unittest.TestCase):
             "companion-m0-result-v1.schema.json",
             "companion-m1-result-v1.schema.json", "companion-m2-result-v1.schema.json",
             "companion-chat-result-v1.schema.json", "companion-reflection-result-v1.schema.json",
+            "companion-cognition-result-v1.schema.json",
             "companion-outcome-result-v1.schema.json", "portfolio-interpretation-result-v1.schema.json",
         )
 

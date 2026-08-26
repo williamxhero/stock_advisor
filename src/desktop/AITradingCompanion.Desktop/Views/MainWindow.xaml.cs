@@ -158,12 +158,14 @@ public partial class MainWindow : Window, IDisposable
     private async void MainCommit_Click(object sender, RoutedEventArgs e)
     {
         if (_companionProjection is null) return;
+        var isConversation = _companionProjection.State == "open";
         var isPreM0 = _companionProjection.State == "queued";
         var isH0 = !isPreM0 && !IsH0LockedForUi();
+        if (isConversation) isH0 = false;
         var staged = CombinedUserMessages().Count(message => message.State == "staged");
         var h0Locked = IsH0LockedForUi();
         if (!CompanionInputPolicy.CanCommit(_companionProjection.State, h0Locked, staged)) return;
-        var type = isPreM0 ? "commit_pre_m0" : isH0 ? "commit_h0" : "commit_chat_batch";
+        var type = isConversation ? "commit_conversation_batch" : isPreM0 ? "commit_pre_m0" : isH0 ? "commit_h0" : "commit_chat_batch";
         if (!isH0 && staged == 0) return;
         if (!await SendCompanionCommandAsync(type, null)) return;
         if (isH0) _locallyLockedCycles.Add(_companionProjection.CycleId);
@@ -285,7 +287,7 @@ public partial class MainWindow : Window, IDisposable
         var projection = CompanionEventProjection.ProjectForTask(events, taskKey);
         if (projection?.ScheduledFor is { } projectionScheduled && projectionScheduled.LocalDateTime.Date != DateTime.Today) projection = null;
         _companionProjection = projection;
-        SwitchDraft(projection?.CycleId);
+        SwitchDraft(taskKey == "conversation.daily" && projection is not null ? CompanionDraftStore.ConversationDraftKey : projection?.CycleId);
         if (projection is null)
         {
             RenderAiMessages([]);
@@ -641,6 +643,8 @@ public partial class MainWindow : Window, IDisposable
             return staged > 0
                 ? $"{staged} 条盘前消息待冻结；M0 开始时会作为待核验线索。"
                 : "现在可以盘前交流；消息可能影响 M0 的搜索重点，但 AI 会独立核验。";
+        if (_companionProjection.State == "open")
+            return staged > 0 ? $"{staged} 条消息待提交；发送前都可以修改或撤回。" : "可以随时聊天；未发送草稿会一直保留。";
         if (h0Locked)
         {
             if (_companionProjection.State is "researching_m1" or "judging_m1" or "m1_retry_wait")

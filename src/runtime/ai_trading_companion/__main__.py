@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .backup import BackupManager
+from .cognition import ReplyMarkdownStream, UnifiedCognition
 from .config import load_settings, save_provider_settings
 from .credentials import write_secret
 from .provider_client import CurrentInformationUnavailable, ProviderClient, ProviderError, ProviderResult
@@ -28,11 +30,11 @@ from .migration import LegacyMigrator, LegacySources
 from .models import TASK_POLICIES
 from .packet_builder import RuntimePacketBuilder
 from .paths import RuntimePaths
-from .portfolio import PortfolioService, explicit_fixture_extraction, is_portfolio_statement
+from .portfolio import PortfolioService
 from .preview import approve_bundle, build_bundle, find_source_cycle, launch_preview, seal_bundle, write_bundle
 from .projection import LearningProjectionRenderer
-from .scheduler import SHANGHAI, ensure_registered_policy, run_registry_schedule
-from .schedule_registry import ScheduleRegistry
+from .scheduler import SHANGHAI, conversation_auto_submit_at, ensure_registered_policy, run_registry_schedule
+from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
 from .research_tools import ResearchTools
 from .store import CompanionStore
@@ -89,9 +91,9 @@ def _backup_before_schedule_migration() -> None:
     source = sqlite3.connect(DB)
     try:
         version = source.execute("PRAGMA user_version").fetchone()[0]
-        if version >= 11:
+        if version >= 12:
             return
-        target = RUNTIME / "backups" / "migrations" / f"before-evidence-v11-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sqlite3"
+        target = RUNTIME / "backups" / "migrations" / f"before-unified-cognition-v12-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sqlite3"
         target.parent.mkdir(parents=True, exist_ok=True)
         destination = sqlite3.connect(target)
         try:
@@ -728,11 +730,8 @@ def run_chat_research(
             search=False, timeout=int(TASK_POLICIES[cycle["task_key"]].m1_timeout.total_seconds()),
         )
         reply = data["reply_markdown"]
-    if data and data.get("judgment_revision"):
-        revision = data["judgment_revision"]
-        engine.judgment_revision_ready(
-            cycle["cycle_id"], str(revision["revision_markdown"]), str(revision["revises_artifact_id"]),
-        )
+    # Ordinary conversation can inform later work, but never silently rewrites
+    # a published M1/M2.  A formal rerun remains an explicit user action.
     store.finish_research_job(job["job_id"])
     source_metadata = json.loads(source.get("metadata_json") or "{}")
     reply_kind = "premarket_chat" if source["kind"] == "pre_m0_submission" else "ai_chat"
@@ -809,11 +808,45 @@ def _seconds_until_next_schedule(at: datetime | None = None) -> int:
     return max(0, int((min(future) - current).total_seconds())) if future else 24 * 60 * 60
 
 
-def run_schedules(engine: CompanionEngine, store: CompanionStore, at: datetime, execute: bool, exchange: LocalExchange) -> list[dict[str, Any]]:
+def run_schedules(engine: CompanionEngine, store: CompanionStore, at: datetime, execute: bool, exchange: LocalExchange, portfolio: PortfolioService) -> list[dict[str, Any]]:
     # Materialisation intentionally does not call an LLM.  The service launches
     # bounded workers from the resulting queued cycles, so later tasks are not
     # held behind a long earlier judgment.
-    return run_registry_schedule(engine, store, _schedule_registry(store), at)
+    registry = _schedule_registry(store)
+    results = run_registry_schedule(engine, store, registry, at)
+    conversation = engine.ensure_daily_conversation(at)
+    defaults = json.loads((PATHS.resources / "schedules" / "tasks.json").read_text(encoding="utf-8"))
+    default_lead = int((defaults.get("conversation") or {}).get("auto_submit_lead_minutes", 20))
+    local_at = at.astimezone(SHANGHAI)
+    for row in registry.list(local_at, include_inactive=False):
+        config = row["config"]
+        target = _target_for_day(config, local_at.date())
+        if target is None or target.date() != local_at.date():
+            continue
+        if config["trigger"]["type"] in {"trading_day_fixed", "market_relative"} and not registry.calendar.is_trading_day(local_at.date()):
+            continue
+        threshold = conversation_auto_submit_at(config, target, default_lead)
+        if threshold is None:
+            continue
+        work_start = target - timedelta(minutes=max(0, int((config.get("trigger") or {}).get("lead_minutes", 0))))
+        if local_at > work_start:
+            continue
+        if local_at < threshold:
+            continue
+        submitted = engine.auto_submit_conversation(conversation["cycle_id"], row["task_key"], target.isoformat(timespec="seconds"))
+        if not submitted:
+            continue
+        flush(store, exchange)
+        reply = run_chat(
+            engine, store, portfolio, conversation["cycle_id"], submitted["committed_batch_id"], execute,
+            on_progress=lambda: flush(store, exchange),
+        )
+        results.append({
+            "task_key": row["task_key"], "scheduled_for": target.isoformat(timespec="seconds"),
+            "action": "conversation_auto_submitted", "conversation_cycle_id": conversation["cycle_id"],
+            "cognition_job_id": reply.get("job_id"),
+        })
+    return results
 
 
 def run_scheduled_cycle(engine: CompanionEngine, store: CompanionStore, exchange: LocalExchange, portfolio: PortfolioService, cycle_id: str, execute: bool) -> dict[str, Any]:
@@ -825,7 +858,7 @@ def run_scheduled_cycle(engine: CompanionEngine, store: CompanionStore, exchange
         if snapshot:
             ensure_registered_policy(cycle["task_key"], snapshot, datetime.fromisoformat(cycle["scheduled_for"]))
         result = run_research(engine, store, cycle, execute, lambda: flush(store, exchange))
-        _process_portfolio_artifact(portfolio, store.latest_artifact(cycle_id, "h0"), execute)
+        process_h0_cognition(engine, store, portfolio, cycle_id, execute)
         return result
     finally:
         store.finish_scheduled_worker(cycle_id)
@@ -905,29 +938,95 @@ def run_background(
     return {"action": "idle"}
 
 
-def _interpret_portfolio(portfolio: PortfolioService, source: dict[str, Any], execute: bool) -> dict[str, Any]:
-    if not execute:
-        return explicit_fixture_extraction(source["body_markdown"])
-    prompt = (
-        "只解释用户是否明确报告了已经发生的真实成交或当前持仓事实。不要搜索互联网，不给投资建议，不修改文件。"
-        "计划、建议、条件句不是成交。只提取原文明确出现的股票、方向、股数、价格和时间；缺失字段必须为 null，并逐字段给出原文 evidence。\n\n"
-        + json.dumps({"user_text": source["body_markdown"], "current_portfolio": portfolio.snapshot()["positions"]}, ensure_ascii=False, indent=2)
-    )
-    result = provider_client().run(
-        prompt, SCHEMAS / "portfolio-interpretation-result-v1.schema.json", timeout=45, search=False,
-        slot="fast", effort=str(load_settings(PATHS.home).provider.get("models", {}).get("fast", {}).get("effort") or "medium"),
-    )
-    return json.loads(result.text)
-
-
-def _process_portfolio_artifact(portfolio: PortfolioService, artifact: dict[str, Any] | None, execute: bool) -> None:
-    if not artifact or not is_portfolio_statement(artifact["body_markdown"]):
-        return
-    portfolio.record_job(artifact["artifact_id"], artifact["cycle_id"], artifact["body_markdown"])
+def run_unified_cognition(
+    engine: CompanionEngine,
+    store: CompanionStore,
+    portfolio: PortfolioService,
+    cycle_id: str,
+    source: dict[str, Any],
+    messages: list[dict[str, Any]],
+    batch_ids: list[str],
+    execute: bool,
+    *,
+    mode: str,
+    reply_kind: str = "ai_chat",
+    on_progress: Any = None,
+) -> dict[str, Any]:
+    """Understand once, then execute allowlisted capabilities from receipts."""
+    if not messages:
+        raise RuntimeError("no submitted messages for cognition")
+    cycle = store.get_cycle(cycle_id)
+    cognition = UnifiedCognition(store, portfolio)
+    job = store.start_cognition_job(cycle_id, source["artifact_id"], mode, source["body_markdown"])
+    stream = None
     try:
-        portfolio.complete_job(artifact["artifact_id"], _interpret_portfolio(portfolio, artifact, execute))
+        if not execute:
+            data = cognition.fixture_result(messages, mode)
+        elif job["state"] == "completed" and job.get("result_json"):
+            data = {"reply_markdown": None, "needs_fresh_search": False, "public_search_request": None, "propositions": [], "actions": []}
+        else:
+            memories = [{
+                "proposition_id": item["proposition_id"], "kind": item["proposition_kind"],
+                "subject": item["subject"], "predicate": item["predicate"],
+                "object": json.loads(item["object_json"]), "known_at": item["known_at"],
+            } for item in store.current_propositions(iso(datetime.now(timezone.utc)), limit=80)]
+            settings = load_settings(PATHS.home)
+            stream = engine.chat_stream_started(cycle_id, batch_ids, reply_kind) if mode != "h0" else None
+            reply_stream = ReplyMarkdownStream()
+
+            def on_delta(delta: str) -> None:
+                visible = reply_stream.feed(delta)
+                if visible and stream:
+                    engine.chat_stream_delta(cycle_id, stream["stream_id"], visible)
+                    if on_progress:
+                        on_progress()
+
+            result = provider_client().run(
+                cognition.prompt(cycle, messages, mode, memories),
+                SCHEMAS / "companion-cognition-result-v1.schema.json",
+                timeout=int(TASK_POLICIES.get(cycle["task_key"], TASK_POLICIES["daily.execution.0945"]).m1_timeout.total_seconds()),
+                search=mode != "h0", slot="fast",
+                effort=str(settings.provider.get("models", {}).get("fast", {}).get("effort") or "medium"),
+                on_delta=on_delta if stream else None,
+            )
+            data = json.loads(result.text)
+        outcome = cognition.apply(cycle, source, messages, mode, data)
     except Exception as exc:
-        portfolio.fail_job(artifact["artifact_id"], str(exc))
+        store.finish_cognition_job(job["job_id"], error=str(exc))
+        if stream:
+            engine.chat_stream_failed(cycle_id, stream["stream_id"], str(exc))
+            if on_progress:
+                on_progress()
+        raise
+
+    engine.emit(cycle, "cognition.receipts.ready", {
+        "cycle": cycle, "job_id": outcome.job_id, "receipts": list(outcome.receipts),
+        "propositions_recorded": outcome.propositions_recorded,
+    })
+    if outcome.needs_fresh_search and outcome.public_search_request:
+        store.queue_research_job(cycle_id, source["artifact_id"], outcome.public_search_request)
+    if outcome.reply_markdown:
+        stream_id = None
+        if stream:
+            current = store.stream_message(stream["stream_id"])["text"]
+            remainder = outcome.reply_markdown[len(current):] if outcome.reply_markdown.startswith(current) else outcome.reply_markdown if not current else ""
+            if remainder:
+                engine.chat_stream_delta(cycle_id, stream["stream_id"], remainder)
+                if on_progress:
+                    on_progress()
+            store.finish_stream_message(stream["stream_id"])
+            stream_id = stream["stream_id"]
+        engine.chat_ready(
+            cycle_id, outcome.reply_markdown,
+            reply_to_batch_id=batch_ids[-1] if batch_ids else None,
+            reply_to_batch_ids=batch_ids, stream_id=stream_id, kind=reply_kind,
+        )
+    elif mode == "h0":
+        store.mark_batches_responded(batch_ids, source["artifact_id"])
+    return {
+        "cycle_id": cycle_id, "job_id": outcome.job_id, "receipts": list(outcome.receipts),
+        "reply_markdown": outcome.reply_markdown,
+    }
 
 
 def run_chat(
@@ -943,46 +1042,43 @@ def run_chat(
     on_progress: Any = None,
 ) -> dict[str, Any]:
     cycle = store.get_cycle(cycle_id)
-    phase = "pre_m0" if source_kind == "pre_m0_submission" else "chat"
+    phase = "pre_m0" if source_kind == "pre_m0_submission" else "conversation" if cycle.get("kind") == "daily_conversation" else "chat"
     batches = store.pending_message_batches(cycle_id, phase)
     batch_ids = [str(item["batch_id"]) for item in batches]
     messages = store.messages_for_batches(batch_ids)
     source = store.latest_artifact(cycle_id, source_kind)
-    _process_portfolio_artifact(portfolio, source, execute)
     if not messages:
         raise RuntimeError("no unresponded submitted messages")
-    if not execute:
-        return engine.chat_ready(
-            cycle_id, "Fixture 模式：已收到这批消息。", reply_to_batch_id=batch_id,
-            reply_to_batch_ids=batch_ids, kind=reply_kind,
-        )
-    message_batch = "\n\n".join(str(message["body_text"]) for message in messages)
-    packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store).build(
-        cycle, "chat", message_batch=message_batch, as_of=iso(datetime.now(timezone.utc))
+    if source is None:
+        raise RuntimeError("submitted conversation artifact is missing")
+    result = run_unified_cognition(
+        engine, store, portfolio, cycle_id, source, messages, batch_ids, execute,
+        mode="conversation", reply_kind=reply_kind, on_progress=on_progress,
     )
-    stream = engine.chat_stream_started(cycle_id, batch_ids, reply_kind)
     if on_progress:
         on_progress()
-    try:
-        settings = load_settings(PATHS.home)
-        result = provider_client().run(
-            RuntimePacketBuilder.prompt(packet), None, slot="fast",
-            effort=str(settings.provider.get("models", {}).get("fast", {}).get("effort") or "medium"),
-            search=True, timeout=int(TASK_POLICIES[cycle["task_key"]].m1_timeout.total_seconds()),
-            on_delta=lambda delta: (engine.chat_stream_delta(cycle_id, stream["stream_id"], delta), on_progress() if on_progress else None),
-        )
-        completed = store.finish_stream_message(stream["stream_id"])
-        if not completed["text"].strip():
-            raise RuntimeError("Provider completed an empty chat response")
-        return engine.chat_ready(
-            cycle_id, completed["text"], reply_to_batch_id=batch_id, reply_to_batch_ids=batch_ids,
-            stream_id=stream["stream_id"], kind=reply_kind,
-        )
-    except Exception as exc:
-        engine.chat_stream_failed(cycle_id, stream["stream_id"], str(exc))
-        if on_progress:
-            on_progress()
-        raise
+    return result
+
+
+def process_h0_cognition(
+    engine: CompanionEngine,
+    store: CompanionStore,
+    portfolio: PortfolioService,
+    cycle_id: str,
+    execute: bool,
+) -> dict[str, Any] | None:
+    source = store.latest_artifact(cycle_id, "h0")
+    if source is None:
+        return None
+    metadata = json.loads(source.get("metadata_json") or "{}")
+    batch_id = str(metadata.get("batch_id") or "")
+    messages = store.messages_for_batches([batch_id]) if batch_id else []
+    if not messages:
+        return None
+    return run_unified_cognition(
+        engine, store, portfolio, cycle_id, source, messages, [batch_id], execute,
+        mode="h0",
+    )
 
 
 def run_pending_premarket_reply(
@@ -1108,11 +1204,26 @@ def consume(
             typ = command.get("type")
             if cycle_id and typ in {"commit_h0", "skip_h0", "submit_h0", "submit_voice_h0"}:
                 if store.get_cycle(cycle_id)["state"] in {"researching_m1", "m1_retry_wait"}:
-                    result = run_m1(engine, store, portfolio, cycle_id, execute)
-                _process_portfolio_artifact(portfolio, store.latest_artifact(cycle_id, "h0"), execute)
+                    # Both branches receive the same immutable H0.  M1 reads
+                    # the pre-H0 private snapshot; cognition may update facts,
+                    # and neither branch waits for the other to begin.
+                    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="h0-fanout") as pool:
+                        m1_future = pool.submit(run_m1, engine, store, portfolio, cycle_id, execute)
+                        cognition_future = pool.submit(process_h0_cognition, engine, store, portfolio, cycle_id, execute)
+                        cognition_error = None
+                        try:
+                            cognition_future.result()
+                        except Exception as exc:
+                            cognition_error = exc
+                            engine.background_failed(cycle_id, "cognition", str(exc))
+                        result = m1_future.result()
+                        if cognition_error:
+                            result = {**result, "cognition_error": str(cognition_error)}
+                else:
+                    process_h0_cognition(engine, store, portfolio, cycle_id, execute)
             elif cycle_id and typ == "commit_pre_m0":
                 run_pending_premarket_reply(engine, store, portfolio, cycle_id, execute)
-            elif cycle_id and typ == "commit_chat_batch":
+            elif cycle_id and typ in {"commit_chat_batch", "commit_conversation_batch"}:
                 result = run_chat(engine, store, portfolio, cycle_id, str(result.get("committed_batch_id") or ""), execute, on_progress=lambda: flush(store, exchange))
             results.append(result)
         except Exception as exc:
@@ -1274,7 +1385,7 @@ def main() -> int:
         for projection in changed:
             cycle_id = projection["cycle"]["cycle_id"]
             completed.append(run_m1(engine, store, portfolio, cycle_id, args.execute))
-            _process_portfolio_artifact(portfolio, store.latest_artifact(cycle_id, "h0"), args.execute)
+            process_h0_cognition(engine, store, portfolio, cycle_id, args.execute)
         flush(store, exchange)
         if completed:
             render_learning(store)
@@ -1282,7 +1393,7 @@ def main() -> int:
         return 0
     if args.cmd == "run-schedule":
         at = datetime.fromisoformat(args.at.replace("Z", "+00:00")) if args.at else datetime.now(timezone.utc)
-        changed = run_schedules(engine, store, at, args.execute, exchange)
+        changed = run_schedules(engine, store, at, args.execute, exchange, portfolio)
         flush(store, exchange)
         print(json.dumps(changed, ensure_ascii=False))
         return 0

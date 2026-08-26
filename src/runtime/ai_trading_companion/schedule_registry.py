@@ -76,6 +76,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         "effective_from": str(config.get("effective_from") or ""),
         "effective_until": str(config.get("effective_until") or ""),
         "note": str(config.get("note") or "").strip(),
+        "conversation_auto_submit_lead_minutes": (
+            None if config.get("conversation_auto_submit_lead_minutes") is None
+            else False if config.get("conversation_auto_submit_lead_minutes") is False
+            else max(0, int(config["conversation_auto_submit_lead_minutes"]))
+        ),
     }
     if normalized["effective_from"]:
         _day(normalized["effective_from"], "effective_from")
@@ -176,12 +181,14 @@ class ScheduleRegistry:
             self.store.seed_schedule(task_key, task_key, {
                 "name": names.get(task_key, task_key), "workflow_key": "companion_judgment",
                 "trigger": {"type": "trading_day_fixed", "time": item["at"], "lead_minutes": item.get("lead_minutes", 0)},
+                "conversation_auto_submit_lead_minutes": item.get("conversation_auto_submit_lead_minutes"),
             })
         for item in payload.get("periodic", []):
             task_key = str(item["task_key"])
             self.store.seed_schedule(task_key, task_key, {
                 "name": names.get(task_key, task_key), "workflow_key": "periodic_review",
                 "trigger": {"type": "calendar_periodic", "months": item.get("months", "*"), "day": item["day"], "time": item["at"]},
+                "conversation_auto_submit_lead_minutes": item.get("conversation_auto_submit_lead_minutes"),
             })
 
     def validate_or_repair(self) -> bool:

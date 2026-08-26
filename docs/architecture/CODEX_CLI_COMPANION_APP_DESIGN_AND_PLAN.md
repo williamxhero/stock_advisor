@@ -1,12 +1,12 @@
 # Provider API 伴生研判应用：正式设计与实施计划
 
-状态：canonical；2026-08-25 grill 后由用户确认。本文取代旧的“隐藏模型 M0、H0 参与 M1、超时直接揭示 M0”设计。
+状态：canonical；2026-08-27 更新为“统一认知伙伴”。本文取代旧的分角色对外形象、独立持仓语义调用、普通聊天 per-cycle 和聊天自动修订正式判断设计。
 
 实现状态：2026-08-25 已完成并迁移为独立本机应用。SQLite 是事实源，`%LOCALAPPDATA%\AITradingCompanion\workspace\state\20_COMPANION_MEMORY.md` 是可重建投影；旧 Codex 自动化已退役，正式日程由本地服务执行。
 
 ## 1. 产品目标
 
-应用模拟两个专业炒股者之间的长期沟通：AI负责广泛挖掘、独立判断、反证和复盘；用户结合 M0与自己的研究形成 H0；系统再形成独立 M1和伴生 M2。前台始终自然交流，后台负责证据、时点、结构化验证和长期记忆。
+应用是用户长期相处的一个完整炒股伙伴：AI负责广泛挖掘、独立判断、反证、日常交流、事实同步和复盘；用户结合 M0与自己的研究形成 H0；系统再形成独立 M1和伴生 M2。前台不暴露秘书、策略或复盘等内部角色，后台只为证据、时点隔离、并发、受控动作和审计拆分能力。
 
 最高目标是长期提升真实炒股赚钱能力。手续费、滑点、流动性、回撤和未来信息隔离是“什么才算真实赚钱能力”的后台校验条件，不作为前台口号。
 
@@ -53,7 +53,7 @@
 - 解释一致、分歧、信息差、周期差和假设差，形成明确综合判断、条件和失效点；
 - 只做有目标的深入核对，不重复全量搜索；
 - 目标8分钟、硬上限15分钟，优先级低于新任务 M0，可暂停或延后；
-- 重要新信息形成 JudgmentRevision，不覆盖 M2。
+- 后续重要信息作为下一正式任务的待核验前情；普通聊天不自动生成 `JudgmentRevision`，不覆盖 M1/M2，也不暗中追加正式判断。
 
 ## 3. 搜索模型
 
@@ -97,9 +97,11 @@
 - 截止时只自动提交待提交消息；输入框草稿永远不发送；
 - 若截止前已开始录音、转写或编辑，给予5分钟宽限，但不能越过 M1最晚发布时间；
 - 自动和手动提交使用同一幂等命令；
-- 普通聊天待提交批次不自动提交。
+- 通用对话待提交批次会在下一正式任务的实际工作开始前自动提交；提前量来自 `resources/schedules/tasks.json` 的全局默认值和单任务覆盖/禁用配置。输入框草稿永不自动发送。
 
 当前盘前实现于 08:30 预取公开信息，但 cycle 的正式计划身份仍为 09:00；盘前 M1 最迟 09:29 发布。这样既给全量研究更长窗口，也保证开盘前完成。盘中仍执行5分钟联网硬限制。
+
+任务前自动提交以实际工作开始为基准：`auto_submit_at = scheduled_for - task.lead_minutes - conversation.auto_submit_lead_minutes`。例如 09:00任务提前30分钟开始、对话提前量20分钟，则在08:10提交，使完整 AI回复与合规命题记忆有机会进入08:30开始的任务上下文。
 
 ## 5. 消息交互
 
@@ -117,17 +119,25 @@
 1. `发送`继续向待提交区增加消息；
 2. `提交`一次提交整个批次；
 3. 一批消息最多触发一次 AI回复；
-4. M1运行期间聊天可基于现有证据回复，但新增联网搜索排在 M1之后；
+4. M1与 H0通用认知使用同一份冻结原文并行开始：M1读取 H0前私人事实快照，通用认知可正常理解事实和执行动作，二者互不等待；
 5. 已提交消息不可删除，只能追加修正；
-6. 持仓解释、经验记录和聊天回复都以提交边界为准。
+6. 一次统一认知同时产生自然回复、命题和受控动作；持仓服务不再单独调用 AI解释原文，只验证并原子执行动作。
+
+### 5.3 每日通用对话
+
+1. 每个上海日历日（含周末）有一个 `conversation.daily`；
+2. 已发送未提交的消息跨日迁移，已提交消息留在原日；
+3. 输入框草稿使用稳定的 `conversation.general` 键，跨日、跨任务和重启不清除；
+4. 用户可在这里正常讨论行情、策略、持仓、偏好、经验和产品工作方式，应用始终以同一个伙伴回应；
+5. 任务前自动提交只冻结已发送内容，按配置和幂等 claim执行；完整回复后批次才算已响应。
 
 ## 6. UI
 
 主界面保持三栏：今日列表、AI 消息、我的消息。宽度为固定导航栏加 3:2内容比例。
 
-AI 消息是一条任务级时间线。M0/M1/M2、普通聊天、故障说明和 JudgmentRevision按时间排列；上方使用 M0/M1/M2/最新锚点。每个里程碑独立显示开始和完成时间。朗读选中或最新消息。
+AI 消息是一条连续时间线。每日通用对话与 M0/M1/M2、普通聊天、回执和故障说明保持同一人格；正式任务上方使用 M0/M1/M2/最新锚点。每个里程碑独立显示开始和完成时间。朗读选中或最新消息。
 
-我的消息显示待提交和已提交状态。待提交消息有撤回操作；已提交消息只显示原文、时间和必要的持仓处理状态。输入框草稿按 cycle保存。
+我的消息显示待提交和已提交状态。待提交消息有撤回操作；已提交消息只显示原文、时间和必要的动作回执。正式 H0草稿按 cycle保存；通用输入框草稿使用跨日稳定键保存。
 
 所有滚动区域复用唯一 `ThinScrollBarStyle`。窗口大小与位置持久化。持仓窗口保持单实例非模态。
 
@@ -214,6 +224,14 @@ AI可以提出或更新经验、查询模板、搜索顺序、反证习惯和方
 
 外部 interface 只接受版本化命令并返回 cycle projection。其 implementation负责 H0批次、截止、M1 attempt、M2、幂等、不可变 artifact和事件 outbox。UI不理解状态迁移细节。
 
+### `DailyConversation`
+
+外部 interface 负责打开当天通用对话、迁移未提交消息、按配置在任务前幂等提交批次。实现可以复用 cycle/message物理表，但对调用者隐藏日历轮换和提交 claim。
+
+### `UnifiedCognition`
+
+外部 interface 接受冻结消息批次，一次返回自然回复、带精确原文 span的命题和 allow-list动作。`PortfolioService`、命题记忆与 `WorkflowEvolution`只消费经过本地验证的动作；每个动作生成幂等回执，回复只能根据真实回执描述成功、缺字段或失败。普通聊天合同中不存在正式判断修订动作。
+
 ### `ContextAssembler`
 
 外部 interface 为 `assemble(stage, cycle_id, as_of) -> StagePacket`。其 implementation负责双时间过滤、每日账本、相关记忆、隐私裁剪、H0盲区和调用预算。任何 LLM调用都不得自行遍历项目文件。
@@ -236,7 +254,7 @@ AI可以提出或更新经验、查询模板、搜索顺序、反证习惯和方
 4. M1独立本地判断；
 5. M2本地综合。
 
-无 H0跳过 M2。普通聊天按每个提交批次一次调用；只有确实需要新信息时才追加联网研究。持仓优先规则解析，歧义时复用聊天或一次短调用。任何额外阶段必须经过用户批准。
+无 H0跳过 M2。普通聊天每个提交批次只做一次统一认知调用；同一次调用理解持仓、个人事实、外部观点、工作流反馈并形成自然回复。只有确实需要新信息时才追加公开联网研究；持仓不再有第二次专用语义调用。确定性能力和路由细节可在已批准范围内进化，扩权仍需用户批准。
 
 默认按认知能力分为 Provider 的 `research`、`judgment` 与 `fast` 三个模型槽；模型 ID 和 effort 在本机 Provider 配置中维护。路由选择模型槽与 effort，不依赖 Codex CLI 或环境变量。
 
@@ -262,13 +280,16 @@ m1_ready + no_h0 -> complete
 现有 SQLite在兼容迁移中增加：
 
 - cycle：`m1_publish_deadline`、`h0_auto_submit_at`、`h0_locked_at`、`h0_artifact_id`、`m1_started_at`、`m1_completed_at`、`m2_started_at`、`m2_completed_at`；
+- cycle补充：`kind`、`work_start_at`和 H0前冻结的 `private_context_json/hash/frozen_at`；
 - `message_batch`与`message_item`：待提交、撤回、已提交和 H0归属；
+- `companion_cognition_job`、`companion_action_receipt`与`memory_proposition`：一次理解、动作级幂等回执和带原文 span的命题记忆；
+- `conversation_auto_submit_claim`：按正式任务时点幂等保护任务前自动提交；
 - `llm_attempt`：stage、attempt、时间、status、error、input/output hash、as_of；
 - `evidence_ledger_entry`：source、occurred_at、known_at、自然语言内容和覆盖状态；
 - `judgment_snapshot`与`outcome_checkpoint`；
 - `memory_index_entry`：事实 artifact到可重建检索索引的映射。
 
-交换合同增加命令：`stage_message`、`withdraw_staged_message`、`commit_h0`、`commit_chat_batch`、`request_projection`。事件增加：`message.staged`、`message.withdrawn`、`h0.locked`、`m1.started/ready/failed`、`m2.started/ready/deferred`、`chat.ready`和`judgment.revised`。
+交换合同包含命令：`stage_message`、`withdraw_staged_message`、`commit_h0`、`commit_chat_batch`、`commit_conversation_batch`、`request_projection`。事件包含：`message.staged`、`message.withdrawn`、`h0.locked`、`m1.started/ready/failed`、`m2.started/ready/deferred`、`chat.ready`和`cognition.receipts.ready`。
 
 ## 18. 实施阶段与 Gate
 
@@ -328,9 +349,9 @@ Gate：历史回放无未来泄露；失败案例能被召回；检索器可由 
 - 记忆检索强制 `known_at <= as_of`，记录选择审计，并主动包含错误、部分正确和反例；
 - 工作流进化只产生 allow-list提案，投资方法需重复证据和用户批准，版本可回滚，不能改代码、权限或自动化；
 - 认知路由按搜索、判断和机械表达选择 Terra、Sol、Luna及 effort，选择原因写入调用审计；
-- UI 已改为任务级单一 AI时间线和“我的消息”，包含 M0/M1/M2锚点、结果验证、复盘、判断修订和自然故障说明；
-- ASR波形、忙碌锁定、按任务草稿、追加转写以及当前任务股票/题材语境热词已经接入；
-- 持仓事实、自然语言成交解释、确定性事务、Markdown投影、冲突保护和可撤销反向事件已经接入。
+- UI 已增加每日通用对话，并保持 M0/M1/M2、结果验证、复盘、回执和故障说明为同一个伙伴的连续表达；
+- ASR波形、忙碌锁定、正式任务草稿、跨日稳定通用草稿、追加转写以及当前任务股票/题材语境热词已经接入；
+- 统一认知一次提取自然回复、命题和动作；持仓保留确定性事务、局部更新默认、显式完整快照、Markdown投影、冲突保护和可撤销事件，不再使用专用持仓语义调用。
 
 ## 19. 完成定义
 
@@ -340,7 +361,7 @@ Gate：历史回放无未来泄露；失败案例能被召回；检索器可由 
 4. M2只在有 H0时形成，并保留分歧；
 5. 每日全量、盘中增量和5分钟硬限制可审计；
 6. 关键故障自然说明，普通数据不完美不机械复读；
-7. UI按任务显示一条 AI时间线和一条我的消息时间线；
+7. UI对外始终是一个完整伙伴；每日通用对话和正式任务均显示连续 AI时间线与我的消息；
 8. 待提交消息可撤回，输入框草稿永不自动发送；
 9. 原始判断、错误观点和双时间事实不可覆盖；
-10. 确定性动作不消耗 LLM调用，额外认知步骤不能自行扩张。
+10. 每批用户文字只做一次通用语义理解；确定性动作不增加 LLM调用，额外认知步骤只能按认知收益与既定权限演进。

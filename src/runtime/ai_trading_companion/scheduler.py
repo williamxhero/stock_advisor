@@ -17,6 +17,15 @@ CATCH_UP_WINDOW = timedelta(minutes=15)
 RESEARCH_STALE_AFTER = timedelta(minutes=12)
 
 
+def conversation_auto_submit_at(config: dict[str, Any], target: datetime, default_lead_minutes: int) -> datetime | None:
+    override = config.get("conversation_auto_submit_lead_minutes")
+    if override is False:
+        return None
+    conversation_lead = default_lead_minutes if override is None else max(0, int(override))
+    work_lead = max(0, int((config.get("trigger") or {}).get("lead_minutes", 0)))
+    return target - timedelta(minutes=work_lead + conversation_lead)
+
+
 @dataclass(frozen=True)
 class DailySchedule:
     task_key: str

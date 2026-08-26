@@ -125,6 +125,9 @@ class CognitiveRouter:
         if stage == "m1_judgment" and not profile.m1_blind:
             problems.append("m1_packet_contains_human_input")
         snapshot = output.get("snapshot") if isinstance(output.get("snapshot"), dict) else None
+        if stage == "m1_judgment" and snapshot is not None:
+            if bool(output.get("judgment_qualified")) != bool(snapshot.get("qualified")):
+                problems.append("judgment_qualification_conflicts_with_snapshot")
         if stage in {"m1_judgment", "m2"} and snapshot:
             if snapshot.get("qualified") and snapshot.get("direction") in {"unknown", "unqualified"}:
                 problems.append("qualified_snapshot_has_no_direction")

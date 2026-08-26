@@ -13,7 +13,7 @@ foreach ($required in @(
     'scripts\run_companion_service.ps1'
 )) {
     $path = Join-Path $InstallRoot $required
-    if (-not (Test-Path -LiteralPath $path)) { throw "安装产物缺失：$path" }
+    if (-not (Test-Path -LiteralPath $path)) { throw "Required installation artifact is missing: $path" }
 }
 $env:AI_TRADING_COMPANION_INSTALL_ROOT = $InstallRoot
 $env:AI_TRADING_COMPANION_HOME = $CompanionHome
@@ -21,4 +21,4 @@ $env:PYTHONPATH = "$InstallRoot\runtime"
 $runtimePython = Join-Path $CompanionHome 'runtime\python\Scripts\python.exe'
 $python = if (Test-Path -LiteralPath $runtimePython) { $runtimePython } else { 'py' }
 & $python -m ai_trading_companion status | Out-Null
-Write-Output "AITradingCompanion 安装验证通过：$InstallRoot"
+Write-Output "AITradingCompanion installation verified: $InstallRoot"

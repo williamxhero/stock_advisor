@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from ai_trading_companion.engine import CompanionEngine, iso, parse
 from ai_trading_companion.__main__ import run_pending_premarket_reply
@@ -32,7 +33,43 @@ class CompanionEngineTests(unittest.TestCase):
 
     def ready(self) -> dict:
         self.engine.research_started(self.cycle["cycle_id"])
-        return self.engine.research_ready(self.cycle["cycle_id"], "今天先看客观信息。")
+        evidence_hash, compose_hash = "test-evidence", "test-compose"
+        return self.engine.research_ready(
+            self.cycle["cycle_id"], "今天先看客观信息。",
+            evidence_attempt_id=self.qualified("m0_research", evidence_hash, output={}),
+            compose_attempt_id=self.qualified("m0_compose", compose_hash, output={"m0_markdown": "今天先看客观信息。"}),
+            evidence_packet_hash=evidence_hash, packet_hash=compose_hash,
+        )
+
+    def qualified(self, stage: str, packet_hash: str, cycle_id: str | None = None, output: dict | None = None) -> str:
+        attempt = self.store.begin_attempt(cycle_id or self.cycle["cycle_id"], stage, iso(self.now), packet_hash)
+        self.store.finish_attempt(attempt["attempt_id"], "succeeded", output=output or {}, verifier={"passed": True, "problems": [], "fixture": True})
+        return attempt["attempt_id"]
+
+    def publish_fixture_m0(self, cycle_id: str, text: str = "m0") -> dict:
+        evidence_hash, compose_hash = "fixture-evidence", "fixture-compose"
+        return self.engine.research_ready(
+            cycle_id, text,
+            evidence_attempt_id=self.qualified("m0_research", evidence_hash, cycle_id, {}),
+            compose_attempt_id=self.qualified("m0_compose", compose_hash, cycle_id, {"m0_markdown": text}),
+            evidence_packet_hash=evidence_hash, packet_hash=compose_hash,
+        )
+
+    def publish_m1(self, text: str) -> dict:
+        research_hash, judgment_hash = "test-m1-research", "test-m1-judgment"
+        return self.engine.m1_ready(
+            self.cycle["cycle_id"], text,
+            research_attempt_id=self.qualified("m1_research", research_hash, output={}),
+            judgment_attempt_id=self.qualified("m1_judgment", judgment_hash, output={"m1_markdown": text}),
+            research_packet_hash=research_hash, judgment_packet_hash=judgment_hash,
+        )
+
+    def publish_m2(self, text: str) -> dict:
+        packet_hash = "test-m2"
+        return self.engine.m2_ready(
+            self.cycle["cycle_id"], text,
+            attempt_id=self.qualified("m2", packet_hash, output={"m2_markdown": text}), packet_hash=packet_hash,
+        )
 
     def stage(self, command_id: str, text: str) -> dict:
         return self.engine.command({
@@ -66,6 +103,33 @@ class CompanionEngineTests(unittest.TestCase):
         self.assertEqual("修正：冲高可能回落", h0["body_markdown"])
         self.assertEqual(1, len(result["user_messages"]))
         self.assertEqual("submitted", result["user_messages"][0]["state"])
+
+    def test_rejected_verifier_cannot_publish_m0(self):
+        self.engine.research_started(self.cycle["cycle_id"])
+        rejected = self.store.begin_attempt(self.cycle["cycle_id"], "m0_research", iso(self.now), "bad-evidence")
+        self.store.finish_attempt(rejected["attempt_id"], "rejected", verifier={"passed": False, "problems": ["missing"]})
+        compose = self.qualified("m0_compose", "good-compose", output={"m0_markdown": "should not publish"})
+        with self.assertRaisesRegex(ValueError, "not qualified"):
+            self.engine.research_ready(
+                self.cycle["cycle_id"], "should not publish",
+                evidence_attempt_id=rejected["attempt_id"], compose_attempt_id=compose,
+                evidence_packet_hash="bad-evidence", packet_hash="good-compose",
+            )
+        self.assertIsNone(self.store.latest_artifact(self.cycle["cycle_id"], "m0"))
+
+    def test_m0_artifact_state_and_outbox_are_one_transaction(self):
+        self.engine.research_started(self.cycle["cycle_id"])
+        evidence_hash, compose_hash = "atomic-evidence", "atomic-compose"
+        evidence = self.qualified("m0_research", evidence_hash, output={})
+        compose = self.qualified("m0_compose", compose_hash, output={"m0_markdown": "atomic"})
+        with patch.object(self.store, "queue_event", side_effect=RuntimeError("fault after state")):
+            with self.assertRaisesRegex(RuntimeError, "fault after state"):
+                self.engine.research_ready(
+                    self.cycle["cycle_id"], "atomic", evidence_attempt_id=evidence,
+                    compose_attempt_id=compose, evidence_packet_hash=evidence_hash, packet_hash=compose_hash,
+                )
+        self.assertIsNone(self.store.latest_artifact(self.cycle["cycle_id"], "m0"))
+        self.assertEqual("researching_m0", self.store.get_cycle(self.cycle["cycle_id"])["state"])
 
     def test_empty_h0_commit_means_no_comment_and_still_starts_blind_m1(self):
         self.ready()
@@ -158,12 +222,12 @@ class CompanionEngineTests(unittest.TestCase):
         self.engine.command({"command_id": "commit", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0"})
         self.engine.m1_judgment_started(self.cycle["cycle_id"])
 
-        result = self.engine.m1_ready(self.cycle["cycle_id"], "我的独立判断是减仓。")
+        result = self.publish_m1("我的独立判断是减仓。")
 
         self.assertEqual("synthesizing_m2", result["state"])
         with self.assertRaisesRegex(ValueError, "formal M1 already exists"):
-            self.engine.m1_ready(self.cycle["cycle_id"], "另一份 M1")
-        completed = self.engine.m2_ready(self.cycle["cycle_id"], "综合后仍然偏谨慎。")
+            self.publish_m1("另一份 M1")
+        completed = self.publish_m2("综合后仍然偏谨慎。")
         self.assertEqual("complete", completed["state"])
 
     def test_no_h0_skips_m2(self):
@@ -171,18 +235,44 @@ class CompanionEngineTests(unittest.TestCase):
         self.engine.command({"command_id": "commit", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0"})
         self.engine.m1_judgment_started(self.cycle["cycle_id"])
 
-        result = self.engine.m1_ready(self.cycle["cycle_id"], "独立判断为观望。")
+        result = self.publish_m1("独立判断为观望。")
 
         self.assertEqual("complete", result["state"])
         with self.assertRaisesRegex(ValueError, "M2 requires H0"):
-            self.engine.m2_ready(self.cycle["cycle_id"], "不应生成")
+            self.publish_m2("不应生成")
+
+    def test_unqualified_m1_never_starts_or_allows_m2(self):
+        self.ready()
+        self.stage("stage-unqualified", "偏弱")
+        self.engine.command({"command_id": "commit-unqualified", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0"})
+        self.engine.m1_judgment_started(self.cycle["cycle_id"])
+        research_hash, judgment_hash = "unqualified-research", "unqualified-judgment"
+        output = {
+            "m1_markdown": "证据不足，暂不形成判断。", "judgment_qualified": False,
+            "snapshot": {"qualified": False, "direction": "uncertain", "triggers": [], "invalidations": []},
+        }
+        result = self.engine.m1_ready(
+            self.cycle["cycle_id"], output["m1_markdown"],
+            research_attempt_id=self.qualified("m1_research", research_hash, output={}),
+            judgment_attempt_id=self.qualified("m1_judgment", judgment_hash, output=output),
+            research_packet_hash=research_hash, judgment_packet_hash=judgment_hash,
+            snapshot=output["snapshot"], qualified=False,
+        )
+        self.assertEqual("complete", result["state"])
+        packet_hash = "blocked-m2"
+        with self.assertRaisesRegex(ValueError, "qualified M1"):
+            self.engine.m2_ready(
+                self.cycle["cycle_id"], "不应生成",
+                attempt_id=self.qualified("m2", packet_hash, output={"m2_markdown": "不应生成"}),
+                packet_hash=packet_hash,
+            )
 
     def test_m2_memory_is_frozen_at_m1_completion(self):
         self.ready()
         self.stage("stage", "偏弱")
         self.engine.command({"command_id": "commit", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0"})
         self.engine.m1_judgment_started(self.cycle["cycle_id"])
-        self.engine.m1_ready(self.cycle["cycle_id"], "独立判断偏谨慎。")
+        self.publish_m1("独立判断偏谨慎。")
         cycle = self.store.get_cycle(self.cycle["cycle_id"])
         other = self.engine.start_cycle("daily.execution.1030", "2026-08-25T10:30:00+08:00", "2026-08-25T02:30:00Z")
         future_text = "M1完成之后才出现的信息不能进入原始M2"
@@ -413,7 +503,7 @@ class CompanionEngineTests(unittest.TestCase):
         def execute(cycle: dict) -> dict:
             completed.append(cycle["cycle_id"])
             self.engine.research_started(cycle["cycle_id"])
-            return self.engine.research_ready(cycle["cycle_id"], "m0")
+            return self.publish_fixture_m0(cycle["cycle_id"])
 
         at = datetime(2026, 8, 25, 2, 30, 30, tzinfo=timezone.utc)
         first = run_daily_schedule(self.engine, self.store, at, execute)
@@ -429,7 +519,7 @@ class CompanionEngineTests(unittest.TestCase):
         def execute(cycle: dict) -> dict:
             completed.append(cycle["scheduled_for"])
             self.engine.research_started(cycle["cycle_id"])
-            return self.engine.research_ready(cycle["cycle_id"], "m0")
+            return self.publish_fixture_m0(cycle["cycle_id"])
 
         at = datetime(2026, 8, 25, 0, 30, tzinfo=timezone.utc)
         results = run_daily_schedule(self.engine, self.store, at, execute)
@@ -472,7 +562,7 @@ class CompanionEngineTests(unittest.TestCase):
         def execute(cycle: dict) -> dict:
             completed.append(cycle["cycle_id"])
             self.engine.research_started(cycle["cycle_id"])
-            return self.engine.research_ready(cycle["cycle_id"], "m0")
+            return self.publish_fixture_m0(cycle["cycle_id"])
 
         _, periodic = load_schedules(PROJECT_ROOT / "resources")
         at = datetime(2026, 10, 2, 11, 31, tzinfo=timezone.utc)

@@ -55,7 +55,15 @@ class MemoryLibraryTests(unittest.TestCase):
             fake_secret = "api_key=" + "sk-proj-" + "abcdefghijklmnopqrstuvwxyz"
             assert_safe(fake_secret, boundary="test")
         self.engine.research_started(self.first["cycle_id"])
-        ready=self.engine.research_ready(self.first["cycle_id"], "M0")
+        attempts = []
+        for stage, packet_hash in (("m0_research", "test-evidence"), ("m0_compose", "test-compose")):
+            attempt = self.store.begin_attempt(self.first["cycle_id"], stage, "2026-08-25T01:45:00Z", packet_hash)
+            self.store.finish_attempt(attempt["attempt_id"], "succeeded", output={"m0_markdown": "M0"} if stage == "m0_compose" else {}, verifier={"passed": True, "fixture": True})
+            attempts.append(attempt["attempt_id"])
+        ready=self.engine.research_ready(
+            self.first["cycle_id"], "M0", evidence_attempt_id=attempts[0], compose_attempt_id=attempts[1],
+            evidence_packet_hash="test-evidence", packet_hash="test-compose",
+        )
         with self.assertRaisesRegex(ValueError, "secret guard"):
             self.engine._stage_message(ready, "Bearer abcdefghijklmnopqrstuvwxyz", None)
 

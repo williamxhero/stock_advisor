@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 from .credentials import read_secret
 from .research_tools import ResearchTools, ResearchToolError
@@ -41,6 +42,7 @@ class ProviderResult:
     usage: dict[str, Any]
     request_id: str | None
     tool_trace: list[dict[str, Any]]
+    validation: dict[str, Any] | None = None
 
 
 @dataclass
@@ -86,7 +88,13 @@ class ProviderClient:
         self._request(continuation, timeout)
         return {"available": True, "base_url": self._base_url(), "response_id": normal.get("id"), "stream_response_id": streamed.get("id"), "structured_response_id": structured.get("id"), "function_response_id": called.get("id")}
 
-    def run(self, prompt: str, schema: Path | None, *, slot: str, effort: str, search: bool, timeout: int, on_delta: Callable[[str], None] | None = None) -> ProviderResult:
+    def run(
+        self, prompt: str, schema: Path | None, *, slot: str, effort: str,
+        search: bool, timeout: int, on_delta: Callable[[str], None] | None = None,
+        research_validator: Callable[[dict[str, Any], list[dict[str, Any]]], dict[str, Any]] | None = None,
+        max_coverage_repairs: int = 2,
+        retry_stream_after_delta: bool = False,
+    ) -> ProviderResult:
         assert_safe(prompt, boundary="Provider input")
         started = time.monotonic()
         tools = ResearchTools(self.home, self.research) if search else None
@@ -95,14 +103,23 @@ class ProviderClient:
         model = self._model(slot)
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         deltas: list[str] = []
+        coverage_repairs = 0
+        forced_tool: str | None = None
         while True:
             remaining = max(1, timeout - int(time.monotonic() - started))
             # CPA accepts tools and JSON Schema independently, but its upstream
             # translation rejects the combination. Keep the research loop in
             # ordinary Chat Completions mode, then make one schema-only pass.
             payload_schema = schema if tools is None else None
-            payload = self._payload_from_messages(messages, model["id"], effort or model.get("effort") or "medium", schema=payload_schema, tools=tools, stream=on_delta is not None)
-            response, new_deltas = self._request_stream(payload, remaining, on_delta) if on_delta else (self._request(payload, remaining), [])
+            payload = self._payload_from_messages(
+                messages, model["id"], effort or model.get("effort") or "medium",
+                schema=payload_schema, tools=tools, stream=on_delta is not None,
+                forced_tool=forced_tool,
+            )
+            forced_tool = None
+            response, new_deltas = self._request_stream(
+                payload, remaining, on_delta, retry_after_delta=retry_stream_after_delta,
+            ) if on_delta else (self._request(payload, remaining), [])
             deltas.extend(new_deltas)
             calls = _tool_calls(response)
             if not calls:
@@ -115,8 +132,28 @@ class ProviderClient:
                     tools = None
                     deltas = []
                     continue
+                validation = None
+                if research_validator is not None:
+                    try:
+                        structured = json.loads(text)
+                    except json.JSONDecodeError as exc:
+                        raise ProviderError("Provider returned invalid structured research JSON", category="invalid_response") from exc
+                    validation = research_validator(structured, trace)
+                    if not validation.get("passed"):
+                        if coverage_repairs >= max_coverage_repairs:
+                            from .evidence_gate import EvidenceInsufficient
+                            raise EvidenceInsufficient(validation)
+                        coverage_repairs += 1
+                        messages.extend([
+                            {"role": "assistant", "content": text},
+                            {"role": "user", "content": self._coverage_repair_message(validation)},
+                        ])
+                        tools = ResearchTools(self.home, self.research)
+                        forced_tool = self._repair_tool(validation, trace)
+                        deltas = []
+                        continue
                 assert_safe(text, boundary="Provider output")
-                return ProviderResult(text, response.get("id"), [], response.get("usage") or {}, _request_id(response), trace)
+                return ProviderResult(text, response.get("id"), [], response.get("usage") or {}, _request_id(response), trace, validation)
             if tools is None:
                 raise ProviderError("Provider attempted an unavailable tool", category="tool_policy", request_id=_request_id(response))
             messages.append(_assistant_message(response))
@@ -124,6 +161,7 @@ class ProviderClient:
             for call in calls:
                 name = str(call.get("function", {}).get("name") or "")
                 call_id = str(call.get("id") or "")
+                arguments: dict[str, Any] = {}
                 try:
                     arguments = json.loads(str(call.get("function", {}).get("arguments") or "{}"))
                     if not isinstance(arguments, dict):
@@ -133,19 +171,100 @@ class ProviderClient:
                         raise ResearchToolError("provider repeated an identical research tool call")
                     seen_tool_calls.add(fingerprint)
                     result = tools.call(name, arguments)
-                    usable_tool_result = usable_tool_result or bool(result.get("results") or result.get("text") or result.get("content_sha256"))
-                    trace.append({"tool": name, "ok": True, "arguments": arguments, "result_sha256": _hash_json(result)})
+                    non_empty = bool(result.get("results") or result.get("text") or result.get("content_sha256"))
+                    usable_tool_result = usable_tool_result or non_empty
+                    observation = self._tool_observation(name, arguments, result, non_empty)
+                    trace.append(observation)
+                    result["runtime_observation_id"] = observation["observation_id"]
+                    item_hashes = {item["url"]: item["result_item_hash"] for item in observation["result_items"]}
+                    item_metadata = {item["url"]: item for item in observation["result_items"]}
+                    if result.get("url") in item_hashes:
+                        result["runtime_result_item_hash"] = item_hashes[result["url"]]
+                        result["runtime_source_family"] = item_metadata[result["url"]]["source_family"]
+                        result["runtime_upstream_id"] = item_metadata[result["url"]]["upstream_id"]
+                    for row in result.get("results") or []:
+                        if isinstance(row, dict) and row.get("url") in item_hashes:
+                            row["runtime_result_item_hash"] = item_hashes[row["url"]]
+                            row["runtime_source_family"] = item_metadata[row["url"]]["source_family"]
+                            row["runtime_upstream_id"] = item_metadata[row["url"]]["upstream_id"]
                 except (ValueError, ResearchToolError) as exc:
                     result = {"error": str(exc), "backend": name}
-                    trace.append({"tool": name, "ok": False, "error": str(exc)})
+                    trace.append({
+                        "tool": name, "backend": name, "operation": name, "ok": False,
+                        "status": "failed", "non_empty": False, "arguments": arguments if "arguments" in locals() else {},
+                        "result_urls": [], "result_items": [], "observation_id": str(uuid.uuid4()),
+                        "error_code": type(exc).__name__, "error": str(exc),
+                    })
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, ensure_ascii=False)})
-            if not usable_tool_result and trace and all(not item.get("ok") for item in trace):
-                raise CurrentInformationUnavailable("all configured current-information backends failed", category="current_information_unavailable", request_id=_request_id(response))
+
+    @staticmethod
+    def _tool_observation(name: str, arguments: dict[str, Any], result: dict[str, Any], non_empty: bool) -> dict[str, Any]:
+        urls: list[str] = []
+        if result.get("url"):
+            urls.append(str(result["url"]))
+        for row in result.get("results") or []:
+            if isinstance(row, dict) and row.get("url"):
+                urls.append(str(row["url"]))
+        result_items: list[dict[str, Any]] = []
+        rows_by_url = {
+            str(row.get("url")): row for row in result.get("results") or []
+            if isinstance(row, dict) and row.get("url")
+        }
+        for url in dict.fromkeys(urls):
+            row = rows_by_url.get(url) or result
+            evidence_text = str(row.get("snippet") or row.get("text") or row.get("title") or "")[:8000]
+            result_items.append({
+                "url": url,
+                "result_item_hash": _hash_json(row),
+                "title": str(row.get("title") or result.get("title") or ""),
+                "evidence_text": evidence_text,
+                "published_at": row.get("published_at"),
+                "acquired_at": result.get("acquired_at"),
+                "source_family": _source_family(url),
+                "upstream_id": urlsplit(url).netloc.lower(),
+            })
+        return {
+            "observation_id": str(uuid.uuid4()),
+            "tool": name,
+            "backend": str(result.get("backend") or name),
+            "operation": name,
+            "ok": True,
+            "status": "succeeded",
+            "non_empty": non_empty,
+            "arguments": arguments,
+            "acquired_at": result.get("acquired_at"),
+            "result_urls": list(dict.fromkeys(urls)),
+            "result_items": result_items,
+            "content_sha256": result.get("content_sha256") or _hash_json(result),
+            "result_sha256": _hash_json(result),
+        }
+
+    @staticmethod
+    def _coverage_repair_message(validation: dict[str, Any]) -> str:
+        return (
+            "EvidenceGate 拒绝结束研究。请只针对以下结构化缺口继续调用研究工具，"
+            "随后重新输出完整 JSON；不要用旧闻、推测或无时间戳材料补齐："
+            + json.dumps({
+                "problems": validation.get("problems") or [],
+                "missing_requirements": validation.get("missing_requirements") or [],
+                "attempted_backends": validation.get("attempted_backends") or [],
+            }, ensure_ascii=False)
+        )
+
+    @staticmethod
+    def _repair_tool(validation: dict[str, Any], trace: list[dict[str, Any]]) -> str:
+        attempted = {str(item.get("tool") or "") for item in trace}
+        failed_browse = any(item.get("tool") == "browse_page" and item.get("status") == "failed" for item in trace)
+        if failed_browse and "search_searxng" not in attempted:
+            return "search_searxng"
+        if "search_searxng" in attempted and "browse_page" not in attempted:
+            return "browse_page"
+        return "search_searxng"
 
     def _payload(self, prompt: str, model: str, effort: str, *, stream: bool = False) -> dict[str, Any]:
         return self._payload_from_messages([{"role": "user", "content": prompt}], model, effort, stream=stream)
 
-    def _payload_from_messages(self, messages: list[dict[str, Any]], model: str, effort: str, *, schema: Path | None = None, tools: ResearchTools | None = None, stream: bool = False) -> dict[str, Any]:
+    def _payload_from_messages(self, messages: list[dict[str, Any]], model: str, effort: str, *, schema: Path | None = None, tools: ResearchTools | None = None, stream: bool = False, forced_tool: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"model": model, "messages": messages, "reasoning_effort": effort}
         if stream:
             payload["stream"] = True
@@ -155,6 +274,8 @@ class ProviderClient:
         if tools:
             payload["tools"] = tools.definitions()
             payload["parallel_tool_calls"] = False
+            if forced_tool:
+                payload["tool_choice"] = {"type": "function", "function": {"name": forced_tool}}
         return payload
 
     def _model(self, slot: str) -> dict[str, Any]:
@@ -192,7 +313,10 @@ class ProviderClient:
             raise ProviderError("Provider returned invalid JSON", category="invalid_response") from exc
         raise ProviderError("Provider returned an invalid response", category="invalid_response")
 
-    def _request_stream(self, payload: dict[str, Any], timeout: int, on_delta: Callable[[str], None]) -> tuple[dict[str, Any], list[str]]:
+    def _request_stream(
+        self, payload: dict[str, Any], timeout: int, on_delta: Callable[[str], None],
+        *, retry_after_delta: bool = False,
+    ) -> tuple[dict[str, Any], list[str]]:
         published = False
         idempotency_key = str(uuid.uuid4())
 
@@ -201,7 +325,12 @@ class ProviderClient:
             published = True
             on_delta(delta)
 
-        return self._with_retries(lambda attempt_timeout: self._request_stream_once(payload, attempt_timeout, guarded_delta, idempotency_key=idempotency_key), timeout, can_retry=lambda: not published)
+        return self._with_retries(
+            lambda attempt_timeout: self._request_stream_once(
+                payload, attempt_timeout, guarded_delta, idempotency_key=idempotency_key,
+            ),
+            timeout, can_retry=lambda: retry_after_delta or not published,
+        )
 
     def _request_stream_once(self, payload: dict[str, Any], timeout: int, on_delta: Callable[[str], None], *, idempotency_key: str | None = None) -> tuple[dict[str, Any], list[str]]:
         request = self._request_object(payload, idempotency_key=idempotency_key)
@@ -268,7 +397,8 @@ class ProviderClient:
             if remaining <= 0:
                 break
             try:
-                result = operation(max(1, int(remaining)))
+                attempt_timeout = min(int(settings["per_attempt_timeout_seconds"]), max(1, int(remaining)))
+                result = operation(attempt_timeout)
                 self._record_circuit_success()
                 return result
             except ProviderError as exc:
@@ -291,7 +421,15 @@ class ProviderClient:
 
     def _retry_settings(self) -> dict[str, float | int]:
         raw = self.provider.get("retry") if isinstance(self.provider.get("retry"), dict) else {}
-        return {"max_attempts": max(1, int(raw.get("max_attempts", 5))), "initial_backoff_seconds": max(0.0, float(raw.get("initial_backoff_seconds", 1))), "max_backoff_seconds": max(0.0, float(raw.get("max_backoff_seconds", 8))), "circuit_breaker_failures": max(1, int(raw.get("circuit_breaker_failures", 5))), "circuit_breaker_cooldown_seconds": max(1.0, float(raw.get("circuit_breaker_cooldown_seconds", 30))), "probe_timeout_seconds": max(30, int(raw.get("probe_timeout_seconds", 180)))}
+        return {
+            "max_attempts": max(1, int(raw.get("max_attempts", 5))),
+            "per_attempt_timeout_seconds": max(15, int(raw.get("per_attempt_timeout_seconds", 90))),
+            "initial_backoff_seconds": max(0.0, float(raw.get("initial_backoff_seconds", 1))),
+            "max_backoff_seconds": max(0.0, float(raw.get("max_backoff_seconds", 8))),
+            "circuit_breaker_failures": max(1, int(raw.get("circuit_breaker_failures", 5))),
+            "circuit_breaker_cooldown_seconds": max(1.0, float(raw.get("circuit_breaker_cooldown_seconds", 30))),
+            "probe_timeout_seconds": max(30, int(raw.get("probe_timeout_seconds", 180))),
+        }
 
     def _assert_circuit_closed(self) -> None:
         key, current = self._base_url(), time.monotonic()
@@ -397,6 +535,18 @@ def _retry_after(value: str | None) -> float | None:
 def _hash_json(value: dict[str, Any]) -> str:
     import hashlib
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _source_family(url: str) -> str:
+    host = urlsplit(url).netloc.lower().split(":", 1)[0]
+    if host.endswith(".gov.cn") or host in {
+        "gov.cn", "www.gov.cn", "www.csrc.gov.cn", "www.sse.com.cn", "www.szse.cn",
+        "www.bse.cn", "www.cninfo.com.cn", "www.pbc.gov.cn", "www.stats.gov.cn",
+    }:
+        return "official"
+    if host in {"quote.eastmoney.com", "push2.eastmoney.com", "finance.sina.com.cn"}:
+        return "market_data"
+    return "media"
 
 
 def _schema_name(schema: Path) -> str:

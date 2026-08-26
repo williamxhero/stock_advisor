@@ -44,11 +44,29 @@ class ProviderClientTests(TestCase):
     def test_defaults_target_the_small_computer_services(self):
         self.assertEqual("http://yosef-server:8317/v1", DEFAULT_PROVIDER["base_url"])
         self.assertEqual("http://yosef-server:8801", DEFAULT_RESEARCH["searxng"]["base_url"])
+        self.assertEqual("gpt-5.6-luna", DEFAULT_PROVIDER["models"]["fast"]["id"])
         self.assertFalse(load_settings(self.home).provider_enabled)
 
     def test_default_circuit_breaker_allows_transient_cpa_failures_to_recover(self):
         self.assertEqual(5, DEFAULT_PROVIDER["retry"]["circuit_breaker_failures"])
         self.assertEqual(5, DEFAULT_PROVIDER["retry"]["max_attempts"])
+        self.assertEqual(90, DEFAULT_PROVIDER["retry"]["per_attempt_timeout_seconds"])
+
+    def test_long_stage_timeout_is_split_into_multiple_cpa_attempts(self):
+        self.provider["retry"] = {
+            "max_attempts": 3, "per_attempt_timeout_seconds": 90,
+            "initial_backoff_seconds": 0, "max_backoff_seconds": 0,
+        }
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        observed: list[int] = []
+
+        def fail(attempt_timeout: int):
+            observed.append(attempt_timeout)
+            raise ProviderError("CPA timeout", category="provider_timeout")
+
+        with self.assertRaises(ProviderError):
+            client._with_retries(fail, 300)
+        self.assertEqual([90, 90, 90], observed)
 
     def test_retries_transient_provider_failure_before_returning_a_response(self):
         self.provider["retry"] = {"max_attempts": 3, "initial_backoff_seconds": 0, "max_backoff_seconds": 0}
@@ -115,6 +133,30 @@ class ProviderClientTests(TestCase):
                 client._request_stream({"model": "test", "stream": True}, 20, lambda _delta: None)
         self.assertEqual(1, request.call_count)
 
+    def test_internal_research_stream_can_retry_after_unpublished_delta(self):
+        self.provider["retry"] = {"max_attempts": 3, "initial_backoff_seconds": 0, "max_backoff_seconds": 0}
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        recovered = {"id": "stream-ok", "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}]}
+
+        calls = 0
+
+        def partial_then_recover(_payload, _timeout, on_delta, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                on_delta("internal only")
+                raise ProviderError("Provider network request failed", category="provider_network")
+            return recovered, ["done"]
+
+        with patch.object(client, "_request_stream_once", side_effect=partial_then_recover) as request:
+            result, deltas = client._request_stream(
+                {"model": "test", "stream": True}, 20, lambda _delta: None,
+                retry_after_delta=True,
+            )
+        self.assertEqual("stream-ok", result["id"])
+        self.assertEqual(["done"], deltas)
+        self.assertEqual(2, request.call_count)
+
     def test_replays_assistant_tool_call_and_tool_output_in_standard_messages(self):
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
         call = {"id": "call_1", "type": "function", "function": {"name": "search_searxng", "arguments": '{"query":"A股"}'}}
@@ -145,6 +187,25 @@ class ProviderClientTests(TestCase):
         final_payload = request.call_args_list[2].args[0]
         self.assertIn("response_format", final_payload)
         self.assertNotIn("tools", final_payload)
+
+    def test_coverage_repair_forces_a_research_backend_after_zero_tool_calls(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        call = {"id": "call_1", "type": "function", "function": {"name": "search_searxng", "arguments": '{"query":"收盘"}'}}
+        responses = [
+            {"id": "r1", "choices": [{"message": {"role": "assistant", "content": "无需搜索"}}]},
+            {"id": "r2", "choices": [{"message": {"role": "assistant", "content": '{"ok":false}'}}]},
+            {"id": "r3", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [call]}}]},
+            {"id": "r4", "choices": [{"message": {"role": "assistant", "content": "已补查"}}]},
+            {"id": "r5", "choices": [{"message": {"role": "assistant", "content": '{"ok":true}'}}]},
+        ]
+        schema = self.home / "schema.json"
+        schema.write_text('{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}', encoding="utf-8")
+        validator = lambda output, trace: {"passed": bool(output.get("ok")) and bool(trace), "problems": [] if trace else ["no_current_information_tool_result"]}
+        with patch.object(client, "_request", side_effect=responses) as request, patch("ai_trading_companion.provider_client.ResearchTools.call", return_value={"backend": "searxng", "results": [{"url": "https://example.test/close"}], "acquired_at": "2026-08-26T08:00:00Z"}):
+            result = client.run("研究收盘", schema, slot="fast", effort="medium", search=True, timeout=30, research_validator=validator)
+        self.assertEqual('{"ok":true}', result.text)
+        self.assertEqual("search_searxng", request.call_args_list[2].args[0]["tool_choice"]["function"]["name"])
+        self.assertTrue(result.validation["passed"])
 
     def test_probe_uses_the_configured_slow_provider_timeout(self):
         self.provider["retry"] = {"probe_timeout_seconds": 91}

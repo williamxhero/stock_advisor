@@ -9,6 +9,8 @@ import os
 import sqlite3
 import time
 import sys
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,7 @@ from .config import load_settings, save_provider_settings
 from .credentials import write_secret
 from .provider_client import CurrentInformationUnavailable, ProviderClient, ProviderError, ProviderResult
 from .engine import CompanionEngine, iso
+from .evidence_gate import EvidenceGate, EvidenceInsufficient
 from .exchange import LocalExchange
 from .governance import RouterGovernance, classify_regime
 from .learning import JudgmentLifecycle, WorkflowEvolution
@@ -26,6 +29,7 @@ from .models import TASK_POLICIES
 from .packet_builder import RuntimePacketBuilder
 from .paths import RuntimePaths
 from .portfolio import PortfolioService, explicit_fixture_extraction, is_portfolio_statement
+from .preview import approve_bundle, build_bundle, find_source_cycle, launch_preview, seal_bundle, write_bundle
 from .projection import LearningProjectionRenderer
 from .scheduler import SHANGHAI, ensure_registered_policy, run_registry_schedule
 from .schedule_registry import ScheduleRegistry
@@ -41,6 +45,19 @@ WORKSPACE = PATHS.workspace
 RUNTIME = Path(os.environ.get("AI_TRADING_COMPANION_RUNTIME", str(PATHS.runtime)))
 DB = Path(os.environ.get("AI_TRADING_COMPANION_DATABASE", str(PATHS.database)))
 SCHEMAS = PATHS.contracts
+
+
+@dataclass(frozen=True)
+class VerifiedStageResult:
+    output: dict[str, Any]
+    provider: ProviderResult
+    attempt_id: str
+    packet_hash: str
+    verifier: dict[str, Any]
+
+    def __iter__(self):
+        yield self.output
+        yield self.provider
 
 
 def exchange_root() -> Path:
@@ -72,9 +89,9 @@ def _backup_before_schedule_migration() -> None:
     source = sqlite3.connect(DB)
     try:
         version = source.execute("PRAGMA user_version").fetchone()[0]
-        if version >= 10:
+        if version >= 11:
             return
-        target = RUNTIME / "backups" / "migrations" / f"before-provider-v10-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sqlite3"
+        target = RUNTIME / "backups" / "migrations" / f"before-evidence-v11-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sqlite3"
         target.parent.mkdir(parents=True, exist_ok=True)
         destination = sqlite3.connect(target)
         try:
@@ -146,7 +163,8 @@ def _call_stage(
     *,
     search: bool,
     timeout: int,
-) -> tuple[dict[str, Any], ProviderResult]:
+    retry_model_slot: str | None = None,
+) -> VerifiedStageResult:
     settings = load_settings(PATHS.home)
     router = CognitiveRouter(settings.provider)
     preliminary = router.plan(stage, packet, timeout, search)
@@ -156,6 +174,16 @@ def _call_stage(
     )
     plan = router.plan(stage, packet, timeout, search, str(cell["mode"]))
     decision = plan.selected
+    if retry_model_slot:
+        configured = settings.provider.get("models") if isinstance(settings.provider.get("models"), dict) else {}
+        retry_model = configured.get(retry_model_slot) if isinstance(configured.get(retry_model_slot), dict) else {}
+        decision = decision.__class__(
+            str(retry_model.get("id") or decision.model),
+            str(retry_model.get("effort") or decision.reasoning_effort),
+            decision.search, decision.timeout_seconds,
+            f"{decision.reason}；前次 Provider 超时，改用 {retry_model_slot} 模型槽执行冻结同包恢复",
+            retry_model_slot,
+        )
     decision_id = store.record_route_decision(
         cycle["cycle_id"], stage, plan.profile.cell_key, plan.mode, plan.profile.as_json(),
         plan.baseline.as_json(), plan.candidate.as_json() if plan.candidate else None, decision.as_json(),
@@ -166,35 +194,57 @@ def _call_stage(
         search_enabled=decision.search, timeout_seconds=decision.timeout_seconds,
         routing_reason=decision.reason, route_decision_id=decision_id,
         runner_fingerprint="chat-completions-v1",
+        input_packet=packet,
     )
     started = time.monotonic()
+    attempt_finished = False
     try:
+        requirements = packet.get("evidence_requirements") if search else None
+        research_validator = (
+            lambda output, trace: EvidenceGate().evaluate(output, requirements or [], trace, str(packet.get("as_of") or ""))
+        ) if search else None
         result = provider_client().run(
             RuntimePacketBuilder.prompt(packet), SCHEMAS / schema_name,
             timeout=decision.timeout_seconds,
             search=decision.search, slot=decision.model_slot, effort=decision.reasoning_effort,
+            research_validator=research_validator,
+            on_delta=(lambda _delta: None) if decision.search else None,
+            retry_stream_after_delta=decision.search,
         )
         data = json.loads(result.text)
         verifier = router.verify(stage, packet, data)
+        if result.validation is not None:
+            verifier = {
+                **verifier,
+                "passed": bool(verifier.get("passed")) and bool(result.validation.get("passed")),
+                "problems": list(dict.fromkeys([*(verifier.get("problems") or []), *(result.validation.get("problems") or [])])),
+                "evidence_gate": result.validation,
+            }
+        status = "succeeded" if verifier["passed"] else "rejected"
         store.finish_attempt(
             attempt["attempt_id"],
-            "succeeded",
+            status,
             output_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(),
+            output=data,
             usage=result.usage, verifier=verifier, provider_response_id=result.response_id,
             provider_request_id=result.request_id, tool_trace=result.tool_trace,
         )
-        if plan.mode == "shadow" and plan.candidate and verifier["passed"]:
+        attempt_finished = True
+        if not verifier["passed"]:
+            raise EvidenceInsufficient(verifier)
+        if not retry_model_slot and plan.mode == "shadow" and plan.candidate and verifier["passed"]:
             store.queue_router_shadow(
                 decision_id, cycle["cycle_id"], stage, packet, schema_name, plan.candidate.as_json(),
                 priority=1 if plan.profile.major else 0,
             )
-        return data, result
+        return VerifiedStageResult(data, result, attempt["attempt_id"], str(packet.get("sha256") or ""), verifier)
     except Exception as exc:
-        status = "timed_out" if isinstance(exc, TimeoutError) else "failed"
-        store.finish_attempt(
-            attempt["attempt_id"], status, error=str(exc),
-            provider_request_id=exc.request_id if isinstance(exc, ProviderError) else None,
-        )
+        if not attempt_finished:
+            status = "timed_out" if isinstance(exc, TimeoutError) else "failed"
+            store.finish_attempt(
+                attempt["attempt_id"], status, error=str(exc),
+                provider_request_id=exc.request_id if isinstance(exc, ProviderError) else None,
+            )
         # A promoted major XHigh route has a deliberately reserved Medium hedge
         # window.  It is sequential (not a duplicate parallel opinion), uses
         # the identical frozen packet, and is only used after the first run
@@ -208,15 +258,24 @@ def _call_stage(
                 search_enabled=hedge.search, timeout_seconds=remaining,
                 routing_reason="XHigh 未在预留窗口内完成，使用冻结同包 Medium 回退",
                 route_decision_id=decision_id, runner_fingerprint="chat-completions-v1",
+                input_packet=packet,
             )
             try:
                 result = provider_client().run(
                     RuntimePacketBuilder.prompt(packet), SCHEMAS / schema_name, timeout=remaining,
                     search=hedge.search, slot=hedge.model_slot, effort=hedge.reasoning_effort,
+                    research_validator=research_validator,
+                    on_delta=(lambda _delta: None) if hedge.search else None,
+                    retry_stream_after_delta=hedge.search,
                 )
                 data = json.loads(result.text); verifier = router.verify(stage, packet, data)
-                store.finish_attempt(hedge_attempt["attempt_id"], "succeeded", output_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(), usage=result.usage, verifier=verifier)
-                return data, result
+                if result.validation is not None:
+                    verifier = {**verifier, "passed": bool(verifier.get("passed")) and bool(result.validation.get("passed")), "problems": list(dict.fromkeys([*(verifier.get("problems") or []), *(result.validation.get("problems") or [])])), "evidence_gate": result.validation}
+                hedge_status = "succeeded" if verifier["passed"] else "rejected"
+                store.finish_attempt(hedge_attempt["attempt_id"], hedge_status, output_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(), output=data, usage=result.usage, verifier=verifier, provider_response_id=result.response_id, provider_request_id=result.request_id, tool_trace=result.tool_trace)
+                if not verifier["passed"]:
+                    raise EvidenceInsufficient(verifier)
+                return VerifiedStageResult(data, result, hedge_attempt["attempt_id"], str(packet.get("sha256") or ""), verifier)
             except Exception as hedge_error:
                 hedge_status = "timed_out" if isinstance(hedge_error, TimeoutError) else "failed"
                 store.finish_attempt(
@@ -279,6 +338,12 @@ def _latest_json_artifact(store: CompanionStore, cycle_id: str, kind: str) -> di
         return None
 
 
+def _fixture_attempt(store: CompanionStore, cycle_id: str, stage: str, packet_hash: str, output: dict[str, Any]) -> str:
+    attempt = store.begin_attempt(cycle_id, stage, iso(datetime.now(timezone.utc)), packet_hash, runner_fingerprint="fixture-v1")
+    store.finish_attempt(attempt["attempt_id"], "succeeded", output=output, verifier={"passed": True, "problems": [], "fixture": True})
+    return attempt["attempt_id"]
+
+
 def run_research(
     engine: CompanionEngine,
     store: CompanionStore,
@@ -293,31 +358,60 @@ def run_research(
     if not execute:
         evidence = {"as_of": cycle["as_of"], "spoken_summary": "Fixture 模式：等待真实公开信息搜索。", "sources": [], "critical_gaps": []}
         store.append_artifact(cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False), cycle["as_of"])
-        return engine.research_ready(cycle["cycle_id"], "Fixture 模式：这里会显示自然、无方向的 M0 客观观察。")
+        evidence_hash = "fixture-m0-research"
+        compose_hash = "fixture-m0-compose"
+        return engine.research_ready(
+            cycle["cycle_id"], "Fixture 模式：这里会显示自然、无方向的 M0 客观观察。",
+            evidence_attempt_id=_fixture_attempt(store, cycle["cycle_id"], "m0_research", evidence_hash, evidence),
+            compose_attempt_id=_fixture_attempt(store, cycle["cycle_id"], "m0_compose", compose_hash, {"m0_markdown": "Fixture 模式：这里会显示自然、无方向的 M0 客观观察。"}),
+            evidence_packet_hash=evidence_hash, packet_hash=compose_hash,
+        )
 
     policy = TASK_POLICIES[cycle["task_key"]]
     public_packet = builder.build(cycle, "m0_research")
     for number in range(1, 3):
         try:
-            evidence, _ = _call_stage(
-                store, cycle, "m0_research", public_packet, "companion-evidence-result-v1.schema.json",
-                search=True, timeout=int(policy.research_timeout.total_seconds()),
-            )
-            store.record_evidence(cycle, "m0_research", evidence)
-            store.append_artifact(
-                cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False),
-                evidence.get("as_of") or cycle["as_of"], {"public_only": True},
-            )
+            checkpoint = store.stage_checkpoint(cycle["cycle_id"], "m0_research", public_packet["sha256"])
+            if checkpoint:
+                evidence = checkpoint["output"]
+                evidence_attempt_id = checkpoint["attempt_id"]
+            else:
+                evidence_stage = _call_stage(
+                    store, cycle, "m0_research", public_packet, "companion-evidence-result-v2.schema.json",
+                    search=True, timeout=int(policy.research_timeout.total_seconds()),
+                    retry_model_slot="fast" if number > 1 else None,
+                )
+                evidence = evidence_stage.output
+                evidence_attempt_id = evidence_stage.attempt_id
+                store.save_stage_checkpoint(cycle["cycle_id"], "m0_research", public_packet["sha256"], evidence_attempt_id, evidence)
+                store.record_evidence(cycle, "m0_research", evidence)
+                store.append_artifact(
+                    cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False),
+                    evidence.get("as_of") or cycle["as_of"], {"public_only": True, "attempt_id": evidence_attempt_id},
+                )
             local_packet = builder.build(cycle, "m0_compose", evidence=evidence)
-            m0, local_result = _call_stage(
-                store, cycle, "m0_compose", local_packet, "companion-m0-result-v1.schema.json",
-                search=False, timeout=int(policy.m1_timeout.total_seconds()),
-            )
+            compose_checkpoint = store.stage_checkpoint(cycle["cycle_id"], "m0_compose", local_packet["sha256"])
+            if compose_checkpoint:
+                m0_output, compose_attempt_id = compose_checkpoint["output"], compose_checkpoint["attempt_id"]
+            else:
+                compose_stage = _call_stage(
+                    store, cycle, "m0_compose", local_packet, "companion-m0-result-v1.schema.json",
+                    search=False, timeout=int(policy.m1_timeout.total_seconds()),
+                )
+                m0_output, compose_attempt_id = compose_stage.output, compose_stage.attempt_id
+                store.save_stage_checkpoint(cycle["cycle_id"], "m0_compose", local_packet["sha256"], compose_attempt_id, m0_output)
             return engine.research_ready(
-                cycle["cycle_id"], m0["m0_markdown"], session_id=local_result.session_id,
-                packet_hash=local_packet["sha256"], evidence_as_of=evidence.get("as_of"),
+                cycle["cycle_id"], m0_output["m0_markdown"],
+                evidence_attempt_id=evidence_attempt_id, compose_attempt_id=compose_attempt_id,
+                evidence_packet_hash=public_packet["sha256"], packet_hash=local_packet["sha256"],
+                evidence_as_of=evidence.get("as_of"),
             )
         except Exception as exc:
+            if isinstance(exc, EvidenceInsufficient):
+                engine.research_failed(cycle["cycle_id"], str(exc), details=exc.verifier)
+                if on_progress:
+                    on_progress()
+                raise
             if number < 2:
                 engine.research_retrying(cycle["cycle_id"], str(exc), number + 1)
                 if on_progress:
@@ -346,37 +440,61 @@ def run_m1(
     builder = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store)
     if not execute:
         engine.m1_judgment_started(cycle_id)
-        result = engine.m1_ready(cycle_id, "Fixture 模式：这里会显示与 H0 隔离的独立 M1 判断。")
+        research_hash, judgment_hash = "fixture-m1-research", "fixture-m1-judgment"
+        result = engine.m1_ready(
+            cycle_id, "Fixture 模式：这里会显示与 H0 隔离的独立 M1 判断。",
+            research_attempt_id=_fixture_attempt(store, cycle_id, "m1_research", research_hash, {}),
+            judgment_attempt_id=_fixture_attempt(store, cycle_id, "m1_judgment", judgment_hash, {"m1_markdown": "Fixture 模式：这里会显示与 H0 隔离的独立 M1 判断。"}),
+            research_packet_hash=research_hash, judgment_packet_hash=judgment_hash,
+        )
         return result
 
     policy = TASK_POLICIES[cycle["task_key"]]
     prior_evidence = _latest_json_artifact(store, cycle_id, "evidence") or {}
+    research_as_of = iso(datetime.now(timezone.utc))
     for number in range(1, 3):
         try:
             public_packet = builder.build(
                 cycle, "m1_research", evidence=prior_evidence,
-                as_of=iso(datetime.now(timezone.utc)),
+                as_of=research_as_of,
             )
-            evidence, _ = _call_stage(
-                store, cycle, "m1_research", public_packet, "companion-evidence-result-v1.schema.json",
-                search=True, timeout=_deadline_timeout(cycle, int(policy.m1_timeout.total_seconds())),
-            )
-            store.record_evidence(cycle, "m1_research", evidence)
-            store.append_artifact(
-                cycle_id, "m1_evidence", "model", json.dumps(evidence, ensure_ascii=False),
-                evidence.get("as_of") or iso(datetime.now(timezone.utc)), {"public_only": True},
-            )
+            checkpoint = store.stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"])
+            if checkpoint:
+                evidence = checkpoint["output"]
+                evidence_attempt_id = checkpoint["attempt_id"]
+            else:
+                evidence_stage = _call_stage(
+                    store, cycle, "m1_research", public_packet, "companion-evidence-result-v2.schema.json",
+                    search=True, timeout=_deadline_timeout(cycle, int(policy.m1_timeout.total_seconds())),
+                    retry_model_slot="fast" if number > 1 else None,
+                )
+                evidence = evidence_stage.output
+                evidence_attempt_id = evidence_stage.attempt_id
+                store.save_stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"], evidence_attempt_id, evidence)
+                store.record_evidence(cycle, "m1_research", evidence)
+                store.append_artifact(
+                    cycle_id, "m1_evidence", "model", json.dumps(evidence, ensure_ascii=False),
+                    evidence.get("as_of") or iso(datetime.now(timezone.utc)), {"public_only": True, "attempt_id": evidence_attempt_id},
+                )
             cycle = engine.m1_judgment_started(cycle_id)
             local_packet = builder.build(
                 cycle, "m1_judgment", evidence=evidence,
                 as_of=str(evidence.get("as_of") or iso(datetime.now(timezone.utc))),
             )
-            judgment, _ = _call_stage(
-                store, cycle, "m1_judgment", local_packet, "companion-m1-result-v1.schema.json",
-                search=False, timeout=_deadline_timeout(cycle, int(policy.m1_timeout.total_seconds())),
-            )
+            judgment_checkpoint = store.stage_checkpoint(cycle_id, "m1_judgment", local_packet["sha256"])
+            if judgment_checkpoint:
+                judgment, judgment_attempt_id = judgment_checkpoint["output"], judgment_checkpoint["attempt_id"]
+            else:
+                judgment_stage = _call_stage(
+                    store, cycle, "m1_judgment", local_packet, "companion-m1-result-v1.schema.json",
+                    search=False, timeout=_deadline_timeout(cycle, int(policy.m1_timeout.total_seconds())),
+                )
+                judgment, judgment_attempt_id = judgment_stage.output, judgment_stage.attempt_id
+                store.save_stage_checkpoint(cycle_id, "m1_judgment", local_packet["sha256"], judgment_attempt_id, judgment)
             return engine.m1_ready(
                 cycle_id, judgment["m1_markdown"], as_of=evidence.get("as_of"),
+                research_attempt_id=evidence_attempt_id, judgment_attempt_id=judgment_attempt_id,
+                research_packet_hash=public_packet["sha256"], judgment_packet_hash=local_packet["sha256"],
                 snapshot=judgment.get("snapshot"), qualified=bool(judgment.get("judgment_qualified")),
             )
         except Exception as exc:
@@ -384,8 +502,8 @@ def run_m1(
                 remaining = _deadline_timeout(store.get_cycle(cycle_id), 60)
             except TimeoutError:
                 remaining = 0
-            retryable = number < 2 and remaining >= 30
-            engine.m1_failed(cycle_id, str(exc), retryable=retryable)
+            retryable = not isinstance(exc, EvidenceInsufficient) and number < 2 and remaining >= 30
+            engine.m1_failed(cycle_id, str(exc), retryable=retryable, details=exc.verifier if isinstance(exc, EvidenceInsufficient) else None)
             if not retryable:
                 raise
             cycle = store.get_cycle(cycle_id)
@@ -398,14 +516,66 @@ def run_m2(engine: CompanionEngine, store: CompanionStore, cycle_id: str, execut
     if cycle["state"] not in {"synthesizing_m2", "m2_deferred"}:
         return cycle
     if not execute:
-        return engine.m2_ready(cycle_id, "Fixture 模式：这里会显示 M0、H0和独立 M1的伴生综合 M2。")
+        packet_hash = "fixture-m2"
+        return engine.m2_ready(
+            cycle_id, "Fixture 模式：这里会显示 M0、H0和独立 M1的伴生综合 M2。",
+            attempt_id=_fixture_attempt(store, cycle_id, "m2", packet_hash, {"m2_markdown": "Fixture 模式：这里会显示 M0、H0和独立 M1的伴生综合 M2。"}), packet_hash=packet_hash,
+        )
     frozen_as_of = str(cycle.get("m1_completed_at") or cycle["as_of"])
     packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store).build(cycle, "m2", as_of=frozen_as_of)
-    data, _ = _call_stage(
+    stage_result = _call_stage(
         store, cycle, "m2", packet, "companion-m2-result-v1.schema.json",
         search=False, timeout=int(TASK_POLICIES[cycle["task_key"]].m2_timeout.total_seconds()),
     )
-    return engine.m2_ready(cycle_id, data["m2_markdown"], snapshot=data.get("snapshot"), as_of=frozen_as_of)
+    store.save_stage_checkpoint(cycle_id, "m2", packet["sha256"], stage_result.attempt_id, stage_result.output)
+    return engine.m2_ready(
+        cycle_id, stage_result.output["m2_markdown"], snapshot=stage_result.output.get("snapshot"), as_of=frozen_as_of,
+        attempt_id=stage_result.attempt_id, packet_hash=packet["sha256"],
+    )
+
+
+def run_preview_worker(source_cycle_id: str, preview_id: str, known_at: str, bundle_path: Path) -> dict[str, Any]:
+    engine, store, _exchange, portfolio = runtime()
+    source = store.get_cycle(source_cycle_id)
+    cycle = store.create_preview_cycle(source_cycle_id, known_at)
+    failure = None
+    try:
+        cycle = run_research(engine, store, cycle, True)
+        preview_deadline = iso(datetime.now(timezone.utc) + timedelta(minutes=45))
+        source_h0 = store.latest_artifact(source_cycle_id, "h0")
+        if source_h0:
+            metadata = json.loads(source_h0.get("metadata_json") or "{}")
+            metadata.update({"preview_frozen_from": source_h0["artifact_id"], "source_cycle_id": source_cycle_id})
+            h0 = store.append_artifact(
+                cycle["cycle_id"], "h0", "human", source_h0["body_markdown"], source_h0["as_of"], metadata,
+                occurred_at=source_h0.get("occurred_at"), known_at=source_h0.get("known_at"),
+            )
+            cycle = store.transition(
+                cycle["cycle_id"], "researching_m1", h0_locked_at=known_at,
+                h0_artifact_id=h0["artifact_id"], has_h0=1, m1_started_at=known_at,
+                m1_publish_deadline=preview_deadline,
+            )
+        else:
+            cycle = store.transition(
+                cycle["cycle_id"], "researching_m1", h0_locked_at=known_at, has_h0=0,
+                m1_started_at=known_at, m1_publish_deadline=preview_deadline,
+            )
+        cycle = run_m1(engine, store, portfolio, cycle["cycle_id"], True)
+        if cycle["state"] in {"synthesizing_m2", "m2_deferred"}:
+            cycle = run_m2(engine, store, cycle["cycle_id"], True)
+    except Exception as exc:
+        failure = {
+            "category": getattr(exc, "category", "runtime_error"),
+            "message": str(exc),
+            "verifier": getattr(exc, "verifier", None),
+        }
+    bundle = build_bundle(store, cycle["cycle_id"], source_cycle_id, preview_id, known_at)
+    if failure:
+        bundle["preview_status"] = "failed"
+        bundle["failure"] = failure
+        seal_bundle(bundle)
+    write_bundle(bundle, bundle_path)
+    return bundle
 
 
 def run_reflection(
@@ -977,6 +1147,16 @@ def main() -> int:
     diagnostic_rerun = sub.add_parser("diagnostic-rerun")
     diagnostic_rerun.add_argument("--cycle-id", required=True)
     diagnostic_rerun.add_argument("--execute", action="store_true")
+    preview_rerun = sub.add_parser("preview-rerun")
+    preview_rerun.add_argument("--date", required=True)
+    preview_rerun.add_argument("--cycle-id")
+    approve_preview = sub.add_parser("approve-preview")
+    approve_preview.add_argument("--preview-id", required=True)
+    preview_worker = sub.add_parser("_preview-worker")
+    preview_worker.add_argument("--source-cycle-id", required=True)
+    preview_worker.add_argument("--preview-id", required=True)
+    preview_worker.add_argument("--known-at", required=True)
+    preview_worker.add_argument("--bundle-path", type=Path, required=True)
     sub.add_parser("claim-scheduled-workers")
     consume_parser = sub.add_parser("consume-command")
     consume_parser.add_argument("--execute", action="store_true")
@@ -1002,7 +1182,25 @@ def main() -> int:
     browser_bootstrap = sub.add_parser("bootstrap-browser-profile")
     browser_bootstrap.add_argument("--source-user-data", type=Path)
     args = parser.parse_args()
+    if args.cmd == "preview-rerun":
+        source = {"cycle_id": args.cycle_id} if args.cycle_id else find_source_cycle(DB, args.date)
+        preview_id = f"{args.date.replace('-', '')}-1520-{uuid.uuid4().hex[:10]}"
+        known_at = iso(datetime.now(timezone.utc))
+        bundle = launch_preview(PATHS.home, DB, INSTALL_ROOT, source["cycle_id"], preview_id, known_at)
+        print(json.dumps({
+            "preview_id": bundle["preview_id"], "bundle_sha256": bundle["bundle_sha256"],
+            "source_cycle_id": bundle["source_cycle_id"], "cycle_state": bundle["cycle_state"],
+            "preview_status": bundle["preview_status"], "failure": bundle.get("failure"),
+            "known_at": bundle["known_at"],
+            "bundle_path": str(PATHS.home / "runtime" / "previews" / preview_id / "bundle.json"),
+        }, ensure_ascii=False, indent=2))
+        return 0
+    if args.cmd == "_preview-worker":
+        bundle = run_preview_worker(args.source_cycle_id, args.preview_id, args.known_at, args.bundle_path)
+        print(json.dumps({"preview_id": bundle["preview_id"], "bundle_sha256": bundle["bundle_sha256"]}, ensure_ascii=False))
+        return 0
     if args.cmd == "migrate-legacy":
+        _backup_before_schedule_migration()
         sources = LegacySources.defaults(INSTALL_ROOT)
         if args.legacy_root:
             legacy_root = args.legacy_root.resolve()
@@ -1038,6 +1236,13 @@ def main() -> int:
         print(json.dumps(ResearchTools(PATHS.home, settings.research).bootstrap_browser_profile(args.source_user_data), ensure_ascii=False, indent=2))
         return 0
     engine, store, exchange, portfolio = runtime()
+    if args.cmd == "approve-preview":
+        bundle_path = PATHS.home / "runtime" / "previews" / args.preview_id / "bundle.json"
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        approved = approve_bundle(store, bundle)
+        flush(store, exchange)
+        print(json.dumps(approved, ensure_ascii=False, indent=2))
+        return 0
     if args.cmd == "probe":
         print(json.dumps(provider_client().probe(), ensure_ascii=False, indent=2))
         return 0

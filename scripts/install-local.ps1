@@ -29,7 +29,7 @@ $env:AI_TRADING_COMPANION_INSTALL_ROOT = $app
 $env:AI_TRADING_COMPANION_HOME = $companionHome
 $env:PYTHONPATH = "$app\runtime"
 & $python -m ai_trading_companion migrate-legacy --legacy-root $root | Out-Host
-if ($LASTEXITCODE -ne 0) { throw '历史数据迁移失败；保留旧数据与旧安装，未启用新版本。' }
+if ($LASTEXITCODE -ne 0) { throw 'Legacy data migration failed; the previous data and installation remain unchanged.' }
 & (Join-Path $app 'scripts\verify-install.ps1') -InstallRoot $app -CompanionHome $companionHome
 
 if ($EnableStartup) {
@@ -42,4 +42,4 @@ if ($EnableStartup) {
     }
 }
 
-Write-Output "已安装 AI交易伙伴：$app"
+Write-Output "AI Trading Companion installed: $app"

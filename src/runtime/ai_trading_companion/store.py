@@ -133,6 +133,14 @@ class CompanionStore:
               as_of TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT,
               input_sha256 TEXT, output_sha256 TEXT, error TEXT,
               UNIQUE(cycle_id, stage, attempt_number));
+            CREATE TABLE IF NOT EXISTS stage_checkpoint (
+              cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              stage TEXT NOT NULL, packet_sha256 TEXT NOT NULL, attempt_id TEXT NOT NULL REFERENCES llm_attempt(attempt_id),
+              output_json TEXT NOT NULL, output_sha256 TEXT NOT NULL, created_at TEXT NOT NULL,
+              PRIMARY KEY(cycle_id,stage,packet_sha256));
+            CREATE TABLE IF NOT EXISTS preview_import (
+              preview_id TEXT PRIMARY KEY, bundle_sha256 TEXT NOT NULL, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              imported_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS companion_research_job (
               job_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL, source_artifact_id TEXT NOT NULL,
               public_scope_json TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -230,7 +238,7 @@ class CompanionStore:
               imported_artifact_id TEXT, imported_at TEXT NOT NULL,
               detail_json TEXT NOT NULL,
               PRIMARY KEY(source_name, source_id));
-            PRAGMA user_version = 10;
+            PRAGMA user_version = 11;
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
@@ -313,6 +321,8 @@ class CompanionStore:
                 "reasoning_tokens": "INTEGER",
                 "verifier_json": "TEXT",
                 "runner_fingerprint": "TEXT",
+                "input_packet_json": "TEXT",
+                "output_json": "TEXT",
             }.items():
                 if name not in attempt_columns:
                     c.execute(f"ALTER TABLE llm_attempt ADD COLUMN {name} {declaration}")
@@ -583,11 +593,14 @@ class CompanionStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def get_cycle(self, cycle_id: str) -> dict[str, Any]:
-        with self.connection() as c:
-            row=c.execute("SELECT * FROM companion_cycle WHERE cycle_id=?", (cycle_id,)).fetchone()
-            if not row: raise ValueError(f"unknown cycle: {cycle_id}")
+    def get_cycle(self, cycle_id: str, *, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
+        if connection is not None:
+            row = connection.execute("SELECT * FROM companion_cycle WHERE cycle_id=?", (cycle_id,)).fetchone()
+            if not row:
+                raise ValueError(f"unknown cycle: {cycle_id}")
             return dict(row)
+        with self.connection() as c:
+            return self.get_cycle(cycle_id, connection=c)
 
     def create_diagnostic_cycle(self, source_cycle_id: str, *, scheduled_for: str | None = None) -> dict[str, Any]:
         """Create an isolated rerun without claiming or rewriting a schedule slot."""
@@ -637,7 +650,35 @@ class CompanionStore:
                 )
         return self.get_cycle(cycle_id)
 
-    def transition(self, cycle_id: str, state: str, **fields: Any) -> dict[str, Any]:
+    def create_preview_cycle(self, source_cycle_id: str, known_at: str) -> dict[str, Any]:
+        """Create a full rerun cycle in an already isolated database copy."""
+        source = self.get_cycle(source_cycle_id)
+        snapshot = json.loads(source.get("schedule_snapshot_json") or "{}")
+        snapshot.update({
+            "preview_rerun": True,
+            "preview_rerun_of": source_cycle_id,
+            "preview_known_at": known_at,
+            "original_scheduled_for": source["scheduled_for"],
+        })
+        cycle_id = str(uuid.uuid4())
+        at = now()
+        with self.connection() as c:
+            revision = c.execute(
+                "SELECT COALESCE(MAX(revision),0)+1 FROM companion_cycle WHERE task_key=? AND scheduled_for=?",
+                (source["task_key"], source["scheduled_for"]),
+            ).fetchone()[0]
+            c.execute(
+                """INSERT INTO companion_cycle(
+                     cycle_id,task_key,scheduled_for,as_of,state,revision,schedule_id,schedule_revision,
+                     schedule_snapshot_json,created_at,updated_at)
+                   VALUES(?,?,?,?, 'queued',?,?,?,?,?,?)""",
+                (cycle_id, source["task_key"], source["scheduled_for"], known_at, revision,
+                 source.get("schedule_id"), source.get("schedule_revision"),
+                 json.dumps(snapshot, ensure_ascii=False, sort_keys=True), at, at),
+            )
+        return self.get_cycle(cycle_id)
+
+    def transition(self, cycle_id: str, state: str, *, connection: sqlite3.Connection | None = None, **fields: Any) -> dict[str, Any]:
         allowed={
             "as_of","human_deadline","voice_grace_deadline","m0_revealed_at","codex_session_id","packet_hash",
             "m1_publish_deadline","h0_auto_submit_at","h0_locked_at","h0_artifact_id","has_h0",
@@ -649,15 +690,17 @@ class CompanionStore:
         values=[state, now()]; assignments=["state=?", "updated_at=?"]
         for key,value in fields.items(): assignments.append(f"{key}=?"); values.append(value)
         values.append(cycle_id)
+        if connection is not None:
+            connection.execute(f"UPDATE companion_cycle SET {', '.join(assignments)}, revision=revision+1 WHERE cycle_id=?", values)
+            return self.get_cycle(cycle_id, connection=connection)
         with self.connection() as c:
-            c.execute(f"UPDATE companion_cycle SET {', '.join(assignments)}, revision=revision+1 WHERE cycle_id=?", values)
-        return self.get_cycle(cycle_id)
+            return self.transition(cycle_id, state, connection=c, **fields)
 
-    def append_artifact(self, cycle_id: str, kind: str, actor: str, body: str, as_of: str, metadata: dict[str, Any] | None=None, *, occurred_at: str | None=None, known_at: str | None=None) -> dict[str, Any]:
+    def append_artifact(self, cycle_id: str, kind: str, actor: str, body: str, as_of: str, metadata: dict[str, Any] | None=None, *, occurred_at: str | None=None, known_at: str | None=None, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
         if not body.strip(): raise ValueError("artifact body must not be empty")
         assert_safe(body, boundary="artifact fact storage")
         artifact_id=str(uuid.uuid4()); sealed=now(); metadata=metadata or {}
-        with self.connection() as c:
+        def insert(c: sqlite3.Connection) -> None:
             revision=c.execute("SELECT COALESCE(MAX(revision),0)+1 FROM narrative_artifact WHERE cycle_id=? AND kind=?", (cycle_id,kind)).fetchone()[0]
             c.execute(
                 """INSERT INTO narrative_artifact(
@@ -679,9 +722,16 @@ class CompanionStore:
                        VALUES(?,?,?,?,?,'pending',?)""",
                     (str(uuid.uuid4()), "artifact", artifact_id, digest(body), known_at or sealed, sealed),
                 )
+            result["revision"] = revision
+        result: dict[str, Any] = {}
+        if connection is not None:
+            insert(connection)
+        else:
+            with self.connection() as c:
+                insert(c)
         return {
             "artifact_id": artifact_id, "cycle_id": cycle_id, "kind": kind,
-            "revision": revision, "sha256": digest(body), "sealed_at": sealed,
+            "revision": result["revision"], "sha256": digest(body), "sealed_at": sealed,
             "as_of": as_of, "known_at": known_at or sealed,
         }
 
@@ -864,6 +914,7 @@ class CompanionStore:
         search_enabled: bool | None = None, timeout_seconds: int | None = None,
         routing_reason: str | None = None, route_decision_id: str | None = None,
         is_shadow: bool = False, runner_fingerprint: str | None = None,
+        input_packet: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         attempt_id = str(uuid.uuid4())
         started = now()
@@ -876,29 +927,32 @@ class CompanionStore:
                 """INSERT INTO llm_attempt(
                      attempt_id,cycle_id,stage,attempt_number,status,as_of,started_at,completed_at,
                      input_sha256,output_sha256,error,model,reasoning_effort,search_enabled,
-                     timeout_seconds,routing_reason,route_decision_id,is_shadow,runner_fingerprint)
-                   VALUES(?,?,?,?,?,?,?,NULL,?,NULL,NULL,?,?,?,?,?,?,?,?)""",
+                     timeout_seconds,routing_reason,route_decision_id,is_shadow,runner_fingerprint,input_packet_json)
+                   VALUES(?,?,?,?,?,?,?,NULL,?,NULL,NULL,?,?,?,?,?,?,?,?,?)""",
                 (attempt_id, cycle_id, stage, number, "running", as_of, started, input_sha256,
                  model, reasoning_effort, None if search_enabled is None else int(search_enabled),
-                 timeout_seconds, routing_reason, route_decision_id, int(is_shadow), runner_fingerprint),
+                 timeout_seconds, routing_reason, route_decision_id, int(is_shadow), runner_fingerprint,
+                 json.dumps(input_packet, ensure_ascii=False, sort_keys=True) if input_packet is not None else None),
             )
         return {"attempt_id": attempt_id, "attempt_number": number, "started_at": started}
 
-    def finish_attempt(self, attempt_id: str, status: str, *, output_sha256: str | None = None, error: str | None = None, usage: dict[str, Any] | None = None, verifier: dict[str, Any] | None = None, provider_response_id: str | None = None, provider_request_id: str | None = None, tool_trace: list[dict[str, Any]] | None = None) -> None:
-        if status not in {"succeeded", "failed", "timed_out"}:
+    def finish_attempt(self, attempt_id: str, status: str, *, output_sha256: str | None = None, output: dict[str, Any] | None = None, error: str | None = None, usage: dict[str, Any] | None = None, verifier: dict[str, Any] | None = None, provider_response_id: str | None = None, provider_request_id: str | None = None, tool_trace: list[dict[str, Any]] | None = None) -> None:
+        if status not in {"succeeded", "rejected", "failed", "timed_out"}:
             raise ValueError(f"invalid attempt status: {status}")
         with self.connection() as c:
             c.execute(
                 """UPDATE llm_attempt SET status=?,completed_at=?,output_sha256=?,error=?,usage_json=?,
                    input_tokens=?,cached_input_tokens=?,output_tokens=?,reasoning_tokens=?,verifier_json=?,
                    provider_response_id=?,provider_request_id=?,tool_trace_json=?,
-                   duration_ms=CAST((julianday(?) - julianday(started_at))*86400000 AS INTEGER) WHERE attempt_id=?""",
+                   output_json=?,duration_ms=CAST((julianday(?) - julianday(started_at))*86400000 AS INTEGER) WHERE attempt_id=?""",
                 (status, now(), output_sha256, error[-2000:] if error else None,
                  json.dumps(usage or {}, ensure_ascii=False, sort_keys=True),
                  (usage or {}).get("input_tokens"), (usage or {}).get("cached_input_tokens"),
                  (usage or {}).get("output_tokens"), (usage or {}).get("reasoning_tokens"),
                   json.dumps(verifier or {}, ensure_ascii=False, sort_keys=True), provider_response_id, provider_request_id,
-                  json.dumps(tool_trace or [], ensure_ascii=False, sort_keys=True), now(), attempt_id),
+                  json.dumps(tool_trace or [], ensure_ascii=False, sort_keys=True),
+                  json.dumps(output, ensure_ascii=False, sort_keys=True) if output is not None else None,
+                  now(), attempt_id),
             )
 
     def attempts(self, cycle_id: str) -> list[dict[str, Any]]:
@@ -907,6 +961,99 @@ class CompanionStore:
                 "SELECT * FROM llm_attempt WHERE cycle_id=? ORDER BY started_at,attempt_number",
                 (cycle_id,),
             )]
+
+    def verified_attempt(self, attempt_id: str, cycle_id: str, stage: str, packet_sha256: str | None) -> dict[str, Any]:
+        with self.connection() as c:
+            row = c.execute(
+                "SELECT * FROM llm_attempt WHERE attempt_id=? AND cycle_id=? AND stage=?",
+                (attempt_id, cycle_id, stage),
+            ).fetchone()
+        if not row:
+            raise ValueError("attempt does not belong to the requested cycle and stage")
+        result = dict(row)
+        verifier = json.loads(result.get("verifier_json") or "{}")
+        if result["status"] != "succeeded" or not verifier.get("passed"):
+            raise ValueError("attempt is not qualified for publication")
+        if packet_sha256 is not None and result.get("input_sha256") != packet_sha256:
+            raise ValueError("attempt packet hash does not match the frozen packet")
+        result["verifier"] = verifier
+        return result
+
+    def save_stage_checkpoint(self, cycle_id: str, stage: str, packet_sha256: str, attempt_id: str, output: dict[str, Any]) -> dict[str, Any]:
+        attempt = self.verified_attempt(attempt_id, cycle_id, stage, packet_sha256)
+        raw = json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        attempt_output = json.loads(attempt.get("output_json") or "null")
+        if attempt_output != output:
+            raise ValueError("checkpoint output does not match the verified attempt output")
+        with self.connection() as c:
+            c.execute(
+                """INSERT INTO stage_checkpoint(cycle_id,stage,packet_sha256,attempt_id,output_json,output_sha256,created_at)
+                   VALUES(?,?,?,?,?,?,?) ON CONFLICT(cycle_id,stage,packet_sha256) DO NOTHING""",
+                (cycle_id, stage, packet_sha256, attempt_id, raw, digest(raw), now()),
+            )
+            row = c.execute(
+                "SELECT * FROM stage_checkpoint WHERE cycle_id=? AND stage=? AND packet_sha256=?",
+                (cycle_id, stage, packet_sha256),
+            ).fetchone()
+        return dict(row)
+
+    def stage_checkpoint(self, cycle_id: str, stage: str, packet_sha256: str) -> dict[str, Any] | None:
+        with self.connection() as c:
+            row = c.execute(
+                "SELECT * FROM stage_checkpoint WHERE cycle_id=? AND stage=? AND packet_sha256=?",
+                (cycle_id, stage, packet_sha256),
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        self.verified_attempt(result["attempt_id"], cycle_id, stage, packet_sha256)
+        result["output"] = json.loads(result["output_json"])
+        return result
+
+    def valid_daily_baseline(self, trading_date: str, known_at: str) -> dict[str, Any] | None:
+        with self.connection() as c:
+            row = c.execute(
+                """SELECT c.*,m.body_markdown AS m0_text,m.known_at AS m0_known_at
+                   FROM companion_cycle c
+                   JOIN narrative_artifact m ON m.cycle_id=c.cycle_id AND m.kind='m0'
+                   WHERE c.task_key='daily.opportunity.0900' AND substr(c.scheduled_for,1,10)=?
+                     AND m.known_at<=? AND COALESCE(c.schedule_snapshot_json,'') NOT LIKE '%diagnostic_rerun%'
+                     AND EXISTS (SELECT 1 FROM llm_attempt a WHERE a.cycle_id=c.cycle_id AND a.stage='m0_research'
+                       AND a.status='succeeded' AND json_extract(a.verifier_json,'$.passed')=1
+                       AND json_extract(a.verifier_json,'$.evidence_gate.validator_version')=2)
+                     AND EXISTS (SELECT 1 FROM llm_attempt a WHERE a.cycle_id=c.cycle_id AND a.stage='m0_compose'
+                       AND a.status='succeeded' AND json_extract(a.verifier_json,'$.passed')=1)
+                   ORDER BY m.known_at DESC LIMIT 1""",
+                (trading_date, known_at),
+            ).fetchone()
+        if not row:
+            return None
+        return {"cycle_id": row["cycle_id"], "known_at": row["m0_known_at"], "summary": row["m0_text"]}
+
+    def frozen_judgments_before(self, trading_date: str, known_at: str, task_keys: tuple[str, ...]) -> list[dict[str, Any]]:
+        if not task_keys:
+            return []
+        placeholders = ",".join("?" for _ in task_keys)
+        with self.connection() as c:
+            rows = c.execute(
+                f"""SELECT c.task_key,c.scheduled_for,a.kind,a.body_markdown,a.as_of,a.known_at,s.snapshot_json
+                    FROM companion_cycle c JOIN narrative_artifact a ON a.cycle_id=c.cycle_id
+                    JOIN judgment_snapshot s ON s.artifact_id=a.artifact_id
+                    WHERE substr(c.scheduled_for,1,10)=? AND c.task_key IN ({placeholders})
+                      AND a.kind IN ('m1','m2') AND a.known_at<=?
+                      AND COALESCE(c.schedule_snapshot_json,'') NOT LIKE '%diagnostic_rerun%'
+                      AND EXISTS (SELECT 1 FROM llm_attempt attempt WHERE attempt.cycle_id=c.cycle_id
+                        AND attempt.stage=CASE WHEN a.kind='m1' THEN 'm1_judgment' ELSE 'm2' END
+                        AND attempt.status='succeeded' AND json_extract(attempt.verifier_json,'$.passed')=1)
+                    ORDER BY c.scheduled_for,a.kind""",
+                (trading_date, *task_keys, known_at),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["snapshot"] = json.loads(item.pop("snapshot_json"))
+            result.append(item)
+        return result
 
     def router_policy_cell(self, cell_key: str, baseline: dict[str, Any], candidate: dict[str, Any] | None) -> dict[str, Any]:
         self.initialize()
@@ -1062,7 +1209,7 @@ class CompanionStore:
 
     def record_evidence(self, cycle: dict[str, Any], stage: str, evidence: dict[str, Any]) -> list[str]:
         trading_date = cycle["scheduled_for"][:10]
-        known_at = str(evidence.get("as_of") or now())
+        known_at = now()
         inserted: list[str] = []
         sources = evidence.get("sources") if isinstance(evidence.get("sources"), list) else []
         with self.connection() as c:
@@ -1081,6 +1228,11 @@ class CompanionStore:
                     "task_key": cycle["task_key"],
                     "factual_reliability": source.get("factual_reliability"),
                     "market_propagation": source.get("market_propagation"),
+                    "published_at": source.get("published_at"),
+                    "source_family": source.get("source_family"),
+                    "upstream_id": source.get("upstream_id"),
+                    "tool_observation_id": source.get("tool_observation_id"),
+                    "result_item_hash": source.get("result_item_hash"),
                 }
                 changed = c.execute(
                     """INSERT OR IGNORE INTO evidence_ledger_entry(
@@ -1088,7 +1240,7 @@ class CompanionStore:
                          occurred_at,known_at,metadata_json,stage,content_sha256,coverage_state)
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,'observed')""",
                     (evidence_id, trading_date, cycle["cycle_id"], url, title, body,
-                     source.get("published_or_retrieved_at"), known_at,
+                     source.get("fact_as_of") or source.get("published_or_retrieved_at"), known_at,
                      json.dumps(metadata, ensure_ascii=False, sort_keys=True), stage, fingerprint),
                 ).rowcount
                 if changed:
@@ -1136,18 +1288,22 @@ class CompanionStore:
 
     def save_judgment_snapshot(
         self, artifact_id: str, cycle_id: str, kind: str, snapshot: dict[str, Any], as_of: str,
+        *, connection: sqlite3.Connection | None = None,
     ) -> dict[str, Any]:
         snapshot_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"judgment|{artifact_id}"))
         payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
-        with self.connection() as c:
+        def save(c: sqlite3.Connection) -> dict[str, Any]:
             c.execute(
                 """INSERT OR IGNORE INTO judgment_snapshot(
                      snapshot_id,artifact_id,cycle_id,kind,snapshot_json,as_of,created_at,verification_status)
                    VALUES(?,?,?,?,?,?,?,'unverified')""",
                 (snapshot_id, artifact_id, cycle_id, kind, payload, as_of, now()),
             )
-            row = c.execute("SELECT * FROM judgment_snapshot WHERE artifact_id=?", (artifact_id,)).fetchone()
-        return dict(row)
+            return dict(c.execute("SELECT * FROM judgment_snapshot WHERE artifact_id=?", (artifact_id,)).fetchone())
+        if connection is not None:
+            return save(connection)
+        with self.connection() as c:
+            return save(c)
 
     def judgment_snapshots(self, cycle_id: str | None = None) -> list[dict[str, Any]]:
         with self.connection() as c:
@@ -1157,9 +1313,9 @@ class CompanionStore:
                 rows = c.execute("SELECT * FROM judgment_snapshot ORDER BY created_at")
             return [dict(row) for row in rows]
 
-    def schedule_outcome(self, snapshot_id: str, horizon: str, due_at: str) -> dict[str, Any]:
+    def schedule_outcome(self, snapshot_id: str, horizon: str, due_at: str, *, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
         checkpoint_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"outcome|{snapshot_id}|{horizon}"))
-        with self.connection() as c:
+        def save(c: sqlite3.Connection) -> dict[str, Any]:
             c.execute(
                 """INSERT OR IGNORE INTO outcome_checkpoint(
                      checkpoint_id,snapshot_id,horizon,as_of,outcome_json,created_at,due_at,status,
@@ -1167,8 +1323,11 @@ class CompanionStore:
                    VALUES(?,?,?,'','{}',?,?, 'pending',NULL,NULL,0)""",
                 (checkpoint_id, snapshot_id, horizon, now(), due_at),
             )
-            row = c.execute("SELECT * FROM outcome_checkpoint WHERE checkpoint_id=?", (checkpoint_id,)).fetchone()
-        return dict(row)
+            return dict(c.execute("SELECT * FROM outcome_checkpoint WHERE checkpoint_id=?", (checkpoint_id,)).fetchone())
+        if connection is not None:
+            return save(connection)
+        with self.connection() as c:
+            return save(c)
 
     def due_outcomes(self, at: str, *, limit: int = 4) -> list[dict[str, Any]]:
         with self.connection() as c:
@@ -1346,9 +1505,14 @@ class CompanionStore:
         raw=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":"));
         with self.connection() as c:c.execute("INSERT INTO companion_command_receipt VALUES(?,?,?,?,?,?)",(command_id,cycle_id,command_type,digest(raw),now(),json.dumps(result,ensure_ascii=False,sort_keys=True)))
 
-    def queue_event(self, cycle_id: str, event_type: str, payload: dict[str, Any]) -> str:
+    def queue_event(self, cycle_id: str, event_type: str, payload: dict[str, Any], *, connection: sqlite3.Connection | None = None) -> str:
         event_id=str(uuid.uuid4())
-        with self.connection() as c:c.execute("INSERT INTO companion_outbox VALUES(?,?,?,?,?,NULL)",(event_id,cycle_id,event_type,json.dumps(payload,ensure_ascii=False,sort_keys=True),now()))
+        values = (event_id,cycle_id,event_type,json.dumps(payload,ensure_ascii=False,sort_keys=True),now())
+        if connection is not None:
+            connection.execute("INSERT INTO companion_outbox VALUES(?,?,?,?,?,NULL)", values)
+        else:
+            with self.connection() as c:
+                c.execute("INSERT INTO companion_outbox VALUES(?,?,?,?,?,NULL)", values)
         return event_id
 
     def pending_events(self) -> list[dict[str, Any]]:

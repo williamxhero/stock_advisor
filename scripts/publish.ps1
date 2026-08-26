@@ -13,7 +13,7 @@ if (Test-Path -LiteralPath $output) {
     $resolvedOutput = [IO.Path]::GetFullPath($output)
     $resolvedParent = [IO.Path]::GetFullPath($outputParent)
     if (-not $resolvedOutput.StartsWith($resolvedParent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "拒绝清理非发布目录：$resolvedOutput"
+        throw "Refusing to clean a directory outside the release output: $resolvedOutput"
     }
     Remove-Item -LiteralPath $output -Recurse -Force
 }
@@ -30,7 +30,7 @@ $publishArguments = @(
 if ($NoRestore) { $publishArguments += '--no-restore' }
 dotnet @publishArguments
 if ($LASTEXITCODE -ne 0) {
-    throw "dotnet publish 失败，未生成可用发布产物。"
+    throw "dotnet publish failed; no usable release artifact was generated."
 }
 
 foreach ($item in @(

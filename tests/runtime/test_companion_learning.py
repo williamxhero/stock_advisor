@@ -30,7 +30,7 @@ class CompanionLearningTests(unittest.TestCase):
     def cycle(self, task_key: str, scheduled: str, as_of: str) -> dict:
         return self.engine.start_cycle(task_key, scheduled, as_of)
 
-    def test_daily_public_ledger_drives_incremental_mode_and_preserves_gaps(self):
+    def test_partial_daily_ledger_does_not_fake_a_baseline_and_preserves_gaps(self):
         baseline = self.cycle("daily.opportunity.0900", "2026-08-25T09:00:00+08:00", "2026-08-25T01:00:00Z")
         evidence = {
             "as_of": "2026-08-25T01:20:00Z",
@@ -43,12 +43,17 @@ class CompanionLearningTests(unittest.TestCase):
             "critical_gaps": ["论坛样本暂时不可用"],
         }
         self.store.record_evidence(baseline, "m0_research", evidence)
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE evidence_ledger_entry SET known_at='2026-08-25T01:20:00Z' WHERE cycle_id=?",
+                (baseline["cycle_id"],),
+            )
         intraday = self.cycle("daily.execution.0945", "2026-08-25T09:45:00+08:00", "2026-08-25T01:45:00Z")
 
         packet = RuntimePacketBuilder(PROJECT_ROOT / "resources", PROJECT_ROOT / "data", self.store).build(intraday, "m0_research")
 
         scope = packet["public_research_scope"]
-        self.assertEqual("incremental", scope["mode"])
+        self.assertEqual("baseline_recovery", scope["mode"])
         self.assertIn("公告A", [item["title"] for item in scope["daily_ledger"]])
         self.assertIn("missing", [item["coverage_state"] for item in scope["daily_ledger"]])
 
@@ -176,6 +181,12 @@ class CompanionLearningTests(unittest.TestCase):
         blocked = router.plan("m1_judgment", {"task_key": "daily.execution.1430", "evidence": {"sources": [{}], "critical_gaps": ["网络不可用"]}}, 300, False)
         self.assertTrue(blocked.profile.data_blocked)
         self.assertIsNone(blocked.candidate)
+        conflict = router.verify("m1_judgment", {"task_key": "daily.execution.1430"}, {
+            "judgment_qualified": False,
+            "snapshot": {"qualified": True, "direction": "bullish", "triggers": ["x"], "invalidations": ["y"]},
+        })
+        self.assertFalse(conflict["passed"])
+        self.assertIn("judgment_qualification_conflicts_with_snapshot", conflict["problems"])
 
     def test_router_store_queues_frozen_shadow_with_daily_budget(self):
         cycle = self.cycle("daily.execution.1430", "2026-08-25T14:30:00+08:00", "2026-08-25T06:30:00Z")
@@ -236,7 +247,8 @@ class CompanionLearningTests(unittest.TestCase):
 
     def test_all_companion_output_schemas_are_strict_at_every_object(self):
         names = (
-            "companion-evidence-result-v1.schema.json", "companion-m0-result-v1.schema.json",
+            "companion-evidence-result-v1.schema.json", "companion-evidence-result-v2.schema.json",
+            "companion-m0-result-v1.schema.json",
             "companion-m1-result-v1.schema.json", "companion-m2-result-v1.schema.json",
             "companion-chat-result-v1.schema.json", "companion-reflection-result-v1.schema.json",
             "companion-outcome-result-v1.schema.json", "portfolio-interpretation-result-v1.schema.json",

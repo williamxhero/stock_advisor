@@ -32,6 +32,7 @@ DEFAULT_PROVIDER = {
     "store": True,
     "retry": {
         "max_attempts": 5,
+        "per_attempt_timeout_seconds": 90,
         "initial_backoff_seconds": 1,
         "max_backoff_seconds": 8,
         "circuit_breaker_failures": 5,
@@ -41,7 +42,7 @@ DEFAULT_PROVIDER = {
     "models": {
         "research": {"id": "gpt-5.6-terra", "effort": "medium"},
         "judgment": {"id": "gpt-5.6-sol", "effort": "medium"},
-        "fast": {"id": "gpt-5.6-terra", "effort": "medium"},
+        "fast": {"id": "gpt-5.6-luna", "effort": "medium"},
     },
 }
 

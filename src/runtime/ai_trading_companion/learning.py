@@ -103,7 +103,7 @@ def normalize_snapshot(value: dict[str, Any] | None, text: str, *, reference_at:
     base["invalidations"] = [str(item) for item in base.get("invalidations") or []]
     base["original_claims"] = [str(item) for item in base.get("original_claims") or _claims(text)]
     base["claims"] = [item for item in base.get("claims") or [] if isinstance(item, dict)]
-    base["qualified"] = bool(base.get("qualified"))
+    base["qualified"] = bool(qualified)
     return base
 
 
@@ -122,10 +122,11 @@ class JudgmentLifecycle:
         snapshot: dict[str, Any] | None = None,
         qualified: bool = True,
         reference_at: str | None = None,
+        connection: Any | None = None,
     ) -> dict[str, Any]:
         as_of = reference_at or artifact.get("as_of") or artifact.get("sealed_at") or now()
         frozen = normalize_snapshot(snapshot, text, reference_at=as_of, qualified=qualified)
-        cycle = self.store.get_cycle(artifact["cycle_id"])
+        cycle = self.store.get_cycle(artifact["cycle_id"], connection=connection)
         default_horizon = {
                 "daily.opportunity.0900": "开盘至09:45，并跟踪T+1/T+3/T+5",
                 "daily.execution.0945": "09:45至10:30，并跟踪T+1/T+3/T+5",
@@ -142,12 +143,12 @@ class JudgmentLifecycle:
                 claim["horizon"] = default_horizon
             if claim.get("benchmark") is None:
                 claim["benchmark"] = frozen["benchmark"]
-        row = self.store.save_judgment_snapshot(artifact["artifact_id"], artifact["cycle_id"], kind, frozen, as_of)
+        row = self.store.save_judgment_snapshot(artifact["artifact_id"], artifact["cycle_id"], kind, frozen, as_of, connection=connection)
         reference = datetime.fromisoformat(as_of.replace("Z", "+00:00")).astimezone(SHANGHAI)
         for horizon, weekdays in HORIZONS.items():
             due_day = _next_weekdays(reference, weekdays)
             due = datetime.combine(due_day.date(), time(16, 10), SHANGHAI)
-            self.store.schedule_outcome(row["snapshot_id"], horizon, due.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z"))
+            self.store.schedule_outcome(row["snapshot_id"], horizon, due.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z"), connection=connection)
         return row
 
     def record_outcome(self, checkpoint: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:

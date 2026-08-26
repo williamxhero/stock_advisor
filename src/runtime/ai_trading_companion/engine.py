@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -83,10 +84,13 @@ class CompanionEngine:
         self.emit(cycle, "m0.started", cycle)
         return cycle
 
-    def research_failed(self, cycle_id: str, reason: str) -> dict[str, Any]:
+    def research_failed(self, cycle_id: str, reason: str, *, details: dict[str, Any] | None = None) -> dict[str, Any]:
+        message = self._stage_failure_message("M0", reason, details)
+        if details:
+            self.store.append_artifact(cycle_id, "stage_failure", "system", message, iso(utc_now()), {"stage": "m0_research", "details": details})
         cycle = self.store.transition(cycle_id, "failed")
         self.emit(cycle, "research.failed", {
-            "cycle": cycle, "reason": self._user_fault_message(reason, "M0"),
+            "cycle": cycle, "reason": message,
             "diagnostic_code": self._diagnostic_code(reason),
         })
         return cycle
@@ -119,23 +123,20 @@ class CompanionEngine:
         self,
         cycle_id: str,
         m0: str,
-        _legacy_hidden_m0: str | None = None,
-        session_id: str | None = None,
-        packet_hash: str | None = None,
         *,
+        evidence_attempt_id: str,
+        compose_attempt_id: str,
+        evidence_packet_hash: str,
+        packet_hash: str,
         evidence_as_of: str | None = None,
     ) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
         if cycle["state"] not in {"researching_m0", "researching"}:
             raise ValueError(f"cycle is not researching M0: {cycle['state']}")
-        artifact = self.store.append_artifact(
-            cycle_id,
-            "m0",
-            "model",
-            m0,
-            evidence_as_of or cycle["as_of"],
-            {"direction_free": True},
-        )
+        self.store.verified_attempt(evidence_attempt_id, cycle_id, "m0_research", evidence_packet_hash)
+        compose_attempt = self.store.verified_attempt(compose_attempt_id, cycle_id, "m0_compose", packet_hash)
+        if json.loads(compose_attempt.get("output_json") or "null") != {"m0_markdown": m0}:
+            raise ValueError("M0 body does not match the verified compose attempt")
         ready_at = utc_now()
         policy = TASK_POLICIES[cycle["task_key"]]
         reserve_seconds, timing_version = self.store.effective_m1_reserve(
@@ -144,28 +145,25 @@ class CompanionEngine:
         auto_submit, publish = policy.deadlines(
             cycle["scheduled_for"], ready_at, reserve=timedelta(seconds=reserve_seconds),
         )
-        cycle = self.store.transition(
-            cycle_id,
-            "awaiting_h0",
-            human_deadline=iso(auto_submit),
-            h0_auto_submit_at=iso(auto_submit),
-            m1_publish_deadline=iso(publish),
-            codex_session_id=session_id,
-            packet_hash=packet_hash,
-            m1_reserve_seconds=reserve_seconds,
-            timing_policy_version=timing_version,
-        )
-        self.emit(
-            cycle,
-            "m0.ready",
-            {
+        with self.store.connection() as connection:
+            artifact = self.store.append_artifact(
+                cycle_id, "m0", "model", m0, evidence_as_of or cycle["as_of"],
+                {"direction_free": True, "evidence_attempt_id": evidence_attempt_id, "compose_attempt_id": compose_attempt_id},
+                connection=connection,
+            )
+            cycle = self.store.transition(
+                cycle_id, "awaiting_h0", connection=connection,
+                human_deadline=iso(auto_submit), h0_auto_submit_at=iso(auto_submit),
+                m1_publish_deadline=iso(publish), packet_hash=packet_hash,
+                m1_reserve_seconds=reserve_seconds, timing_policy_version=timing_version,
+            )
+            self.store.queue_event(cycle_id, "m0.ready", {
                 "cycle": cycle,
                 "m0": m0,
                 "source_artifact_id": artifact["artifact_id"],
                 "h0_auto_submit_at": cycle["h0_auto_submit_at"],
                 "m1_publish_deadline": cycle["m1_publish_deadline"],
-            },
-        )
+            }, connection=connection)
         return cycle
 
     def command(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -366,57 +364,108 @@ class CompanionEngine:
 
     def m1_ready(
         self, cycle_id: str, m1: str, *, as_of: str | None = None,
+        research_attempt_id: str, judgment_attempt_id: str,
+        research_packet_hash: str, judgment_packet_hash: str,
         snapshot: dict[str, Any] | None = None, qualified: bool = True,
     ) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
+        self.store.verified_attempt(research_attempt_id, cycle_id, "m1_research", research_packet_hash)
+        judgment_attempt = self.store.verified_attempt(judgment_attempt_id, cycle_id, "m1_judgment", judgment_packet_hash)
+        verified_output = json.loads(judgment_attempt.get("output_json") or "null")
+        if not isinstance(verified_output, dict) or verified_output.get("m1_markdown") != m1:
+            raise ValueError("M1 body does not match the verified judgment attempt")
+        verified_snapshot = verified_output.get("snapshot") if isinstance(verified_output.get("snapshot"), dict) else snapshot
+        verified_qualified = bool(verified_output.get("judgment_qualified", qualified))
+        if isinstance(verified_snapshot, dict) and bool(verified_snapshot.get("qualified")) != verified_qualified:
+            raise ValueError("M1 judgment qualification conflicts with the verified snapshot")
+        if snapshot is not None and verified_output.get("snapshot") is not None and snapshot != verified_output.get("snapshot"):
+            raise ValueError("M1 snapshot does not match the verified judgment attempt")
         recovered = any(attempt["status"] in {"failed", "timed_out"} for attempt in self.store.attempts(cycle_id))
         if self.store.latest_artifact(cycle_id, "m1"):
             raise ValueError("formal M1 already exists")
         if cycle["state"] not in {"researching_m1", "judging_m1", "m1_retry_wait"}:
             raise ValueError(f"M1 cannot be published from: {cycle['state']}")
-        artifact = self.store.append_artifact(cycle_id, "m1", "model", m1, as_of or iso(utc_now()), {"blind_to_h0": True})
-        self.judgments.capture(artifact, "m1", m1, snapshot=snapshot, qualified=qualified)
         completed = iso(utc_now())
-        next_state = "synthesizing_m2" if bool(cycle.get("has_h0")) else "complete"
-        cycle = self.store.transition(
-            cycle_id,
-            next_state,
-            m1_completed_at=completed,
-            m2_started_at=completed if next_state == "synthesizing_m2" else None,
-        )
+        next_state = "synthesizing_m2" if bool(cycle.get("has_h0")) and verified_qualified else "complete"
+        with self.store.connection() as connection:
+            artifact = self.store.append_artifact(
+                cycle_id, "m1", "model", m1, as_of or iso(utc_now()),
+                {"blind_to_h0": True, "research_attempt_id": research_attempt_id, "judgment_attempt_id": judgment_attempt_id},
+                connection=connection,
+            )
+            self.judgments.capture(
+                artifact, "m1", m1, snapshot=verified_snapshot,
+                qualified=verified_qualified, connection=connection,
+            )
+            cycle = self.store.transition(
+                cycle_id, next_state, connection=connection, m1_completed_at=completed,
+                m2_started_at=completed if next_state == "synthesizing_m2" else None,
+            )
+            self.store.queue_event(
+                cycle_id, "m1.ready", {"cycle": cycle, "m1": m1, "source_artifact_id": artifact["artifact_id"]},
+                connection=connection,
+            )
+            if next_state == "synthesizing_m2":
+                self.store.queue_event(cycle_id, "m2.started", {"cycle": cycle}, connection=connection)
         if recovered:
             self.emit(cycle, "m1.recovered", {
                 "cycle": cycle,
                 "message": "刚才 M1 因运行配置问题有所延迟，系统已修复并重新完成；最终判断使用的是修复后的完整流程。",
             })
-        self.emit(cycle, "m1.ready", {"cycle": cycle, "m1": m1, "source_artifact_id": artifact["artifact_id"]})
-        if next_state == "synthesizing_m2":
-            self.emit(cycle, "m2.started", {"cycle": cycle})
         return cycle
 
-    def m1_failed(self, cycle_id: str, reason: str, *, retryable: bool) -> dict[str, Any]:
+    def m1_failed(self, cycle_id: str, reason: str, *, retryable: bool, details: dict[str, Any] | None = None) -> dict[str, Any]:
+        message = self._stage_failure_message("M1", str(reason), details)
+        if details and not retryable:
+            self.store.append_artifact(cycle_id, "stage_failure", "system", message, iso(utc_now()), {"stage": "m1_research", "details": details})
         cycle = self.store.transition(cycle_id, "m1_retry_wait" if retryable else "waiting_for_repair")
         self.emit(cycle, "m1.failed", {
-            "cycle": cycle, "reason": self._user_fault_message(reason, "M1"),
-            "diagnostic_code": self._diagnostic_code(reason), "retryable": retryable,
+            "cycle": cycle, "reason": message,
+            "diagnostic_code": self._diagnostic_code(str(reason)), "retryable": retryable,
         })
         return cycle
 
+    @classmethod
+    def _stage_failure_message(cls, stage: str, reason: str, details: dict[str, Any] | None) -> str:
+        if not details:
+            return cls._user_fault_message(reason, stage)
+        missing = "、".join(str(item) for item in details.get("missing_requirements") or []) or "关键事实覆盖"
+        backends = "、".join(str(item) for item in details.get("attempted_backends") or []) or "未取得可用后端结果"
+        return f"{stage} 未发布：缺少 {missing}；已尝试 {backends}。需要取得同一时点、可回溯到本轮工具结果的证据后再运行。"
+
     def m2_ready(
         self, cycle_id: str, m2: str, *, as_of: str | None = None,
-        snapshot: dict[str, Any] | None = None,
+        attempt_id: str, packet_hash: str, snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
+        verified_attempt = self.store.verified_attempt(attempt_id, cycle_id, "m2", packet_hash)
+        verified_output = json.loads(verified_attempt.get("output_json") or "null")
+        if not isinstance(verified_output, dict) or verified_output.get("m2_markdown") != m2:
+            raise ValueError("M2 body does not match the verified synthesis attempt")
         if not cycle.get("has_h0"):
             raise ValueError("M2 requires H0")
+        m1_snapshots = [row for row in self.store.judgment_snapshots(cycle_id) if row.get("kind") == "m1"]
+        if not m1_snapshots or not bool(json.loads(m1_snapshots[-1]["snapshot_json"]).get("qualified")):
+            raise ValueError("M2 requires a qualified M1 judgment")
         if self.store.latest_artifact(cycle_id, "m2"):
             raise ValueError("formal M2 already exists")
         if cycle["state"] not in {"synthesizing_m2", "m2_deferred"}:
             raise ValueError(f"M2 cannot be published from: {cycle['state']}")
-        artifact = self.store.append_artifact(cycle_id, "m2", "model", m2, as_of or iso(utc_now()))
-        self.judgments.capture(artifact, "m2", m2, snapshot=snapshot)
-        cycle = self.store.transition(cycle_id, "complete", m2_completed_at=iso(utc_now()))
-        self.emit(cycle, "m2.ready", {"cycle": cycle, "m2": m2, "source_artifact_id": artifact["artifact_id"]})
+        with self.store.connection() as connection:
+            artifact = self.store.append_artifact(
+                cycle_id, "m2", "model", m2, as_of or iso(utc_now()),
+                {"attempt_id": attempt_id}, connection=connection,
+            )
+            self.judgments.capture(
+                artifact, "m2", m2, snapshot=snapshot,
+                qualified=bool(snapshot.get("qualified")) if isinstance(snapshot, dict) else True,
+                connection=connection,
+            )
+            cycle = self.store.transition(cycle_id, "complete", connection=connection, m2_completed_at=iso(utc_now()))
+            self.store.queue_event(
+                cycle_id, "m2.ready", {"cycle": cycle, "m2": m2, "source_artifact_id": artifact["artifact_id"]},
+                connection=connection,
+            )
         return cycle
 
     def m2_deferred(self, cycle_id: str, reason: str) -> dict[str, Any]:
@@ -492,10 +541,6 @@ class CompanionEngine:
         })
         return artifact
 
-    # Compatibility for the former single synthesis stage.
-    def synthesis_ready(self, cycle_id: str, m1: str) -> dict[str, Any]:
-        return self.m1_ready(cycle_id, m1)
-
     def _projection(self, cycle: dict[str, Any]) -> dict[str, Any]:
         artifacts = self.store.artifacts(cycle["cycle_id"])
         ai_kinds = {
@@ -549,6 +594,7 @@ class CompanionEngine:
         if "provider_timeout" in lowered: return "provider_timeout"
         if "timed out" in lowered or "timeout" in lowered: return "timeout"
         if "current_information_unavailable" in lowered: return "current_information_unavailable"
+        if "evidence_insufficient" in lowered: return "evidence_insufficient"
         if "provider_not_configured" in lowered: return "provider_not_configured"
         if "provider_auth" in lowered: return "provider_auth"
         if "provider_quota" in lowered or "provider_rate_limited" in lowered: return "provider_quota"
@@ -563,6 +609,7 @@ class CompanionEngine:
             "output_schema_invalid": f"{stage} 因输出格式配置错误中断。这不是市场信息缺失；系统会在修复配置后重新执行。",
             "timeout": f"{stage} 本次运行超时，当前信息可能不完整；系统会在时效窗口内重试。",
             "current_information_unavailable": f"{stage} 的当前信息后端都没有取得可用资料，系统不会据此生成市场结论。",
+            "evidence_insufficient": f"{stage} 的关键事实仍未达到可核验标准，系统只保留缺口记录，不生成正式研判。",
             "provider_not_configured": f"{stage} 尚未配置可用的 Provider，系统没有生成结论。",
             "provider_auth": f"{stage} 的 Provider 认证失败，系统没有生成结论。",
             "provider_quota": f"{stage} 的 Provider 当前额度或限流不可用，系统没有生成结论。",

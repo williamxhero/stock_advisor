@@ -181,6 +181,28 @@ class ProviderClientTests(TestCase):
         self.assertEqual(["done"], deltas)
         self.assertEqual(2, request.call_count)
 
+    def test_stream_request_enforces_absolute_deadline_despite_continuous_events(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.headers = {}
+        response.__iter__ = Mock(return_value=iter([
+            b'data: {"id":"stream","choices":[{"delta":{"content":"working"}}]}\n',
+            b': keep-alive\n',
+        ]))
+
+        with patch.object(client, "_request_object", return_value=Mock()), patch(
+            "ai_trading_companion.provider_client.urlopen", return_value=response,
+        ), patch(
+            "ai_trading_companion.provider_client.time.monotonic", side_effect=[0.0, 0.1, 21.0],
+        ):
+            with self.assertRaises(ProviderError) as raised:
+                client._request_stream_once({"model": "test", "stream": True}, 20, lambda _delta: None)
+
+        self.assertEqual("provider_timeout", raised.exception.category)
+        self.assertIn("absolute deadline", str(raised.exception))
+
     def test_replays_assistant_tool_call_and_tool_output_in_standard_messages(self):
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
         call = {"id": "call_1", "type": "function", "function": {"name": "search_searxng", "arguments": '{"query":"A股"}'}}

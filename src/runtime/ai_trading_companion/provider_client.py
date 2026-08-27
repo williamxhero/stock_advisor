@@ -426,6 +426,7 @@ class ProviderClient:
 
     def _request_stream_once(self, payload: dict[str, Any], timeout: int, on_delta: Callable[[str], None], *, idempotency_key: str | None = None) -> tuple[dict[str, Any], list[str]]:
         request = self._request_object(payload, idempotency_key=idempotency_key)
+        absolute_deadline = time.monotonic() + timeout
         response_data: dict[str, Any] = {"object": "chat.completion", "choices": [{"index": 0, "message": {"role": "assistant", "content": None}, "finish_reason": None}]}
         content: list[str] = []
         tool_calls: dict[int, dict[str, Any]] = {}
@@ -433,6 +434,11 @@ class ProviderClient:
         try:
             with urlopen(request, timeout=timeout) as response:
                 for raw in response:
+                    if time.monotonic() >= absolute_deadline:
+                        raise ProviderError(
+                            "Provider streaming request exceeded its absolute deadline",
+                            category="provider_timeout",
+                        )
                     line = raw.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
                         continue

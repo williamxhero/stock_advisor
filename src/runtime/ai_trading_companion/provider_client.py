@@ -306,7 +306,14 @@ class ProviderClient:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
         if schema:
-            payload["response_format"] = {"type": "json_schema", "json_schema": {"name": _schema_name(schema), "strict": True, "schema": json.loads(schema.read_text(encoding="utf-8"))}}
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": _schema_name(schema),
+                    "strict": True,
+                    "schema": _provider_json_schema(json.loads(schema.read_text(encoding="utf-8"))),
+                },
+            }
         if tools:
             payload["tools"] = tools.definitions()
             payload["parallel_tool_calls"] = False
@@ -628,3 +635,33 @@ def _schema_name(schema: Path) -> str:
     """CPA accepts only OpenAI schema names made from alphanumerics, '_' and '-'."""
     name = re.sub(r"[^A-Za-z0-9_-]", "_", schema.stem)
     return name or "structured_output"
+
+
+def _provider_json_schema(value: Any) -> Any:
+    """Make semantically implied scalar types explicit for strict providers."""
+    if isinstance(value, list):
+        return [_provider_json_schema(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    normalized = {key: _provider_json_schema(item) for key, item in value.items()}
+    if "type" not in normalized:
+        candidates = [normalized["const"]] if "const" in normalized else normalized.get("enum")
+        inferred = {_json_schema_scalar_type(item) for item in candidates or []}
+        inferred.discard(None)
+        if len(inferred) == 1:
+            normalized["type"] = inferred.pop()
+    return normalized
+
+
+def _json_schema_scalar_type(value: Any) -> str | None:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return None

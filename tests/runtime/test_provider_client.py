@@ -35,6 +35,23 @@ class ProviderClientTests(TestCase):
         self.assertEqual("json_schema", payload["response_format"]["type"])
         self.assertRegex(payload["response_format"]["json_schema"]["name"], r"^[A-Za-z0-9_-]+$")
 
+    def test_normalizes_implicit_const_and_enum_types_for_strict_provider_schema(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        schema = self.home / "schema.json"
+        schema.write_text(
+            '{"type":"object","additionalProperties":false,"required":["version","status"],'
+            '"properties":{"version":{"const":3},"status":{"enum":["covered","missing"]}}}',
+            encoding="utf-8",
+        )
+
+        payload = client._payload_from_messages(
+            [{"role": "user", "content": "hello"}], "test-model", "medium", schema=schema,
+        )
+
+        properties = payload["response_format"]["json_schema"]["schema"]["properties"]
+        self.assertEqual("integer", properties["version"]["type"])
+        self.assertEqual("string", properties["status"]["type"])
+
     def test_provider_requests_identify_as_the_companion_app(self):
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
         with patch("ai_trading_companion.provider_client.read_secret", return_value="test-key"):

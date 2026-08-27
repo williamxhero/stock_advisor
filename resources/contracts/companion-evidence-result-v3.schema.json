@@ -4,13 +4,13 @@
   "additionalProperties": false,
   "required": ["schema_version", "as_of", "spoken_summary", "sources", "coverage", "critical_gaps", "conflicts", "high_impact_events"],
   "properties": {
-    "schema_version": {"const": 3},
+    "schema_version": {"type": "integer", "const": 3},
     "as_of": {"type": "string"},
     "spoken_summary": {"type": "string", "minLength": 1},
     "sources": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["evidence_ref", "excerpt", "analysis"], "properties": {"evidence_ref": {"type": "string"}, "excerpt": {"type": "string"}, "analysis": {"type": "string"}}}},
-    "coverage": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["requirement_key", "status", "evidence_refs"], "properties": {"requirement_key": {"type": "string"}, "status": {"enum": ["covered", "checked_no_change", "missing", "stale", "failed"]}, "evidence_refs": {"type": "array", "items": {"type": "string"}}}}},
+    "coverage": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["requirement_key", "status", "evidence_refs"], "properties": {"requirement_key": {"type": "string"}, "status": {"type": "string", "enum": ["covered", "checked_no_change", "missing", "stale", "failed"]}, "evidence_refs": {"type": "array", "items": {"type": "string"}}}}},
     "critical_gaps": {"type": "array", "items": {"type": "string"}},
-    "conflicts": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["claim", "competing_evidence_refs", "materiality"], "properties": {"claim": {"type": "string"}, "competing_evidence_refs": {"type": "array", "items": {"type": "string"}}, "materiality": {"enum": ["low", "medium", "high"]}}}},
-    "high_impact_events": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["summary", "scope", "materiality", "evidence_refs"], "properties": {"summary": {"type": "string"}, "scope": {"enum": ["market", "theme", "portfolio"]}, "materiality": {"enum": ["low", "medium", "high"]}, "evidence_refs": {"type": "array", "items": {"type": "string"}}}}}
+    "conflicts": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["claim", "competing_evidence_refs", "materiality"], "properties": {"claim": {"type": "string"}, "competing_evidence_refs": {"type": "array", "items": {"type": "string"}}, "materiality": {"type": "string", "enum": ["low", "medium", "high"]}}}},
+    "high_impact_events": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["summary", "scope", "materiality", "evidence_refs"], "properties": {"summary": {"type": "string"}, "scope": {"type": "string", "enum": ["market", "theme", "portfolio"]}, "materiality": {"type": "string", "enum": ["low", "medium", "high"]}, "evidence_refs": {"type": "array", "items": {"type": "string"}}}}}
   }
 }

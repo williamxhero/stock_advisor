@@ -30,6 +30,13 @@ DEFAULT_PROVIDER = {
     "base_url": "http://yosef-server:8317/v1",
     "credential_target": "AITradingCompanion/CPA",
     "store": True,
+    "hedge": {
+        "enabled": True,
+        # Zero means run every enabled configured endpoint concurrently.
+        "max_parallel": 0,
+        "per_endpoint_timeout_seconds": 45,
+        "per_endpoint_max_attempts": 1,
+    },
     "retry": {
         "max_attempts": 5,
         "per_attempt_timeout_seconds": 90,
@@ -77,10 +84,7 @@ def load_settings(home: Path) -> RuntimeSettings:
     provider = _merge(DEFAULT_PROVIDER, data.get("provider"))
     research = _merge(DEFAULT_RESEARCH, data.get("research"))
     if provider.get("enabled"):
-        if not str(provider.get("base_url") or "").strip():
-            raise ValueError("provider configuration missing: base_url")
-        if not str(provider.get("credential_target") or "").strip():
-            raise ValueError("provider configuration missing: credential_target")
+        _validate_provider_connection(provider)
         models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
         for slot in ("research", "judgment", "fast"):
             item = models.get(slot) if isinstance(models.get(slot), dict) else {}
@@ -91,6 +95,35 @@ def load_settings(home: Path) -> RuntimeSettings:
         experiments=dict(data.get("experiments") or {}),
         provider=provider, research=research,
     )
+
+
+def _validate_provider_connection(provider: dict[str, Any]) -> None:
+    endpoints = provider.get("endpoints")
+    if isinstance(endpoints, list):
+        active = [item for item in endpoints if isinstance(item, dict) and item.get("enabled", True)]
+        if not active:
+            raise ValueError("provider configuration missing: enabled endpoints")
+        identifiers: set[str] = set()
+        for index, endpoint in enumerate(active, start=1):
+            identifier = str(endpoint.get("id") or f"endpoint-{index}").strip()
+            if identifier in identifiers:
+                raise ValueError(f"provider configuration has duplicate endpoint id: {identifier}")
+            identifiers.add(identifier)
+            if not str(endpoint.get("base_url") or "").strip():
+                raise ValueError(f"provider configuration missing: endpoints.{identifier}.base_url")
+            if not (
+                str(endpoint.get("api_key") or "").strip()
+                or str(endpoint.get("credential_target") or "").strip()
+            ):
+                raise ValueError(f"provider configuration missing: endpoints.{identifier}.api_key")
+        return
+    if not str(provider.get("base_url") or "").strip():
+        raise ValueError("provider configuration missing: base_url")
+    if not (
+        str(provider.get("api_key") or "").strip()
+        or str(provider.get("credential_target") or "").strip()
+    ):
+        raise ValueError("provider configuration missing: api_key")
 
 
 def _merge(defaults: dict[str, Any], value: Any) -> dict[str, Any]:
@@ -106,7 +139,7 @@ def _merge(defaults: dict[str, Any], value: Any) -> dict[str, Any]:
 
 
 def save_provider_settings(home: Path, provider: dict[str, Any], research: dict[str, Any] | None = None) -> None:
-    """Persist non-secret Provider settings atomically; credentials live in Windows Credential Manager."""
+    """Persist local Provider settings atomically, including explicitly configured API keys."""
     path = settings_path(home)
     data: dict[str, Any] = {}
     if path.exists():

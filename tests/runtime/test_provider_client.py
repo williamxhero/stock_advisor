@@ -1,6 +1,7 @@
 import json
 from http.client import RemoteDisconnected
 from pathlib import Path
+import time
 from unittest.mock import Mock
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -58,6 +59,35 @@ class ProviderClientTests(TestCase):
             request = client._request_object({"model": "test"})
         self.assertEqual(client.user_agent, request.headers["User-agent"])
 
+    def test_local_json_api_key_takes_precedence_over_the_legacy_credential_reference(self):
+        self.provider["api_key"] = "local-json-test-key"
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+
+        with patch("ai_trading_companion.provider_client.read_secret") as read_secret:
+            request = client._request_object({"model": "test"})
+
+        self.assertEqual("Bearer local-json-test-key", request.headers["Authorization"])
+        read_secret.assert_not_called()
+
+    def test_enabled_provider_pool_accepts_local_json_keys_without_credential_targets(self):
+        settings = {
+            "provider": {
+                "enabled": True,
+                "endpoints": [
+                    {"id": "one", "base_url": "https://one.example/v1", "api_key": "key-one"},
+                    {"id": "two", "base_url": "https://two.example/v1", "api_key": "key-two"},
+                ],
+            },
+        }
+        path = self.home / "config" / "settings.local.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(settings), encoding="utf-8")
+
+        loaded = load_settings(self.home)
+
+        self.assertEqual("key-one", loaded.provider["endpoints"][0]["api_key"])
+        self.assertEqual("key-two", loaded.provider["endpoints"][1]["api_key"])
+
     def test_user_agent_reads_the_current_local_codex_version_at_startup(self):
         with patch("ai_trading_companion.provider_client._local_codex_version", return_value="0.150.0-alpha.8"), patch("ai_trading_companion.provider_client._local_codex_desktop_build", return_value="26.820.60940"), patch("ai_trading_companion.provider_client.platform.version", return_value="10.0.26200"), patch("ai_trading_companion.provider_client.platform.machine", return_value="AMD64"):
             self.assertEqual(
@@ -75,6 +105,79 @@ class ProviderClientTests(TestCase):
         self.assertEqual(5, DEFAULT_PROVIDER["retry"]["circuit_breaker_failures"])
         self.assertEqual(5, DEFAULT_PROVIDER["retry"]["max_attempts"])
         self.assertEqual(90, DEFAULT_PROVIDER["retry"]["per_attempt_timeout_seconds"])
+
+    def test_provider_pool_returns_the_first_completed_endpoint_without_waiting_for_a_slow_peer(self):
+        self.provider["endpoints"] = [
+            {"id": "slow", "base_url": "https://slow.example/v1", "api_key": "slow-key", "enabled": True},
+            {"id": "fast", "base_url": "https://fast.example/v1", "api_key": "fast-key", "enabled": True},
+        ]
+        self.provider["hedge"] = {
+            "enabled": True, "max_parallel": 2,
+            "per_endpoint_timeout_seconds": 15, "per_endpoint_max_attempts": 1,
+        }
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+
+        def complete(endpoint, _payload, _timeout):
+            if endpoint["id"] == "slow":
+                time.sleep(0.2)
+                return {"id": "slow-response"}
+            time.sleep(0.01)
+            return {"id": "fast-response"}
+
+        started = time.monotonic()
+        with patch.object(client, "_request_for_endpoint", side_effect=complete) as request:
+            response = client._request({"model": "test"}, 20)
+
+        self.assertEqual("fast-response", response["id"])
+        self.assertEqual("fast", response["_provider_endpoint_id"])
+        self.assertLess(time.monotonic() - started, 0.15)
+        self.assertCountEqual(["slow", "fast"], [call.args[0]["id"] for call in request.call_args_list])
+
+    def test_provider_pool_reports_every_endpoint_failure_without_reverting_to_a_single_provider(self):
+        self.provider["endpoints"] = [
+            {"id": "one", "base_url": "https://one.example/v1", "api_key": "one-key", "enabled": True},
+            {"id": "two", "base_url": "https://two.example/v1", "api_key": "two-key", "enabled": True},
+        ]
+        self.provider["hedge"] = {"enabled": True, "max_parallel": 2, "per_endpoint_max_attempts": 1}
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+
+        with patch.object(
+            client, "_request_for_endpoint",
+            side_effect=[
+                ProviderError("one timed out", category="provider_timeout"),
+                ProviderError("two disconnected", category="provider_network"),
+            ],
+        ):
+            with self.assertRaises(ProviderError) as raised:
+                client._request({"model": "test"}, 20)
+
+        self.assertEqual("provider_pool_exhausted", raised.exception.category)
+        self.assertIn("one: provider_timeout", str(raised.exception))
+        self.assertIn("two: provider_network", str(raised.exception))
+
+    def test_provider_pool_stream_publishes_only_the_completed_winner(self):
+        self.provider["endpoints"] = [
+            {"id": "slow", "base_url": "https://slow.example/v1", "api_key": "slow-key", "enabled": True},
+            {"id": "fast", "base_url": "https://fast.example/v1", "api_key": "fast-key", "enabled": True},
+        ]
+        self.provider["hedge"] = {"enabled": True, "max_parallel": 0, "per_endpoint_max_attempts": 1}
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+
+        def complete(endpoint, _payload, _timeout, _retry_after_delta):
+            if endpoint["id"] == "slow":
+                time.sleep(0.2)
+                return {"id": "slow-response"}, ["slow"]
+            time.sleep(0.01)
+            return {"id": "fast-response"}, ["fast"]
+
+        published: list[str] = []
+        with patch.object(client, "_request_stream_for_endpoint", side_effect=complete):
+            response, deltas = client._request_stream({"model": "test", "stream": True}, 20, published.append)
+
+        self.assertEqual("fast-response", response["id"])
+        self.assertEqual("fast", response["_provider_endpoint_id"])
+        self.assertEqual(["fast"], deltas)
+        self.assertEqual(["fast"], published)
 
     def test_long_stage_timeout_is_split_into_multiple_cpa_attempts(self):
         self.provider["retry"] = {

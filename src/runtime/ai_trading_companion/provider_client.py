@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -165,11 +166,14 @@ class ProviderClient:
     _circuits: dict[str, _CircuitState] = {}
     _circuit_lock = threading.Lock()
 
-    def __init__(self, provider: dict[str, Any], research: dict[str, Any], home: Path) -> None:
+    def __init__(
+        self, provider: dict[str, Any], research: dict[str, Any], home: Path, *,
+        user_agent: str | None = None,
+    ) -> None:
         self.provider, self.research, self.home = provider, research, home
         # Version detection is local-only and runs once for each runtime process.
         # It never invokes Codex as an LLM backend.
-        self.user_agent = current_codex_desktop_user_agent()
+        self.user_agent = user_agent or current_codex_desktop_user_agent()
 
     def probe(self) -> dict[str, Any]:
         """Verify the Chat Completions subset used by the runtime."""
@@ -329,7 +333,7 @@ class ProviderClient:
                     if not validation.get("passed"):
                         if max_coverage_repairs is not None and coverage_repairs >= max_coverage_repairs:
                             assert_safe(text, boundary="Provider output")
-                            return ProviderResult(text, response.get("id"), [], response.get("usage") or {}, _request_id(response), trace, validation)
+                            return ProviderResult(text, response.get("id"), [], _usage(response), _request_id(response), trace, validation)
                         coverage_repairs += 1
                         messages.extend([
                             {"role": "assistant", "content": text},
@@ -340,7 +344,7 @@ class ProviderClient:
                         deltas = []
                         continue
                 assert_safe(text, boundary="Provider output")
-                return ProviderResult(text, response.get("id"), [], response.get("usage") or {}, _request_id(response), trace, validation)
+                return ProviderResult(text, response.get("id"), [], _usage(response), _request_id(response), trace, validation)
             if tools is None:
                 raise ProviderError("Provider attempted an unavailable tool", category="tool_policy", request_id=_request_id(response), tool_trace=trace)
             messages.append(_assistant_message(response))
@@ -519,8 +523,104 @@ class ProviderClient:
         return value
 
     def _request(self, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
+        endpoints = self._request_endpoints()
+        if endpoints:
+            if len(endpoints) == 1:
+                result = self._request_for_endpoint(endpoints[0], payload, timeout)
+                result["_provider_endpoint_id"] = str(endpoints[0]["id"])
+                return result
+            return self._hedged_request(endpoints, payload, timeout)
+        return self._request_single(payload, timeout)
+
+    def _request_single(self, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
         idempotency_key = str(uuid.uuid4())
         return self._with_retries(lambda attempt_timeout: self._request_once(payload, attempt_timeout, idempotency_key=idempotency_key), timeout)
+
+    def _request_for_endpoint(
+        self, endpoint: dict[str, Any], payload: dict[str, Any], timeout: int,
+    ) -> dict[str, Any]:
+        client = ProviderClient(endpoint, self.research, self.home, user_agent=self.user_agent)
+        result = client._request_single(payload, timeout)
+        result["_provider_endpoint_id"] = str(endpoint["id"])
+        return result
+
+    def _request_endpoints(self) -> list[dict[str, Any]]:
+        raw = self.provider.get("endpoints")
+        if not isinstance(raw, list):
+            return []
+        settings = self._hedge_settings()
+        endpoints: list[dict[str, Any]] = []
+        for index, item in enumerate(raw):
+            if not isinstance(item, dict) or not item.get("enabled", True):
+                continue
+            endpoint = json.loads(json.dumps(self.provider))
+            endpoint.pop("endpoints", None)
+            endpoint.pop("hedge", None)
+            endpoint.update(item)
+            endpoint["id"] = str(item.get("id") or f"endpoint-{index + 1}")
+            retry = dict(endpoint.get("retry") or {})
+            retry.update({
+                "max_attempts": settings["per_endpoint_max_attempts"],
+                "per_attempt_timeout_seconds": settings["per_endpoint_timeout_seconds"],
+                "initial_backoff_seconds": 0,
+                "max_backoff_seconds": 0,
+            })
+            endpoint["retry"] = retry
+            endpoints.append(endpoint)
+        if not settings["enabled"]:
+            return endpoints[:1]
+        maximum = settings["max_parallel"]
+        return endpoints if maximum == 0 else endpoints[:maximum]
+
+    def _hedged_request(
+        self, endpoints: list[dict[str, Any]], payload: dict[str, Any], timeout: int,
+    ) -> dict[str, Any]:
+        errors: list[tuple[str, ProviderError]] = []
+        workers = len(endpoints)
+        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="provider-hedge")
+        futures = {
+            executor.submit(self._request_for_endpoint, endpoint, payload, timeout): endpoint
+            for endpoint in endpoints
+        }
+        try:
+            pending = set(futures)
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    endpoint = futures[future]
+                    try:
+                        result = future.result()
+                        result["_provider_endpoint_id"] = str(endpoint["id"])
+                        return result
+                    except ProviderError as exc:
+                        errors.append((str(endpoint["id"]), exc))
+                    except Exception:  # pragma: no cover - defensive boundary
+                        errors.append((str(endpoint["id"]), ProviderError(
+                            "Provider request failed unexpectedly",
+                            category="provider_error",
+                        )))
+            details = "; ".join(f"{identifier}: {error.category}" for identifier, error in errors)
+            raise ProviderError(
+                f"All configured Provider endpoints failed ({details or 'no endpoint result'})",
+                category="provider_pool_exhausted",
+                retry_attempts=1,
+            )
+        finally:
+            for future in futures:
+                future.cancel()
+            # urllib cannot force-cancel an in-flight socket.  Do not wait for a
+            # slow losing endpoint before returning the winning response.
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _hedge_settings(self) -> dict[str, int | bool]:
+        raw = self.provider.get("hedge") if isinstance(self.provider.get("hedge"), dict) else {}
+        return {
+            "enabled": bool(raw.get("enabled", True)),
+            # Zero deliberately means every configured endpoint participates.
+            "max_parallel": max(0, int(raw.get("max_parallel", 0))),
+            "per_endpoint_timeout_seconds": max(5, int(raw.get("per_endpoint_timeout_seconds", 45))),
+            "per_endpoint_max_attempts": max(1, int(raw.get("per_endpoint_max_attempts", 1))),
+        }
 
     def _request_once(self, payload: dict[str, Any], timeout: int, *, idempotency_key: str | None = None) -> dict[str, Any]:
         request = self._request_object(payload, idempotency_key=idempotency_key)
@@ -541,6 +641,76 @@ class ProviderClient:
         raise ProviderError("Provider returned an invalid response", category="invalid_response")
 
     def _request_stream(
+        self, payload: dict[str, Any], timeout: int, on_delta: Callable[[str], None],
+        *, retry_after_delta: bool = False,
+    ) -> tuple[dict[str, Any], list[str]]:
+        endpoints = self._request_endpoints()
+        if endpoints:
+            if len(endpoints) == 1:
+                response, deltas = self._request_stream_for_endpoint(
+                    endpoints[0], payload, timeout, retry_after_delta,
+                )
+                response["_provider_endpoint_id"] = str(endpoints[0]["id"])
+            else:
+                response, deltas = self._hedged_stream(
+                    endpoints, payload, timeout, retry_after_delta,
+                )
+            for delta in deltas:
+                on_delta(delta)
+            return response, deltas
+        return self._request_stream_single(payload, timeout, on_delta, retry_after_delta=retry_after_delta)
+
+    def _request_stream_for_endpoint(
+        self, endpoint: dict[str, Any], payload: dict[str, Any], timeout: int,
+        retry_after_delta: bool,
+    ) -> tuple[dict[str, Any], list[str]]:
+        client = ProviderClient(endpoint, self.research, self.home, user_agent=self.user_agent)
+        deltas: list[str] = []
+        return client._request_stream_single(
+            payload, timeout, deltas.append, retry_after_delta=retry_after_delta,
+        )
+
+    def _hedged_stream(
+        self, endpoints: list[dict[str, Any]], payload: dict[str, Any], timeout: int,
+        retry_after_delta: bool,
+    ) -> tuple[dict[str, Any], list[str]]:
+        errors: list[tuple[str, ProviderError]] = []
+        executor = ThreadPoolExecutor(max_workers=len(endpoints), thread_name_prefix="provider-hedge")
+        futures = {
+            executor.submit(
+                self._request_stream_for_endpoint, endpoint, payload, timeout, retry_after_delta,
+            ): endpoint
+            for endpoint in endpoints
+        }
+        try:
+            pending = set(futures)
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    endpoint = futures[future]
+                    try:
+                        response, deltas = future.result()
+                        response["_provider_endpoint_id"] = str(endpoint["id"])
+                        return response, deltas
+                    except ProviderError as exc:
+                        errors.append((str(endpoint["id"]), exc))
+                    except Exception:  # pragma: no cover - defensive boundary
+                        errors.append((str(endpoint["id"]), ProviderError(
+                            "Provider streaming request failed unexpectedly",
+                            category="provider_error",
+                        )))
+            details = "; ".join(f"{identifier}: {error.category}" for identifier, error in errors)
+            raise ProviderError(
+                f"All configured Provider endpoints failed ({details or 'no endpoint result'})",
+                category="provider_pool_exhausted",
+                retry_attempts=1,
+            )
+        finally:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _request_stream_single(
         self, payload: dict[str, Any], timeout: int, on_delta: Callable[[str], None],
         *, retry_after_delta: bool = False,
     ) -> tuple[dict[str, Any], list[str]]:
@@ -686,9 +856,11 @@ class ProviderClient:
                 state.open_until = time.monotonic() + float(settings["circuit_breaker_cooldown_seconds"])
 
     def _request_object(self, payload: dict[str, Any], *, idempotency_key: str | None = None) -> Request:
-        key = read_secret(str(self.provider.get("credential_target") or ""))
+        key = str(self.provider.get("api_key") or "").strip()
         if not key:
-            raise ProviderError("Provider API key is not configured in Windows Credential Manager", category="provider_not_configured")
+            key = read_secret(str(self.provider.get("credential_target") or ""))
+        if not key:
+            raise ProviderError("Provider API key is not configured", category="provider_not_configured")
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "Accept": "text/event-stream" if payload.get("stream") else "application/json", "User-Agent": self.user_agent}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
@@ -857,6 +1029,14 @@ def _bounded_json(value: Any, limit: int) -> Any:
 
 def _request_id(response: dict[str, Any]) -> str | None:
     return response.get("_request_id") if isinstance(response.get("_request_id"), str) else None
+
+
+def _usage(response: dict[str, Any]) -> dict[str, Any]:
+    usage = dict(response.get("usage") or {})
+    endpoint_id = response.get("_provider_endpoint_id")
+    if isinstance(endpoint_id, str) and endpoint_id:
+        usage["provider_endpoint_id"] = endpoint_id
+    return usage
 
 
 def _response_request_id(headers: Any) -> str | None:

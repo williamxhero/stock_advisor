@@ -1,0 +1,35 @@
+{
+  "forecast": [
+    {"id": "q1", "outcome": "qualified", "qualified_duration_minutes": 28, "delivered_at": "2026-08-20T10:13:00"},
+    {"id": "q2", "outcome": "qualified", "qualified_duration_minutes": 34, "delivered_at": "2026-08-21T10:29:00"},
+    {"id": "reject", "outcome": "rejected"},
+    {"id": "failure", "outcome": "failed"},
+    {"id": "late", "outcome": "late"},
+    {"id": "missed", "outcome": "missed"},
+    {"id": "pending", "outcome": "pending"}
+  ],
+  "hard_fault_four": {
+    "required_regimes": ["up", "down"],
+    "observations": [
+      {"market_regime": "up"}, {"market_regime": "down"},
+      {"market_regime": "up", "protected_hard_fault": true}, {"market_regime": "down"}
+    ]
+  },
+  "missing_coverage_six": {
+    "required_regimes": ["up", "down", "sideways"],
+    "observations": [
+      {"market_regime": "up"}, {"market_regime": "down"}, {"market_regime": "up"},
+      {"market_regime": "down"}, {"market_regime": "up"}, {"market_regime": "down"}
+    ]
+  },
+  "baseline": {"baseline_start": "09:45", "quality_score": 90},
+  "faster_regression": {"quality_score": 82, "material_regression": 5, "diverse": true, "consistent": true},
+  "promotion_candidate": {"quality_score": 90, "material_regression": 5, "diverse": true, "consistent": true},
+  "attribution": {
+    "prefetch_actual_start": "2026-08-20T09:00:00",
+    "prefetch_completed_at": "2026-08-20T09:18:00",
+    "cycle_actual_start": "2026-08-20T09:47:00",
+    "cycle_delivered_at": "2026-08-20T10:02:00"
+  },
+  "observation": {"baseline_start": "09:45"}
+}

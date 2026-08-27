@@ -24,6 +24,19 @@ from .secret_guard import assert_safe
 
 
 _FALLBACK_CPA_USER_AGENT = "AITradingCompanion/1.0 (Windows; x64)"
+_SYNTHESIZE_FROM_EXISTING_EVIDENCE = (
+    "停止调用工具，基于本轮已经取得的证据立即输出要求的结构化 JSON；"
+    "不得把空结果、缺失事实或未核实推测写成事实。"
+)
+
+
+def _synthesis_reserve_seconds(stage_timeout: int) -> int:
+    """Keep enough of a research stage for one bounded schema-only response."""
+    return min(180, max(15, stage_timeout // 5), max(1, stage_timeout // 2))
+
+
+def _has_usable_evidence(trace: list[dict[str, Any]]) -> bool:
+    return any(item.get("status") == "succeeded" and item.get("non_empty") for item in trace)
 
 
 class ProviderError(RuntimeError):
@@ -129,6 +142,7 @@ class ProviderClient:
         model_turns = 0
         tool_calls = 0
         empty_tool_results = 0
+        synthesis_reserve = _synthesis_reserve_seconds(timeout) if search and schema is not None else 0
         while True:
             if time.monotonic() >= deadline:
                 raise ResearchDeadlineExceeded(
@@ -140,6 +154,15 @@ class ProviderClient:
                 raise ProviderError("research model turn limit exceeded", category="research_loop_limit", tool_trace=trace)
             model_turns += 1
             remaining = max(1, int(deadline - time.monotonic()))
+            has_evidence = _has_usable_evidence(trace)
+            if tools is not None and schema is not None and has_evidence and remaining <= synthesis_reserve:
+                messages.append({
+                    "role": "user",
+                    "content": _SYNTHESIZE_FROM_EXISTING_EVIDENCE,
+                })
+                tools = None
+                deltas = []
+                continue
             # CPA accepts tools and JSON Schema independently, but its upstream
             # translation rejects the combination. Keep the research loop in
             # ordinary Chat Completions mode, then make one schema-only pass.
@@ -150,10 +173,28 @@ class ProviderClient:
                 forced_tool=forced_tool,
             )
             forced_tool = None
+            request_timeout = remaining
+            if tools is not None and schema is not None and has_evidence:
+                request_timeout = max(1, remaining - synthesis_reserve)
             try:
                 response, new_deltas = self._request_stream(
-                    payload, remaining, on_delta, retry_after_delta=retry_stream_after_delta,
-                ) if on_delta else (self._request(payload, remaining), [])
+                    payload, request_timeout, on_delta, retry_after_delta=retry_stream_after_delta,
+                ) if on_delta else (self._request(payload, request_timeout), [])
+            except ProviderError as exc:
+                if (
+                    exc.category == "provider_timeout"
+                    and tools is not None
+                    and schema is not None
+                    and _has_usable_evidence(trace)
+                    and time.monotonic() < deadline
+                ):
+                    messages.append({"role": "user", "content": _SYNTHESIZE_FROM_EXISTING_EVIDENCE})
+                    tools = None
+                    deltas = []
+                    continue
+                if trace and not getattr(exc, "tool_trace", None):
+                    exc.tool_trace = list(trace)
+                raise
             except Exception as exc:
                 if trace and not getattr(exc, "tool_trace", None):
                     exc.tool_trace = list(trace)
@@ -234,10 +275,7 @@ class ProviderClient:
                     if any(item.get("status") == "succeeded" and item.get("non_empty") for item in trace):
                         messages.append({
                             "role": "user",
-                            "content": (
-                                "连续补查没有取得新证据。停止调用工具，基于本轮已经取得的证据"
-                                "立即输出要求的结构化 JSON；不得把空结果或未核实推测写成事实。"
-                            ),
+                            "content": _SYNTHESIZE_FROM_EXISTING_EVIDENCE,
                         })
                         tools = None
                         deltas = []

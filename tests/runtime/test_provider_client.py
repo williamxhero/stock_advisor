@@ -382,6 +382,51 @@ class ProviderClientTests(TestCase):
 
         self.assertEqual(1, len(raised.exception.tool_trace))
 
+    def test_research_timeout_after_evidence_uses_reserved_time_for_schema_synthesis(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        schema = self.home / "schema.json"
+        schema.write_text(
+            '{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}',
+            encoding="utf-8",
+        )
+        call = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "search_searxng", "arguments": '{"query":"current market"}'},
+        }
+        first = {"id": "r1", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [call]}}]}
+        timeout = ProviderError("CPA timed out", category="provider_timeout")
+        final = {"id": "done", "choices": [{"message": {"role": "assistant", "content": '{"ok":true}'}}]}
+
+        with patch.object(client, "_request", side_effect=[first, timeout, final]) as request, patch(
+            "ai_trading_companion.provider_client.ResearchTools.call",
+            return_value={"backend": "searxng", "results": [{"url": "https://example.test/current"}]},
+        ):
+            completed = client.run(
+                "research", schema, slot="fast", effort="low", search=True, timeout=1200,
+            )
+
+        self.assertEqual('{"ok":true}', completed.text)
+        self.assertEqual(1, len(completed.tool_trace))
+        self.assertLessEqual(request.call_args_list[1].args[1], 1020)
+        self.assertNotIn("tools", request.call_args_list[-1].args[0])
+
+    def test_research_timeout_without_evidence_is_not_converted_to_synthesis(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        schema = self.home / "schema.json"
+        schema.write_text(
+            '{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}',
+            encoding="utf-8",
+        )
+        timeout = ProviderError("CPA timed out", category="provider_timeout")
+
+        with patch.object(client, "_request", side_effect=timeout) as request:
+            with self.assertRaises(ProviderError) as raised:
+                client.run("research", schema, slot="fast", effort="low", search=True, timeout=1200)
+
+        self.assertEqual("provider_timeout", raised.exception.category)
+        self.assertEqual(1, request.call_count)
+
     def test_research_deadline_preserves_completed_tool_trace(self):
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
         call = {

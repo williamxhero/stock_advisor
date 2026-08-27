@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -37,8 +38,90 @@ def _synthesis_reserve_seconds(stage_timeout: int) -> int:
     return min(300, max(30, stage_timeout // 4), max(1, stage_timeout // 2))
 
 
-def _has_usable_evidence(trace: list[dict[str, Any]]) -> bool:
-    return any(item.get("status") == "succeeded" and item.get("non_empty") for item in trace)
+@dataclass(frozen=True)
+class _ResearchProgress:
+    """Decide whether tool observations permit synthesis or require a backend change.
+
+    EvidenceGate remains the sole authority on factual coverage.  This module only
+    prevents an undated or stale search listing from consuming the time reserved
+    for a browser-backed research repair.
+    """
+
+    can_synthesize: bool
+    alternate_backend: str | None
+
+    @classmethod
+    def from_trace(
+        cls, trace: list[dict[str, Any]], research_contract: dict[str, Any] | None,
+    ) -> "_ResearchProgress":
+        attempted = {
+            str(item.get("tool") or "")
+            for item in trace
+            if item.get("status") != "deferred"
+        }
+        qualifying = any(cls._qualifies(item, research_contract) for item in trace)
+        alternate = None
+        if not qualifying:
+            if "search_searxng" in attempted and "browse_page" not in attempted:
+                alternate = "browse_page"
+            elif "browse_page" in attempted and "search_searxng" not in attempted:
+                alternate = "search_searxng"
+        return cls(qualifying, alternate)
+
+    @staticmethod
+    def _qualifies(observation: dict[str, Any], research_contract: dict[str, Any] | None) -> bool:
+        if observation.get("status") != "succeeded" or not observation.get("non_empty"):
+            return False
+        if research_contract is None:
+            return True
+        tool = str(observation.get("tool") or "")
+        if tool != "search_searxng":
+            return True
+        start, end = _research_window(research_contract)
+        if start is None or end is None:
+            return False
+        for item in observation.get("evidence_items") or []:
+            published = _parse_utc_time(item.get("published_at"))
+            if published is not None and start <= published <= end:
+                return True
+        return False
+
+
+def _parse_utc_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _research_window(contract: dict[str, Any]) -> tuple[datetime | None, datetime | None]:
+    windows = [
+        requirement.get("window") or {}
+        for requirement in contract.get("requirements") or []
+        if requirement.get("blocking", True)
+    ]
+    starts = [_parse_utc_time(window.get("start")) for window in windows]
+    ends = [_parse_utc_time(window.get("end")) for window in windows]
+    valid_starts = [value for value in starts if value is not None]
+    valid_ends = [value for value in ends if value is not None]
+    if not valid_starts or not valid_ends:
+        return None, None
+    return min(valid_starts), max(valid_ends)
+
+
+def _has_replacement_character(value: Any) -> bool:
+    if isinstance(value, str):
+        return "\ufffd" in value
+    if isinstance(value, dict):
+        return any(_has_replacement_character(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_replacement_character(item) for item in value)
+    return False
 
 
 class ProviderError(RuntimeError):
@@ -122,6 +205,7 @@ class ProviderClient:
         self, prompt: str, schema: Path | None, *, slot: str, effort: str,
         search: bool, timeout: int, on_delta: Callable[[str], None] | None = None,
         research_validator: Callable[[dict[str, Any], list[dict[str, Any]]], dict[str, Any]] | None = None,
+        research_contract: dict[str, Any] | None = None,
         max_coverage_repairs: int | None = None,
         retry_stream_after_delta: bool = False,
         attempt_id: str | None = None,
@@ -157,7 +241,8 @@ class ProviderClient:
                 raise ProviderError("research model turn limit exceeded", category="research_loop_limit", tool_trace=trace)
             model_turns += 1
             remaining = max(1, int(deadline - time.monotonic()))
-            has_evidence = _has_usable_evidence(trace)
+            progress = _ResearchProgress.from_trace(trace, research_contract)
+            has_evidence = progress.can_synthesize
             if tools is not None and schema is not None and has_evidence and remaining <= synthesis_reserve:
                 messages = _synthesis_messages(prompt, trace)
                 tools = None
@@ -185,7 +270,7 @@ class ProviderClient:
                     exc.category == "provider_timeout"
                     and tools is not None
                     and schema is not None
-                    and _has_usable_evidence(trace)
+                    and _ResearchProgress.from_trace(trace, research_contract).can_synthesize
                     and time.monotonic() < deadline
                 ):
                     messages = _synthesis_messages(prompt, trace)
@@ -204,6 +289,25 @@ class ProviderClient:
             if not calls:
                 text = _message_content(response) or "".join(deltas)
                 if schema is not None and tools is not None:
+                    progress = _ResearchProgress.from_trace(trace, research_contract)
+                    if research_contract is not None and not progress.can_synthesize:
+                        if progress.alternate_backend is None:
+                            raise ProviderError(
+                                "research ended without qualifying current evidence",
+                                category="evidence_insufficient",
+                                request_id=_request_id(response),
+                                tool_trace=trace,
+                            )
+                        forced_tool = progress.alternate_backend
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "当前工具结果不足以支撑本轮事实，不能开始综合。"
+                                "下一步必须使用尚未尝试的研究后端，并取得可核验的当前材料。"
+                            ),
+                        })
+                        deltas = []
+                        continue
                     messages = _synthesis_messages(prompt, trace)
                     tools = None
                     deltas = []
@@ -240,8 +344,8 @@ class ProviderClient:
             if tools is None:
                 raise ProviderError("Provider attempted an unavailable tool", category="tool_policy", request_id=_request_id(response), tool_trace=trace)
             messages.append(_assistant_message(response))
-            usable_tool_result = False
             batch_tool_counts: dict[str, int] = {}
+            batch_start = len(trace)
             for call in calls:
                 if max_tool_calls is not None and tool_calls >= max_tool_calls:
                     raise ProviderError("research tool call limit exceeded", category="research_loop_limit", request_id=_request_id(response), tool_trace=trace)
@@ -253,6 +357,8 @@ class ProviderClient:
                     arguments = json.loads(str(call.get("function", {}).get("arguments") or "{}"))
                     if not isinstance(arguments, dict):
                         raise ValueError("tool arguments must be an object")
+                    if _has_replacement_character(arguments):
+                        raise ResearchToolError("research tool arguments contain replacement characters")
                     batch_tool_counts[name] = batch_tool_counts.get(name, 0) + 1
                     if batch_tool_counts[name] > max_empty_tool_results:
                         result = {
@@ -273,7 +379,6 @@ class ProviderClient:
                     seen_tool_calls.add(fingerprint)
                     result = tools.call(name, arguments)
                     non_empty = bool(result.get("results") or result.get("text") or result.get("content_sha256"))
-                    usable_tool_result = usable_tool_result or non_empty
                     assert acquisition is not None
                     observation, result = acquisition.observe(name, arguments, result, non_empty)
                     trace.append(observation)
@@ -286,23 +391,26 @@ class ProviderClient:
                         "error_code": type(exc).__name__, "error": str(exc),
                     })
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, ensure_ascii=False)})
-            if usable_tool_result:
+            progress = _ResearchProgress.from_trace(trace, research_contract)
+            batch_progress = _ResearchProgress.from_trace(trace[batch_start:], research_contract)
+            if batch_progress.can_synthesize:
                 empty_tool_results = 0
             else:
                 empty_tool_results += 1
-                alternate = self._untried_research_backend(trace)
+                alternate = progress.alternate_backend
                 if alternate is not None:
                     forced_tool = alternate
                     messages.append({
                         "role": "user",
                         "content": (
-                            "当前检索后端本轮没有取得非空信息。下一步必须改用尚未尝试的研究后端；"
-                            "由你选择最合适的查询参数或公开页面，不要重复刚才的空查询。"
+                            "当前检索后端本轮没有取得可用于当前事实的材料。"
+                            "下一步必须改用尚未尝试的研究后端；"
+                            "由你选择最合适的查询参数或公开页面，不要重复刚才的查询。"
                         ),
                     })
                     continue
                 if empty_tool_results >= max_empty_tool_results:
-                    if any(item.get("status") == "succeeded" and item.get("non_empty") for item in trace):
+                    if progress.can_synthesize:
                         messages = _synthesis_messages(prompt, trace)
                         tools = None
                         deltas = []
@@ -372,15 +480,6 @@ class ProviderClient:
         if "search_searxng" in attempted and "browse_page" not in attempted:
             return "browse_page"
         return "search_searxng"
-
-    @staticmethod
-    def _untried_research_backend(trace: list[dict[str, Any]]) -> str | None:
-        attempted = {str(item.get("tool") or "") for item in trace if item.get("status") != "deferred"}
-        if "search_searxng" in attempted and "browse_page" not in attempted:
-            return "browse_page"
-        if "browse_page" in attempted and "search_searxng" not in attempted:
-            return "search_searxng"
-        return None
 
     def _payload(self, prompt: str, model: str, effort: str, *, stream: bool = False) -> dict[str, Any]:
         return self._payload_from_messages([{"role": "user", "content": prompt}], model, effort, stream=stream)

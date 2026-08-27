@@ -402,6 +402,139 @@ class ProviderClientTests(TestCase):
         )
         self.assertEqual(["search_searxng"] * 3 + ["browse_page"], [item[0][0] for item in tool.call_args_list])
 
+    def test_stale_searxng_results_force_playwright_before_research_can_finish(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        stale_search = {
+            "id": "search",
+            "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "search_1", "type": "function",
+                "function": {"name": "search_searxng", "arguments": '{"query":"market close"}'},
+            }]}}],
+        }
+        browse = {
+            "id": "browse",
+            "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "browse_1", "type": "function",
+                "function": {"name": "browse_page", "arguments": '{"url":"https://example.test/market"}'},
+            }]}}],
+        }
+        done = {"id": "done", "choices": [{"message": {"role": "assistant", "content": "research complete"}}]}
+        contract = {
+            "as_of": "2026-08-27T01:00:00Z",
+            "requirements": [{
+                "key": "current_market_state", "blocking": True,
+                "window": {"start": "2026-08-26T07:00:00Z", "end": "2026-08-27T01:00:00Z"},
+            }],
+        }
+
+        def tool_result(name, _arguments):
+            if name == "browse_page":
+                return {"backend": "playwright", "url": "https://example.test/market", "text": "today market evidence"}
+            return {
+                "backend": "searxng",
+                "results": [{
+                    "url": "https://example.test/old-market",
+                    "snippet": "market close evidence",
+                    "published_at": "2026-08-20T07:00:00Z",
+                }],
+            }
+
+        with patch.object(client, "_request", side_effect=[stale_search, browse, done]) as request, patch(
+            "ai_trading_companion.provider_client.ResearchTools.call", side_effect=tool_result,
+        ):
+            completed = client.run(
+                "research", None, slot="fast", effort="low", search=True, timeout=20,
+                research_contract=contract,
+            )
+
+        self.assertEqual("research complete", completed.text)
+        self.assertEqual(
+            "browse_page",
+            request.call_args_list[1].args[0]["tool_choice"]["function"]["name"],
+        )
+
+    def test_timeout_after_stale_searxng_results_is_not_converted_to_synthesis(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        schema = self.home / "schema.json"
+        schema.write_text(
+            '{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}',
+            encoding="utf-8",
+        )
+        search = {
+            "id": "search",
+            "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "search_1", "type": "function",
+                "function": {"name": "search_searxng", "arguments": '{"query":"market close"}'},
+            }]}}],
+        }
+        contract = {
+            "as_of": "2026-08-27T01:00:00Z",
+            "requirements": [{
+                "key": "current_market_state", "blocking": True,
+                "window": {"start": "2026-08-26T07:00:00Z", "end": "2026-08-27T01:00:00Z"},
+            }],
+        }
+        stale = {
+            "backend": "searxng",
+            "results": [{
+                "url": "https://example.test/old-market",
+                "snippet": "market close evidence",
+                "published_at": "2026-08-20T07:00:00Z",
+            }],
+        }
+
+        with patch.object(client, "_request", side_effect=[search, ProviderError("CPA timed out", category="provider_timeout")]) as request, patch(
+            "ai_trading_companion.provider_client.ResearchTools.call", return_value=stale,
+        ):
+            with self.assertRaisesRegex(ProviderError, "CPA timed out"):
+                client.run(
+                    "research", schema, slot="fast", effort="low", search=True, timeout=1200,
+                    research_contract=contract,
+                )
+
+        self.assertIn("tools", request.call_args_list[1].args[0])
+        self.assertEqual(
+            "browse_page",
+            request.call_args_list[1].args[0]["tool_choice"]["function"]["name"],
+        )
+
+    def test_replacement_character_in_research_arguments_is_not_sent_to_backend(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        malformed_search = {
+            "id": "malformed-search",
+            "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "search_1", "type": "function",
+                "function": {"name": "search_searxng", "arguments": '{"query":"\u5e02\u573a\ufffd"}'},
+            }]}}],
+        }
+        browse = {
+            "id": "browse",
+            "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "browse_1", "type": "function",
+                "function": {"name": "browse_page", "arguments": '{"url":"https://example.test/market"}'},
+            }]}}],
+        }
+        done = {"id": "done", "choices": [{"message": {"role": "assistant", "content": "research complete"}}]}
+        calls: list[str] = []
+
+        def tool_result(name, _arguments):
+            calls.append(name)
+            return {"backend": "playwright", "url": "https://example.test/market", "text": "current market evidence"}
+
+        with patch.object(client, "_request", side_effect=[malformed_search, browse, done]) as request, patch(
+            "ai_trading_companion.provider_client.ResearchTools.call", side_effect=tool_result,
+        ):
+            completed = client.run(
+                "research", None, slot="fast", effort="low", search=True, timeout=20,
+            )
+
+        self.assertEqual("research complete", completed.text)
+        self.assertEqual(["browse_page"], calls)
+        self.assertEqual(
+            "browse_page",
+            request.call_args_list[1].args[0]["tool_choice"]["function"]["name"],
+        )
+
     def test_research_loop_failure_preserves_completed_tool_trace(self):
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
         responses = []

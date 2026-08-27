@@ -212,6 +212,7 @@ def _call_stage(
             timeout=decision.timeout_seconds,
             search=decision.search, slot=decision.model_slot, effort=decision.reasoning_effort,
             research_validator=research_validator,
+            research_contract=contract,
             # Research/tool-loop output is internal and never user-visible.
             # Keep it non-streaming so CPA can retry a whole idempotent request
             # when an upstream closes or stalls before returning a response.
@@ -277,6 +278,7 @@ def _call_stage(
                     RuntimePacketBuilder.prompt(packet), SCHEMAS / schema_name, timeout=remaining,
                     search=hedge.search, slot=hedge.model_slot, effort=hedge.reasoning_effort,
                     research_validator=research_validator_for(hedge_attempt["attempt_id"]) if contract and hedge.search else None,
+                    research_contract=contract,
                     on_delta=None,
                     retry_stream_after_delta=False,
                     attempt_id=hedge_attempt["attempt_id"],

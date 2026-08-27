@@ -136,6 +136,32 @@ class EvidenceV3Tests(TestCase):
             self.assertEqual("failed", attempt["status"])
             self.assertEqual(trace, json.loads(attempt["tool_trace_json"]))
 
+    def test_internal_research_tool_loop_does_not_use_provider_streaming(self):
+        with TemporaryDirectory() as temporary:
+            store = CompanionStore(Path(temporary) / "companion.sqlite3")
+            cycle = CompanionEngine(store).start_cycle(
+                "daily.opportunity.0900", "2026-08-26T09:00:00+08:00", self.as_of,
+            )
+            client = Mock()
+            client.run.side_effect = ProviderError("stop after inspecting request", category="test")
+            settings = SimpleNamespace(provider=DEFAULT_PROVIDER)
+            packet = {
+                "task_key": "daily.opportunity.0900", "stage": "m0_research", "as_of": self.as_of,
+                "sha256": "frozen-packet", "evidence_contract": self.contract,
+            }
+
+            with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
+                "ai_trading_companion.__main__.provider_client", return_value=client,
+            ):
+                with self.assertRaisesRegex(ProviderError, "stop after inspecting request"):
+                    _call_stage(
+                        store, cycle, "m0_research", packet,
+                        "companion-research-evidence-v2.schema.json", search=True, timeout=60,
+                    )
+
+            self.assertIsNone(client.run.call_args.kwargs["on_delta"])
+            self.assertFalse(client.run.call_args.kwargs["retry_stream_after_delta"])
+
 
 class _WeekdayCalendar:
     def is_trading_day(self, value: date) -> bool:

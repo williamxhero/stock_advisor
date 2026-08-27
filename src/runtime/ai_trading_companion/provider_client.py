@@ -28,11 +28,13 @@ _SYNTHESIZE_FROM_EXISTING_EVIDENCE = (
     "停止调用工具，基于本轮已经取得的证据立即输出要求的结构化 JSON；"
     "不得把空结果、缺失事实或未核实推测写成事实。"
 )
+_MAX_SYNTHESIS_EVIDENCE_BYTES = 48_000
+_MAX_SYNTHESIS_EXCERPT_CHARS = 700
 
 
 def _synthesis_reserve_seconds(stage_timeout: int) -> int:
     """Keep enough of a research stage for one bounded schema-only response."""
-    return min(180, max(15, stage_timeout // 5), max(1, stage_timeout // 2))
+    return min(300, max(30, stage_timeout // 4), max(1, stage_timeout // 2))
 
 
 def _has_usable_evidence(trace: list[dict[str, Any]]) -> bool:
@@ -616,43 +618,107 @@ def _message_content(response: dict[str, Any]) -> str:
 
 def _synthesis_messages(prompt: str, trace: list[dict[str, Any]], *, retry_empty: bool = False) -> list[dict[str, Any]]:
     """Detach final writing from the verbose tool protocol while preserving evidence identities."""
+    evidence_packet = _compact_synthesis_evidence(trace)
+    retry_instruction = "上一次结构化响应正文为空；这是最后一次综合，不得再次返回空正文。" if retry_empty else ""
+    return [
+        {"role": "user", "content": prompt},
+        {"role": "user", "content": f"{_SYNTHESIZE_FROM_EXISTING_EVIDENCE}{retry_instruction}\n运行时证据包：{evidence_packet}"},
+    ]
+
+
+def _compact_synthesis_evidence(trace: list[dict[str, Any]]) -> str:
+    """Build a bounded model view while the immutable attempt retains the full audit trace."""
     observations: list[dict[str, Any]] = []
     seen_evidence: set[str] = set()
-    for observation in trace:
-        evidence_items: list[dict[str, Any]] = []
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    total_evidence = 0
+    for observation_index, observation in enumerate(trace):
+        observation_id = observation.get("observation_id")
         for item in observation.get("evidence_items") or []:
             if not isinstance(item, dict):
                 continue
+            total_evidence += 1
             identity = str(item.get("evidence_ref") or item.get("url") or item.get("source_identity") or "")
             if identity and identity in seen_evidence:
                 continue
             if identity:
                 seen_evidence.add(identity)
-            evidence_items.append({
-                key: item.get(key) for key in (
-                    "evidence_ref", "url", "title", "excerpt_text", "fact_as_of",
-                    "published_at", "acquired_at", "source_identity",
-                    "independence_group", "primary",
-                ) if item.get(key) is not None
-            })
+            compact_item = {
+                "observation_id": observation_id,
+                "evidence_ref": _bounded_text(item.get("evidence_ref"), 160),
+                "url": _bounded_text(item.get("url"), 600),
+                "title": _bounded_text(item.get("title"), 240),
+                "excerpt_text": _bounded_text(item.get("excerpt_text"), _MAX_SYNTHESIS_EXCERPT_CHARS),
+                "fact_as_of": _bounded_text(item.get("fact_as_of"), 80),
+                "published_at": _bounded_text(item.get("published_at"), 80),
+                "acquired_at": _bounded_text(item.get("acquired_at"), 80),
+                "source_identity": _bounded_text(item.get("source_identity"), 240),
+                "independence_group": _bounded_text(item.get("independence_group"), 240),
+                "primary": bool(item.get("primary")),
+            }
+            candidates.append((observation_index, {key: value for key, value in compact_item.items() if value not in {None, ""}}))
         observations.append({
-            "observation_id": observation.get("observation_id"),
-            "tool": observation.get("tool"),
-            "backend": observation.get("backend"),
+            "observation_id": observation_id,
+            "tool": _bounded_text(observation.get("tool"), 80),
+            "backend": _bounded_text(observation.get("backend"), 80),
             "status": observation.get("status"),
             "non_empty": observation.get("non_empty"),
-            "arguments": observation.get("arguments") or {},
-            "acquired_at": observation.get("acquired_at"),
-            "error_code": observation.get("error_code"),
-            "error": observation.get("error"),
-            "evidence_items": evidence_items,
+            "arguments": _bounded_json(observation.get("arguments") or {}, 800),
+            "acquired_at": _bounded_text(observation.get("acquired_at"), 80),
+            "error_code": _bounded_text(observation.get("error_code"), 120),
+            "error": _bounded_text(observation.get("error"), 500),
         })
-    retry_instruction = "上一次结构化响应正文为空；这是最后一次综合，不得再次返回空正文。" if retry_empty else ""
-    evidence_packet = json.dumps({"tool_observations": observations}, ensure_ascii=False, separators=(",", ":"))
-    return [
-        {"role": "user", "content": prompt},
-        {"role": "user", "content": f"{_SYNTHESIZE_FROM_EXISTING_EVIDENCE}{retry_instruction}\n运行时证据包：{evidence_packet}"},
-    ]
+
+    # Cover distinct research operations and independent upstreams before adding
+    # lower-value duplicates. This is payload shaping, not an evidence quota:
+    # the complete trace remains persisted and available to EvidenceGate.
+    candidates.sort(key=lambda pair: (
+        not pair[1].get("primary"),
+        not bool(pair[1].get("fact_as_of")),
+        not bool(pair[1].get("published_at")),
+        pair[0],
+    ))
+    first_by_observation: list[tuple[int, dict[str, Any]]] = []
+    remaining: list[tuple[int, dict[str, Any]]] = []
+    covered_observations: set[int] = set()
+    for candidate in candidates:
+        if candidate[0] not in covered_observations:
+            covered_observations.add(candidate[0])
+            first_by_observation.append(candidate)
+        else:
+            remaining.append(candidate)
+    prioritized = first_by_observation + remaining
+
+    packet: dict[str, Any] = {
+        "tool_observations": observations,
+        "evidence_items": [],
+        "total_evidence_items": total_evidence,
+        "unique_evidence_items": len(candidates),
+        "omitted_evidence_items": len(candidates),
+    }
+    for _observation_index, candidate in prioritized:
+        packet["evidence_items"].append(candidate)
+        packet["omitted_evidence_items"] -= 1
+        serialized = json.dumps(packet, ensure_ascii=False, separators=(",", ":"))
+        if len(serialized.encode("utf-8")) > _MAX_SYNTHESIS_EVIDENCE_BYTES:
+            packet["evidence_items"].pop()
+            packet["omitted_evidence_items"] += 1
+            break
+    return json.dumps(packet, ensure_ascii=False, separators=(",", ":"))
+
+
+def _bounded_text(value: Any, limit: int) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if len(text) <= limit else f"{text[:limit - 1]}…"
+
+
+def _bounded_json(value: Any, limit: int) -> Any:
+    serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(serialized) <= limit:
+        return value
+    return f"{serialized[:limit - 1]}…"
 
 
 def _request_id(response: dict[str, Any]) -> str | None:

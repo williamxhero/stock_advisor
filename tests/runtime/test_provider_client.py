@@ -456,8 +456,47 @@ class ProviderClientTests(TestCase):
 
         self.assertEqual('{"ok":true}', completed.text)
         self.assertEqual(1, len(completed.tool_trace))
-        self.assertLessEqual(request.call_args_list[1].args[1], 1020)
+        self.assertLessEqual(request.call_args_list[1].args[1], 900)
         self.assertNotIn("tools", request.call_args_list[-1].args[0])
+
+    def test_research_synthesis_bounds_large_evidence_payload_without_discarding_audit_trace(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        schema = self.home / "schema.json"
+        schema.write_text(
+            '{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}',
+            encoding="utf-8",
+        )
+        call = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "search_searxng", "arguments": '{"query":"current market"}'},
+        }
+        first = {"id": "r1", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [call]}}]}
+        timeout = ProviderError("CPA timed out", category="provider_timeout")
+        final = {"id": "done", "choices": [{"message": {"role": "assistant", "content": '{"ok":true}'}}]}
+        rows = [
+            {
+                "url": f"https://source-{number % 25}.example.test/article/{number}",
+                "title": f"Evidence {number}",
+                "snippet": f"current market evidence {number} " + ("x" * 8_000),
+                "published_at": "2026-08-27T09:00:00+08:00",
+            }
+            for number in range(200)
+        ]
+
+        with patch.object(client, "_request", side_effect=[first, timeout, final]) as request, patch(
+            "ai_trading_companion.provider_client.ResearchTools.call",
+            return_value={"backend": "searxng", "results": rows},
+        ):
+            completed = client.run(
+                "research", schema, slot="fast", effort="low", search=True, timeout=1200,
+            )
+
+        synthesis_payload = request.call_args_list[-1].args[0]
+        synthesis_chars = sum(len(str(message.get("content") or "")) for message in synthesis_payload["messages"])
+        self.assertLessEqual(synthesis_chars, 64_000)
+        self.assertEqual(200, len(completed.tool_trace[0]["evidence_items"]))
+        self.assertIn("omitted_evidence_items", synthesis_payload["messages"][-1]["content"])
 
     def test_research_timeout_without_evidence_is_not_converted_to_synthesis(self):
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)

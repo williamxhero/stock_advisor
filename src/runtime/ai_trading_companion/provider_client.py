@@ -38,6 +38,10 @@ class ProviderError(RuntimeError):
         return f"{self.category}: {super().__str__()}{suffix}"
 
 
+class ResearchDeadlineExceeded(ProviderError, TimeoutError):
+    pass
+
+
 class CurrentInformationUnavailable(ProviderError):
     pass
 
@@ -127,7 +131,11 @@ class ProviderClient:
         empty_tool_results = 0
         while True:
             if time.monotonic() >= deadline:
-                raise TimeoutError("research hard deadline exceeded")
+                raise ResearchDeadlineExceeded(
+                    "research hard deadline exceeded",
+                    category="provider_timeout",
+                    tool_trace=trace,
+                )
             if max_model_turns is not None and model_turns >= max_model_turns:
                 raise ProviderError("research model turn limit exceeded", category="research_loop_limit", tool_trace=trace)
             model_turns += 1
@@ -142,9 +150,14 @@ class ProviderClient:
                 forced_tool=forced_tool,
             )
             forced_tool = None
-            response, new_deltas = self._request_stream(
-                payload, remaining, on_delta, retry_after_delta=retry_stream_after_delta,
-            ) if on_delta else (self._request(payload, remaining), [])
+            try:
+                response, new_deltas = self._request_stream(
+                    payload, remaining, on_delta, retry_after_delta=retry_stream_after_delta,
+                ) if on_delta else (self._request(payload, remaining), [])
+            except Exception as exc:
+                if trace and not getattr(exc, "tool_trace", None):
+                    exc.tool_trace = list(trace)
+                raise
             deltas.extend(new_deltas)
             calls = _tool_calls(response)
             if not calls:

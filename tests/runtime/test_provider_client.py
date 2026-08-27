@@ -277,6 +277,45 @@ class ProviderClientTests(TestCase):
 
         self.assertEqual(2, len(raised.exception.tool_trace))
 
+    def test_provider_failure_after_research_preserves_completed_tool_trace(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        call = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "search_searxng", "arguments": '{"query":"current market"}'},
+        }
+        first = {"id": "r1", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [call]}}]}
+        failure = ProviderError("CPA disconnected", category="provider_network")
+
+        with patch.object(client, "_request", side_effect=[first, failure]), patch(
+            "ai_trading_companion.provider_client.ResearchTools.call",
+            return_value={"backend": "searxng", "results": [{"url": "https://example.test/current"}]},
+        ):
+            with self.assertRaises(ProviderError) as raised:
+                client.run("research", None, slot="fast", effort="low", search=True, timeout=20)
+
+        self.assertEqual(1, len(raised.exception.tool_trace))
+
+    def test_research_deadline_preserves_completed_tool_trace(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        call = {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "search_searxng", "arguments": '{"query":"current market"}'},
+        }
+        first = {"id": "r1", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [call]}}]}
+
+        with patch("ai_trading_companion.provider_client.time.monotonic", side_effect=[0, 0, 0, 20]), patch.object(
+            client, "_request", return_value=first
+        ), patch(
+            "ai_trading_companion.provider_client.ResearchTools.call",
+            return_value={"backend": "searxng", "results": [{"url": "https://example.test/current"}]},
+        ):
+            with self.assertRaisesRegex(TimeoutError, "hard deadline") as raised:
+                client.run("research", None, slot="fast", effort="low", search=True, timeout=20)
+
+        self.assertEqual(1, len(raised.exception.tool_trace))
+
     def test_probe_uses_the_configured_slow_provider_timeout(self):
         self.provider["retry"] = {"probe_timeout_seconds": 91}
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)

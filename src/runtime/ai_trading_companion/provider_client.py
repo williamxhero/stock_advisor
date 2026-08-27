@@ -231,6 +231,17 @@ class ProviderClient:
             else:
                 empty_tool_results += 1
                 if empty_tool_results >= max_empty_tool_results:
+                    if any(item.get("status") == "succeeded" and item.get("non_empty") for item in trace):
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "连续补查没有取得新证据。停止调用工具，基于本轮已经取得的证据"
+                                "立即输出要求的结构化 JSON；不得把空结果或未核实推测写成事实。"
+                            ),
+                        })
+                        tools = None
+                        deltas = []
+                        continue
                     raise ProviderError("research empty tool result limit exceeded", category="research_loop_limit", tool_trace=trace)
 
     @staticmethod

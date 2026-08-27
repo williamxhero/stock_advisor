@@ -326,6 +326,43 @@ class ProviderClientTests(TestCase):
 
         self.assertEqual(2, len(raised.exception.tool_trace))
 
+    def test_empty_tool_limit_synthesizes_when_prior_evidence_exists(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        schema = self.home / "schema.json"
+        schema.write_text(
+            '{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}',
+            encoding="utf-8",
+        )
+        responses = []
+        for number in range(3):
+            call = {
+                "id": f"call_{number}",
+                "type": "function",
+                "function": {
+                    "name": "search_searxng",
+                    "arguments": json.dumps({"query": f"evidence {number}"}),
+                },
+            }
+            responses.append({"id": f"r{number}", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [call]}}]})
+        responses.append({"id": "done", "choices": [{"message": {"role": "assistant", "content": '{"ok":true}'}}]})
+
+        tool_results = [
+            {"backend": "searxng", "results": [{"url": "https://example.test/current", "snippet": "current evidence"}]},
+            {"backend": "searxng", "results": []},
+            {"backend": "searxng", "results": []},
+        ]
+        with patch.object(client, "_request", side_effect=responses) as request, patch(
+            "ai_trading_companion.provider_client.ResearchTools.call", side_effect=tool_results,
+        ):
+            completed = client.run(
+                "research", schema, slot="fast", effort="low", search=True, timeout=20,
+                max_empty_tool_results=2,
+            )
+
+        self.assertEqual('{"ok":true}', completed.text)
+        self.assertEqual(3, len(completed.tool_trace))
+        self.assertNotIn("tools", request.call_args_list[-1].args[0])
+
     def test_provider_failure_after_research_preserves_completed_tool_trace(self):
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
         call = {

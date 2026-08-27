@@ -241,6 +241,7 @@ class ProviderClient:
                 raise ProviderError("Provider attempted an unavailable tool", category="tool_policy", request_id=_request_id(response), tool_trace=trace)
             messages.append(_assistant_message(response))
             usable_tool_result = False
+            batch_tool_counts: dict[str, int] = {}
             for call in calls:
                 if max_tool_calls is not None and tool_calls >= max_tool_calls:
                     raise ProviderError("research tool call limit exceeded", category="research_loop_limit", request_id=_request_id(response), tool_trace=trace)
@@ -252,6 +253,20 @@ class ProviderClient:
                     arguments = json.loads(str(call.get("function", {}).get("arguments") or "{}"))
                     if not isinstance(arguments, dict):
                         raise ValueError("tool arguments must be an object")
+                    batch_tool_counts[name] = batch_tool_counts.get(name, 0) + 1
+                    if batch_tool_counts[name] > max_empty_tool_results:
+                        result = {
+                            "error": "deferred: too many calls to one backend in a single model turn",
+                            "backend": name,
+                        }
+                        trace.append({
+                            "tool": name, "backend": name, "operation": name, "ok": False,
+                            "status": "deferred", "non_empty": False, "arguments": arguments,
+                            "attempt_id": attempt_id, "evidence_items": [], "observation_id": str(uuid.uuid4()),
+                            "error_code": "same_backend_batch_deferred", "error": result["error"],
+                        })
+                        messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, ensure_ascii=False)})
+                        continue
                     fingerprint = _hash_json({"tool": name, "arguments": arguments})
                     if fingerprint in seen_tool_calls:
                         raise ResearchToolError("provider repeated an identical research tool call")
@@ -275,6 +290,17 @@ class ProviderClient:
                 empty_tool_results = 0
             else:
                 empty_tool_results += 1
+                alternate = self._untried_research_backend(trace)
+                if alternate is not None:
+                    forced_tool = alternate
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "当前检索后端本轮没有取得非空信息。下一步必须改用尚未尝试的研究后端；"
+                            "由你选择最合适的查询参数或公开页面，不要重复刚才的空查询。"
+                        ),
+                    })
+                    continue
                 if empty_tool_results >= max_empty_tool_results:
                     if any(item.get("status") == "succeeded" and item.get("non_empty") for item in trace):
                         messages = _synthesis_messages(prompt, trace)
@@ -346,6 +372,15 @@ class ProviderClient:
         if "search_searxng" in attempted and "browse_page" not in attempted:
             return "browse_page"
         return "search_searxng"
+
+    @staticmethod
+    def _untried_research_backend(trace: list[dict[str, Any]]) -> str | None:
+        attempted = {str(item.get("tool") or "") for item in trace if item.get("status") != "deferred"}
+        if "search_searxng" in attempted and "browse_page" not in attempted:
+            return "browse_page"
+        if "browse_page" in attempted and "search_searxng" not in attempted:
+            return "search_searxng"
+        return None
 
     def _payload(self, prompt: str, model: str, effort: str, *, stream: bool = False) -> dict[str, Any]:
         return self._payload_from_messages([{"role": "user", "content": prompt}], model, effort, stream=stream)

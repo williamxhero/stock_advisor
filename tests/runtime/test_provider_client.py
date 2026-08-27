@@ -354,14 +354,68 @@ class ProviderClientTests(TestCase):
         self.assertEqual("research complete", completed.text)
         self.assertEqual(13, len(completed.tool_trace))
 
+    def test_empty_same_backend_batch_is_bounded_and_forces_the_other_backend(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        searx_calls = [
+            {
+                "id": f"searx_{number}",
+                "type": "function",
+                "function": {
+                    "name": "search_searxng",
+                    "arguments": json.dumps({"query": f"empty market query {number}"}),
+                },
+            }
+            for number in range(4)
+        ]
+        browse_call = {
+            "id": "browse_1",
+            "type": "function",
+            "function": {
+                "name": "browse_page",
+                "arguments": '{"url":"https://example.test/market"}',
+            },
+        }
+        responses = [
+            {"id": "search_batch", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": searx_calls}}]},
+            {"id": "browse", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [browse_call]}}]},
+            {"id": "done", "choices": [{"message": {"role": "assistant", "content": "research complete"}}]},
+        ]
+
+        def tool_result(name, _arguments):
+            if name == "browse_page":
+                return {"backend": "playwright", "url": "https://example.test/market", "text": "current market evidence"}
+            return {"backend": "searxng", "results": []}
+
+        with patch.object(client, "_request", side_effect=responses) as request, patch(
+            "ai_trading_companion.provider_client.ResearchTools.call", side_effect=tool_result,
+        ) as tool:
+            completed = client.run(
+                "research", None, slot="fast", effort="low", search=True, timeout=20,
+                max_empty_tool_results=3,
+            )
+
+        self.assertEqual("research complete", completed.text)
+        self.assertEqual(4, tool.call_count)
+        self.assertEqual(
+            "browse_page",
+            request.call_args_list[1].args[0]["tool_choice"]["function"]["name"],
+        )
+        self.assertEqual(["search_searxng"] * 3 + ["browse_page"], [item[0][0] for item in tool.call_args_list])
+
     def test_research_loop_failure_preserves_completed_tool_trace(self):
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
         responses = []
-        for number in range(2):
+        for number, tool_name in enumerate(("search_searxng", "browse_page")):
             call = {
                 "id": f"empty_{number}",
                 "type": "function",
-                "function": {"name": "search_searxng", "arguments": json.dumps({"query": f"empty {number}"})},
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(
+                        {"query": "empty search"} if tool_name == "search_searxng"
+                        else {"url": "https://example.test/empty"}
+                    ),
+                },
             }
             responses.append({"id": f"r{number}", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [call]}}]})
 
@@ -382,13 +436,16 @@ class ProviderClientTests(TestCase):
             encoding="utf-8",
         )
         responses = []
-        for number in range(3):
+        for number, tool_name in enumerate(("search_searxng", "search_searxng", "browse_page")):
             call = {
                 "id": f"call_{number}",
                 "type": "function",
                 "function": {
-                    "name": "search_searxng",
-                    "arguments": json.dumps({"query": f"evidence {number}"}),
+                    "name": tool_name,
+                    "arguments": json.dumps(
+                        {"query": f"evidence {number}"} if tool_name == "search_searxng"
+                        else {"url": "https://example.test/current"}
+                    ),
                 },
             }
             responses.append({"id": f"r{number}", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [call]}}]})

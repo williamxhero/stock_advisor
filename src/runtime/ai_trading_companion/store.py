@@ -1132,11 +1132,11 @@ class CompanionStore:
         if status not in {"succeeded", "rejected", "failed", "timed_out"}:
             raise ValueError(f"invalid attempt status: {status}")
         with self.connection() as c:
-            c.execute(
+            cursor = c.execute(
                 """UPDATE llm_attempt SET status=?,completed_at=?,output_sha256=?,error=?,usage_json=?,
                    input_tokens=?,cached_input_tokens=?,output_tokens=?,reasoning_tokens=?,verifier_json=?,
                    provider_response_id=?,provider_request_id=?,tool_trace_json=?,
-                   output_json=?,duration_ms=CAST((julianday(?) - julianday(started_at))*86400000 AS INTEGER) WHERE attempt_id=?""",
+                   output_json=?,duration_ms=CAST((julianday(?) - julianday(started_at))*86400000 AS INTEGER) WHERE attempt_id=? AND status='running'""",
                 (status, now(), output_sha256, error[-2000:] if error else None,
                  json.dumps(usage or {}, ensure_ascii=False, sort_keys=True),
                  (usage or {}).get("input_tokens"), (usage or {}).get("cached_input_tokens"),
@@ -1146,6 +1146,8 @@ class CompanionStore:
                   json.dumps(output, ensure_ascii=False, sort_keys=True) if output is not None else None,
                   now(), attempt_id),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("attempt is already terminal or does not exist")
 
     def attempts(self, cycle_id: str) -> list[dict[str, Any]]:
         with self.connection() as c:
@@ -1212,7 +1214,7 @@ class CompanionStore:
                      AND m.known_at<=? AND COALESCE(c.schedule_snapshot_json,'') NOT LIKE '%diagnostic_rerun%'
                      AND EXISTS (SELECT 1 FROM llm_attempt a WHERE a.cycle_id=c.cycle_id AND a.stage='m0_research'
                        AND a.status='succeeded' AND json_extract(a.verifier_json,'$.passed')=1
-                       AND json_extract(a.verifier_json,'$.evidence_gate.validator_version')=2)
+                       AND json_extract(a.verifier_json,'$.evidence_gate.validator_version')=3)
                      AND EXISTS (SELECT 1 FROM llm_attempt a WHERE a.cycle_id=c.cycle_id AND a.stage='m0_compose'
                        AND a.status='succeeded' AND json_extract(a.verifier_json,'$.passed')=1)
                    ORDER BY m.known_at DESC LIMIT 1""",

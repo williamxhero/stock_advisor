@@ -207,6 +207,27 @@ class ProviderClientTests(TestCase):
         self.assertEqual("search_searxng", request.call_args_list[2].args[0]["tool_choice"]["function"]["name"])
         self.assertTrue(result.validation["passed"])
 
+    def test_rejected_candidate_keeps_provider_audit_information(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        schema = self.home / "schema.json"
+        schema.write_text('{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}', encoding="utf-8")
+        response = {"id": "response-1", "_request_id": "request-1", "usage": {"prompt_tokens": 7}, "choices": [{"message": {"role": "assistant", "content": '{"ok":false}'}}]}
+        with patch.object(client, "_request", return_value=response):
+            result = client.run("research", schema, slot="fast", effort="low", search=True, timeout=20, max_coverage_repairs=0, research_validator=lambda _output, _trace: {"passed": False, "problems": ["missing"]})
+        self.assertFalse(result.validation["passed"])
+        self.assertEqual('{"ok":false}', result.text)
+        self.assertEqual("response-1", result.response_id)
+        self.assertEqual("request-1", result.request_id)
+        self.assertEqual({"prompt_tokens": 7}, result.usage)
+        self.assertEqual([], result.tool_trace)
+
+    def test_research_loop_bounds_fail_before_unbounded_requests(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        with self.assertRaisesRegex(TimeoutError, "hard deadline"):
+            client.run("research", None, slot="fast", effort="low", search=True, timeout=0)
+        with self.assertRaisesRegex(ProviderError, "turn limit"):
+            client.run("research", None, slot="fast", effort="low", search=True, timeout=20, max_model_turns=0)
+
     def test_probe_uses_the_configured_slow_provider_timeout(self):
         self.provider["retry"] = {"probe_timeout_seconds": 91}
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)

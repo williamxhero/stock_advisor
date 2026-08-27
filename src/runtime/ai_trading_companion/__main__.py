@@ -201,10 +201,12 @@ def _call_stage(
     started = time.monotonic()
     attempt_finished = False
     try:
-        requirements = packet.get("evidence_requirements") if search else None
-        research_validator = (
-            lambda output, trace: EvidenceGate().evaluate(output, requirements or [], trace, str(packet.get("as_of") or ""))
-        ) if search else None
+        contract = packet.get("evidence_contract") if search else None
+        def research_validator_for(active_attempt_id: str):
+            return lambda output, trace: EvidenceGate().evaluate(
+                output, contract or {}, trace, str(packet.get("as_of") or ""), attempt_id=active_attempt_id,
+            )
+        research_validator = research_validator_for(attempt["attempt_id"]) if contract else None
         result = provider_client().run(
             RuntimePacketBuilder.prompt(packet), SCHEMAS / schema_name,
             timeout=decision.timeout_seconds,
@@ -212,8 +214,11 @@ def _call_stage(
             research_validator=research_validator,
             on_delta=(lambda _delta: None) if decision.search else None,
             retry_stream_after_delta=decision.search,
+            attempt_id=attempt["attempt_id"],
         )
         data = json.loads(result.text)
+        if result.validation and result.validation.get("normalized_evidence"):
+            data = result.validation["normalized_evidence"]
         verifier = router.verify(stage, packet, data)
         if result.validation is not None:
             verifier = {
@@ -262,28 +267,35 @@ def _call_stage(
                 route_decision_id=decision_id, runner_fingerprint="chat-completions-v1",
                 input_packet=packet,
             )
+            hedge_finished = False
             try:
                 result = provider_client().run(
                     RuntimePacketBuilder.prompt(packet), SCHEMAS / schema_name, timeout=remaining,
                     search=hedge.search, slot=hedge.model_slot, effort=hedge.reasoning_effort,
-                    research_validator=research_validator,
+                    research_validator=research_validator_for(hedge_attempt["attempt_id"]) if contract and hedge.search else None,
                     on_delta=(lambda _delta: None) if hedge.search else None,
                     retry_stream_after_delta=hedge.search,
+                    attempt_id=hedge_attempt["attempt_id"],
                 )
-                data = json.loads(result.text); verifier = router.verify(stage, packet, data)
+                data = json.loads(result.text)
+                if result.validation and result.validation.get("normalized_evidence"):
+                    data = result.validation["normalized_evidence"]
+                verifier = router.verify(stage, packet, data)
                 if result.validation is not None:
                     verifier = {**verifier, "passed": bool(verifier.get("passed")) and bool(result.validation.get("passed")), "problems": list(dict.fromkeys([*(verifier.get("problems") or []), *(result.validation.get("problems") or [])])), "evidence_gate": result.validation}
                 hedge_status = "succeeded" if verifier["passed"] else "rejected"
                 store.finish_attempt(hedge_attempt["attempt_id"], hedge_status, output_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(), output=data, usage=result.usage, verifier=verifier, provider_response_id=result.response_id, provider_request_id=result.request_id, tool_trace=result.tool_trace)
+                hedge_finished = True
                 if not verifier["passed"]:
                     raise EvidenceInsufficient(verifier)
                 return VerifiedStageResult(data, result, hedge_attempt["attempt_id"], str(packet.get("sha256") or ""), verifier)
             except Exception as hedge_error:
-                hedge_status = "timed_out" if isinstance(hedge_error, TimeoutError) else "failed"
-                store.finish_attempt(
-                    hedge_attempt["attempt_id"], hedge_status, error=str(hedge_error),
-                    provider_request_id=hedge_error.request_id if isinstance(hedge_error, ProviderError) else None,
-                )
+                if not hedge_finished:
+                    hedge_status = "timed_out" if isinstance(hedge_error, TimeoutError) else "failed"
+                    store.finish_attempt(
+                        hedge_attempt["attempt_id"], hedge_status, error=str(hedge_error),
+                        provider_request_id=hedge_error.request_id if isinstance(hedge_error, ProviderError) else None,
+                    )
         raise
 
 
@@ -379,7 +391,7 @@ def run_research(
                 evidence_attempt_id = checkpoint["attempt_id"]
             else:
                 evidence_stage = _call_stage(
-                    store, cycle, "m0_research", public_packet, "companion-evidence-result-v2.schema.json",
+                    store, cycle, "m0_research", public_packet, "companion-evidence-result-v3.schema.json",
                     search=True, timeout=int(policy.research_timeout.total_seconds()),
                     retry_model_slot="fast" if number > 1 else None,
                 )
@@ -466,7 +478,7 @@ def run_m1(
                 evidence_attempt_id = checkpoint["attempt_id"]
             else:
                 evidence_stage = _call_stage(
-                    store, cycle, "m1_research", public_packet, "companion-evidence-result-v2.schema.json",
+                    store, cycle, "m1_research", public_packet, "companion-evidence-result-v3.schema.json",
                     search=True, timeout=_deadline_timeout(cycle, int(policy.m1_timeout.total_seconds())),
                     retry_model_slot="fast" if number > 1 else None,
                 )

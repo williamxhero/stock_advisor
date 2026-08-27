@@ -92,8 +92,6 @@ class CompanionEngine:
 
     def research_failed(self, cycle_id: str, reason: str, *, details: dict[str, Any] | None = None) -> dict[str, Any]:
         message = self._stage_failure_message("M0", reason, details)
-        if details:
-            self.store.append_artifact(cycle_id, "stage_failure", "system", message, iso(utc_now()), {"stage": "m0_research", "details": details})
         cycle = self.store.transition(cycle_id, "failed")
         self.emit(cycle, "research.failed", {
             "cycle": cycle, "reason": message,
@@ -476,8 +474,6 @@ class CompanionEngine:
 
     def m1_failed(self, cycle_id: str, reason: str, *, retryable: bool, details: dict[str, Any] | None = None) -> dict[str, Any]:
         message = self._stage_failure_message("M1", str(reason), details)
-        if details and not retryable:
-            self.store.append_artifact(cycle_id, "stage_failure", "system", message, iso(utc_now()), {"stage": "m1_research", "details": details})
         cycle = self.store.transition(cycle_id, "m1_retry_wait" if retryable else "waiting_for_repair")
         self.emit(cycle, "m1.failed", {
             "cycle": cycle, "reason": message,

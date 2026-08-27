@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,9 +13,24 @@ from ai_trading_companion.memory import MemoryQuery, SqliteMemoryRetriever
 from ai_trading_companion.packet_builder import RuntimePacketBuilder
 from ai_trading_companion.scheduler import conversation_auto_submit_at, load_schedules, run_daily_schedule, run_periodic_schedule
 from ai_trading_companion.store import CompanionStore
+from ai_trading_companion.evidence_contract import EvidenceContractFactory
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+class _WeekdayCalendar:
+    def is_trading_day(self, day: date) -> bool:
+        return day.weekday() < 5
+
+
+def packet_builder(store: CompanionStore) -> RuntimePacketBuilder:
+    return RuntimePacketBuilder(
+        PROJECT_ROOT / "resources",
+        PROJECT_ROOT / "data",
+        store,
+        evidence_contract_factory=EvidenceContractFactory(_WeekdayCalendar()),
+    )
 
 
 class CompanionEngineTests(unittest.TestCase):
@@ -416,7 +431,7 @@ class CompanionEngineTests(unittest.TestCase):
         started = self.engine.research_started(cycle["cycle_id"])
         frozen = self.store.messages(cycle["cycle_id"], state="submitted", phase="pre_m0")
         artifact = self.store.latest_artifact(cycle["cycle_id"], "pre_m0")
-        builder = RuntimePacketBuilder(PROJECT_ROOT / "resources", PROJECT_ROOT / "data", self.store)
+        builder = packet_builder(self.store)
         public_packet = builder.build(started, "m0_research")
         compose_packet = builder.build(started, "m0_compose", evidence={"sources": []})
 
@@ -457,7 +472,7 @@ class CompanionEngineTests(unittest.TestCase):
         })
         started = self.engine.research_started(cycle["cycle_id"])
         artifact = self.store.latest_artifact(cycle["cycle_id"], "pre_m0")
-        builder = RuntimePacketBuilder(PROJECT_ROOT / "resources", PROJECT_ROOT / "data", self.store)
+        builder = packet_builder(self.store)
         public_packet = builder.build(started, "m0_research")
 
         self.assertIn("先核实机器人板块", artifact["body_markdown"])

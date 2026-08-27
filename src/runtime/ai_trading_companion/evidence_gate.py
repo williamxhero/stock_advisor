@@ -24,10 +24,14 @@ class EvidenceGate:
     def evaluate(
         self,
         evidence: dict[str, Any],
-        requirements: list[dict[str, Any]],
+        requirements: list[dict[str, Any]] | dict[str, Any],
         observations: list[dict[str, Any]],
         expected_as_of: str | None = None,
+        *,
+        attempt_id: str | None = None,
     ) -> dict[str, Any]:
+        if isinstance(requirements, dict) and requirements.get("version") == 3:
+            return _EvidenceGateV3().evaluate(evidence, requirements, observations, expected_as_of, attempt_id)
         problems: list[str] = []
         successful = [item for item in observations if item.get("status") == "succeeded" and item.get("non_empty")]
         if not successful:
@@ -243,3 +247,115 @@ class EvidenceGate:
             return False
         local = fact_as_of.astimezone(ZoneInfo("Asia/Shanghai"))
         return any((int(hour), int(minute or 0)) > (local.hour, local.minute) for hour, minute in matches)
+
+
+class _EvidenceGateV3:
+    """Pure validation of runtime-bound, attempt-scoped Evidence v3 references."""
+
+    def evaluate(
+        self, evidence: dict[str, Any], contract: dict[str, Any], observations: list[dict[str, Any]],
+        expected_as_of: str | None, attempt_id: str | None,
+    ) -> dict[str, Any]:
+        problems: list[str] = []
+        as_of = self._time(evidence.get("as_of"), "evidence_as_of", problems)
+        expected = self._time(expected_as_of or contract.get("as_of"), "frozen_as_of", problems)
+        if as_of and expected and as_of != expected:
+            problems.append("evidence_as_of_does_not_match_frozen_packet")
+        current = [item for item in observations if item.get("status") == "succeeded" and item.get("non_empty") and (not attempt_id or item.get("attempt_id") == attempt_id)]
+        if not current:
+            problems.append("no_current_information_tool_result")
+        items = {
+            str(entry.get("evidence_ref")): {**entry, "tool_arguments": observation.get("arguments") or {}}
+            for observation in current for entry in observation.get("evidence_items") or []
+            if entry.get("evidence_ref")
+        }
+        sources: dict[str, dict[str, Any]] = {}
+        for source in evidence.get("sources") or []:
+            ref = str(source.get("evidence_ref") or "")
+            item = items.get(ref)
+            if not item:
+                problems.append("source_ref_not_in_current_attempt")
+                continue
+            excerpt = EvidenceGate._normalize_text(source.get("excerpt"))
+            runtime_excerpt = EvidenceGate._normalize_text(item.get("excerpt_text"))
+            if not excerpt or not runtime_excerpt or excerpt not in runtime_excerpt:
+                problems.append("source_excerpt_not_in_runtime_evidence")
+                continue
+            for key in ("fact_as_of", "published_at", "acquired_at"):
+                value = item.get(key)
+                parsed = self._time(value, f"source_{key}", problems, required=(key != "published_at"))
+                if parsed and as_of and parsed > as_of:
+                    problems.append("source_from_future" if key == "fact_as_of" else f"source_{key}_in_future")
+            sources[ref] = {**item, "excerpt": excerpt, "analysis": str(source.get("analysis") or "")}
+        coverage = {str(row.get("requirement_key") or ""): row for row in evidence.get("coverage") or [] if isinstance(row, dict)}
+        missing: list[str] = []
+        for requirement in contract.get("requirements") or []:
+            if not requirement.get("blocking", True):
+                continue
+            key = str(requirement.get("key") or "")
+            row = coverage.get(key)
+            allowed = set(requirement.get("allowed_coverage") or ["covered"])
+            if not row or row.get("status") not in allowed:
+                problems.append(f"blocking_requirement_missing:{key}"); missing.append(key); continue
+            refs = [str(ref) for ref in row.get("evidence_refs") or []]
+            bound = [sources[ref] for ref in refs if ref in sources]
+            if not refs or len(bound) != len(refs):
+                problems.append(f"blocking_requirement_untraceable:{key}"); missing.append(key); continue
+            if not self._in_window(bound, requirement.get("window") or {}, problems):
+                problems.append(f"blocking_requirement_stale:{key}"); missing.append(key); continue
+            if row.get("status") == "checked_no_change" and not self._matching_negative_query(bound, requirement.get("negative_query_terms") or []):
+                problems.append(f"checked_no_change_query_not_matched:{key}"); missing.append(key)
+        for event in evidence.get("high_impact_events") or []:
+            if event.get("materiality") != "high":
+                continue
+            refs = [str(ref) for ref in event.get("evidence_refs") or []]
+            bound = [sources[ref] for ref in refs if ref in sources]
+            independent = {str(item.get("independence_group") or "") for item in bound if item.get("independence_group")}
+            if not any(item.get("primary") for item in bound) and len(independent) < 2:
+                problems.append("high_impact_fact_lacks_primary_or_independent_confirmation")
+        return {
+            "validator_version": 3, "passed": not problems,
+            "problems": list(dict.fromkeys(problems)), "missing_requirements": list(dict.fromkeys(missing)),
+            "attempted_backends": sorted({str(item.get("backend") or "") for item in current if item.get("backend")}),
+            "successful_tool_results": len(current), "normalized_evidence": self._normalized(evidence, sources),
+        }
+
+    @staticmethod
+    def _time(value: Any, label: str, problems: list[str], *, required: bool = True) -> datetime | None:
+        if not value:
+            if required: problems.append(f"{label}_missing")
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            problems.append(f"{label}_invalid"); return None
+        if parsed.tzinfo is None:
+            problems.append(f"{label}_missing_timezone"); return None
+        return parsed.astimezone(timezone.utc)
+
+    def _in_window(self, sources: list[dict[str, Any]], window: dict[str, Any], problems: list[str]) -> bool:
+        start = self._time(window.get("start"), "contract_window_start", problems)
+        end = self._time(window.get("end"), "contract_window_end", problems)
+        if not start or not end:
+            return False
+        values = [self._time(item.get("fact_as_of"), "source_fact_as_of", problems) for item in sources]
+        if any(value is None for value in values):
+            return False
+        if window.get("mode") == "exact":
+            return any(value == start == end for value in values)
+        return any(start < value <= end for value in values)
+
+    @staticmethod
+    def _matching_negative_query(sources: list[dict[str, Any]], terms: list[str]) -> bool:
+        if not terms:
+            return True
+        return any(all(term.casefold() in str(item.get("tool_arguments", {}).get("query") or "").casefold() for term in terms) for item in sources)
+
+    @staticmethod
+    def _normalized(evidence: dict[str, Any], sources: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        materialized = []
+        for source in evidence.get("sources") or []:
+            item = sources.get(str(source.get("evidence_ref") or ""))
+            if item:
+                materialized.append({**item, "evidence_ref": source.get("evidence_ref"), "excerpt": source.get("excerpt"), "analysis": source.get("analysis")})
+        return {**evidence, "sources": materialized}

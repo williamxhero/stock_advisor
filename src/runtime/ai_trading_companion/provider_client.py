@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
 
 from .credentials import read_secret
+from .acquisition import AcquisitionBoundary
 from .research_tools import ResearchTools, ResearchToolError
 from .secret_guard import assert_safe
 
@@ -94,10 +95,16 @@ class ProviderClient:
         research_validator: Callable[[dict[str, Any], list[dict[str, Any]]], dict[str, Any]] | None = None,
         max_coverage_repairs: int = 2,
         retry_stream_after_delta: bool = False,
+        attempt_id: str | None = None,
+        max_model_turns: int = 12,
+        max_tool_calls: int = 12,
+        max_empty_tool_results: int = 3,
     ) -> ProviderResult:
         assert_safe(prompt, boundary="Provider input")
         started = time.monotonic()
+        deadline = started + timeout
         tools = ResearchTools(self.home, self.research) if search else None
+        acquisition = AcquisitionBoundary(attempt_id or str(uuid.uuid4())) if search else None
         trace: list[dict[str, Any]] = []
         seen_tool_calls: set[str] = set()
         model = self._model(slot)
@@ -105,8 +112,16 @@ class ProviderClient:
         deltas: list[str] = []
         coverage_repairs = 0
         forced_tool: str | None = None
+        model_turns = 0
+        tool_calls = 0
+        empty_tool_results = 0
         while True:
-            remaining = max(1, timeout - int(time.monotonic() - started))
+            if time.monotonic() >= deadline:
+                raise TimeoutError("research hard deadline exceeded")
+            if model_turns >= max_model_turns:
+                raise ProviderError("research model turn limit exceeded", category="research_loop_limit")
+            model_turns += 1
+            remaining = max(1, int(deadline - time.monotonic()))
             # CPA accepts tools and JSON Schema independently, but its upstream
             # translation rejects the combination. Keep the research loop in
             # ordinary Chat Completions mode, then make one schema-only pass.
@@ -141,8 +156,8 @@ class ProviderClient:
                     validation = research_validator(structured, trace)
                     if not validation.get("passed"):
                         if coverage_repairs >= max_coverage_repairs:
-                            from .evidence_gate import EvidenceInsufficient
-                            raise EvidenceInsufficient(validation)
+                            assert_safe(text, boundary="Provider output")
+                            return ProviderResult(text, response.get("id"), [], response.get("usage") or {}, _request_id(response), trace, validation)
                         coverage_repairs += 1
                         messages.extend([
                             {"role": "assistant", "content": text},
@@ -159,6 +174,9 @@ class ProviderClient:
             messages.append(_assistant_message(response))
             usable_tool_result = False
             for call in calls:
+                if tool_calls >= max_tool_calls:
+                    raise ProviderError("research tool call limit exceeded", category="research_loop_limit", request_id=_request_id(response))
+                tool_calls += 1
                 name = str(call.get("function", {}).get("name") or "")
                 call_id = str(call.get("id") or "")
                 arguments: dict[str, Any] = {}
@@ -173,29 +191,24 @@ class ProviderClient:
                     result = tools.call(name, arguments)
                     non_empty = bool(result.get("results") or result.get("text") or result.get("content_sha256"))
                     usable_tool_result = usable_tool_result or non_empty
-                    observation = self._tool_observation(name, arguments, result, non_empty)
+                    assert acquisition is not None
+                    observation, result = acquisition.observe(name, arguments, result, non_empty)
                     trace.append(observation)
-                    result["runtime_observation_id"] = observation["observation_id"]
-                    item_hashes = {item["url"]: item["result_item_hash"] for item in observation["result_items"]}
-                    item_metadata = {item["url"]: item for item in observation["result_items"]}
-                    if result.get("url") in item_hashes:
-                        result["runtime_result_item_hash"] = item_hashes[result["url"]]
-                        result["runtime_source_family"] = item_metadata[result["url"]]["source_family"]
-                        result["runtime_upstream_id"] = item_metadata[result["url"]]["upstream_id"]
-                    for row in result.get("results") or []:
-                        if isinstance(row, dict) and row.get("url") in item_hashes:
-                            row["runtime_result_item_hash"] = item_hashes[row["url"]]
-                            row["runtime_source_family"] = item_metadata[row["url"]]["source_family"]
-                            row["runtime_upstream_id"] = item_metadata[row["url"]]["upstream_id"]
                 except (ValueError, ResearchToolError) as exc:
                     result = {"error": str(exc), "backend": name}
                     trace.append({
                         "tool": name, "backend": name, "operation": name, "ok": False,
                         "status": "failed", "non_empty": False, "arguments": arguments if "arguments" in locals() else {},
-                        "result_urls": [], "result_items": [], "observation_id": str(uuid.uuid4()),
+                        "attempt_id": attempt_id, "evidence_items": [], "observation_id": str(uuid.uuid4()),
                         "error_code": type(exc).__name__, "error": str(exc),
                     })
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result, ensure_ascii=False)})
+            if usable_tool_result:
+                empty_tool_results = 0
+            else:
+                empty_tool_results += 1
+                if empty_tool_results >= max_empty_tool_results:
+                    raise ProviderError("research empty tool result limit exceeded", category="research_loop_limit")
 
     @staticmethod
     def _tool_observation(name: str, arguments: dict[str, Any], result: dict[str, Any], non_empty: bool) -> dict[str, Any]:

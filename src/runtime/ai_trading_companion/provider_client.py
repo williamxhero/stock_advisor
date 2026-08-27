@@ -142,6 +142,7 @@ class ProviderClient:
         model_turns = 0
         tool_calls = 0
         empty_tool_results = 0
+        empty_synthesis_retried = False
         synthesis_reserve = _synthesis_reserve_seconds(timeout) if search and schema is not None else 0
         while True:
             if time.monotonic() >= deadline:
@@ -156,10 +157,7 @@ class ProviderClient:
             remaining = max(1, int(deadline - time.monotonic()))
             has_evidence = _has_usable_evidence(trace)
             if tools is not None and schema is not None and has_evidence and remaining <= synthesis_reserve:
-                messages.append({
-                    "role": "user",
-                    "content": _SYNTHESIZE_FROM_EXISTING_EVIDENCE,
-                })
+                messages = _synthesis_messages(prompt, trace)
                 tools = None
                 deltas = []
                 continue
@@ -188,7 +186,7 @@ class ProviderClient:
                     and _has_usable_evidence(trace)
                     and time.monotonic() < deadline
                 ):
-                    messages.append({"role": "user", "content": _SYNTHESIZE_FROM_EXISTING_EVIDENCE})
+                    messages = _synthesis_messages(prompt, trace)
                     tools = None
                     deltas = []
                     continue
@@ -204,11 +202,15 @@ class ProviderClient:
             if not calls:
                 text = _message_content(response) or "".join(deltas)
                 if schema is not None and tools is not None:
-                    messages.extend([
-                        {"role": "assistant", "content": text},
-                        {"role": "user", "content": "将以上研究结果整理为要求的结构化 JSON。只返回 JSON，不要添加 Markdown 或解释。"},
-                    ])
+                    messages = _synthesis_messages(prompt, trace)
                     tools = None
+                    deltas = []
+                    continue
+                if schema is not None and tools is None and not text.strip() and trace and not empty_synthesis_retried:
+                    empty_synthesis_retried = True
+                    messages = _synthesis_messages(prompt, trace, retry_empty=True)
+                    model = self._model("fast")
+                    effort = "medium"
                     deltas = []
                     continue
                 validation = None
@@ -273,10 +275,7 @@ class ProviderClient:
                 empty_tool_results += 1
                 if empty_tool_results >= max_empty_tool_results:
                     if any(item.get("status") == "succeeded" and item.get("non_empty") for item in trace):
-                        messages.append({
-                            "role": "user",
-                            "content": _SYNTHESIZE_FROM_EXISTING_EVIDENCE,
-                        })
+                        messages = _synthesis_messages(prompt, trace)
                         tools = None
                         deltas = []
                         continue
@@ -613,6 +612,47 @@ def _tool_calls(response: dict[str, Any]) -> list[dict[str, Any]]:
 def _message_content(response: dict[str, Any]) -> str:
     content = (response.get("choices") or [{}])[0].get("message", {}).get("content")
     return str(content or "")
+
+
+def _synthesis_messages(prompt: str, trace: list[dict[str, Any]], *, retry_empty: bool = False) -> list[dict[str, Any]]:
+    """Detach final writing from the verbose tool protocol while preserving evidence identities."""
+    observations: list[dict[str, Any]] = []
+    seen_evidence: set[str] = set()
+    for observation in trace:
+        evidence_items: list[dict[str, Any]] = []
+        for item in observation.get("evidence_items") or []:
+            if not isinstance(item, dict):
+                continue
+            identity = str(item.get("evidence_ref") or item.get("url") or item.get("source_identity") or "")
+            if identity and identity in seen_evidence:
+                continue
+            if identity:
+                seen_evidence.add(identity)
+            evidence_items.append({
+                key: item.get(key) for key in (
+                    "evidence_ref", "url", "title", "excerpt_text", "fact_as_of",
+                    "published_at", "acquired_at", "source_identity",
+                    "independence_group", "primary",
+                ) if item.get(key) is not None
+            })
+        observations.append({
+            "observation_id": observation.get("observation_id"),
+            "tool": observation.get("tool"),
+            "backend": observation.get("backend"),
+            "status": observation.get("status"),
+            "non_empty": observation.get("non_empty"),
+            "arguments": observation.get("arguments") or {},
+            "acquired_at": observation.get("acquired_at"),
+            "error_code": observation.get("error_code"),
+            "error": observation.get("error"),
+            "evidence_items": evidence_items,
+        })
+    retry_instruction = "上一次结构化响应正文为空；这是最后一次综合，不得再次返回空正文。" if retry_empty else ""
+    evidence_packet = json.dumps({"tool_observations": observations}, ensure_ascii=False, separators=(",", ":"))
+    return [
+        {"role": "user", "content": prompt},
+        {"role": "user", "content": f"{_SYNTHESIZE_FROM_EXISTING_EVIDENCE}{retry_instruction}\n运行时证据包：{evidence_packet}"},
+    ]
 
 
 def _request_id(response: dict[str, Any]) -> str | None:

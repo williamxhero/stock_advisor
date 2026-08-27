@@ -233,6 +233,32 @@ class ProviderClientTests(TestCase):
         final_payload = request.call_args_list[2].args[0]
         self.assertIn("response_format", final_payload)
         self.assertNotIn("tools", final_payload)
+        self.assertEqual(2, len(final_payload["messages"]))
+        self.assertIn("运行时证据包", final_payload["messages"][1]["content"])
+
+    def test_empty_structured_synthesis_reuses_evidence_with_fast_model(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        call = {"id": "call_1", "type": "function", "function": {"name": "search_searxng", "arguments": '{"query":"A股"}'}}
+        responses = [
+            {"id": "r1", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [call]}}]},
+            {"id": "r2", "choices": [{"message": {"role": "assistant", "content": "研究完成"}}]},
+            {"id": "r3", "choices": [{"message": {"role": "assistant", "content": None}, "finish_reason": "stop"}]},
+            {"id": "r4", "choices": [{"message": {"role": "assistant", "content": '{"ok":true}'}, "finish_reason": "stop"}]},
+        ]
+        schema = self.home / "schema.json"
+        schema.write_text('{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}', encoding="utf-8")
+        with patch.object(client, "_request", side_effect=responses) as request, patch(
+            "ai_trading_companion.provider_client.ResearchTools.call",
+            return_value={"backend": "searxng", "results": [{"url": "https://example.test", "title": "市场"}]},
+        ):
+            result = client.run("研究 A 股", schema, slot="research", effort="high", search=True, timeout=30)
+
+        self.assertEqual('{"ok":true}', result.text)
+        retry_payload = request.call_args_list[3].args[0]
+        self.assertEqual(self.provider["models"]["fast"]["id"], retry_payload["model"])
+        self.assertEqual("medium", retry_payload["reasoning_effort"])
+        self.assertNotIn("tools", retry_payload)
+        self.assertIn("上一次结构化响应正文为空", retry_payload["messages"][1]["content"])
 
     def test_coverage_repair_forces_a_research_backend_after_zero_tool_calls(self):
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)

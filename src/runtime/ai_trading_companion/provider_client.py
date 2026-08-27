@@ -525,12 +525,42 @@ class ProviderClient:
     def _request(self, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
         endpoints = self._request_endpoints()
         if endpoints:
-            if len(endpoints) == 1:
-                result = self._request_for_endpoint(endpoints[0], payload, timeout)
-                result["_provider_endpoint_id"] = str(endpoints[0]["id"])
-                return result
-            return self._hedged_request(endpoints, payload, timeout)
+            return self._request_by_cost_group(endpoints, payload, timeout)
         return self._request_single(payload, timeout)
+
+    def _request_by_cost_group(
+        self, endpoints: list[dict[str, Any]], payload: dict[str, Any], timeout: int,
+    ) -> dict[str, Any]:
+        if len(endpoints) == 1:
+            result = self._request_for_endpoint(endpoints[0], payload, timeout)
+            result["_provider_endpoint_id"] = str(endpoints[0]["id"])
+            return result
+        errors: list[str] = []
+        deadline = time.monotonic() + timeout
+        for group, members in self._endpoint_cost_groups(endpoints):
+            for batch in self._endpoint_batches(members):
+                candidates = list(batch)
+                while candidates:
+                    remaining = int(deadline - time.monotonic())
+                    if remaining <= 0:
+                        errors.append(f"group-{group}: provider_timeout")
+                        break
+                    endpoint, probe_errors = self._select_current_endpoint(candidates, remaining)
+                    errors.extend(f"group-{group}/{identifier}: {error}" for identifier, error in probe_errors)
+                    if endpoint is None:
+                        break
+                    candidates = [item for item in candidates if item["id"] != endpoint["id"]]
+                    try:
+                        result = self._request_for_endpoint(endpoint, payload, remaining)
+                        result["_provider_endpoint_id"] = str(endpoint["id"])
+                        return result
+                    except ProviderError as exc:
+                        errors.append(f"group-{group}/{endpoint['id']}: {exc}")
+        raise ProviderError(
+            f"All configured Provider cost groups failed ({'; '.join(errors) or 'no endpoint result'})",
+            category="provider_pool_exhausted",
+            retry_attempts=1,
+        )
 
     def _request_single(self, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
         idempotency_key = str(uuid.uuid4())
@@ -567,19 +597,37 @@ class ProviderClient:
             })
             endpoint["retry"] = retry
             endpoints.append(endpoint)
-        if not settings["enabled"]:
-            return endpoints[:1]
-        maximum = settings["max_parallel"]
-        return endpoints if maximum == 0 else endpoints[:maximum]
+        return endpoints[:1] if not settings["enabled"] else endpoints
 
-    def _hedged_request(
-        self, endpoints: list[dict[str, Any]], payload: dict[str, Any], timeout: int,
-    ) -> dict[str, Any]:
+    @staticmethod
+    def _endpoint_cost_groups(
+        endpoints: list[dict[str, Any]],
+    ) -> list[tuple[int, list[dict[str, Any]]]]:
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for endpoint in endpoints:
+            priority = max(0, int(endpoint.get("priority", 0)))
+            group = (priority // 100) * 100
+            grouped.setdefault(group, []).append(endpoint)
+        return sorted(grouped.items())
+
+    def _endpoint_batches(
+        self, endpoints: list[dict[str, Any]],
+    ) -> list[list[dict[str, Any]]]:
+        maximum = int(self._hedge_settings()["max_parallel"])
+        if maximum == 0:
+            return [endpoints]
+        return [endpoints[index:index + maximum] for index in range(0, len(endpoints), maximum)]
+
+    def _select_current_endpoint(
+        self, endpoints: list[dict[str, Any]], timeout: int,
+    ) -> tuple[dict[str, Any] | None, list[tuple[str, ProviderError]]]:
+        """Race token-free connectivity probes and return the first usable endpoint."""
         errors: list[tuple[str, ProviderError]] = []
-        workers = len(endpoints)
-        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="provider-hedge")
+        inconclusive: dict[str, Any] | None = None
+        probe_timeout = min(timeout, int(self._hedge_settings()["availability_probe_timeout_seconds"]))
+        executor = ThreadPoolExecutor(max_workers=len(endpoints), thread_name_prefix="provider-probe")
         futures = {
-            executor.submit(self._request_for_endpoint, endpoint, payload, timeout): endpoint
+            executor.submit(self._probe_endpoint, endpoint, probe_timeout): endpoint
             for endpoint in endpoints
         }
         try:
@@ -589,35 +637,66 @@ class ProviderClient:
                 for future in done:
                     endpoint = futures[future]
                     try:
-                        result = future.result()
-                        result["_provider_endpoint_id"] = str(endpoint["id"])
-                        return result
+                        if future.result():
+                            return endpoint, errors
+                        if inconclusive is None:
+                            inconclusive = endpoint
                     except ProviderError as exc:
                         errors.append((str(endpoint["id"]), exc))
                     except Exception:  # pragma: no cover - defensive boundary
                         errors.append((str(endpoint["id"]), ProviderError(
-                            "Provider request failed unexpectedly",
+                            "Provider availability probe failed unexpectedly",
                             category="provider_error",
                         )))
-            details = "; ".join(f"{identifier}: {error.category}" for identifier, error in errors)
-            raise ProviderError(
-                f"All configured Provider endpoints failed ({details or 'no endpoint result'})",
-                category="provider_pool_exhausted",
-                retry_attempts=1,
-            )
+            # A 404/405 /models response only means that the cheap probe is not
+            # implemented. Prefer a positively confirmed peer, but preserve
+            # compatibility by trying one inconclusive endpoint when necessary.
+            return inconclusive, errors
         finally:
             for future in futures:
                 future.cancel()
-            # urllib cannot force-cancel an in-flight socket.  Do not wait for a
-            # slow losing endpoint before returning the winning response.
+            # urllib cannot force-cancel an in-flight socket. These losing
+            # requests are token-free GETs and are bounded by the probe timeout.
             executor.shutdown(wait=False, cancel_futures=True)
+
+    def _probe_endpoint(self, endpoint: dict[str, Any], timeout: int) -> bool:
+        client = ProviderClient(endpoint, self.research, self.home, user_agent=self.user_agent)
+        return client._probe_connectivity_once(timeout)
+
+    def _probe_connectivity_once(self, timeout: int) -> bool:
+        request = Request(
+            f"{self._base_url()}/models",
+            headers=self._request_headers(accept="application/json"),
+            method="GET",
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                response.read(1)
+                return True
+        except HTTPError as exc:
+            # Some OpenAI-compatible gateways omit /models. An unsupported
+            # probe is inconclusive, so let the real request decide.
+            if exc.code in (404, 405):
+                return False
+            raise ProviderError(
+                _http_error_message(exc), category=_http_category(exc.code),
+                request_id=_response_request_id(exc.headers), status=exc.code,
+                retry_after=_retry_after(exc.headers.get("Retry-After")),
+            ) from exc
+        except TimeoutError as exc:
+            raise ProviderError("Provider availability probe timed out", category="provider_timeout") from exc
+        except (URLError, ConnectionError) as exc:
+            raise ProviderError("Provider availability probe failed", category="provider_network") from exc
 
     def _hedge_settings(self) -> dict[str, int | bool]:
         raw = self.provider.get("hedge") if isinstance(self.provider.get("hedge"), dict) else {}
         return {
             "enabled": bool(raw.get("enabled", True)),
-            # Zero deliberately means every configured endpoint participates.
+            # Zero means every endpoint in the active cost group is probed.
             "max_parallel": max(0, int(raw.get("max_parallel", 0))),
+            "availability_probe_timeout_seconds": max(
+                1, int(raw.get("availability_probe_timeout_seconds", 5)),
+            ),
             "per_endpoint_timeout_seconds": max(5, int(raw.get("per_endpoint_timeout_seconds", 45))),
             "per_endpoint_max_attempts": max(1, int(raw.get("per_endpoint_max_attempts", 1))),
         }
@@ -646,19 +725,52 @@ class ProviderClient:
     ) -> tuple[dict[str, Any], list[str]]:
         endpoints = self._request_endpoints()
         if endpoints:
-            if len(endpoints) == 1:
-                response, deltas = self._request_stream_for_endpoint(
-                    endpoints[0], payload, timeout, retry_after_delta,
-                )
-                response["_provider_endpoint_id"] = str(endpoints[0]["id"])
-            else:
-                response, deltas = self._hedged_stream(
-                    endpoints, payload, timeout, retry_after_delta,
-                )
+            response, deltas = self._request_stream_by_cost_group(
+                endpoints, payload, timeout, retry_after_delta,
+            )
             for delta in deltas:
                 on_delta(delta)
             return response, deltas
         return self._request_stream_single(payload, timeout, on_delta, retry_after_delta=retry_after_delta)
+
+    def _request_stream_by_cost_group(
+        self, endpoints: list[dict[str, Any]], payload: dict[str, Any], timeout: int,
+        retry_after_delta: bool,
+    ) -> tuple[dict[str, Any], list[str]]:
+        if len(endpoints) == 1:
+            response, deltas = self._request_stream_for_endpoint(
+                endpoints[0], payload, timeout, retry_after_delta,
+            )
+            response["_provider_endpoint_id"] = str(endpoints[0]["id"])
+            return response, deltas
+        errors: list[str] = []
+        deadline = time.monotonic() + timeout
+        for group, members in self._endpoint_cost_groups(endpoints):
+            for batch in self._endpoint_batches(members):
+                candidates = list(batch)
+                while candidates:
+                    remaining = int(deadline - time.monotonic())
+                    if remaining <= 0:
+                        errors.append(f"group-{group}: provider_timeout")
+                        break
+                    endpoint, probe_errors = self._select_current_endpoint(candidates, remaining)
+                    errors.extend(f"group-{group}/{identifier}: {error}" for identifier, error in probe_errors)
+                    if endpoint is None:
+                        break
+                    candidates = [item for item in candidates if item["id"] != endpoint["id"]]
+                    try:
+                        response, deltas = self._request_stream_for_endpoint(
+                            endpoint, payload, remaining, retry_after_delta,
+                        )
+                        response["_provider_endpoint_id"] = str(endpoint["id"])
+                        return response, deltas
+                    except ProviderError as exc:
+                        errors.append(f"group-{group}/{endpoint['id']}: {exc}")
+        raise ProviderError(
+            f"All configured Provider cost groups failed ({'; '.join(errors) or 'no endpoint result'})",
+            category="provider_pool_exhausted",
+            retry_attempts=1,
+        )
 
     def _request_stream_for_endpoint(
         self, endpoint: dict[str, Any], payload: dict[str, Any], timeout: int,
@@ -669,46 +781,6 @@ class ProviderClient:
         return client._request_stream_single(
             payload, timeout, deltas.append, retry_after_delta=retry_after_delta,
         )
-
-    def _hedged_stream(
-        self, endpoints: list[dict[str, Any]], payload: dict[str, Any], timeout: int,
-        retry_after_delta: bool,
-    ) -> tuple[dict[str, Any], list[str]]:
-        errors: list[tuple[str, ProviderError]] = []
-        executor = ThreadPoolExecutor(max_workers=len(endpoints), thread_name_prefix="provider-hedge")
-        futures = {
-            executor.submit(
-                self._request_stream_for_endpoint, endpoint, payload, timeout, retry_after_delta,
-            ): endpoint
-            for endpoint in endpoints
-        }
-        try:
-            pending = set(futures)
-            while pending:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    endpoint = futures[future]
-                    try:
-                        response, deltas = future.result()
-                        response["_provider_endpoint_id"] = str(endpoint["id"])
-                        return response, deltas
-                    except ProviderError as exc:
-                        errors.append((str(endpoint["id"]), exc))
-                    except Exception:  # pragma: no cover - defensive boundary
-                        errors.append((str(endpoint["id"]), ProviderError(
-                            "Provider streaming request failed unexpectedly",
-                            category="provider_error",
-                        )))
-            details = "; ".join(f"{identifier}: {error.category}" for identifier, error in errors)
-            raise ProviderError(
-                f"All configured Provider endpoints failed ({details or 'no endpoint result'})",
-                category="provider_pool_exhausted",
-                retry_attempts=1,
-            )
-        finally:
-            for future in futures:
-                future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
 
     def _request_stream_single(
         self, payload: dict[str, Any], timeout: int, on_delta: Callable[[str], None],
@@ -856,15 +928,25 @@ class ProviderClient:
                 state.open_until = time.monotonic() + float(settings["circuit_breaker_cooldown_seconds"])
 
     def _request_object(self, payload: dict[str, Any], *, idempotency_key: str | None = None) -> Request:
+        headers = self._request_headers(
+            accept="text/event-stream" if payload.get("stream") else "application/json",
+        )
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        return Request(f"{self._base_url()}/chat/completions", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
+
+    def _request_headers(self, *, accept: str) -> dict[str, str]:
         key = str(self.provider.get("api_key") or "").strip()
         if not key:
             key = read_secret(str(self.provider.get("credential_target") or ""))
         if not key:
             raise ProviderError("Provider API key is not configured", category="provider_not_configured")
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "Accept": "text/event-stream" if payload.get("stream") else "application/json", "User-Agent": self.user_agent}
-        if idempotency_key:
-            headers["Idempotency-Key"] = idempotency_key
-        return Request(f"{self._base_url()}/chat/completions", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
+        return {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Accept": accept,
+            "User-Agent": self.user_agent,
+        }
 
 
 def current_codex_desktop_user_agent() -> str:

@@ -32,8 +32,9 @@ DEFAULT_PROVIDER = {
     "store": True,
     "hedge": {
         "enabled": True,
-        # Zero means run every enabled configured endpoint concurrently.
+        # Zero means run every enabled endpoint in the active cost group concurrently.
         "max_parallel": 0,
+        "availability_probe_timeout_seconds": 5,
         "per_endpoint_timeout_seconds": 45,
         "per_endpoint_max_attempts": 1,
     },
@@ -109,6 +110,12 @@ def _validate_provider_connection(provider: dict[str, Any]) -> None:
             if identifier in identifiers:
                 raise ValueError(f"provider configuration has duplicate endpoint id: {identifier}")
             identifiers.add(identifier)
+            priority = endpoint.get("priority", 0)
+            if isinstance(priority, bool) or not isinstance(priority, int) or priority < 0:
+                raise ValueError(
+                    f"provider configuration invalid: endpoints.{identifier}.priority "
+                    "must be a non-negative integer"
+                )
             if not str(endpoint.get("base_url") or "").strip():
                 raise ValueError(f"provider configuration missing: endpoints.{identifier}.base_url")
             if not (

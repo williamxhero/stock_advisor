@@ -1,8 +1,10 @@
 import json
 from http.client import RemoteDisconnected
 from pathlib import Path
+import threading
 import time
-from unittest.mock import Mock
+from urllib.error import HTTPError
+from unittest.mock import MagicMock, Mock
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
@@ -74,7 +76,7 @@ class ProviderClientTests(TestCase):
             "provider": {
                 "enabled": True,
                 "endpoints": [
-                    {"id": "one", "base_url": "https://one.example/v1", "api_key": "key-one"},
+                    {"id": "one", "priority": 191, "base_url": "https://one.example/v1", "api_key": "key-one"},
                     {"id": "two", "base_url": "https://two.example/v1", "api_key": "key-two"},
                 ],
             },
@@ -86,7 +88,34 @@ class ProviderClientTests(TestCase):
         loaded = load_settings(self.home)
 
         self.assertEqual("key-one", loaded.provider["endpoints"][0]["api_key"])
+        self.assertEqual(191, loaded.provider["endpoints"][0]["priority"])
         self.assertEqual("key-two", loaded.provider["endpoints"][1]["api_key"])
+
+    def test_provider_priority_must_be_a_non_negative_json_integer(self):
+        for invalid in (-1, "191", True):
+            with self.subTest(priority=invalid):
+                settings = {
+                    "provider": {
+                        "enabled": True,
+                        "endpoints": [
+                            {
+                                "id": "invalid",
+                                "priority": invalid,
+                                "base_url": "https://invalid.example/v1",
+                                "api_key": "test-key",
+                            },
+                        ],
+                    },
+                }
+                path = self.home / "config" / "settings.local.json"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(settings), encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"endpoints\.invalid\.priority must be a non-negative integer",
+                ):
+                    load_settings(self.home)
 
     def test_user_agent_reads_the_current_local_codex_version_at_startup(self):
         with patch("ai_trading_companion.provider_client._local_codex_version", return_value="0.150.0-alpha.8"), patch("ai_trading_companion.provider_client._local_codex_desktop_build", return_value="26.820.60940"), patch("ai_trading_companion.provider_client.platform.version", return_value="10.0.26200"), patch("ai_trading_companion.provider_client.platform.machine", return_value="AMD64"):
@@ -106,7 +135,7 @@ class ProviderClientTests(TestCase):
         self.assertEqual(5, DEFAULT_PROVIDER["retry"]["max_attempts"])
         self.assertEqual(90, DEFAULT_PROVIDER["retry"]["per_attempt_timeout_seconds"])
 
-    def test_provider_pool_returns_the_first_completed_endpoint_without_waiting_for_a_slow_peer(self):
+    def test_provider_pool_sends_the_real_request_only_to_the_first_endpoint_with_a_successful_current_probe(self):
         self.provider["endpoints"] = [
             {"id": "slow", "base_url": "https://slow.example/v1", "api_key": "slow-key", "enabled": True},
             {"id": "fast", "base_url": "https://fast.example/v1", "api_key": "fast-key", "enabled": True},
@@ -117,21 +146,223 @@ class ProviderClientTests(TestCase):
         }
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
 
-        def complete(endpoint, _payload, _timeout):
+        def probe(endpoint, _timeout):
             if endpoint["id"] == "slow":
                 time.sleep(0.2)
-                return {"id": "slow-response"}
+                return True
             time.sleep(0.01)
-            return {"id": "fast-response"}
+            return True
+
+        def complete(endpoint, _payload, _timeout):
+            return {"id": f"{endpoint['id']}-response"}
 
         started = time.monotonic()
-        with patch.object(client, "_request_for_endpoint", side_effect=complete) as request:
+        with patch.object(client, "_probe_endpoint", side_effect=probe) as current_probe, patch.object(
+            client, "_request_for_endpoint", side_effect=complete,
+        ) as request:
             response = client._request({"model": "test"}, 20)
 
         self.assertEqual("fast-response", response["id"])
         self.assertEqual("fast", response["_provider_endpoint_id"])
         self.assertLess(time.monotonic() - started, 0.15)
-        self.assertCountEqual(["slow", "fast"], [call.args[0]["id"] for call in request.call_args_list])
+        self.assertCountEqual(["slow", "fast"], [call.args[0]["id"] for call in current_probe.call_args_list])
+        self.assertEqual(["fast"], [call.args[0]["id"] for call in request.call_args_list])
+
+    def test_provider_pool_does_not_contact_a_more_expensive_group_when_a_cheaper_group_succeeds(self):
+        self.provider["endpoints"] = [
+            {"id": "cheap-one", "priority": 0, "base_url": "https://cheap-one.example/v1", "api_key": "one"},
+            {"id": "cheap-two", "priority": 99, "base_url": "https://cheap-two.example/v1", "api_key": "two"},
+            {"id": "expensive", "priority": 100, "base_url": "https://expensive.example/v1", "api_key": "three"},
+        ]
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        cheap_ready = threading.Barrier(2)
+
+        def probe(endpoint, _timeout):
+            if endpoint["priority"] < 100:
+                cheap_ready.wait(timeout=1)
+            return True
+
+        def complete(endpoint, _payload, _timeout):
+            return {"id": f"{endpoint['id']}-response"}
+
+        with patch.object(client, "_probe_endpoint", side_effect=probe) as current_probe, patch.object(
+            client, "_request_for_endpoint", side_effect=complete,
+        ) as request:
+            response = client._request({"model": "test"}, 20)
+
+        self.assertIn(response["_provider_endpoint_id"], {"cheap-one", "cheap-two"})
+        self.assertCountEqual(
+            ["cheap-one", "cheap-two"],
+            [call.args[0]["id"] for call in current_probe.call_args_list],
+        )
+        self.assertEqual(1, request.call_count)
+        self.assertNotEqual("expensive", request.call_args.args[0]["id"])
+
+    def test_provider_pool_advances_to_the_next_cost_group_only_after_the_cheaper_group_fails(self):
+        self.provider["endpoints"] = [
+            {"id": "cheap-one", "priority": 0, "base_url": "https://cheap-one.example/v1", "api_key": "one"},
+            {"id": "cheap-two", "priority": 42, "base_url": "https://cheap-two.example/v1", "api_key": "two"},
+            {"id": "mid", "priority": 191, "base_url": "https://mid.example/v1", "api_key": "three"},
+            {"id": "premium", "priority": 200, "base_url": "https://premium.example/v1", "api_key": "four"},
+        ]
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        probed: list[str] = []
+        requested: list[str] = []
+
+        def probe(endpoint, _timeout):
+            probed.append(endpoint["id"])
+            if endpoint["priority"] < 100:
+                raise ProviderError("unavailable", category="provider_network")
+            return True
+
+        def complete(endpoint, _payload, _timeout):
+            requested.append(endpoint["id"])
+            return {"id": f"{endpoint['id']}-response"}
+
+        with patch.object(client, "_probe_endpoint", side_effect=probe), patch.object(
+            client, "_request_for_endpoint", side_effect=complete,
+        ):
+            response = client._request({"model": "test"}, 20)
+
+        self.assertEqual("mid", response["_provider_endpoint_id"])
+        self.assertCountEqual(["cheap-one", "cheap-two", "mid"], probed)
+        self.assertEqual(["mid"], requested)
+        self.assertNotIn("premium", probed)
+
+    def test_provider_pool_stream_advances_by_cost_group_and_never_contacts_a_later_group_after_success(self):
+        self.provider["endpoints"] = [
+            {"id": "cheap-one", "priority": 0, "base_url": "https://cheap-one.example/v1", "api_key": "one"},
+            {"id": "cheap-two", "priority": 80, "base_url": "https://cheap-two.example/v1", "api_key": "two"},
+            {"id": "mid", "priority": 191, "base_url": "https://mid.example/v1", "api_key": "three"},
+            {"id": "premium", "priority": 200, "base_url": "https://premium.example/v1", "api_key": "four"},
+        ]
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        probed: list[str] = []
+        requested: list[str] = []
+
+        def probe(endpoint, _timeout):
+            probed.append(endpoint["id"])
+            if endpoint["priority"] < 100:
+                raise ProviderError("unavailable", category="provider_network")
+            return True
+
+        def complete(endpoint, _payload, _timeout, _retry_after_delta):
+            requested.append(endpoint["id"])
+            return {"id": f"{endpoint['id']}-response"}, [endpoint["id"]]
+
+        published: list[str] = []
+        with patch.object(client, "_probe_endpoint", side_effect=probe), patch.object(
+            client, "_request_stream_for_endpoint", side_effect=complete,
+        ):
+            response, deltas = client._request_stream(
+                {"model": "test", "stream": True}, 20, published.append,
+            )
+
+        self.assertEqual("mid", response["_provider_endpoint_id"])
+        self.assertCountEqual(["cheap-one", "cheap-two", "mid"], probed)
+        self.assertEqual(["mid"], requested)
+        self.assertNotIn("premium", probed)
+        self.assertEqual(["mid"], deltas)
+        self.assertEqual(["mid"], published)
+
+    def test_provider_pool_retries_another_endpoint_in_the_same_group_before_spending_more(self):
+        self.provider["endpoints"] = [
+            {"id": "fast-bad", "priority": 0, "base_url": "https://bad.example/v1", "api_key": "one"},
+            {"id": "slower-good", "priority": 50, "base_url": "https://good.example/v1", "api_key": "two"},
+            {"id": "premium", "priority": 100, "base_url": "https://premium.example/v1", "api_key": "three"},
+        ]
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        probed: list[str] = []
+        requested: list[str] = []
+
+        def probe(endpoint, _timeout):
+            probed.append(endpoint["id"])
+            if endpoint["id"] == "slower-good":
+                time.sleep(0.02)
+            return True
+
+        def complete(endpoint, _payload, _timeout):
+            requested.append(endpoint["id"])
+            if endpoint["id"] == "fast-bad":
+                raise ProviderError("request disconnected", category="provider_network")
+            return {"id": "same-group-success"}
+
+        with patch.object(client, "_probe_endpoint", side_effect=probe), patch.object(
+            client, "_request_for_endpoint", side_effect=complete,
+        ):
+            response = client._request({"model": "test"}, 20)
+
+        self.assertEqual("slower-good", response["_provider_endpoint_id"])
+        self.assertEqual(["fast-bad", "slower-good"], requested)
+        self.assertNotIn("premium", probed)
+
+    def test_provider_pool_prefers_a_confirmed_probe_over_a_fast_unsupported_models_route(self):
+        self.provider["endpoints"] = [
+            {"id": "unsupported", "priority": 0, "base_url": "https://unsupported.example/v1", "api_key": "one"},
+            {"id": "confirmed", "priority": 0, "base_url": "https://confirmed.example/v1", "api_key": "two"},
+        ]
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+
+        def probe(endpoint, _timeout):
+            if endpoint["id"] == "unsupported":
+                return False
+            time.sleep(0.01)
+            return True
+
+        with patch.object(client, "_probe_endpoint", side_effect=probe), patch.object(
+            client, "_request_for_endpoint", return_value={"id": "confirmed-response"},
+        ) as request:
+            response = client._request({"model": "test"}, 20)
+
+        self.assertEqual("confirmed", response["_provider_endpoint_id"])
+        self.assertEqual("confirmed", request.call_args.args[0]["id"])
+
+    def test_availability_probe_is_a_token_free_get_to_models(self):
+        self.provider["base_url"] = "https://provider.example/v1"
+        self.provider["api_key"] = "local-test-key"
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home, user_agent="Companion/Test")
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b"{"
+
+        with patch("ai_trading_companion.provider_client.urlopen", return_value=response) as open_url:
+            confirmed = client._probe_connectivity_once(3)
+
+        request = open_url.call_args.args[0]
+        self.assertTrue(confirmed)
+        self.assertEqual("https://provider.example/v1/models", request.full_url)
+        self.assertEqual("GET", request.get_method())
+        self.assertIsNone(request.data)
+        self.assertEqual("application/json", request.headers["Accept"])
+        self.assertEqual("Companion/Test", request.headers["User-agent"])
+        self.assertEqual("Bearer local-test-key", request.headers["Authorization"])
+
+    def test_availability_probe_treats_an_unsupported_models_route_as_inconclusive(self):
+        self.provider["base_url"] = "https://provider.example/v1"
+        self.provider["api_key"] = "local-test-key"
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        unsupported = HTTPError(
+            "https://provider.example/v1/models", 404, "not found", {}, None,
+        )
+
+        with patch("ai_trading_companion.provider_client.urlopen", side_effect=unsupported):
+            self.assertFalse(client._probe_connectivity_once(3))
+
+    def test_disabled_cpa_endpoint_is_never_probed_or_requested(self):
+        self.provider["endpoints"] = [
+            {"id": "cpa", "enabled": False, "priority": 0, "base_url": "http://yosef-server:8317/v1", "api_key": "cpa"},
+            {"id": "direct", "enabled": True, "priority": 100, "base_url": "https://direct.example/v1", "api_key": "direct"},
+        ]
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+
+        with patch.object(client, "_probe_endpoint") as current_probe, patch.object(
+            client, "_request_for_endpoint", return_value={"id": "direct-response"},
+        ) as request:
+            response = client._request({"model": "test"}, 20)
+
+        self.assertEqual("direct", response["_provider_endpoint_id"])
+        current_probe.assert_not_called()
+        self.assertEqual("direct", request.call_args.args[0]["id"])
 
     def test_provider_pool_reports_every_endpoint_failure_without_reverting_to_a_single_provider(self):
         self.provider["endpoints"] = [
@@ -141,12 +372,13 @@ class ProviderClientTests(TestCase):
         self.provider["hedge"] = {"enabled": True, "max_parallel": 2, "per_endpoint_max_attempts": 1}
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
 
-        with patch.object(
-            client, "_request_for_endpoint",
-            side_effect=[
-                ProviderError("one timed out", category="provider_timeout"),
-                ProviderError("two disconnected", category="provider_network"),
-            ],
+        def fail(endpoint, _payload, _timeout):
+            if endpoint["id"] == "one":
+                raise ProviderError("one timed out", category="provider_timeout")
+            raise ProviderError("two disconnected", category="provider_network")
+
+        with patch.object(client, "_probe_endpoint"), patch.object(
+            client, "_request_for_endpoint", side_effect=fail,
         ):
             with self.assertRaises(ProviderError) as raised:
                 client._request({"model": "test"}, 20)
@@ -163,21 +395,27 @@ class ProviderClientTests(TestCase):
         self.provider["hedge"] = {"enabled": True, "max_parallel": 0, "per_endpoint_max_attempts": 1}
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
 
-        def complete(endpoint, _payload, _timeout, _retry_after_delta):
+        def probe(endpoint, _timeout):
             if endpoint["id"] == "slow":
                 time.sleep(0.2)
-                return {"id": "slow-response"}, ["slow"]
+                return True
             time.sleep(0.01)
-            return {"id": "fast-response"}, ["fast"]
+            return True
+
+        def complete(endpoint, _payload, _timeout, _retry_after_delta):
+            return {"id": f"{endpoint['id']}-response"}, [endpoint["id"]]
 
         published: list[str] = []
-        with patch.object(client, "_request_stream_for_endpoint", side_effect=complete):
+        with patch.object(client, "_probe_endpoint", side_effect=probe), patch.object(
+            client, "_request_stream_for_endpoint", side_effect=complete,
+        ) as request:
             response, deltas = client._request_stream({"model": "test", "stream": True}, 20, published.append)
 
         self.assertEqual("fast-response", response["id"])
         self.assertEqual("fast", response["_provider_endpoint_id"])
         self.assertEqual(["fast"], deltas)
         self.assertEqual(["fast"], published)
+        self.assertEqual(["fast"], [call.args[0]["id"] for call in request.call_args_list])
 
     def test_long_stage_timeout_is_split_into_multiple_cpa_attempts(self):
         self.provider["retry"] = {

@@ -16,6 +16,7 @@
     "hedge": {
       "enabled": true,
       "max_parallel": 0,
+      "availability_probe_timeout_seconds": 5,
       "per_endpoint_timeout_seconds": 45,
       "per_endpoint_max_attempts": 1
     },
@@ -23,12 +24,14 @@
       {
         "id": "cpa",
         "enabled": true,
+        "priority": 0,
         "base_url": "http://yosef-server:8317/v1",
         "api_key": "<paste-cpa-api-key-here>"
       },
       {
         "id": "direct-provider-example",
         "enabled": false,
+        "priority": 100,
         "base_url": "https://provider.example/v1",
         "api_key": "<paste-direct-provider-api-key-here>"
       }

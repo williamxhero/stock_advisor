@@ -1,11 +1,17 @@
+import json
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest import TestCase
+from unittest.mock import Mock, patch
 
+from ai_trading_companion.__main__ import _call_stage
+from ai_trading_companion.config import DEFAULT_PROVIDER
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.evidence_gate import EvidenceGate
 from ai_trading_companion.engine import CompanionEngine
+from ai_trading_companion.provider_client import ProviderError
 from ai_trading_companion.store import CompanionStore
 
 
@@ -96,6 +102,39 @@ class EvidenceV3Tests(TestCase):
                 checkpoint = connection.execute("SELECT 1 FROM stage_checkpoint WHERE cycle_id=?", (cycle["cycle_id"],)).fetchone()
             self.assertIsNone(checkpoint)
             self.assertIsNone(store.valid_daily_baseline("2026-08-26", self.as_of))
+
+    def test_failed_research_attempt_persists_completed_tool_trace(self):
+        trace = [{
+            "backend": "searxng", "tool": "search_searxng", "status": "succeeded",
+            "non_empty": True, "arguments": {"query": "A股 盘前 公告"},
+        }]
+        with TemporaryDirectory() as temporary:
+            store = CompanionStore(Path(temporary) / "companion.sqlite3")
+            cycle = CompanionEngine(store).start_cycle(
+                "daily.opportunity.0900", "2026-08-26T09:00:00+08:00", self.as_of,
+            )
+            client = Mock()
+            client.run.side_effect = ProviderError(
+                "research stopped", category="research_loop_limit", tool_trace=trace,
+            )
+            settings = SimpleNamespace(provider=DEFAULT_PROVIDER)
+            packet = {
+                "task_key": "daily.opportunity.0900", "stage": "m0_research", "as_of": self.as_of,
+                "sha256": "frozen-packet", "evidence_contract": self.contract,
+            }
+
+            with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
+                "ai_trading_companion.__main__.provider_client", return_value=client,
+            ):
+                with self.assertRaisesRegex(ProviderError, "research stopped"):
+                    _call_stage(
+                        store, cycle, "m0_research", packet,
+                        "companion-research-evidence-v2.schema.json", search=True, timeout=60,
+                    )
+
+            attempt = store.attempts(cycle["cycle_id"])[0]
+            self.assertEqual("failed", attempt["status"])
+            self.assertEqual(trace, json.loads(attempt["tool_trace_json"]))
 
 
 class _WeekdayCalendar:

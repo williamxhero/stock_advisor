@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
+import platform
 import random
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -20,11 +23,15 @@ from .research_tools import ResearchTools, ResearchToolError
 from .secret_guard import assert_safe
 
 
+_FALLBACK_CPA_USER_AGENT = "AITradingCompanion/1.0 (Windows; x64)"
+
+
 class ProviderError(RuntimeError):
-    def __init__(self, message: str, *, category: str = "provider_error", request_id: str | None = None, status: int | None = None, retry_after: float | None = None, retry_attempts: int = 1) -> None:
+    def __init__(self, message: str, *, category: str = "provider_error", request_id: str | None = None, status: int | None = None, retry_after: float | None = None, retry_attempts: int = 1, tool_trace: list[dict[str, Any]] | None = None) -> None:
         super().__init__(message)
         self.category, self.request_id, self.status = category, request_id, status
         self.retry_after, self.retry_attempts = retry_after, retry_attempts
+        self.tool_trace = list(tool_trace or [])
 
     def __str__(self) -> str:
         suffix = f" (attempts={self.retry_attempts})" if self.retry_attempts > 1 else ""
@@ -58,6 +65,9 @@ class ProviderClient:
 
     def __init__(self, provider: dict[str, Any], research: dict[str, Any], home: Path) -> None:
         self.provider, self.research, self.home = provider, research, home
+        # Version detection is local-only and runs once for each runtime process.
+        # It never invokes Codex as an LLM backend.
+        self.user_agent = current_codex_desktop_user_agent()
 
     def probe(self) -> dict[str, Any]:
         """Verify the Chat Completions subset used by the runtime."""
@@ -96,8 +106,8 @@ class ProviderClient:
         max_coverage_repairs: int = 2,
         retry_stream_after_delta: bool = False,
         attempt_id: str | None = None,
-        max_model_turns: int = 12,
-        max_tool_calls: int = 12,
+        max_model_turns: int | None = None,
+        max_tool_calls: int | None = None,
         max_empty_tool_results: int = 3,
     ) -> ProviderResult:
         assert_safe(prompt, boundary="Provider input")
@@ -118,8 +128,8 @@ class ProviderClient:
         while True:
             if time.monotonic() >= deadline:
                 raise TimeoutError("research hard deadline exceeded")
-            if model_turns >= max_model_turns:
-                raise ProviderError("research model turn limit exceeded", category="research_loop_limit")
+            if max_model_turns is not None and model_turns >= max_model_turns:
+                raise ProviderError("research model turn limit exceeded", category="research_loop_limit", tool_trace=trace)
             model_turns += 1
             remaining = max(1, int(deadline - time.monotonic()))
             # CPA accepts tools and JSON Schema independently, but its upstream
@@ -152,7 +162,7 @@ class ProviderClient:
                     try:
                         structured = json.loads(text)
                     except json.JSONDecodeError as exc:
-                        raise ProviderError("Provider returned invalid structured research JSON", category="invalid_response") from exc
+                        raise ProviderError("Provider returned invalid structured research JSON", category="invalid_response", tool_trace=trace) from exc
                     validation = research_validator(structured, trace)
                     if not validation.get("passed"):
                         if coverage_repairs >= max_coverage_repairs:
@@ -170,12 +180,12 @@ class ProviderClient:
                 assert_safe(text, boundary="Provider output")
                 return ProviderResult(text, response.get("id"), [], response.get("usage") or {}, _request_id(response), trace, validation)
             if tools is None:
-                raise ProviderError("Provider attempted an unavailable tool", category="tool_policy", request_id=_request_id(response))
+                raise ProviderError("Provider attempted an unavailable tool", category="tool_policy", request_id=_request_id(response), tool_trace=trace)
             messages.append(_assistant_message(response))
             usable_tool_result = False
             for call in calls:
-                if tool_calls >= max_tool_calls:
-                    raise ProviderError("research tool call limit exceeded", category="research_loop_limit", request_id=_request_id(response))
+                if max_tool_calls is not None and tool_calls >= max_tool_calls:
+                    raise ProviderError("research tool call limit exceeded", category="research_loop_limit", request_id=_request_id(response), tool_trace=trace)
                 tool_calls += 1
                 name = str(call.get("function", {}).get("name") or "")
                 call_id = str(call.get("id") or "")
@@ -208,7 +218,7 @@ class ProviderClient:
             else:
                 empty_tool_results += 1
                 if empty_tool_results >= max_empty_tool_results:
-                    raise ProviderError("research empty tool result limit exceeded", category="research_loop_limit")
+                    raise ProviderError("research empty tool result limit exceeded", category="research_loop_limit", tool_trace=trace)
 
     @staticmethod
     def _tool_observation(name: str, arguments: dict[str, Any], result: dict[str, Any], non_empty: bool) -> dict[str, Any]:
@@ -469,10 +479,49 @@ class ProviderClient:
         key = read_secret(str(self.provider.get("credential_target") or ""))
         if not key:
             raise ProviderError("Provider API key is not configured in Windows Credential Manager", category="provider_not_configured")
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "Accept": "text/event-stream" if payload.get("stream") else "application/json", "User-Agent": "AITradingCompanion/1.0 (Windows; x64)"}
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "Accept": "text/event-stream" if payload.get("stream") else "application/json", "User-Agent": self.user_agent}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         return Request(f"{self._base_url()}/chat/completions", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
+
+
+def current_codex_desktop_user_agent() -> str:
+    """Build a current local Codex Desktop identifier without contacting Codex."""
+    version = _local_codex_version()
+    if not version:
+        return _FALLBACK_CPA_USER_AGENT
+    machine = platform.machine().lower()
+    architecture = "x86_64" if machine in {"amd64", "x86_64"} else machine or "unknown"
+    desktop_build = _local_codex_desktop_build()
+    desktop_suffix = f"; {desktop_build}" if desktop_build else ""
+    return f"Codex Desktop/{version} (Windows {platform.version()}; {architecture}) unknown (Codex Desktop{desktop_suffix})"
+
+
+def _local_codex_version() -> str | None:
+    root = Path(os.environ.get("LOCALAPPDATA", "")) / "OpenAI" / "Codex" / "bin"
+    candidates = list(root.glob("*/codex.exe")) if root.is_dir() else []
+    if not candidates:
+        return None
+    try:
+        executable = max(candidates, key=lambda path: path.stat().st_mtime)
+        completed = subprocess.run(
+            [str(executable), "--version"], capture_output=True, text=True,
+            timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"(?:codex(?:-cli)?\s+)([^\s]+)", completed.stdout or "", re.IGNORECASE)
+    return match.group(1) if completed.returncode == 0 and match else None
+
+
+def _local_codex_desktop_build() -> str | None:
+    manifest = Path(os.environ.get("LOCALAPPDATA", "")) / "OpenAI" / "Codex" / "chrome-native-hosts-v2.json"
+    try:
+        entries = json.loads(manifest.read_text(encoding="utf-8")).get("entries", [])
+    except (OSError, ValueError):
+        return None
+    current = max((entry for entry in entries if isinstance(entry, dict)), key=lambda entry: str(entry.get("updatedAt") or ""), default=None)
+    return str(current.get("appVersion")) if isinstance(current, dict) and current.get("appVersion") else None
 
 
 def _assistant_message(response: dict[str, Any]) -> dict[str, Any]:

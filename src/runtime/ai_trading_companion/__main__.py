@@ -251,6 +251,7 @@ def _call_stage(
             store.finish_attempt(
                 attempt["attempt_id"], status, error=str(exc),
                 provider_request_id=exc.request_id if isinstance(exc, ProviderError) else None,
+                tool_trace=getattr(exc, "tool_trace", None),
             )
         # A promoted major XHigh route has a deliberately reserved Medium hedge
         # window.  It is sequential (not a duplicate parallel opinion), uses
@@ -295,6 +296,7 @@ def _call_stage(
                     store.finish_attempt(
                         hedge_attempt["attempt_id"], hedge_status, error=str(hedge_error),
                         provider_request_id=hedge_error.request_id if isinstance(hedge_error, ProviderError) else None,
+                        tool_trace=getattr(hedge_error, "tool_trace", None),
                     )
         raise
 

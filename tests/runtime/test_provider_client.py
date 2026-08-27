@@ -7,7 +7,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from ai_trading_companion.config import DEFAULT_PROVIDER, DEFAULT_RESEARCH, load_settings
-from ai_trading_companion.provider_client import ProviderClient, ProviderError
+from ai_trading_companion.provider_client import ProviderClient, ProviderError, current_codex_desktop_user_agent
 
 
 class ProviderClientTests(TestCase):
@@ -39,7 +39,14 @@ class ProviderClientTests(TestCase):
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
         with patch("ai_trading_companion.provider_client.read_secret", return_value="test-key"):
             request = client._request_object({"model": "test"})
-        self.assertEqual("AITradingCompanion/1.0 (Windows; x64)", request.headers["User-agent"])
+        self.assertEqual(client.user_agent, request.headers["User-agent"])
+
+    def test_user_agent_reads_the_current_local_codex_version_at_startup(self):
+        with patch("ai_trading_companion.provider_client._local_codex_version", return_value="0.150.0-alpha.8"), patch("ai_trading_companion.provider_client._local_codex_desktop_build", return_value="26.820.60940"), patch("ai_trading_companion.provider_client.platform.version", return_value="10.0.26200"), patch("ai_trading_companion.provider_client.platform.machine", return_value="AMD64"):
+            self.assertEqual(
+                "Codex Desktop/0.150.0-alpha.8 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.820.60940)",
+                current_codex_desktop_user_agent(),
+            )
 
     def test_defaults_target_the_small_computer_services(self):
         self.assertEqual("http://yosef-server:8317/v1", DEFAULT_PROVIDER["base_url"])
@@ -227,6 +234,48 @@ class ProviderClientTests(TestCase):
             client.run("research", None, slot="fast", effort="low", search=True, timeout=0)
         with self.assertRaisesRegex(ProviderError, "turn limit"):
             client.run("research", None, slot="fast", effort="low", search=True, timeout=20, max_model_turns=0)
+
+    def test_research_does_not_stop_while_distinct_tool_calls_keep_adding_evidence(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        responses = []
+        for number in range(13):
+            call = {
+                "id": f"call_{number}",
+                "type": "function",
+                "function": {
+                    "name": "search_searxng",
+                    "arguments": json.dumps({"query": f"current market evidence {number}"}),
+                },
+            }
+            responses.append({"id": f"r{number}", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [call]}}]})
+        responses.append({"id": "done", "choices": [{"message": {"role": "assistant", "content": "research complete"}}]})
+
+        result = {"backend": "searxng", "results": [{"url": "https://example.test/current", "snippet": "current evidence"}]}
+        with patch.object(client, "_request", side_effect=responses), patch("ai_trading_companion.provider_client.ResearchTools.call", return_value=result):
+            completed = client.run("research", None, slot="fast", effort="low", search=True, timeout=20)
+
+        self.assertEqual("research complete", completed.text)
+        self.assertEqual(13, len(completed.tool_trace))
+
+    def test_research_loop_failure_preserves_completed_tool_trace(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        responses = []
+        for number in range(2):
+            call = {
+                "id": f"empty_{number}",
+                "type": "function",
+                "function": {"name": "search_searxng", "arguments": json.dumps({"query": f"empty {number}"})},
+            }
+            responses.append({"id": f"r{number}", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [call]}}]})
+
+        with patch.object(client, "_request", side_effect=responses), patch("ai_trading_companion.provider_client.ResearchTools.call", return_value={"backend": "searxng", "results": []}):
+            with self.assertRaisesRegex(ProviderError, "empty tool result limit") as raised:
+                client.run(
+                    "research", None, slot="fast", effort="low", search=True, timeout=20,
+                    max_empty_tool_results=2,
+                )
+
+        self.assertEqual(2, len(raised.exception.tool_trace))
 
     def test_probe_uses_the_configured_slow_provider_timeout(self):
         self.provider["retry"] = {"probe_timeout_seconds": 91}

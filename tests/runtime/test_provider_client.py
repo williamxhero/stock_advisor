@@ -214,6 +214,38 @@ class ProviderClientTests(TestCase):
         self.assertEqual("search_searxng", request.call_args_list[2].args[0]["tool_choice"]["function"]["name"])
         self.assertTrue(result.validation["passed"])
 
+    def test_coverage_repair_continues_past_two_rejections_while_progress_is_possible(self):
+        client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
+        schema = self.home / "schema.json"
+        schema.write_text('{"type":"object","properties":{"coverage":{"type":"integer"}},"required":["coverage"],"additionalProperties":false}', encoding="utf-8")
+        responses = [{"id": "initial", "choices": [{"message": {"role": "assistant", "content": "initial research"}}]}]
+        for number in range(4):
+            responses.extend([
+                {"id": f"structured_{number}", "choices": [{"message": {"role": "assistant", "content": json.dumps({"coverage": number})}}]},
+                {"id": f"tool_{number}", "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": f"call_{number}", "type": "function",
+                    "function": {"name": "search_searxng", "arguments": json.dumps({"query": f"missing evidence {number}"})},
+                }]}}]},
+                {"id": f"research_{number}", "choices": [{"message": {"role": "assistant", "content": f"evidence {number}"}}]},
+            ])
+        responses.append({"id": "final", "choices": [{"message": {"role": "assistant", "content": '{"coverage":4}'}}]})
+
+        validator = lambda output, _trace: {
+            "passed": output["coverage"] >= 4,
+            "problems": [] if output["coverage"] >= 4 else [f"missing_{output['coverage']}"],
+        }
+        with patch.object(client, "_request", side_effect=responses), patch(
+            "ai_trading_companion.provider_client.ResearchTools.call",
+            return_value={"backend": "searxng", "results": [{"url": "https://example.test/current"}]},
+        ):
+            result = client.run(
+                "research", schema, slot="fast", effort="medium", search=True,
+                timeout=30, research_validator=validator,
+            )
+
+        self.assertTrue(result.validation["passed"])
+        self.assertEqual(4, len(result.tool_trace))
+
     def test_rejected_candidate_keeps_provider_audit_information(self):
         client = ProviderClient(self.provider, DEFAULT_RESEARCH, self.home)
         schema = self.home / "schema.json"

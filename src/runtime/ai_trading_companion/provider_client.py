@@ -107,7 +107,7 @@ class ProviderClient:
         self, prompt: str, schema: Path | None, *, slot: str, effort: str,
         search: bool, timeout: int, on_delta: Callable[[str], None] | None = None,
         research_validator: Callable[[dict[str, Any], list[dict[str, Any]]], dict[str, Any]] | None = None,
-        max_coverage_repairs: int = 2,
+        max_coverage_repairs: int | None = None,
         retry_stream_after_delta: bool = False,
         attempt_id: str | None = None,
         max_model_turns: int | None = None,
@@ -178,7 +178,7 @@ class ProviderClient:
                         raise ProviderError("Provider returned invalid structured research JSON", category="invalid_response", tool_trace=trace) from exc
                     validation = research_validator(structured, trace)
                     if not validation.get("passed"):
-                        if coverage_repairs >= max_coverage_repairs:
+                        if max_coverage_repairs is not None and coverage_repairs >= max_coverage_repairs:
                             assert_safe(text, boundary="Provider output")
                             return ProviderResult(text, response.get("id"), [], response.get("usage") or {}, _request_id(response), trace, validation)
                         coverage_repairs += 1

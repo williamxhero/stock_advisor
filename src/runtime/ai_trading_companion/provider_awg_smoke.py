@@ -67,8 +67,8 @@ def _broker(provider: dict[str, Any], research: dict[str, Any], home: Path, *, f
     return ProviderBroker(scoped, ChatCompletionsTransport(home, research, retry=provider.get("retry") or {}), hedge_seconds=hedge_seconds, probe_seconds=probe_seconds)
 
 
-def _invoke(broker: ProviderBroker, *, stage: str, packet: dict[str, Any], schema: dict[str, Any], timeout: float, mode: str = "race", verifier: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> ProviderOutcome:
-    request = StageRequest(stage=stage, packet=packet, packet_sha256=canonical_packet_hash(packet), effort="medium", schema=schema, mode=mode, required_capabilities=("duel",) if mode == "duel" else ("race",), absolute_deadline=time.monotonic() + timeout, route_timeout_seconds=timeout, verifier_name="provider-wag-smoke/v3", verifier=verifier, h0_forbidden=stage == "m1_judgment")
+def _invoke(broker: ProviderBroker, *, stage: str, packet: dict[str, Any], schema: dict[str, Any], timeout: float, verifier: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> ProviderOutcome:
+    request = StageRequest(stage=stage, packet=packet, packet_sha256=canonical_packet_hash(packet), effort="medium", schema=schema, mode="race", required_capabilities=("race",), absolute_deadline=time.monotonic() + timeout, route_timeout_seconds=timeout, verifier_name="provider-wag-smoke/v3", verifier=verifier, h0_forbidden=stage == "m1_judgment")
     try: return broker.invoke(request)
     except ProviderError as exc:
         code = "PROVIDER_OUTAGE" if exc.category == "PROVIDER_OUTAGE" else "PROVIDER_INVOCATION_FAILED"
@@ -137,7 +137,7 @@ def run_smoke(settings: dict[str, Any], output_dir: Path, *, query: str, probe_t
     research = settings.get("research") if isinstance(settings.get("research"), dict) else {}
     wag_config = research.get("web_access_gateway") if isinstance(research.get("web_access_gateway"), dict) else {}
     secrets = [*[str(item.get("api_key") or "") for item in provider_raw.get("endpoints", []) if isinstance(item, dict)], str(wag_config.get("token") or "")]
-    report: dict[str, Any] = {"contract": "provider-wag-smoke-report/v3", "run_id": str(uuid.uuid4()), "started_at": _utc_now(), "completed_at": None, "status": "running", "failure_code": None, "providers": {"probes": []}, "invocations": [], "upgrade_trace": [], "wag": {"status": "not_started", "calls": []}, "evidence": None, "duel": None}
+    report: dict[str, Any] = {"contract": "provider-wag-smoke-report/v3", "run_id": str(uuid.uuid4()), "started_at": _utc_now(), "completed_at": None, "status": "running", "failure_code": None, "providers": {"probes": []}, "invocations": [], "upgrade_trace": [], "wag": {"status": "not_started", "calls": []}, "evidence": None, "m1": None, "duel": None}
     try:
         provider = normalize_provider(provider_raw, warn_legacy=False)
         if not provider.get("enabled") or not any(item.get("enabled") for item in provider.get("endpoints", [])): raise SmokeFailure("PROVIDER_OUTAGE", "No enabled Provider")
@@ -210,10 +210,15 @@ def run_smoke(settings: dict[str, Any], output_dir: Path, *, query: str, probe_t
             if upgrade is None:
                 raise SmokeFailure("FAST_UPGRADE_NOT_PROVABLE", "No real missing-Luna inventory completed Terra fast composition")
         m1_packet = {"frozen_evidence": bundle, "evidence_bundle_sha256": bundle_hash, "instruction": "Make an independent M1 judgment using only the frozen evidence bundle."}
-        duel = _invoke(broker, stage="m1_judgment", packet=m1_packet, schema=M1_SCHEMA, timeout=provider_timeout, mode="duel", verifier=_verify_evidence(evidence_ids))
-        report["invocations"].append(_outcome("m1_duel", duel)); families = {item.model_family for item in duel.attempts if item.product_success and item.actual_level == "L3"}
-        if not duel.winner_route or families != {"openai", "anthropic"}: raise SmokeFailure("M1_DUEL_FAILED", "M1 needs qualified real L3 results from both families")
-        report["duel"] = {"status": (duel.duel or {}).get("status"), "bundle_sha256": bundle_hash, "families": sorted(families), "arbitration": duel.arbitration}; report["status"] = "passed"
+        m1 = _invoke(broker, stage="m1_judgment", packet=m1_packet, schema=M1_SCHEMA, timeout=provider_timeout, verifier=_verify_evidence(evidence_ids))
+        report["invocations"].append(_outcome("m1_race", m1))
+        if not m1.winner_route or m1.actual_level != "L3":
+            raise SmokeFailure("M1_RACE_FAILED", "M1 needs one qualified real L3 race result")
+        report["m1"] = {
+            "status": "race_completed", "bundle_sha256": bundle_hash,
+            "model_family": m1.model_family, "route_id": m1.winner_route,
+        }
+        report["status"] = "passed"
     except SmokeFailure as exc: report["status"], report["failure_code"] = "failed", exc.code
     except Exception: report["status"], report["failure_code"] = "failed", "UNEXPECTED_ERROR"
     finally:

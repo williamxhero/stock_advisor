@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from ai_trading_companion.local_research import freeze_evidence_bundle
-from ai_trading_companion.provider_awg_smoke import _broker, missing_luna_terra_endpoints, normalize_usage, write_smoke_report
+from ai_trading_companion.provider_awg_smoke import _broker, _invoke, missing_luna_terra_endpoints, normalize_usage, write_smoke_report
 from ai_trading_companion.provider_broker import ChatCompletionsTransport, ProviderBroker
 from ai_trading_companion.provider_routes import normalize_provider
 
@@ -72,3 +72,23 @@ def test_upgrade_proof_uses_only_real_missing_luna_terra_inventory():
     ]
 
     assert missing_luna_terra_endpoints(provider, probes) == ["b"]
+
+
+def test_smoke_m1_invocation_is_a_single_race_without_duel_mode():
+    captured = []
+    sentinel = object()
+
+    class Broker:
+        def invoke(self, request):
+            captured.append(request)
+            return sentinel
+
+    result = _invoke(
+        Broker(), stage="m1_judgment", packet={"evidence": []},
+        schema={"type": "object"}, timeout=1,
+    )
+
+    assert result is sentinel
+    assert captured[0].mode == "race"
+    assert captured[0].required_capabilities == ("race",)
+    assert captured[0].candidate_judgments == ()

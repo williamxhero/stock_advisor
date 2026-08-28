@@ -364,8 +364,10 @@ def _call_stage(
 
         if not search or not schema_name.startswith("companion-evidence-result-"):
             schema = json.loads((SCHEMAS / schema_name).read_text(encoding="utf-8"))
-            mode = "duel" if stage == "m1_judgment" else "race"
-            required = ("duel",) if mode == "duel" else ("race",)
+            # M1 is one independent Provider race. Cross-family duel and
+            # arbitration are not part of the production judgment path.
+            mode = "race"
+            required = ("race",)
             request = StageRequest(
                 stage=stage, packet=request_packet, packet_sha256=request_hash,
                 effort=decision.reasoning_effort, schema=schema, mode=mode,
@@ -377,9 +379,9 @@ def _call_stage(
             )
             outcome = broker.invoke(request)
             if not outcome.winner_route or not isinstance(outcome.result, dict):
-                disposition = (outcome.arbitration or {}).get("failure") or (outcome.duel or {}).get("status")
+                disposition = (outcome.arbitration or {}).get("failure")
                 category = "model_judgment_conflict" if disposition == "model_judgment_conflict" else "provider_exhausted"
-                if disposition in {"provider_family_unavailable", "missing_required_family", "required_m1_family_failed"}:
+                if disposition in {"provider_family_unavailable", "missing_required_family"}:
                     category = "provider_family_unavailable"
                 raise ProviderError(f"ProviderBroker produced no qualified result for {stage}", category=category)
             data = outcome.result

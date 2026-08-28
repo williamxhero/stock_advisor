@@ -36,7 +36,7 @@
         <TextBlock Text="普通阶段路由模式" FontWeight="SemiBold"/>
         <StackPanel Orientation="Horizontal" Margin="0,5,0,14">
           <ComboBox x:Name="FamilyMode" Width="190"><ComboBoxItem Tag="auto" Content="自动竞技"/><ComboBoxItem Tag="openai" Content="仅 Codex / GPT"/><ComboBoxItem Tag="anthropic" Content="仅 Claude"/></ComboBox>
-          <TextBlock Text="M1 始终使用 GPT + Claude 盲判，不受此开关影响。" Margin="12,5,0,0" Foreground="{StaticResource SecondaryTextBrush}"/>
+          <TextBlock Text="M1 使用一次独立 race，不运行 duel 或仲裁。" Margin="12,5,0,0" Foreground="{StaticResource SecondaryTextBrush}"/>
         </StackPanel>
       </StackPanel>
       <Grid Grid.Row="1" Margin="0,0,0,12">
@@ -53,6 +53,8 @@
       </Grid>
       <StackPanel Grid.Row="2">
         <WrapPanel Margin="0,0,0,10">
+          <TextBlock Text="Provider 类型" Margin="0,2,8,0"/>
+          <ComboBox x:Name="ProviderKind" Width="165" Margin="0,0,20,0"><ComboBoxItem Tag="single_family" Content="单一家族"/><ComboBoxItem Tag="cpa" Content="CPA（多家族）"/></ComboBox>
           <CheckBox x:Name="OpenAiFamily" Content="Codex（Responses API）" Checked="FamilyChanged" Unchecked="FamilyChanged" Margin="0,0,20,0"/>
           <CheckBox x:Name="AnthropicFamily" Content="Claude（Chat Completions）" Checked="FamilyChanged" Unchecked="FamilyChanged" Margin="0,0,20,0"/>
           <CheckBox x:Name="EnabledBox" Content="启用 Provider" VerticalAlignment="Center"/>

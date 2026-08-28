@@ -35,6 +35,7 @@ class RuntimeSettings:
 
 
 DEFAULT_PROVIDER = {
+    "schema_version": 5,
     "enabled": False,
     "store": True,
     "hedge": {
@@ -60,11 +61,11 @@ DEFAULT_PROVIDER = {
     "endpoints": [
         {
             "id": "cpa", "enabled": False, "base_url": "http://yosef-server:8317/v1",
-            "weight": DEFAULT_WEIGHT,
+            "provider_kind": "cpa", "supported_families": ["openai"], "weight": DEFAULT_WEIGHT,
         },
         {
             "id": "direct-provider-example", "enabled": False, "base_url": "https://provider.example/v1",
-            "weight": DEFAULT_WEIGHT,
+            "provider_kind": "cpa", "supported_families": ["openai", "anthropic"], "weight": DEFAULT_WEIGHT,
         },
     ],
     "routes": [
@@ -283,12 +284,21 @@ def provider_management(home: Path, payload: dict[str, Any]) -> dict[str, Any]:
         existing["archived"] = bool(submitted.get("archived", False))
         existing["weight"] = submitted.get("weight", candidate["routing"].get("default_weight", DEFAULT_WEIGHT))
         existing["families"] = _provider_families(submitted.get("families"))
+        existing["provider_kind"] = str(submitted.get("provider_kind") or existing.get("provider_kind") or ("cpa" if len(existing["families"]) > 1 else "single_family"))
+        if existing["provider_kind"] == "single_family" and len(existing["families"]) == 1:
+            existing["model_family"] = existing["families"][0]
+            existing.pop("supported_families", None)
+        elif existing["provider_kind"] == "cpa":
+            existing["supported_families"] = list(existing["families"])
+            existing.pop("model_family", None)
         # Model discovery is metadata owned by the runtime.  UI saves must not
         # erase a successful prior /models refresh.
         if isinstance(submitted.get("available_models"), list):
             existing["available_models"] = submitted["available_models"]
         if submitted.get("models_updated_at"):
             existing["models_updated_at"] = submitted["models_updated_at"]
+        if submitted.get("model_directory_status"):
+            existing["model_directory_status"] = submitted["model_directory_status"]
         existing["updated_at"] = utc_now()
         # Omitted / blank means retain the current secret.  Clones are forced
         # to supply one rather than borrowing the source Provider credential.
@@ -371,6 +381,50 @@ def provider_management(home: Path, payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def refresh_all_provider_models(home: Path) -> dict[str, Any]:
+    """Refresh enabled Provider inventories and persist one atomic snapshot."""
+    settings = load_settings(home)
+    candidate = json.loads(json.dumps(settings.provider))
+    refreshed: list[dict[str, str]] = []
+    for endpoint in candidate["endpoints"]:
+        if not endpoint.get("enabled") or endpoint.get("archived"):
+            continue
+        try:
+            models, state = _fetch_provider_models(endpoint)
+        except ValueError:
+            refreshed.append({"endpoint_id": endpoint["id"], "status": "refresh_failed"})
+            continue
+        endpoint["available_models"] = models
+        endpoint["model_directory_status"] = state
+        endpoint["models_updated_at"] = utc_now()
+        endpoint.pop("model_fulfillment", None)
+        _match_refreshed_models(candidate, endpoint["id"])
+        refreshed.append({"endpoint_id": endpoint["id"], "status": state})
+    normalized = normalize_provider(candidate, warn_legacy=False)
+    save_provider_settings(home, normalized, settings.research)
+    return {
+        "contract": "provider-management/v1",
+        "provider": redacted_provider(normalized),
+        "refreshed": refreshed,
+    }
+
+
+def record_model_fulfillment(home: Path, endpoint_id: str, requested: str, actual: str) -> None:
+    """Persist model identifiers only; prompts, responses, and credentials stay out."""
+    settings = load_settings(home)
+    provider = json.loads(json.dumps(settings.provider))
+    endpoint = next((item for item in provider["endpoints"] if item["id"] == endpoint_id), None)
+    if endpoint is None:
+        return
+    observations = endpoint.setdefault("model_fulfillment", {})
+    observations[requested] = {
+        "actual_model": actual,
+        "fulfilled": requested.lower().replace("_", "-") == actual.lower().replace("_", "-"),
+        "observed_at": utc_now(),
+    }
+    save_provider_settings(home, provider, settings.research)
+
+
 def _provider_id(value: Any) -> str:
     endpoint_id = str(value or "").strip()
     if not endpoint_id or any(char.isspace() for char in endpoint_id): raise ValueError("provider ID is required and cannot contain whitespace")
@@ -442,7 +496,6 @@ def _match_refreshed_models(provider: dict[str, Any], endpoint_id: str) -> None:
             route["catalog_model"] = entry["canonical_model"] if entry else desired
             route.pop("model_resolution", None)
         else:
-            route["enabled"] = False
             route["model_resolution"] = "needs_selection"
 
 

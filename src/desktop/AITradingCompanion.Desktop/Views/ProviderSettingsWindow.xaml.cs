@@ -169,6 +169,7 @@ public partial class ProviderSettingsWindow : Window
             : $"已读取 {AvailableModels.Count} 个模型{(modelsUpdatedAt.Length == 0 ? "" : $"（{modelsUpdatedAt}）")}。";
         EnabledBox.IsChecked = Bool(endpoint, "enabled") && !Bool(endpoint, "archived");
         var families = Families(endpoint);
+        SelectProviderKind(Text(endpoint, "provider_kind", families.Count > 1 ? "cpa" : "single_family"));
         OpenAiFamily.IsChecked = families.Contains("openai");
         AnthropicFamily.IsChecked = families.Contains("anthropic");
         SelectFamilyMode(Text(Routing(), "family_mode", "auto"));
@@ -210,7 +211,7 @@ public partial class ProviderSettingsWindow : Window
     private void New_Click(object sender, RoutedEventArgs e)
     {
         _isNew = true; _requiresNewKey = true;
-        LoadEndpoint(new JsonObject { ["weight"] = 0.3, ["enabled"] = true, ["families"] = new JsonArray("openai") });
+        LoadEndpoint(new JsonObject { ["weight"] = 0.3, ["enabled"] = true, ["provider_kind"] = "single_family", ["families"] = new JsonArray("openai") });
         ProviderId.Clear(); ProviderId.IsReadOnly = false; StatusText.Text = "新 Provider：必须填写唯一 ID、URL、密钥和所有模型槽。";
     }
 
@@ -333,7 +334,16 @@ public partial class ProviderSettingsWindow : Window
         var families = SelectedFamilies();
         if (families.Count == 0) throw new InvalidOperationException("至少选择一个模型家族。");
         if ((_isNew || _requiresNewKey) && string.IsNullOrWhiteSpace(ApiKey.Password)) throw new InvalidOperationException("新建或复制 Provider 必须填写 API key。");
-        var endpoint = new JsonObject { ["id"] = id, ["base_url"] = url, ["weight"] = weight, ["enabled"] = EnabledBox.IsChecked == true, ["archived"] = false, ["families"] = new JsonArray(families.Select(family => JsonValue.Create(family)).ToArray()) };
+        var providerKind = (ProviderKind.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? "single_family";
+        if (providerKind == "single_family" && families.Count != 1) throw new InvalidOperationException("单一家族 Provider 必须且只能选择一个模型家族；多家族请明确选择 CPA。");
+        var endpoint = new JsonObject {
+            ["id"] = id, ["base_url"] = url, ["weight"] = weight,
+            ["enabled"] = EnabledBox.IsChecked == true, ["archived"] = false,
+            ["provider_kind"] = providerKind,
+            ["families"] = new JsonArray(families.Select(family => JsonValue.Create(family)).ToArray())
+        };
+        if (providerKind == "cpa") endpoint["supported_families"] = endpoint["families"]?.DeepClone();
+        else if (families.Count == 1) endpoint["model_family"] = families[0];
         PreserveInventoryMetadata(_current, endpoint);
         return endpoint;
     }
@@ -379,6 +389,7 @@ public partial class ProviderSettingsWindow : Window
         var values = new List<string>(); if (OpenAiFamily.IsChecked == true) values.Add("openai"); if (AnthropicFamily.IsChecked == true) values.Add("anthropic"); return values;
     }
     private void SelectFamilyMode(string mode) => FamilyMode.SelectedItem = FamilyMode.Items.OfType<ComboBoxItem>().FirstOrDefault(item => item.Tag?.ToString() == mode) ?? FamilyMode.Items[0];
+    private void SelectProviderKind(string kind) => ProviderKind.SelectedItem = ProviderKind.Items.OfType<ComboBoxItem>().FirstOrDefault(item => item.Tag?.ToString() == kind) ?? ProviderKind.Items[0];
     private static string Host(JsonObject endpoint) => Uri.TryCreate(Text(endpoint, "base_url", ""), UriKind.Absolute, out var uri) ? uri.Host : "URL 未配置";
     private double QualityScore(string endpoint) => _quality.TryGetValue(endpoint, out var value) && value.StartsWith("产品 ", StringComparison.Ordinal) && double.TryParse(value.Split(' ')[1].TrimEnd('%'), NumberStyles.Float, CultureInfo.InvariantCulture, out var rate) ? rate : -1;
     private static string Text(JsonObject node, string key, string fallback) => node[key] is JsonValue value && value.TryGetValue<string>(out var text) ? text ?? fallback : fallback;

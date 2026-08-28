@@ -7,18 +7,23 @@ from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 
-from ai_trading_companion.config import load_settings, provider_management
+from ai_trading_companion.config import load_settings, provider_management, refresh_all_provider_models
 from ai_trading_companion.provider_routes import SLOT_STAGES
 
 
 def endpoint(provider_id: str, families: list[str], *, weight: float = 0.3, enabled: bool = True) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "id": provider_id,
         "base_url": f"https://{provider_id}.example/v1/chat/completions",
         "families": families,
         "weight": weight,
         "enabled": enabled,
     }
+    if len(families) == 1:
+        value.update({"provider_kind": "single_family", "model_family": families[0]})
+    else:
+        value.update({"provider_kind": "cpa", "supported_families": families})
+    return value
 
 
 def routes(provider_id: str, families: list[str]) -> list[dict[str, object]]:
@@ -145,18 +150,18 @@ class ProviderManagementTests(unittest.TestCase):
             self.assertEqual(6, len(result["draft_routes"]))
             self.assertEqual({"research", "judgment", "fast"}, {row["slot"] for row in result["draft_routes"]})
 
-    def test_refresh_404_disables_routes_without_a_model_directory(self) -> None:
+    def test_refresh_404_keeps_operator_route_enabled_but_marks_inventory_unknown(self) -> None:
         with TemporaryDirectory() as directory:
             home = self._home(directory)
             provider_management(home, {"action": "upsert", "endpoint": endpoint("alpha", ["openai"]),
                                        "routes": routes("alpha", ["openai"]), "api_key": "test-key"})
             with patch("ai_trading_companion.config.urlopen", side_effect=HTTPError("https://alpha.example/models", 404, "missing", {}, None)):
                 result = provider_management(home, {"action": "refresh_models", "id": "alpha"})
-            self.assertFalse(any(item["enabled"] for item in result["provider"]["routes"]))
+            self.assertTrue(any(item["enabled"] for item in result["provider"]["routes"]))
             self.assertEqual([], result["provider"]["endpoints"][0]["available_models"])
             self.assertEqual("unknown_http_404", result["provider"]["endpoints"][0]["model_directory_status"])
 
-    def test_empty_model_directory_disables_configured_slots(self) -> None:
+    def test_empty_model_directory_keeps_operator_route_enabled_for_later_inventory(self) -> None:
         with TemporaryDirectory() as directory:
             home = self._home(directory)
             provider_management(home, {"action": "upsert", "endpoint": endpoint("alpha", ["openai"]),
@@ -165,9 +170,25 @@ class ProviderManagementTests(unittest.TestCase):
             response.__enter__.return_value = response
             with patch("ai_trading_companion.config.urlopen", return_value=response):
                 result = provider_management(home, {"action": "refresh_models", "id": "alpha"})
-            self.assertFalse(any(item["enabled"] for item in result["provider"]["routes"]))
+            self.assertTrue(any(item["enabled"] for item in result["provider"]["routes"]))
             self.assertEqual([], result["provider"]["endpoints"][0]["available_models"])
             self.assertEqual("empty", result["provider"]["endpoints"][0]["model_directory_status"])
+
+    def test_refresh_all_updates_enabled_provider_inventory_without_exposing_keys(self) -> None:
+        with TemporaryDirectory() as directory:
+            home = self._home(directory)
+            provider_management(home, {
+                "action": "upsert", "endpoint": endpoint("alpha", ["openai"]),
+                "routes": routes("alpha", ["openai"]), "api_key": "alpha-secret",
+            })
+            response = MagicMock()
+            response.read.return_value = b'{"data":[]}'
+            response.__enter__.return_value = response
+            with patch("ai_trading_companion.config.urlopen", return_value=response):
+                result = refresh_all_provider_models(home)
+
+            self.assertEqual("empty", result["refreshed"][0]["status"])
+            self.assertNotIn("alpha-secret", json.dumps(result))
 
     def test_model_catalog_recalculates_auto_tier_but_not_manual_route(self) -> None:
         with TemporaryDirectory() as directory:

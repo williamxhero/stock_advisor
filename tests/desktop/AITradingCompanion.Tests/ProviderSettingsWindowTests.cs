@@ -7,6 +7,23 @@ namespace AITradingCompanion.Tests;
 public sealed class ProviderSettingsWindowTests
 {
     [Fact]
+    public void ProviderManagementRequiresAnExplicitKindAndDescribesM1AsOneRace()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln")))
+            root = root.Parent;
+        Assert.NotNull(root);
+        var xaml = File.ReadAllText(Path.Combine(
+            root.FullName, "src", "desktop", "AITradingCompanion.Desktop", "Views", "ProviderSettingsWindow.xaml"));
+
+        Assert.Contains("x:Name=\"ProviderKind\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Tag=\"single_family\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Tag=\"cpa\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("M1 使用一次独立 race", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("GPT + Claude 盲判", xaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void UnexpectedNumericLegacyFieldIsTreatedAsMissingTextInsteadOfCrashingTheWindow()
     {
         var text = typeof(ProviderSettingsWindow).GetMethod(

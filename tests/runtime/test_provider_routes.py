@@ -74,7 +74,7 @@ class ProviderRouteConfigTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         template = json.loads((root / "resources" / "seeds" / "companion.settings.template.json").read_text(encoding="utf-8"))
         provider = normalize_provider(template["provider"], warn_legacy=False)
-        self.assertEqual(4, provider["schema_version"])
+        self.assertEqual(5, provider["schema_version"])
         self.assertEqual(9, len(provider["routes"]))
         self.assertFalse(provider["enabled"])
         self.assertFalse(any(route["enabled"] for route in provider["routes"]))
@@ -142,7 +142,7 @@ class ProviderRouteConfigTests(unittest.TestCase):
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(0, result["migrated_endpoint_count"])
             self.assertEqual("local-secret", saved["provider"]["endpoints"][0]["api_key"])
-            self.assertEqual(4, saved["provider"]["schema_version"])
+            self.assertEqual(5, saved["provider"]["schema_version"])
             self.assertEqual(100, saved["provider"]["routes"][0]["cost"]["tier"])
             self.assertEqual(91, saved["provider"]["routes"][0]["preference"])
             self.assertEqual("http://research.test/mcp", saved["research"]["web_access_gateway"]["mcp_url"])
@@ -169,6 +169,56 @@ class ProviderRouteConfigTests(unittest.TestCase):
         }}, "endpoints": [], "routes": []}, warn_legacy=False)
         price = provider["routing"]["model_catalog"]["openai"]["gpt-x"]["price"]
         self.assertEqual(1, price["cached_input_per_million"])
+
+    def test_catalog_assigns_intellect_and_target_level_to_known_models(self) -> None:
+        provider = normalize_provider({
+            "endpoints": [{
+                "id": "openai", "base_url": "https://example.test/v1",
+                "provider_kind": "single_family", "model_family": "openai",
+            }],
+            "routes": [{
+                "id": "terra", "endpoint": "openai", "model": "gpt-5.6-terra",
+                "model_family": "openai", "stages": ["fast"],
+                "cost": {"tier": 0, "mode": "relative"},
+            }],
+        }, warn_legacy=False)
+
+        self.assertEqual("smart", provider["routes"][0]["intellect"])
+        self.assertEqual("L2", provider["routing"]["model_catalog"]["openai"]["gpt-5.6-terra"]["target_level"])
+
+    def test_only_cpa_can_keep_multiple_model_families_enabled(self) -> None:
+        blocked = normalize_provider({
+            "endpoints": [{
+                "id": "ambiguous", "base_url": "https://example.test/v1",
+                "provider_kind": "single_family", "families": ["openai", "anthropic"],
+            }],
+            "routes": [],
+        }, warn_legacy=False)
+        self.assertFalse(blocked["endpoints"][0]["enabled"])
+        self.assertTrue(blocked["endpoints"][0]["needs_provider_kind_correction"])
+
+        cpa = normalize_provider({
+            "endpoints": [{
+                "id": "relay", "base_url": "https://example.test/v1", "provider_kind": "cpa",
+                "supported_families": ["openai", "anthropic"],
+            }],
+            "routes": [],
+        }, warn_legacy=False)
+        self.assertEqual(["anthropic", "openai"], cpa["endpoints"][0]["supported_families"])
+
+    def test_legacy_routes_cannot_leave_an_ambiguous_single_family_endpoint_enabled(self) -> None:
+        provider = normalize_provider({
+            "enabled": True,
+            "endpoints": [{"id": "legacy", "base_url": "https://example.test/v1"}],
+            "routes": [
+                {"id": "gpt", "endpoint": "legacy", "model": "gpt-5.6-luna", "model_family": "openai", "stages": ["fast"], "cost": {"tier": 0, "mode": "relative"}},
+                {"id": "claude", "endpoint": "legacy", "model": "claude-sonnet-5", "model_family": "anthropic", "stages": ["research"], "cost": {"tier": 0, "mode": "relative"}},
+            ],
+        }, warn_legacy=False)
+
+        self.assertFalse(provider["endpoints"][0]["enabled"])
+        self.assertFalse(any(route["enabled"] for route in provider["routes"]))
+        self.assertTrue(provider["endpoints"][0]["needs_provider_kind_correction"])
 
     def test_credential_writer_is_ignored_and_settings_are_written_locally(self) -> None:
         with TemporaryDirectory() as temporary:

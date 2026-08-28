@@ -27,10 +27,10 @@ from .secret_guard import assert_safe
 
 @dataclass(frozen=True)
 class StageRequest:
-    stage: str
+    stage: str | None
     packet: dict[str, Any]
     packet_sha256: str
-    effort: str
+    effort: str | None
     schema: dict[str, Any] | None = None
     mode: str = "race"
     required_capabilities: tuple[str, ...] = ("race",)
@@ -39,6 +39,8 @@ class StageRequest:
     absolute_deadline: float = math.inf
     route_timeout_seconds: float = 90.0
     output_token_allowance: int = 2_000
+    target_level: str | None = None
+    intellect: str | None = None
     verifier_name: str = "none/v1"
     verifier: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     h0_forbidden: bool = False
@@ -54,6 +56,10 @@ class StageRequest:
             raise ValueError("M1 packet contains H0 or human-message material")
         if self.candidate_judgments and self.mode != "arbitration":
             raise ValueError("Candidate judgments are only valid for arbitration requests")
+        if self.target_level is not None and self.target_level not in {"L1", "L2", "L3"}:
+            raise ValueError("target_level must be L1, L2, or L3")
+        if self.intellect is not None and self.intellect not in {"standard", "smart", "expert"}:
+            raise ValueError("intellect must be standard, smart, or expert")
 
 
 @dataclass
@@ -166,7 +172,10 @@ class AttemptTrace:
     base_price_calibrated: bool = False
     cost_basis: str = "relative_multiplier_only"
     effective_unit_price: dict[str, float] = field(default_factory=dict)
+    requested_effort: str | None = None
+    effective_effort: str | None = None
     quality_score: int | None = None
+    requested_model: str | None = None
     cost_index: float | None = None
     verifier: dict[str, Any] = field(default_factory=dict)
 
@@ -221,15 +230,22 @@ class ProviderBroker:
         self._endpoints = {item["id"]: item for item in provider.get("endpoints", []) if item.get("enabled", True) and not item.get("archived", False)}
 
     def invoke(self, request: StageRequest) -> ProviderOutcome:
+        audit_stage = _audit_stage(request)
         self.audit("provider_invocation_started", {
-            "invocation_id": request.invocation_id, "stage": request.stage, "mode": request.mode,
+            "invocation_id": request.invocation_id, "stage": audit_stage, "mode": request.mode,
             "packet_sha256": request.packet_sha256, "absolute_deadline": request.absolute_deadline,
             "route_timeout_seconds": request.route_timeout_seconds, "verifier_name": request.verifier_name,
         })
         health_probes: list[dict[str, Any]] = []
         try:
-            health_probes = self._health_gate(request)
-            outcome = self._invoke_core(request)
+            if request.absolute_deadline <= time.monotonic():
+                outcome = ProviderOutcome(
+                    request.invocation_id, request.packet_sha256, None, None, None, None, None, [], [],
+                    arbitration={"failure": "stage_deadline_exhausted"},
+                )
+            else:
+                health_probes = self._health_gate(request)
+                outcome = self._invoke_core(request)
         except Exception as exc:
             self.audit("provider_invocation_finished", {
                 "invocation_id": request.invocation_id, "winner_route": None,
@@ -326,15 +342,21 @@ class ProviderBroker:
     def _invoke_core(self, request: StageRequest) -> ProviderOutcome:
         if request.mode == "duel":
             return self._duel(request)
-        policy = capability_policy(request.stage)
+        if request.target_level:
+            requested_level = request.target_level
+            allowed_levels = (request.target_level,)
+        else:
+            policy = capability_policy(_request_stage(request))
+            requested_level = policy.requested_level
+            allowed_levels = policy.allowed_levels
         routes = self._eligible(request)
         if not routes:
             return ProviderOutcome(request.invocation_id, request.packet_sha256, None, None, None, None, None, [], [], arbitration={"failure": "provider_family_unavailable", "family_mode": self.provider.get("routing", {}).get("family_mode", "auto")})
         attempts: list[AttemptTrace] = []
         probes: list[dict[str, Any]] = []
         attempted_requested = False
-        for level in policy.allowed_levels:
-            level_routes = [route for route in routes if capability_level(route.get("model")) == level]
+        for level in allowed_levels:
+            level_routes = [route for route in routes if _route_level(self.provider, route) == level]
             for tier in sorted({int(route["cost"]["tier"]) for route in level_routes}):
                 if time.monotonic() >= request.absolute_deadline:
                     break
@@ -343,13 +365,13 @@ class ProviderBroker:
                 probes.extend(tier_probes)
                 if not current:
                     continue
-                reason = upgrade_reason(policy.requested_level, level, attempted_requested=attempted_requested)
+                reason = upgrade_reason(requested_level, level, attempted_requested=attempted_requested)
                 before = len(attempts)
                 winner = self._race_tier(
-                    current, request, attempts, requested_level=policy.requested_level,
+                    current, request, attempts, requested_level=requested_level,
                     actual_level=level, level_upgrade_reason=reason,
                 )
-                if level == policy.requested_level and len(attempts) > before:
+                if level == requested_level and len(attempts) > before:
                     attempted_requested = True
                 if winner is not None:
                     trace, result, parsed, visible_incomplete = winner
@@ -375,10 +397,18 @@ class ProviderBroker:
             if not route.get("enabled", True) or route["endpoint"] not in self._endpoints or route["id"] in excluded:
                 continue
             mode = str(self.provider.get("routing", {}).get("family_mode", "auto"))
-            required_family = family or (mode if request.mode not in {"duel", "arbitration"} and mode in {"openai", "anthropic"} else None)
+            required_family = family or (
+                mode if request.intellect is None and request.mode not in {"duel", "arbitration"}
+                and mode in {"openai", "anthropic"} else None
+            )
             if required_family and route.get("model_family") != required_family:
                 continue
-            if capability_level(route.get("model")) not in capability_policy(request.stage).allowed_levels:
+            if request.target_level and _route_level(self.provider, route) != request.target_level:
+                continue
+            if request.target_level is None and _route_level(self.provider, route) not in capability_policy(_request_stage(request)).allowed_levels:
+                continue
+            fulfillment = self._endpoints[route["endpoint"]].get("model_fulfillment", {}).get(str(route.get("model") or ""))
+            if isinstance(fulfillment, dict) and fulfillment.get("fulfilled") is False:
                 continue
             if not set(request.required_capabilities).issubset(set(route.get("capabilities", []))):
                 continue
@@ -456,9 +486,10 @@ class ProviderBroker:
         return ordered
 
     def _sort_cost_group(self, routes: list[dict[str, Any]], request: StageRequest) -> list[dict[str, Any]]:
+        quality_stage = _request_stage(request)
         return sorted(routes, key=lambda row: (
-            -self._quality_score(row, request.stage), self._pre_cost(row, request),
-            -int(row.get("preference", 0)), -self.history_score(row, request.stage), row["id"],
+            -self._quality_score(row, quality_stage), self._pre_cost(row, request),
+            -int(row.get("preference", 0)), -self.history_score(row, quality_stage), row["id"],
         ))
 
     def _quality_score(self, route: dict[str, Any], stage: str) -> int:
@@ -491,13 +522,16 @@ class ProviderBroker:
                 estimated_cost=estimate["amount"], currency=estimate["currency"],
                 multiplier=estimate["multiplier"], base_price_calibrated=estimate["calibrated"],
                 cost_basis=estimate["basis"], effective_unit_price=estimate["unit_price"],
-                quality_score=self._quality_score(route, request.stage),
+                requested_effort=request.effort,
+                effective_effort=request.effort or str(route.get("effort") or "medium"),
+                requested_model=route["model"],
+                quality_score=self._quality_score(route, _request_stage(request)),
                 cost_index=float(route["cost_index"]) if isinstance(route.get("cost_index"), (int, float)) else None,
             )
             cancel = threading.Event(); attempts.append(trace); active[trace.attempt_id] = (route, trace, cancel)
             payload = self._payload(route, request)
             self.audit("llm_attempt_started", {**asdict(trace), "invocation_id": request.invocation_id,
-                                                "packet_sha256": request.packet_sha256, "stage": request.stage,
+                                                "packet_sha256": request.packet_sha256, "stage": _audit_stage(request),
                                                 "verifier_name": request.verifier_name})
             def delta(text: str) -> None:
                 nonlocal locked_id, published
@@ -711,7 +745,7 @@ class ProviderBroker:
         if route.get("transport") == "responses":
             payload: dict[str, Any] = {
                 "model": route["model"], "input": text,
-                "reasoning": {"effort": request.effort}, "max_output_tokens": request.output_token_allowance,
+                "reasoning": {"effort": request.effort or str(route.get("effort") or "medium")}, "max_output_tokens": request.output_token_allowance,
                 "stream": True,
             }
             if request.schema is not None:
@@ -729,7 +763,7 @@ class ProviderBroker:
             messages.append({"role": "user", "content": text})
             payload = {
                 "model": route["model"], "messages": messages,
-                "reasoning_effort": request.effort, "max_completion_tokens": request.output_token_allowance,
+                "reasoning_effort": request.effort or str(route.get("effort") or "medium"), "max_completion_tokens": request.output_token_allowance,
                 "stream": True,
             }
             payload["stream_options"] = {"include_usage": True}
@@ -811,6 +845,33 @@ def _stage_slot(stage: str) -> str:
     if "research" in stage: return "research"
     if stage in {"m1_judgment", "m2", "reflection", "workflow_feedback", "judgment"}: return "judgment"
     return "fast"
+
+
+def _request_stage(request: StageRequest) -> str:
+    if request.stage:
+        return request.stage
+    return {
+        "standard": "fast",
+        "smart": "research",
+        "expert": "judgment",
+    }.get(request.intellect or "", "fast")
+
+
+def _audit_stage(request: StageRequest) -> str:
+    return request.stage or "provider_generate"
+
+
+def _route_level(provider: dict[str, Any], route: dict[str, Any]) -> str | None:
+    explicit = str(route.get("target_level") or "")
+    if explicit in {"L1", "L2", "L3"}:
+        return explicit
+    entry = catalog_entry(
+        provider,
+        str(route.get("model_family") or ""),
+        str(route.get("catalog_model") or route.get("model") or ""),
+    )
+    target = str((entry or {}).get("target_level") or "")
+    return target if target in {"L1", "L2", "L3"} else capability_level(route.get("model"))
 
 
 def _contains_h0(value: Any) -> bool:

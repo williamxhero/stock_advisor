@@ -111,6 +111,33 @@ public sealed class UiContractTests
     }
 
     [Fact]
+    public void HistoryListHeaderDoesNotDisplayTheRecordCount()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln")))
+            root = root.Parent;
+        Assert.NotNull(root);
+        var xaml = File.ReadAllText(Path.Combine(root.FullName!,
+            "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml"));
+
+        Assert.Contains("Text=\"历史列表\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Binding HistoryCount", xaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SelectedHistoryItemUsesAReadableForegroundAndBackground()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln"))) root = root.Parent;
+        Assert.NotNull(root);
+        var xaml = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml"));
+
+        Assert.Contains("Property=\"IsSelected\" Value=\"True\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Value=\"{StaticResource BlueBrush}\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Foreground\" Value=\"White\"", xaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void EveryRenderedAiAndUserMessageGetsAnOriginalTextCopyButton()
     {
         var root = new DirectoryInfo(AppContext.BaseDirectory);
@@ -180,6 +207,27 @@ public sealed class UiContractTests
         var mainViewModel = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "ViewModels", "MainViewModel.cs"));
         Assert.DoesNotContain("· {SelectedMessage.Source}", mainViewModel, StringComparison.Ordinal);
         Assert.Contains("SourceTextFor", mainViewModel, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ProviderQualityPageExposesFiltersSamplesRaceCountersAndRedactedExports()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln"))) root = root.Parent;
+        Assert.NotNull(root);
+        var view = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "Views", "ProviderQualityWindow.xaml"));
+        var main = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml"));
+        var code = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml.cs"));
+
+        Assert.Contains("Provider 质量", view, StringComparison.Ordinal);
+        Assert.Contains("ItemsSource=\"{Binding Windows}\"", view, StringComparison.Ordinal);
+        Assert.Contains("ItemsSource=\"{Binding Families}\"", view, StringComparison.Ordinal);
+        Assert.Contains("数据不足", view, StringComparison.Ordinal);
+        Assert.Contains("SuspiciousCancels", view, StringComparison.Ordinal);
+        Assert.Contains("导出 CSV", view, StringComparison.Ordinal);
+        Assert.Contains("导出 JSON", view, StringComparison.Ordinal);
+        Assert.Contains("Content=\"Provider质量\"", main, StringComparison.Ordinal);
+        Assert.Contains("ProviderQualityButton_Click", code, StringComparison.Ordinal);
     }
 
     private static IEnumerable<T> Descendants<T>(DependencyObject root) where T : DependencyObject

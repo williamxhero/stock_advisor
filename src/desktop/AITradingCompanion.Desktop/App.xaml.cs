@@ -34,7 +34,7 @@ public partial class App : System.Windows.Application, IDisposable
             window.Activate();
         });
 
-        var viewModel = new MainViewModel(store, _inbox, _notifications, paths, settings);
+        var viewModel = new MainViewModel(store, _inbox, _notifications, paths, settings, new LoopbackHttpGateway(paths));
         try
         {
             CompanionRuntimeService.EnsureStarted();

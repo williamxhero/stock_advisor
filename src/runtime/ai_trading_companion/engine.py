@@ -57,7 +57,7 @@ class CompanionEngine:
         })
         return cycle
 
-    def research_started(self, cycle_id: str) -> dict[str, Any]:
+    def research_started(self, cycle_id: str, *, as_of: str | None = None) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
         if cycle["state"] != "queued":
             raise ValueError(f"cycle is not queued: {cycle['state']}")
@@ -70,7 +70,7 @@ class CompanionEngine:
                 "pre_m0",
                 "human",
                 body,
-                iso(utc_now()),
+                as_of or iso(utc_now()),
                 {
                     "batch_id": batch_id,
                     "message_ids": [message["message_id"] for message in messages],
@@ -86,7 +86,7 @@ class CompanionEngine:
                 "messages": messages,
                 "source_artifact_id": artifact["artifact_id"],
             })
-        cycle = self.store.transition(cycle_id, "researching_m0", as_of=iso(utc_now()))
+        cycle = self.store.transition(cycle_id, "researching_m0", as_of=as_of or iso(utc_now()))
         self.emit(cycle, "m0.started", cycle)
         return cycle
 

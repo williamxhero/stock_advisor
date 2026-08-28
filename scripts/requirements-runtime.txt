@@ -1,4 +1,4 @@
 # The installed product uses the locally installed Python interpreter.  The
 # installer checks these modules before enabling the scheduler.
 exchange-calendars==4.13.2
-playwright==1.55.0
+aiohttp==3.14.3

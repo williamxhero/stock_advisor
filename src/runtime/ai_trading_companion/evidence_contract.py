@@ -43,6 +43,23 @@ class EvidenceContractFactory:
                     "negative_query_terms": ["公告", "政策", "风险"],
                 },
             ]
+        if task_key == "daily.review.1520" and stage == "m0_research":
+            close = self._latest_completed_close(as_of)
+            close_text = self._iso(close)
+            prior_close_text = self._iso(self._latest_completed_close(close - timedelta(seconds=1)))
+            return [
+                {
+                    "key": "current_market_state", "blocking": True,
+                    "allowed_coverage": ["covered"],
+                    "window": {"start": close_text, "end": close_text, "mode": "exact"},
+                },
+                {
+                    "key": "material_events_and_counterevidence", "blocking": True,
+                    "allowed_coverage": ["covered", "checked_no_change"],
+                    "window": {"start": prior_close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
+                    "negative_query_terms": ["公告", "政策", "风险"],
+                },
+            ]
         return [
             {
                 "key": "current_market_state", "blocking": True,

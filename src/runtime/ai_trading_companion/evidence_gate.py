@@ -284,7 +284,10 @@ class _EvidenceGateV3:
             for key in ("fact_as_of", "published_at", "acquired_at"):
                 value = item.get(key)
                 parsed = self._time(value, f"source_{key}", problems, required=(key != "published_at"))
-                if parsed and as_of and parsed > as_of:
+                # Historical replays are necessarily acquired after their frozen
+                # decision time.  Only the fact/publication time can introduce
+                # look-ahead; acquisition remains required and timezone-aware.
+                if key != "acquired_at" and parsed and as_of and parsed > as_of:
                     problems.append("source_from_future" if key == "fact_as_of" else f"source_{key}_in_future")
             sources[ref] = {**item, "excerpt": excerpt, "analysis": str(source.get("analysis") or "")}
         coverage = {str(row.get("requirement_key") or ""): row for row in evidence.get("coverage") or [] if isinstance(row, dict)}

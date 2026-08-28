@@ -15,7 +15,7 @@ class EvidenceGateTests(unittest.TestCase):
         ]
         self.observations = [
             {
-                "backend": "search_searxng",
+                "backend": "gateway",
                 "status": "succeeded",
                 "non_empty": True,
                 "acquired_at": "2026-08-26T07:40:00Z",

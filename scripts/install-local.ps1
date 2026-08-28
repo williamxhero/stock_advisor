@@ -2,14 +2,16 @@
 param(
     [ValidateSet('win-x64', 'win-arm64')]
     [string]$Runtime = 'win-x64',
-    [switch]$EnableStartup
+    [switch]$EnableStartup,
+    [string]$CompanionHome = (Join-Path $env:LOCALAPPDATA 'AITradingCompanion'),
+    [switch]$SkipLegacyMigration
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 & (Join-Path $root 'scripts\publish.ps1') -Runtime $Runtime -NoRestore
 $source = Join-Path $root "dist\$Runtime\AITradingCompanion"
-$companionHome = Join-Path $env:LOCALAPPDATA 'AITradingCompanion'
+$companionHome = [System.IO.Path]::GetFullPath($CompanionHome)
 $app = Join-Path $companionHome 'app'
 $staging = "$app.staging-$([guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Path $companionHome -Force | Out-Null
@@ -28,8 +30,10 @@ Move-Item -LiteralPath $staging -Destination $app
 $env:AI_TRADING_COMPANION_INSTALL_ROOT = $app
 $env:AI_TRADING_COMPANION_HOME = $companionHome
 $env:PYTHONPATH = "$app\runtime"
-& $python -m ai_trading_companion migrate-legacy --legacy-root $root | Out-Host
-if ($LASTEXITCODE -ne 0) { throw 'Legacy data migration failed; the previous data and installation remain unchanged.' }
+if (-not $SkipLegacyMigration) {
+    & $python -m ai_trading_companion migrate-legacy --legacy-root $root | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'Legacy data migration failed; the previous data and installation remain unchanged.' }
+}
 & (Join-Path $app 'scripts\verify-install.ps1') -InstallRoot $app -CompanionHome $companionHome
 
 if ($EnableStartup) {

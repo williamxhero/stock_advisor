@@ -42,6 +42,7 @@ public partial class MainWindow : Window, IDisposable
     private PortfolioWorkspaceProjection? _portfolioProjection;
     private PortfolioWindow? _portfolioWindow;
     private TaskManagementWindow? _taskManagementWindow;
+    private ProviderQualityWindow? _providerQualityWindow;
     private string? _activeAiMarkdown;
     private string? _requestedProjectionCycleId;
     private string? _editingStagedMessageId;
@@ -184,7 +185,27 @@ public partial class MainWindow : Window, IDisposable
 
     private void ProviderSettingsButton_Click(object sender, RoutedEventArgs e)
     {
-        new ProviderSettingsWindow(_paths, _companionExchange) { Owner = this }.ShowDialog();
+        try
+        {
+            new ProviderSettingsWindow(_viewModel.Gateway) { Owner = this }.ShowDialog();
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(
+                this,
+                $"无法打开 Provider 管理：{exception.Message}",
+                "Provider 管理",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+    }
+
+    private void ProviderQualityButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_providerQualityWindow is { IsLoaded: true }) { _providerQualityWindow.Activate(); return; }
+        _providerQualityWindow = new ProviderQualityWindow(_paths) { Owner = this };
+        _providerQualityWindow.Closed += (_, _) => _providerQualityWindow = null;
+        _providerQualityWindow.Show();
     }
 
     private void EditStaged_Click(object sender, RoutedEventArgs e)

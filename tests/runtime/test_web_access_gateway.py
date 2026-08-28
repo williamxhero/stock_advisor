@@ -136,6 +136,17 @@ class WebAccessGatewayTests(unittest.TestCase):
         self.assertEqual("WAG_CLIENT_COMPATIBILITY_ERROR", raised.exception.category)
         self.assertEqual(1, open_request.call_count)
 
+    def test_search_requires_results_array_without_retrying(self) -> None:
+        response = _Response({"jsonrpc": "2.0", "id": "request", "result": {
+            "content": [{"type": "text", "text": json.dumps({"trace_id": "missing-results"})}],
+        }})
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=response) as open_request:
+            with self.assertRaises(WebAccessGatewayError) as raised:
+                self.client.search("market close")
+
+        self.assertEqual("WAG_CLIENT_COMPATIBILITY_ERROR", raised.exception.category)
+        self.assertEqual(1, open_request.call_count)
+
     def test_empty_news_search_retries_general_discovery(self) -> None:
         empty = _Response({"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
             "trace_id": "news", "results": [],
@@ -174,7 +185,7 @@ class WebAccessGatewayTests(unittest.TestCase):
             }},
         }).replace("[", "\\[").replace("]", "\\]")
         response = {"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
-            "trace_id": "trace", "results": [{"url": url, "title": "history", "markdown": markdown}],
+            "trace_id": "trace", "url": url, "title": "history", "markdown": markdown,
         })}]}}
         with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=_Response(response)):
             item = self.client.read(url, not_after="2026-08-27T07:20:00Z")["results"][0]
@@ -182,6 +193,21 @@ class WebAccessGatewayTests(unittest.TestCase):
         self.assertIn('"close":"3956.570"', item["excerpt_text"])
         self.assertNotIn("future-value", item["excerpt_text"])
         self.assertFalse(item["primary"])
+
+    def test_read_accepts_direct_web_read_document_payload(self) -> None:
+        response = _Response({"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
+            "trace_id": "read-trace",
+            "url": "https://example.test/2026-08-28",
+            "title": "Market close",
+            "markdown": "2026-08-28 market close evidence",
+        })}]}})
+
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=response):
+            result = self.client.read("https://example.test/2026-08-28")
+
+        self.assertEqual("read-trace", result["trace_id"])
+        self.assertEqual("Market close", result["results"][0]["title"])
+        self.assertEqual("2026-08-28 market close evidence", result["results"][0]["excerpt_text"])
 
     def test_empty_read_results_raise_no_read_content_without_outage(self) -> None:
         response = _Response({"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
@@ -197,7 +223,7 @@ class WebAccessGatewayTests(unittest.TestCase):
 
     def test_blank_read_markdown_raises_no_read_content_without_outage(self) -> None:
         response = _Response({"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
-            "trace_id": "empty", "results": [{"url": "https://example.test", "markdown": "  "}],
+            "trace_id": "empty", "url": "https://example.test", "markdown": "  ",
         })}]}})
         with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=response) as open_request:
             with self.assertRaises(WebAccessGatewayError) as raised:

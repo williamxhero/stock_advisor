@@ -45,10 +45,10 @@ class WebAccessGatewayClient:
 
     def search(self, query: str, categories: str = "news") -> dict[str, Any]:
         value = self._call("web_search", {"query": query, "categories": categories}, self.search_timeout)
-        results = value["results"]
+        results = _result_items(value, tool="web_search")
         if not results and categories != "general":
             value = self._call("web_search", {"query": query, "categories": "general"}, self.search_timeout)
-            results = value["results"]
+            results = _result_items(value, tool="web_search")
         if not results:
             raise WebAccessGatewayError(
                 "Web Access Gateway search returned no results",
@@ -60,13 +60,21 @@ class WebAccessGatewayClient:
         if not url.startswith(("http://", "https://")):
             raise WebAccessGatewayError("web_read requires an http(s) URL")
         value = self._call("web_read", {"url": url, "render": render, "output": "markdown"}, self.read_timeout)
-        rows = [item for item in value["results"] if isinstance(item, dict)]
-        if not rows:
-            raise WebAccessGatewayError(
-                "Web Access Gateway read returned no content",
-                category="WAG_NO_READ_CONTENT",
-            )
-        row = rows[0]
+        rows = value.get("results")
+        if rows is None:
+            row = value
+        else:
+            if not isinstance(rows, list) or any(not isinstance(item, dict) for item in rows):
+                raise WebAccessGatewayError(
+                    "Web Access Gateway read returned incompatible result items",
+                    category="WAG_CLIENT_COMPATIBILITY_ERROR",
+                )
+            if not rows:
+                raise WebAccessGatewayError(
+                    "Web Access Gateway read returned no content",
+                    category="WAG_NO_READ_CONTENT",
+                )
+            row = rows[0]
         body = _text(row, "markdown") or _text(row, "content") or _text(row, "text")
         if not body.strip():
             raise WebAccessGatewayError(
@@ -212,16 +220,6 @@ class WebAccessGatewayClient:
                 "Web Access Gateway tool data is not an object",
                 category="WAG_CLIENT_COMPATIBILITY_ERROR",
             )
-        if not isinstance(value.get("results"), list):
-            raise WebAccessGatewayError(
-                "Web Access Gateway tool data has no results array",
-                category="WAG_CLIENT_COMPATIBILITY_ERROR",
-            )
-        if any(not isinstance(item, dict) for item in value["results"]):
-            raise WebAccessGatewayError(
-                "Web Access Gateway tool data has incompatible result items",
-                category="WAG_CLIENT_COMPATIBILITY_ERROR",
-            )
         return value
 
 
@@ -255,6 +253,21 @@ def _jsonrpc(raw: str, content_type: str) -> dict[str, Any]:
 
 def _text(value: Any, key: str) -> str:
     return str(value.get(key) or "") if isinstance(value, dict) else ""
+
+
+def _result_items(value: dict[str, Any], *, tool: str) -> list[dict[str, Any]]:
+    results = value.get("results")
+    if not isinstance(results, list):
+        raise WebAccessGatewayError(
+            f"Web Access Gateway {tool} data has no results array",
+            category="WAG_CLIENT_COMPATIBILITY_ERROR",
+        )
+    if any(not isinstance(item, dict) for item in results):
+        raise WebAccessGatewayError(
+            f"Web Access Gateway {tool} data has incompatible result items",
+            category="WAG_CLIENT_COMPATIBILITY_ERROR",
+        )
+    return results
 
 
 def _item(value: dict[str, Any]) -> dict[str, Any]:

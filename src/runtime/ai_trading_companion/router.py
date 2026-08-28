@@ -58,10 +58,17 @@ class CognitiveRouter:
         self.provider = provider or DEFAULT_PROVIDER
 
     def _slot(self, name: str) -> tuple[str, str]:
-        models = self.provider.get("models") if isinstance(self.provider.get("models"), dict) else {}
-        item = models.get(name) if isinstance(models.get(name), dict) else {}
-        fallback = DEFAULT_PROVIDER["models"][name]
-        return str(item.get("id") or fallback["id"]), str(item.get("effort") or fallback["effort"])
+        # The model is informational in the cognitive plan. ProviderBroker owns
+        # final route/model selection after current probes and cost ordering.
+        routes = self.provider.get("routes") if isinstance(self.provider.get("routes"), list) else []
+        eligible = [item for item in routes if isinstance(item, dict) and item.get("enabled", True)
+                    and (name in item.get("stages", []) or any(_slot_for_stage(stage) == name for stage in item.get("stages", [])))]
+        eligible.sort(key=lambda item: (int(item.get("cost", {}).get("tier", 0)),
+                                        float(item.get("cost", {}).get("weight", 1.0)),
+                                        -int(item.get("preference", 0)), str(item.get("id", ""))))
+        fallback = {"research": "gpt-5.6-terra", "judgment": "gpt-5.6-sol", "fast": "gpt-5.6-luna"}[name]
+        efforts = self.provider.get("efforts") if isinstance(self.provider.get("efforts"), dict) else {}
+        return str(eligible[0].get("model") if eligible else fallback), str(efforts.get(name) or "medium")
 
     def profile(self, stage: str, packet: dict[str, Any], requested_timeout: int) -> CognitiveTaskProfile:
         evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
@@ -134,3 +141,11 @@ class CognitiveRouter:
             if snapshot.get("qualified") and (not snapshot.get("triggers") or not snapshot.get("invalidations")):
                 problems.append("qualified_snapshot_lacks_execution_boundary")
         return {"passed": not problems, "problems": problems, "profile": profile.as_json()}
+
+
+def _slot_for_stage(stage: str) -> str:
+    if "research" in str(stage):
+        return "research"
+    if stage in JUDGMENT_STAGES or stage == "judgment":
+        return "judgment"
+    return "fast"

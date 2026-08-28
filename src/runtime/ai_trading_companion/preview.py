@@ -15,15 +15,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .credentials import read_secret, write_secret
+from .config import settings_path
 from .evidence_gate import EvidenceGate
 from .router import CognitiveRouter
 from .secret_guard import assert_safe
 from .store import CompanionStore, digest, now
 
 
-BUNDLE_SCHEMA_VERSION = 1
-PREVIEW_SIGNING_CREDENTIAL = "AITradingCompanion/PreviewSigningKey"
+BUNDLE_SCHEMA_VERSION = 2
+PREVIEW_SIGNING_KEY_FIELD = "signing_key"
 
 
 def canonical_hash(value: dict[str, Any]) -> str:
@@ -35,14 +35,38 @@ def canonical_hash(value: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def preview_signing_key(*, create: bool) -> str:
-    key = read_secret(PREVIEW_SIGNING_CREDENTIAL)
+def preview_signing_key(*, create: bool, home: Path | None = None) -> str:
+    """Read the preview signer from the runtime-local settings file.
+
+    Preview approval must work from a copied, isolated runtime home.  Keeping the
+    signer alongside the Provider keys also removes the Windows Credential
+    Manager dependency without ever returning the value through a UI, audit, or
+    bundle payload.
+    """
+    configured_home = os.environ.get("AI_TRADING_COMPANION_HOME")
+    if home is None and configured_home:
+        home = Path(configured_home)
+    elif home is None:
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if not local_app_data:
+            raise RuntimeError("LOCALAPPDATA is required")
+        home = Path(local_app_data) / "AITradingCompanion"
+    path = settings_path(home)
+    data: dict[str, Any] = {}
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+    preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
+    key = str(preview.get(PREVIEW_SIGNING_KEY_FIELD) or "").strip()
     if key:
         return key
     if not create:
-        raise ValueError("preview signing credential is unavailable")
+        raise ValueError("preview signing key is unavailable from local settings")
     key = secrets.token_hex(32)
-    write_secret(PREVIEW_SIGNING_CREDENTIAL, key)
+    data["preview"] = {**preview, PREVIEW_SIGNING_KEY_FIELD: key}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
     return key
 
 
@@ -115,12 +139,6 @@ def prepare_preview_home(product_home: Path, database: Path, preview_id: str) ->
         source_path = product_home / relative
         if source_path.exists():
             shutil.copytree(source_path, work / relative, dirs_exist_ok=True)
-    browser_profile = product_home / "browser-profile"
-    if browser_profile.exists():
-        shutil.copytree(
-            browser_profile, work / "browser-profile", dirs_exist_ok=True,
-            ignore=shutil.ignore_patterns("Singleton*", "LOCK", "*.tmp", "Cache", "Code Cache", "GPUCache"),
-        )
     return root, work
 
 
@@ -149,7 +167,10 @@ def launch_preview(
     if completed.returncode != 0:
         raise RuntimeError((completed.stderr or completed.stdout or "preview worker failed")[-4000:])
     bundle = json.loads((root / "bundle.json").read_text(encoding="utf-8"))
-    verify_bundle(bundle)
+    # The worker seals the bundle with the signer copied into its isolated
+    # runtime home.  Verify with that same signer; the formal runtime must not
+    # need a signing key merely to inspect an isolated preview.
+    verify_bundle(bundle, signing_key=preview_signing_key(create=False, home=work))
     shutil.rmtree(work, ignore_errors=True)
     return bundle
 
@@ -178,6 +199,34 @@ def build_bundle(
         ledger = [dict(row) for row in connection.execute(
             "SELECT * FROM evidence_ledger_entry WHERE cycle_id=? ORDER BY known_at,evidence_id", (preview_cycle_id,),
         )]
+        packet_hashes = sorted({str(item.get("input_sha256")) for item in attempts if item.get("input_sha256")})
+        traced_invocation_ids = sorted({
+            str(trace.get("invocation_id"))
+            for item in attempts for trace in (item.get("tool_trace") or [])
+            if isinstance(trace, dict) and trace.get("kind") == "provider_invocation" and trace.get("invocation_id")
+        })
+        provider_attempts: list[dict[str, Any]] = []
+        provider_invocations: list[dict[str, Any]] = []
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if packet_hashes:
+            clauses.append(f"packet_sha256 IN ({','.join('?' for _ in packet_hashes)})")
+            parameters.extend(packet_hashes)
+        if traced_invocation_ids:
+            clauses.append(f"invocation_id IN ({','.join('?' for _ in traced_invocation_ids)})")
+            parameters.extend(traced_invocation_ids)
+        if clauses:
+            provider_attempts = [dict(row) for row in connection.execute(
+                f"""SELECT * FROM provider_llm_attempt WHERE {' OR '.join(clauses)}
+                    ORDER BY recorded_at,attempt_id""", parameters,
+            )]
+            invocation_ids = sorted({*traced_invocation_ids, *(str(item["invocation_id"]) for item in provider_attempts)})
+            if invocation_ids:
+                invocation_placeholders = ",".join("?" for _ in invocation_ids)
+                provider_invocations = [dict(row) for row in connection.execute(
+                    f"""SELECT * FROM provider_invocation WHERE invocation_id IN ({invocation_placeholders})
+                        ORDER BY recorded_at,invocation_id""", invocation_ids,
+                )]
     for checkpoint in checkpoints:
         checkpoint["output"] = json.loads(checkpoint.pop("output_json"))
     for snapshot in snapshots:
@@ -186,6 +235,35 @@ def build_bundle(
     for artifact in artifacts:
         if artifact["kind"] in {"evidence", "m1_evidence"}:
             evidence[artifact["kind"]] = json.loads(artifact["body_markdown"])
+    evidence_coverage = []
+    for attempt in attempts:
+        if attempt.get("stage") not in {"m0_research", "m1_research"}:
+            continue
+        output = attempt.get("output") or {}
+        evidence_coverage.append({
+            "stage": attempt.get("stage"),
+            "packet_sha256": attempt.get("input_sha256"),
+            "qualified": bool((attempt.get("verifier") or {}).get("passed")),
+            "coverage": output.get("coverage") or [],
+            "critical_gaps": output.get("critical_gaps") or [],
+            "source_count": len(output.get("sources") or []),
+        })
+    provider_summary = [{
+        "invocation_id": item["invocation_id"], "stage": item["stage"],
+        "route_id": item["route_id"], "endpoint_id": item["endpoint_id"],
+        "model": item["model"], "model_family": item["model_family"],
+        "cost_tier": item["tier"], "delayed_start": bool(item["delayed_start"]),
+        "ttft_ms": item.get("ttft_ms"), "estimated_cost": item.get("estimated_cost"),
+        "actual_cost": item.get("actual_cost"), "currency": item.get("currency"),
+        "protocol_success": bool(item["protocol_success"]),
+        "product_success": bool(item["product_success"]), "winner": bool(item["winner"]),
+        "terminal_error": item.get("terminal_error"),
+        "cancellation_class": item.get("cancellation_class"),
+    } for item in provider_attempts]
+    report_body = {
+        item["kind"]: item["body_markdown"] for item in artifacts
+        if item["kind"] in {"m0", "m1", "m2", "stage_failure"}
+    }
     bundle: dict[str, Any] = {
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "preview_id": preview_id,
@@ -197,13 +275,18 @@ def build_bundle(
         "task_key": cycle["task_key"],
         "scheduled_for": cycle["scheduled_for"],
         "known_at": known_at,
-        "replay_mode": "current_reassessment",
+        "replay_mode": "original_cycle_inputs",
         "qualification_version": 2,
         "cycle_state": cycle["state"],
         "preview_status": "passed" if {"evidence", "m0", "m1_evidence", "m1"}.issubset({item["kind"] for item in artifacts}) else "failed",
         "schedule_snapshot": json.loads(cycle.get("schedule_snapshot_json") or "{}"),
         "artifacts": artifacts,
         "attempts": attempts,
+        "provider_invocations": provider_invocations,
+        "provider_attempts": provider_attempts,
+        "provider_summary": provider_summary,
+        "evidence_coverage": evidence_coverage,
+        "report_body": report_body,
         "stage_checkpoints": checkpoints,
         "evidence_ledger": ledger,
         "judgment_snapshots": snapshots,
@@ -255,6 +338,22 @@ def verify_bundle(
     if not {"evidence", "m0", "m1_evidence", "m1"}.issubset(required):
         raise ValueError("preview bundle is incomplete")
     attempts = {attempt["attempt_id"]: attempt for attempt in bundle.get("attempts") or []}
+    packet_hashes = {attempt.get("input_sha256") for attempt in attempts.values() if attempt.get("input_sha256")}
+    traced_invocation_ids = {
+        trace.get("invocation_id") for attempt in attempts.values() for trace in (attempt.get("tool_trace") or [])
+        if isinstance(trace, dict) and trace.get("kind") == "provider_invocation" and trace.get("invocation_id")
+    }
+    provider_invocations = bundle.get("provider_invocations") or []
+    invocation_ids = {item.get("invocation_id") for item in provider_invocations}
+    provider_packet_hashes = {item.get("packet_sha256") for item in provider_invocations if item.get("packet_sha256")}
+    for invocation in provider_invocations:
+        if invocation.get("packet_sha256") not in packet_hashes and invocation.get("invocation_id") not in traced_invocation_ids:
+            raise ValueError("Provider invocation is not bound to a frozen stage attempt")
+    for provider_attempt in bundle.get("provider_attempts") or []:
+        if provider_attempt.get("packet_sha256") not in provider_packet_hashes:
+            raise ValueError("Provider attempt is not bound to its frozen invocation packet")
+        if provider_attempt.get("invocation_id") not in invocation_ids:
+            raise ValueError("Provider attempt is not bound to an invocation")
     successful_stages = {
         attempt.get("stage") for attempt in attempts.values()
         if attempt.get("status") == "succeeded" and (attempt.get("verifier") or {}).get("passed")

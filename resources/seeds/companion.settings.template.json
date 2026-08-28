@@ -11,40 +11,125 @@
     "max_attempts_per_record": 3
   },
   "provider": {
+    "schema_version": 4,
     "enabled": false,
     "store": true,
     "hedge": {
       "enabled": true,
-      "max_parallel": 0,
+      "max_parallel": 2,
       "availability_probe_timeout_seconds": 5,
       "per_endpoint_timeout_seconds": 45,
       "per_endpoint_max_attempts": 1
     },
+    "routing": {
+      "family_mode": "auto",
+      "default_weight": 0.3,
+      "price_catalog": {},
+      "model_catalog": {
+        "openai": {
+          "gpt-5.6-sol": {"aliases": ["gpt-5.6-sol"], "price": {"currency": "USD", "input_per_million": 4, "output_per_million": 20}, "quality": {"research": 96, "judgment": 100, "fast": 70}},
+          "gpt-5.6-terra": {"aliases": ["gpt-5.6-terra"], "price": {"currency": "USD", "input_per_million": 2, "output_per_million": 12}, "quality": {"research": 88, "judgment": 86, "fast": 84}},
+          "gpt-5.6-luna": {"aliases": ["gpt-5.6-luna"], "price": {"currency": "USD", "input_per_million": 0.2, "output_per_million": 1.2}, "quality": {"research": 68, "judgment": 65, "fast": 92}}
+        },
+        "anthropic": {
+          "claude-opus-5": {"aliases": ["claude-opus-5"], "price": {"currency": "USD", "input_per_million": 5, "output_per_million": 25}, "quality": {"research": 98, "judgment": 100, "fast": 68}},
+          "claude-opus-4.8": {"aliases": ["claude-opus-4.8"], "price": {"currency": "USD", "input_per_million": 5, "output_per_million": 25}, "quality": {"research": 95, "judgment": 97, "fast": 65}},
+          "claude-sonnet-5": {"aliases": ["claude-sonnet-5"], "price": {"currency": "USD", "input_per_million": 2, "output_per_million": 10}, "quality": {"research": 92, "judgment": 90, "fast": 88}}
+        }
+      }
+    },
     "endpoints": [
       {
         "id": "cpa",
-        "enabled": true,
-        "priority": 0,
+        "enabled": false,
         "base_url": "http://yosef-server:8317/v1",
-        "api_key": "<paste-cpa-api-key-here>"
+        "weight": 0.3,
+        "families": ["openai"],
+        "api_key": "__SET_IN_UNTRACKED_SETTINGS_LOCAL_JSON__"
       },
       {
         "id": "direct-provider-example",
         "enabled": false,
-        "priority": 100,
         "base_url": "https://provider.example/v1",
-        "api_key": "<paste-direct-provider-api-key-here>"
+        "weight": 0.3,
+        "families": ["openai", "anthropic"],
+        "api_key": "__SET_IN_UNTRACKED_SETTINGS_LOCAL_JSON__"
       }
     ],
-    "models": {
-      "research": { "id": "gpt-5.6-terra", "effort": "medium" },
-      "judgment": { "id": "gpt-5.6-sol", "effort": "medium" },
-      "fast": { "id": "gpt-5.6-terra", "effort": "medium" }
-    }
+    "efforts": { "research": "medium", "judgment": "medium", "fast": "medium" },
+    "routes": [
+      {
+        "id": "cpa-research", "endpoint": "cpa",
+        "model": "gpt-5.6-terra", "model_family": "openai", "enabled": false,
+        "cost": { "tier": 0, "mode": "relative", "weight": 0.3 }, "preference": 0,
+        "stages": ["research", "m0_research", "m1_research", "outcome_research", "chat_research"],
+        "capabilities": ["stream", "json_schema", "race", "duel", "arbitration"]
+      },
+      {
+        "id": "cpa-judgment", "endpoint": "cpa",
+        "model": "gpt-5.6-sol", "model_family": "openai", "enabled": false,
+        "cost": { "tier": 0, "mode": "relative", "weight": 0.3 }, "preference": 0,
+        "stages": ["judgment", "m1_judgment", "m2", "reflection", "workflow_feedback"],
+        "capabilities": ["stream", "json_schema", "race", "duel", "arbitration"]
+      },
+      {
+        "id": "cpa-fast", "endpoint": "cpa",
+        "model": "gpt-5.6-luna", "model_family": "openai", "enabled": false,
+        "cost": { "tier": 0, "mode": "relative", "weight": 0.3 }, "preference": 0,
+        "stages": ["fast", "m0_compose", "chat"],
+        "capabilities": ["stream", "json_schema", "race", "duel", "arbitration"]
+      },
+      {
+        "id": "example-claude-research", "endpoint": "direct-provider-example",
+        "model": "claude-opus-5", "model_family": "anthropic", "enabled": false,
+        "cost": { "tier": 100, "mode": "relative", "weight": 0.3 }, "preference": 0,
+        "stages": ["research", "m0_research", "m1_research", "outcome_research", "chat_research"],
+        "capabilities": ["stream", "json_schema", "race", "duel", "arbitration"]
+      },
+      {
+        "id": "example-claude-judgment", "endpoint": "direct-provider-example",
+        "model": "claude-opus-5", "model_family": "anthropic", "enabled": false,
+        "cost": { "tier": 100, "mode": "relative", "weight": 0.3 }, "preference": 0,
+        "stages": ["judgment", "m1_judgment", "m2", "reflection", "workflow_feedback"],
+        "capabilities": ["stream", "json_schema", "race", "duel", "arbitration"]
+      },
+      {
+        "id": "example-claude-fast", "endpoint": "direct-provider-example",
+        "model": "claude-opus-5", "model_family": "anthropic", "enabled": false,
+        "cost": { "tier": 100, "mode": "relative", "weight": 0.3 }, "preference": 0,
+        "stages": ["fast", "m0_compose", "chat"],
+        "capabilities": ["stream", "json_schema", "race", "duel", "arbitration"]
+      },
+      {
+        "id": "direct-provider-example-research", "endpoint": "direct-provider-example",
+        "model": "gpt-5.6-terra", "model_family": "openai", "enabled": false,
+        "cost": { "tier": 200, "mode": "relative", "weight": 0.3 }, "preference": 0,
+        "stages": ["research", "m0_research", "m1_research", "outcome_research", "chat_research"],
+        "capabilities": ["stream", "json_schema", "race", "duel", "arbitration"]
+      },
+      {
+        "id": "direct-provider-example-judgment", "endpoint": "direct-provider-example",
+        "model": "gpt-5.6-sol", "model_family": "openai", "enabled": false,
+        "cost": { "tier": 200, "mode": "relative", "weight": 0.3 }, "preference": 0,
+        "stages": ["judgment", "m1_judgment", "m2", "reflection", "workflow_feedback"],
+        "capabilities": ["stream", "json_schema", "race", "duel", "arbitration"]
+      },
+      {
+        "id": "direct-provider-example-fast", "endpoint": "direct-provider-example",
+        "model": "gpt-5.6-luna", "model_family": "openai", "enabled": false,
+        "cost": { "tier": 200, "mode": "relative", "weight": 0.3 }, "preference": 0,
+        "stages": ["fast", "m0_compose", "chat"],
+        "capabilities": ["stream", "json_schema", "race", "duel", "arbitration"]
+      }
+    ]
   },
   "research": {
-    "searxng": { "base_url": "http://yosef-server:8801", "timeout_seconds": 20 },
-    "playwright": { "edge_profile": "Profile 2", "profile_directory": "browser-profile", "download_limit_mb": 50 }
+    "web_access_gateway": {
+      "mcp_url": "http://yosef-server:8930/mcp",
+      "token": "__SET_IN_UNTRACKED_SETTINGS_LOCAL_JSON__",
+      "search_timeout_seconds": 35,
+      "read_timeout_seconds": 100
+    }
   },
   "experiments": {
     "material_quality_uplift": 0.1,

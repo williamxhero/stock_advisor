@@ -15,7 +15,11 @@ if (Test-Path -LiteralPath $output) {
     if (-not $resolvedOutput.StartsWith($resolvedParent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to clean a directory outside the release output: $resolvedOutput"
     }
-    Remove-Item -LiteralPath $output -Recurse -Force
+    # Some PowerShell hosts install a Remove-Item proxy that fails on a
+    # self-contained publish tree.  The target has already been resolved and
+    # constrained to this release output parent, so use the .NET operation
+    # directly rather than widening deletion scope or silently reusing files.
+    [IO.Directory]::Delete($resolvedOutput, $true)
 }
 $revision = (& git -C $projectRoot rev-parse --short HEAD 2>$null)
 if (-not $revision) { $revision = 'unknown' }

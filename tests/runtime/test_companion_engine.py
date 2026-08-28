@@ -441,6 +441,15 @@ class CompanionEngineTests(unittest.TestCase):
         self.assertIn("pre_m0", [item["kind"] for item in compose_packet["artifacts"]])
         self.assertFalse(started["has_h0"])
 
+    def test_historical_research_start_preserves_explicit_frozen_as_of(self):
+        cycle = self.engine.start_cycle(
+            "daily.review.1520", "2026-08-27T15:20:00+08:00", "2026-08-27T07:20:02.555Z"
+        )
+
+        started = self.engine.research_started(cycle["cycle_id"], as_of=cycle["as_of"])
+
+        self.assertEqual("2026-08-27T07:20:02.555Z", started["as_of"])
+
     def test_pre_m0_messages_can_be_submitted_in_batches_before_research(self):
         cycle = self.engine.start_cycle(
             "daily.opportunity.0900", "2026-08-25T09:00:00+08:00", "2026-08-24T16:05:00Z"

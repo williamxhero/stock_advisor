@@ -1,0 +1,36 @@
+<Window x:Class="AITradingCompanion.Desktop.Views.ProviderQualityWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Provider 质量" Width="1180" Height="720" MinWidth="900" MinHeight="560"
+        WindowStartupLocation="CenterOwner" Background="{StaticResource WindowBrush}" Foreground="{StaticResource PrimaryTextBrush}">
+  <Grid Margin="18">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="12"/><RowDefinition Height="3*"/><RowDefinition Height="12"/><RowDefinition Height="2*"/></Grid.RowDefinitions>
+    <DockPanel>
+      <StackPanel DockPanel.Dock="Left"><TextBlock Text="Provider 质量" FontSize="24" FontWeight="SemiBold"/><TextBlock Text="真实业务请求；轻量探测独立统计。历史数据只用于同成本组软排序。" Foreground="{StaticResource SecondaryTextBrush}" Margin="0,4,0,0"/></StackPanel>
+      <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" HorizontalAlignment="Right">
+        <TextBlock Text="窗口" VerticalAlignment="Center"/><ComboBox ItemsSource="{Binding Windows}" SelectedItem="{Binding Window}" Width="75" Margin="6,0,10,0"/>
+        <TextBlock Text="家族" VerticalAlignment="Center"/><ComboBox ItemsSource="{Binding Families}" SelectedItem="{Binding Family}" Width="100" Margin="6,0,10,0"/>
+        <TextBlock Text="阶段" VerticalAlignment="Center"/><ComboBox ItemsSource="{Binding Stages}" SelectedItem="{Binding Stage}" Width="100" Margin="6,0,10,0"/>
+        <TextBlock Text="排序" VerticalAlignment="Center"/><ComboBox ItemsSource="{Binding Sorts}" SelectedItem="{Binding Sort}" Width="170" Margin="6,0,10,0"/>
+        <Button Content="刷新" Click="Refresh_Click" Padding="12,6"/><Button Content="导出 CSV" Click="ExportCsv_Click" Padding="12,6" Margin="8,0,0,0"/><Button Content="导出 JSON" Click="ExportJson_Click" Padding="12,6" Margin="8,0,0,0"/>
+      </StackPanel>
+    </DockPanel>
+    <DataGrid Grid.Row="2" ItemsSource="{Binding Rows}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" HeadersVisibility="Column" AlternatingRowBackground="#111E30">
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="端点" Binding="{Binding Endpoint}" Width="*"/><DataGridTextColumn Header="模型" Binding="{Binding Model}" Width="1.4*"/><DataGridTextColumn Header="家族" Binding="{Binding Family}" Width="90"/><DataGridTextColumn Header="阶段" Binding="{Binding Stage}" Width="90"/>
+        <DataGridTextColumn Header="样本" Binding="{Binding Samples}" Width="60"/><DataGridCheckBoxColumn Header="数据不足" Binding="{Binding Insufficient}" Width="75"/>
+        <DataGridTextColumn Header="协议成功" Binding="{Binding ProtocolSuccess, StringFormat=P1}" Width="78"/><DataGridTextColumn Header="产品成功" Binding="{Binding ProductSuccess, StringFormat=P1}" Width="78"/><DataGridTextColumn Header="未获首字" Binding="{Binding NoFirstToken, StringFormat=P1}" Width="78"/>
+        <DataGridTextColumn Header="TTFT P50 ms" Binding="{Binding TtftP50}" Width="92"/><DataGridTextColumn Header="TTFT P95 ms" Binding="{Binding TtftP95}" Width="92"/>
+        <DataGridTextColumn Header="完成 P50 ms" Binding="{Binding DurationP50}" Width="92"/><DataGridTextColumn Header="完成 P95 ms" Binding="{Binding DurationP95}" Width="92"/><DataGridTextColumn Header="币种" Binding="{Binding Currency}" Width="58"/>
+        <DataGridTextColumn Header="估算成本" Binding="{Binding EstimatedCost}" Width="80"/><DataGridTextColumn Header="实际成本" Binding="{Binding ActualCost}" Width="80"/><DataGridTextColumn Header="估算有效均本" Binding="{Binding AverageEffectiveCost}" Width="92"/><DataGridTextColumn Header="实际有效均本" Binding="{Binding AverageActualEffectiveCost}" Width="92"/><DataGridTextColumn Header="获胜" Binding="{Binding Wins}" Width="58"/><DataGridTextColumn Header="延迟启动" Binding="{Binding Delayed}" Width="72"/><DataGridTextColumn Header="疑似计费取消" Binding="{Binding SuspiciousCancels}" Width="92"/><DataGridTextColumn Header="取消估算成本" Binding="{Binding SuspiciousEstimatedCost}" Width="92"/><DataGridTextColumn Header="取消实际成本" Binding="{Binding SuspiciousActualCost}" Width="92"/>
+      </DataGrid.Columns>
+    </DataGrid>
+    <Grid Grid.Row="4"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+      <TextBlock Text="错误类别" FontSize="17" FontWeight="SemiBold"/>
+      <DataGrid Grid.Row="1" ItemsSource="{Binding Errors}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" Margin="0,7,0,0">
+        <DataGrid.Columns><DataGridTextColumn Header="端点" Binding="{Binding Endpoint}" Width="*"/><DataGridTextColumn Header="模型" Binding="{Binding Model}" Width="*"/><DataGridTextColumn Header="家族" Binding="{Binding Family}" Width="100"/><DataGridTextColumn Header="阶段" Binding="{Binding Stage}" Width="100"/><DataGridTextColumn Header="错误" Binding="{Binding Error}" Width="1.2*"/><DataGridTextColumn Header="次数" Binding="{Binding Count}" Width="70"/><DataGridTextColumn Header="比例" Binding="{Binding Rate, StringFormat=P1}" Width="70"/><DataGridTextColumn Header="样本" Binding="{Binding Samples}" Width="70"/></DataGrid.Columns>
+      </DataGrid>
+      <TextBlock Text="{Binding Status}" VerticalAlignment="Bottom" HorizontalAlignment="Right" Foreground="{StaticResource SecondaryTextBrush}" Margin="0,0,8,8"/>
+    </Grid>
+  </Grid>
+</Window>

@@ -60,12 +60,36 @@ class EvidenceV3Tests(TestCase):
         self.assertEqual("2026-08-25T07:00:00Z", self.events["window"]["start"])
         self.assertEqual(self.as_of, self.events["window"]["end"])
 
+    def test_1520_review_binds_market_to_completed_close_and_events_to_cycle(self):
+        as_of = "2026-08-27T07:20:02.555Z"
+        contract = EvidenceContractFactory(_WeekdayCalendar()).build(
+            task_key="daily.review.1520", stage="m0_research", as_of=as_of,
+        )
+        market, events = contract["requirements"]
+
+        self.assertEqual(
+            {"start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z", "mode": "exact"},
+            market["window"],
+        )
+        self.assertEqual("2026-08-26T07:00:00Z", events["window"]["start"])
+        self.assertEqual("2026-08-27T07:20:02.555000Z", events["window"]["end"])
+
     def test_rejects_foreign_reference_and_naive_runtime_time(self):
         foreign = EvidenceGate().evaluate(self._evidence("ev_other_1"), self.contract, self.observations, self.as_of, attempt_id="attempt-1")
         self.assertIn("source_ref_not_in_current_attempt", foreign["problems"])
         self.observations[0]["evidence_items"][0]["fact_as_of"] = "2026-08-25T15:00:00"
         naive = EvidenceGate().evaluate(self._evidence(), self.contract, self.observations, self.as_of, attempt_id="attempt-1")
         self.assertIn("source_fact_as_of_missing_timezone", naive["problems"])
+
+    def test_historical_replay_allows_acquisition_after_frozen_as_of(self):
+        self.observations[0]["evidence_items"][0]["acquired_at"] = "2026-08-27T07:20:00Z"
+        self.observations[0]["evidence_items"][1]["acquired_at"] = "2026-08-27T07:20:00Z"
+
+        result = EvidenceGate().evaluate(
+            self._evidence(), self.contract, self.observations, self.as_of, attempt_id="attempt-1",
+        )
+
+        self.assertTrue(result["passed"], result["problems"])
 
     def test_checked_no_change_requires_matching_current_attempt_query(self):
         self.observations[0]["arguments"] = {"query": "A股 公告"}
@@ -105,7 +129,7 @@ class EvidenceV3Tests(TestCase):
 
     def test_failed_research_attempt_persists_completed_tool_trace(self):
         trace = [{
-            "backend": "searxng", "tool": "search_searxng", "status": "succeeded",
+            "backend": "gateway", "tool": "web_read", "status": "succeeded",
             "non_empty": True, "arguments": {"query": "A股 盘前 公告"},
         }]
         with TemporaryDirectory() as temporary:
@@ -117,14 +141,16 @@ class EvidenceV3Tests(TestCase):
             client.run.side_effect = ProviderError(
                 "research stopped", category="research_loop_limit", tool_trace=trace,
             )
-            settings = SimpleNamespace(provider=DEFAULT_PROVIDER)
+            settings = SimpleNamespace(provider=DEFAULT_PROVIDER, research={})
             packet = {
                 "task_key": "daily.opportunity.0900", "stage": "m0_research", "as_of": self.as_of,
                 "sha256": "frozen-packet", "evidence_contract": self.contract,
             }
 
+            broker = Mock()
+            broker.invoke.side_effect = client.run.side_effect
             with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
-                "ai_trading_companion.__main__.provider_client", return_value=client,
+                "ai_trading_companion.__main__.provider_broker", return_value=broker,
             ):
                 with self.assertRaisesRegex(ProviderError, "research stopped"):
                     _call_stage(
@@ -136,7 +162,7 @@ class EvidenceV3Tests(TestCase):
             self.assertEqual("failed", attempt["status"])
             self.assertEqual(trace, json.loads(attempt["tool_trace_json"]))
 
-    def test_internal_research_tool_loop_does_not_use_provider_streaming(self):
+    def test_research_planning_uses_broker_and_never_calls_legacy_provider_tool_loop(self):
         with TemporaryDirectory() as temporary:
             store = CompanionStore(Path(temporary) / "companion.sqlite3")
             cycle = CompanionEngine(store).start_cycle(
@@ -144,14 +170,16 @@ class EvidenceV3Tests(TestCase):
             )
             client = Mock()
             client.run.side_effect = ProviderError("stop after inspecting request", category="test")
-            settings = SimpleNamespace(provider=DEFAULT_PROVIDER)
+            settings = SimpleNamespace(provider=DEFAULT_PROVIDER, research={})
             packet = {
                 "task_key": "daily.opportunity.0900", "stage": "m0_research", "as_of": self.as_of,
                 "sha256": "frozen-packet", "evidence_contract": self.contract,
             }
 
+            broker = Mock()
+            broker.invoke.side_effect = ProviderError("stop after inspecting request", category="test")
             with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
-                "ai_trading_companion.__main__.provider_client", return_value=client,
+                "ai_trading_companion.__main__.provider_broker", return_value=broker,
             ):
                 with self.assertRaisesRegex(ProviderError, "stop after inspecting request"):
                     _call_stage(
@@ -159,8 +187,11 @@ class EvidenceV3Tests(TestCase):
                         "companion-research-evidence-v2.schema.json", search=True, timeout=60,
                     )
 
-            self.assertIsNone(client.run.call_args.kwargs["on_delta"])
-            self.assertFalse(client.run.call_args.kwargs["retry_stream_after_delta"])
+            client.run.assert_not_called()
+            request = broker.invoke.call_args.args[0]
+            self.assertEqual("research", request.stage)
+            self.assertFalse(request.visible_stream)
+            self.assertIsNotNone(request.schema)
 
 
 class _WeekdayCalendar:

@@ -74,27 +74,14 @@ function Start-ScheduledWorkers {
 }
 
 try {
-    Write-Host "Companion service started. Execute=$Execute; poll=${PollSeconds}s. Ctrl+C stops it."
-    while ($true) {
-        try {
-            if ($Execute) { Invoke-Companion -Arguments @('run-schedule', '--execute') }
-            else { Invoke-Companion -Arguments @('run-schedule') }
-            Start-ScheduledWorkers
-            if ($Execute) { Invoke-Companion -Arguments @('run-due', '--execute') }
-            else { Invoke-Companion -Arguments @('run-due') }
-            if ($Execute) { Invoke-Companion -Arguments @('consume-command', '--execute') }
-            else { Invoke-Companion -Arguments @('consume-command') }
-            if ($Execute) { Invoke-Companion -Arguments @('run-background', '--execute') }
-            else { Invoke-Companion -Arguments @('run-background') }
-            Invoke-Companion -Arguments @('dispatch')
-            Write-ServiceState 'running'
-        }
-        catch {
-            Write-ServiceError $_.Exception.ToString()
-            Write-ServiceState 'degraded' $_.Exception.Message
-        }
-        Start-Sleep -Seconds ([Math]::Max(1, $PollSeconds))
-    }
+    Write-Host "Companion Gateway service started. Execute=$Execute. Ctrl+C stops it."
+    $arguments = @('-m', 'ai_trading_companion', 'serve-gateway')
+    if ($Execute) { $arguments += '--execute' }
+    $runtimePython = Join-Path $env:AI_TRADING_COMPANION_HOME 'runtime\python\Scripts\python.exe'
+    $python = if (Test-Path -LiteralPath $runtimePython) { $runtimePython } else { 'py' }
+    Write-ServiceState 'starting'
+    & $python @arguments
+    if ($LASTEXITCODE -ne 0) { Write-ServiceError "Gateway exited with code $LASTEXITCODE"; Write-ServiceState 'degraded' "Gateway exited with code $LASTEXITCODE" }
 }
 finally {
     $mutex.ReleaseMutex()

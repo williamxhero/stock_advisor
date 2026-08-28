@@ -18,13 +18,17 @@ from typing import Any
 
 from .backup import BackupManager
 from .cognition import ReplyMarkdownStream, UnifiedCognition
-from .config import load_settings, save_provider_settings
-from .credentials import write_secret
-from .provider_client import CurrentInformationUnavailable, ProviderClient, ProviderError, ProviderResult
+from .config import load_settings, migrate_embedded_provider_credentials, provider_management, save_provider_settings
+from .provider_routes import redacted_provider
+from .provider_client import CurrentInformationUnavailable, ProviderError
+from .provider_broker import (
+    ChatCompletionsTransport, ProviderBroker, ProviderOutcome, StageRequest, canonical_packet_hash,
+)
 from .engine import CompanionEngine, iso
 from .evidence_gate import EvidenceGate, EvidenceInsufficient
 from .exchange import LocalExchange
 from .governance import RouterGovernance, classify_regime
+from .gateway import RuntimeGateway, serve as serve_gateway
 from .learning import JudgmentLifecycle, WorkflowEvolution
 from .migration import LegacyMigrator, LegacySources
 from .models import TASK_POLICIES
@@ -36,7 +40,11 @@ from .projection import LearningProjectionRenderer
 from .scheduler import SHANGHAI, conversation_auto_submit_at, ensure_registered_policy, run_registry_schedule
 from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
-from .research_tools import ResearchTools
+from .web_access_gateway import WebAccessGatewayClient, WebAccessGatewayError
+from .local_research import (
+    BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
+    ReadOnlyResearchExecutor, WebAccessGatewayBackend,
+)
 from .store import CompanionStore
 from .trading_calendar import XshgTradingCalendar
 
@@ -52,7 +60,7 @@ SCHEMAS = PATHS.contracts
 @dataclass(frozen=True)
 class VerifiedStageResult:
     output: dict[str, Any]
-    provider: ProviderResult
+    provider: ProviderOutcome
     attempt_id: str
     packet_hash: str
     verifier: dict[str, Any]
@@ -71,6 +79,7 @@ def runtime() -> tuple[CompanionEngine, CompanionStore, LocalExchange, Portfolio
     _backup_before_schedule_migration()
     store = CompanionStore(DB)
     store.initialize()
+    store.compact_provider_probes()
     registry = _schedule_registry(store)
     registry.seed(json.loads((PATHS.resources / "schedules" / "tasks.json").read_text(encoding="utf-8")))
     registry.validate_or_repair()
@@ -91,9 +100,9 @@ def _backup_before_schedule_migration() -> None:
     source = sqlite3.connect(DB)
     try:
         version = source.execute("PRAGMA user_version").fetchone()[0]
-        if version >= 12:
+        if version >= 13:
             return
-        target = RUNTIME / "backups" / "migrations" / f"before-unified-cognition-v12-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sqlite3"
+        target = RUNTIME / "backups" / "migrations" / f"before-provider-broker-v13-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sqlite3"
         target.parent.mkdir(parents=True, exist_ok=True)
         destination = sqlite3.connect(target)
         try:
@@ -149,11 +158,115 @@ def render_learning(store: CompanionStore) -> None:
     LearningProjectionRenderer(WORKSPACE, store).render()
 
 
-def provider_client() -> ProviderClient:
+def _gateway_snapshot(engine: CompanionEngine, store: CompanionStore, portfolio: PortfolioService, kind: str, query: dict[str, str]) -> dict[str, Any]:
+    if kind == "history":
+        return store.history_page(before=query.get("before"), limit=int(query.get("limit", "31")), search=query.get("search", ""))
+    if kind == "today":
+        date = query.get("date") or datetime.now(SHANGHAI).date().isoformat()
+        return {"contract": "companion-today/v1", "scheduled_date": date,
+                "projections": [engine._projection(cycle) for cycle in store.latest_cycles_for_date(date)]}
+    if kind == "cycle":
+        cycle_id = query.get("cycle_id")
+        if not cycle_id:
+            raise ValueError("cycle_id is required")
+        return {"contract": "companion-cycle-projection/v1", "projection": engine._projection(store.get_cycle(cycle_id))}
+    if kind == "portfolio":
+        return {"contract": "portfolio-snapshot/v1", "snapshot": portfolio.snapshot()}
+    if kind == "schedules":
+        return {"contract": "schedule-list/v1", "schedules": _schedule_registry(store).list()}
+    if kind == "provider-config":
+        settings = load_settings(PATHS.home)
+        return {"contract": "provider-management/v1", "provider": redacted_provider(settings.provider)}
+    raise ValueError("unknown snapshot kind")
+
+
+def run_gateway(execute: bool = False) -> None:
+    """Serve desktop requests without granting the desktop database access."""
+    engine, store, exchange, portfolio = runtime()
+    def command(payload: dict[str, Any]) -> dict[str, Any]:
+        contract = payload.get("contract")
+        if contract == "schedule-user-command/v1":
+            result = _schedule_command(store, payload)
+        elif contract == "portfolio-user-command/v1":
+            result = _portfolio_command(store, portfolio, payload)
+        elif contract == "provider-management/v1":
+            result = provider_management(PATHS.home, payload)
+            action = str(payload.get("action") or "")
+            endpoint_id = payload.get("id") or (payload.get("endpoint") or {}).get("id")
+            if action in {"upsert", "restore", "clone", "probe", "refresh_models"} and endpoint_id:
+                try:
+                    result["probe"] = probe_provider_endpoints(endpoint_id=str(endpoint_id), store=store)
+                except ProviderError as exc:
+                    # The config is already valid and atomically saved.  A probe is
+                    # advisory only, never a reason to silently undo a user edit.
+                    result["probe"] = {"kind": "connectivity_only", "inference_verified": False,
+                                       "error": exc.category}
+        else:
+            result = engine.command(payload)
+        flush(store, exchange)
+        return result
+    def snapshot(kind: str, request: Any) -> dict[str, Any]:
+        return _gateway_snapshot(engine, store, portfolio, kind, dict(request.query))
+    def tick() -> None:
+        run_schedules(engine, store, datetime.now(timezone.utc), execute, exchange, portfolio)
+        for cycle in store.claim_scheduled_workers(limit=2):
+            run_scheduled_cycle(engine, store, exchange, portfolio, cycle["cycle_id"], execute)
+        for projection in engine.run_due():
+            cycle_id = projection["cycle"]["cycle_id"]
+            run_m1(engine, store, portfolio, cycle_id, execute)
+            process_h0_cognition(engine, store, portfolio, cycle_id, execute)
+        consume(engine, store, exchange, portfolio, execute)
+        run_background(engine, store, execute)
+        flush(store, exchange)
+    import asyncio
+    asyncio.run(serve_gateway(RuntimeGateway(PATHS.home, store, command, snapshot, tick)))
+
+
+def probe_provider_endpoints(*, endpoint_id: str | None = None, store: CompanionStore | None = None) -> dict[str, Any]:
+    """Run connectivity-only probes for configured endpoints; never treat them as inference success."""
+    settings = load_settings(PATHS.home)
+    transport = ChatCompletionsTransport(PATHS.home, settings.research, retry=settings.provider.get("retry") or {})
+    endpoints = [item for item in settings.provider.get("endpoints", [])
+                 if item.get("enabled", True) and not item.get("archived", False)
+                 and (endpoint_id is None or item["id"] == endpoint_id)]
+    if not endpoints:
+        raise ProviderError("No enabled Provider endpoint matched", category="provider_not_configured")
+    invocation_id = str(uuid.uuid4())
+    results = []
+    for endpoint in endpoints:
+        started = time.monotonic()
+        try:
+            probe = transport.probe(endpoint, 3.0)
+            status = str(probe.get("status") or "definitive_failure")
+            model_count = len(probe.get("models") or [])
+        except Exception:
+            status = "definitive_failure"
+            model_count = 0
+        completed = time.monotonic()
+        record = {"invocation_id": invocation_id, "endpoint_id": endpoint["id"], "status": status,
+                  "model_count": model_count, "started_at": started, "completed_at": completed}
+        if store is not None:
+            store.record_provider_audit("provider_probe_attempt", record)
+        results.append({"endpoint_id": endpoint["id"], "status": status,
+                        "model_count": model_count,
+                        "duration_ms": round((completed - started) * 1000, 3)})
+    return {"kind": "connectivity_only", "inference_verified": False, "results": results}
+
+
+def provider_broker(*, store: CompanionStore | None = None, audit: Any = None) -> ProviderBroker:
     settings = load_settings(PATHS.home)
     if not settings.provider_enabled:
         raise ProviderError("Provider is not enabled", category="provider_not_configured")
-    return ProviderClient(settings.provider, settings.research, PATHS.home)
+    transport = ChatCompletionsTransport(
+        PATHS.home, settings.research, retry=settings.provider.get("retry") or {},
+    )
+    hedge = settings.provider.get("hedge") if isinstance(settings.provider.get("hedge"), dict) else {}
+    return ProviderBroker(
+        settings.provider, transport,
+        hedge_seconds=float(hedge.get("first_token_seconds") or 8), probe_seconds=3,
+        history_score=store.provider_history_score if store is not None else None,
+        audit=audit or (store.record_provider_audit if store is not None else None),
+    )
 
 
 def _call_stage(
@@ -176,134 +289,156 @@ def _call_stage(
     )
     plan = router.plan(stage, packet, timeout, search, str(cell["mode"]))
     decision = plan.selected
-    if retry_model_slot:
-        configured = settings.provider.get("models") if isinstance(settings.provider.get("models"), dict) else {}
-        retry_model = configured.get(retry_model_slot) if isinstance(configured.get(retry_model_slot), dict) else {}
-        decision = decision.__class__(
-            str(retry_model.get("id") or decision.model),
-            str(retry_model.get("effort") or decision.reasoning_effort),
-            decision.search, decision.timeout_seconds,
-            f"{decision.reason}；前次 Provider 超时，改用 {retry_model_slot} 模型槽执行冻结同包恢复",
-            retry_model_slot,
-        )
     decision_id = store.record_route_decision(
         cycle["cycle_id"], stage, plan.profile.cell_key, plan.mode, plan.profile.as_json(),
         plan.baseline.as_json(), plan.candidate.as_json() if plan.candidate else None, decision.as_json(),
     )
     attempt = store.begin_attempt(
         cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), packet.get("sha256"),
-        model=decision.model, reasoning_effort=decision.reasoning_effort,
-        search_enabled=decision.search, timeout_seconds=decision.timeout_seconds,
-        routing_reason=decision.reason, route_decision_id=decision_id,
-        runner_fingerprint="chat-completions-v1",
+        model=None, reasoning_effort=decision.reasoning_effort,
+        search_enabled=search, timeout_seconds=min(timeout, decision.timeout_seconds),
+        routing_reason="ProviderBroker cost-tier routing", route_decision_id=decision_id,
+        runner_fingerprint="provider-broker/chat-completions-v1",
         input_packet=packet,
     )
-    started = time.monotonic()
     attempt_finished = False
+    tool_trace: list[dict[str, Any]] = []
+    planner: BrokerResearchPlanner | None = None
     try:
-        contract = packet.get("evidence_contract") if search else None
-        def research_validator_for(active_attempt_id: str):
-            return lambda output, trace: EvidenceGate().evaluate(
-                output, contract or {}, trace, str(packet.get("as_of") or ""), attempt_id=active_attempt_id,
+        broker = provider_broker(store=store)
+        deadline = time.monotonic() + max(1, min(timeout, decision.timeout_seconds))
+        evidence_verifier: dict[str, Any] | None = None
+        outcome: ProviderOutcome | None = None
+        request_packet = {key: value for key, value in packet.items() if key != "sha256"}
+        request_hash = str(packet.get("sha256") or canonical_packet_hash(request_packet))
+
+        if search:
+            contract = packet.get("evidence_contract")
+            if not isinstance(contract, dict):
+                contract = {
+                    "version": 3, "as_of": packet.get("as_of"),
+                    "requirements": packet.get("evidence_requirements") or [],
+                }
+            planner = BrokerResearchPlanner(
+                broker, deadline=lambda: deadline, effort=decision.reasoning_effort,
             )
-        research_validator = research_validator_for(attempt["attempt_id"]) if contract else None
-        result = provider_client().run(
-            RuntimePacketBuilder.prompt(packet), SCHEMAS / schema_name,
-            timeout=decision.timeout_seconds,
-            search=decision.search, slot=decision.model_slot, effort=decision.reasoning_effort,
-            research_validator=research_validator,
-            research_contract=contract,
-            # Research/tool-loop output is internal and never user-visible.
-            # Keep it non-streaming so CPA can retry a whole idempotent request
-            # when an upstream closes or stalls before returning a response.
-            on_delta=None,
-            retry_stream_after_delta=False,
-            attempt_id=attempt["attempt_id"],
-        )
-        data = json.loads(result.text)
-        if result.validation and result.validation.get("normalized_evidence"):
-            data = result.validation["normalized_evidence"]
-        verifier = router.verify(stage, packet, data)
-        if result.validation is not None:
-            verifier = {
-                **verifier,
-                "passed": bool(verifier.get("passed")) and bool(result.validation.get("passed")),
-                "problems": list(dict.fromkeys([*(verifier.get("problems") or []), *(result.validation.get("problems") or [])])),
-                "evidence_gate": result.validation,
-            }
-        status = "succeeded" if verifier["passed"] else "rejected"
+            web = WebAccessGatewayBackend(
+                WebAccessGatewayClient(settings.research), as_of=str(packet.get("as_of") or "") or None,
+            )
+            market_facts = packet.get("deterministic_market_facts")
+            backends = {"gateway": web}
+            if isinstance(market_facts, dict) and market_facts:
+                backends["market"] = DeterministicMarketBackend(market_facts)
+            executor = ReadOnlyResearchExecutor(backends)
+            research = LocalResearchChain(planner, executor, max_repairs=2).run(
+                packet, contract, attempt_id=attempt["attempt_id"],
+            )
+            tool_trace = [*research.observations, *_provider_invocation_trace(planner.outcomes)]
+            evidence_verifier = research.verifier
+            if not research.qualified:
+                if any(item.get("category") == "AWG_OUTAGE" for item in research.stage_failures):
+                    raise WebAccessGatewayError(
+                        "Formal research stopped after persistent AWG failure",
+                        category="AWG_OUTAGE", attempts=3,
+                    )
+                raise EvidenceInsufficient(research.verifier)
+            if schema_name.startswith("companion-evidence-result-"):
+                data = research.evidence
+                outcome = planner.outcomes[-1] if planner.outcomes else None
+                verifier = research.verifier
+            else:
+                request_packet = {
+                    **request_packet,
+                    "frozen_evidence": research.evidence,
+                    "evidence_bundle_sha256": research.bundle_sha256,
+                }
+                request_hash = canonical_packet_hash(request_packet)
+
+        if not search or not schema_name.startswith("companion-evidence-result-"):
+            schema = json.loads((SCHEMAS / schema_name).read_text(encoding="utf-8"))
+            mode = "duel" if stage == "m1_judgment" else "race"
+            required = ("duel",) if mode == "duel" else ("race",)
+            request = StageRequest(
+                stage=stage, packet=request_packet, packet_sha256=request_hash,
+                effort=decision.reasoning_effort, schema=schema, mode=mode,
+                required_capabilities=required, visible_stream=False,
+                absolute_deadline=deadline, route_timeout_seconds=min(90, max(1, timeout)),
+                verifier_name=f"cognitive-router/{stage}",
+                verifier=lambda output: router.verify(stage, packet, output),
+                h0_forbidden=stage == "m1_judgment",
+            )
+            outcome = broker.invoke(request)
+            if not outcome.winner_route or not isinstance(outcome.result, dict):
+                disposition = (outcome.arbitration or {}).get("failure") or (outcome.duel or {}).get("status")
+                category = "model_judgment_conflict" if disposition == "model_judgment_conflict" else "provider_exhausted"
+                if disposition in {"provider_family_unavailable", "missing_required_family", "required_m1_family_failed"}:
+                    category = "provider_family_unavailable"
+                raise ProviderError(f"ProviderBroker produced no qualified result for {stage}", category=category)
+            data = outcome.result
+            verifier = dict((outcome.verifier or {}).get("business") or router.verify(stage, packet, data))
+            if evidence_verifier is not None:
+                verifier["evidence_gate"] = evidence_verifier
+                verifier["passed"] = bool(verifier.get("passed")) and bool(evidence_verifier.get("passed"))
+
+        if outcome is None:
+            raise ProviderError("ProviderBroker produced no auditable outcome", category="provider_exhausted")
+        status = "succeeded" if verifier.get("passed") else "rejected"
+        output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(
             attempt["attempt_id"],
             status,
-            output_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(),
+            output_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
             output=data,
-            usage=result.usage, verifier=verifier, provider_response_id=result.response_id,
-            provider_request_id=result.request_id, tool_trace=result.tool_trace,
+            usage=outcome.usage, verifier=verifier,
+            provider_request_id=outcome.request_id, tool_trace=tool_trace,
         )
         attempt_finished = True
-        if not verifier["passed"]:
+        if not verifier.get("passed"):
             raise EvidenceInsufficient(verifier)
         if not retry_model_slot and plan.mode == "shadow" and plan.candidate and verifier["passed"]:
             store.queue_router_shadow(
                 decision_id, cycle["cycle_id"], stage, packet, schema_name, plan.candidate.as_json(),
                 priority=1 if plan.profile.major else 0,
             )
-        return VerifiedStageResult(data, result, attempt["attempt_id"], str(packet.get("sha256") or ""), verifier)
+        return VerifiedStageResult(data, outcome, attempt["attempt_id"], str(packet.get("sha256") or ""), verifier)
     except Exception as exc:
         if not attempt_finished:
+            if planner is not None:
+                known_invocations = {
+                    str(item.get("invocation_id")) for item in tool_trace
+                    if isinstance(item, dict) and item.get("kind") == "provider_invocation"
+                }
+                tool_trace.extend(
+                    item for item in _provider_invocation_trace(planner.outcomes)
+                    if str(item["invocation_id"]) not in known_invocations
+                )
             status = "timed_out" if isinstance(exc, TimeoutError) else "failed"
             store.finish_attempt(
                 attempt["attempt_id"], status, error=str(exc),
                 provider_request_id=exc.request_id if isinstance(exc, ProviderError) else None,
-                tool_trace=getattr(exc, "tool_trace", None),
+                tool_trace=getattr(exc, "tool_trace", None) or tool_trace,
             )
-        # A promoted major XHigh route has a deliberately reserved Medium hedge
-        # window.  It is sequential (not a duplicate parallel opinion), uses
-        # the identical frozen packet, and is only used after the first run
-        # failed before publication.
-        remaining = timeout - int(time.monotonic() - started)
-        if plan.mode == "promoted" and decision.reasoning_effort == "xhigh" and remaining >= 30:
-            hedge = plan.baseline
-            hedge_attempt = store.begin_attempt(
-                cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), packet.get("sha256"),
-                model=hedge.model, reasoning_effort=hedge.reasoning_effort,
-                search_enabled=hedge.search, timeout_seconds=remaining,
-                routing_reason="XHigh 未在预留窗口内完成，使用冻结同包 Medium 回退",
-                route_decision_id=decision_id, runner_fingerprint="chat-completions-v1",
-                input_packet=packet,
-            )
-            hedge_finished = False
-            try:
-                result = provider_client().run(
-                    RuntimePacketBuilder.prompt(packet), SCHEMAS / schema_name, timeout=remaining,
-                    search=hedge.search, slot=hedge.model_slot, effort=hedge.reasoning_effort,
-                    research_validator=research_validator_for(hedge_attempt["attempt_id"]) if contract and hedge.search else None,
-                    research_contract=contract,
-                    on_delta=None,
-                    retry_stream_after_delta=False,
-                    attempt_id=hedge_attempt["attempt_id"],
-                )
-                data = json.loads(result.text)
-                if result.validation and result.validation.get("normalized_evidence"):
-                    data = result.validation["normalized_evidence"]
-                verifier = router.verify(stage, packet, data)
-                if result.validation is not None:
-                    verifier = {**verifier, "passed": bool(verifier.get("passed")) and bool(result.validation.get("passed")), "problems": list(dict.fromkeys([*(verifier.get("problems") or []), *(result.validation.get("problems") or [])])), "evidence_gate": result.validation}
-                hedge_status = "succeeded" if verifier["passed"] else "rejected"
-                store.finish_attempt(hedge_attempt["attempt_id"], hedge_status, output_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(), output=data, usage=result.usage, verifier=verifier, provider_response_id=result.response_id, provider_request_id=result.request_id, tool_trace=result.tool_trace)
-                hedge_finished = True
-                if not verifier["passed"]:
-                    raise EvidenceInsufficient(verifier)
-                return VerifiedStageResult(data, result, hedge_attempt["attempt_id"], str(packet.get("sha256") or ""), verifier)
-            except Exception as hedge_error:
-                if not hedge_finished:
-                    hedge_status = "timed_out" if isinstance(hedge_error, TimeoutError) else "failed"
-                    store.finish_attempt(
-                        hedge_attempt["attempt_id"], hedge_status, error=str(hedge_error),
-                        provider_request_id=hedge_error.request_id if isinstance(hedge_error, ProviderError) else None,
-                        tool_trace=getattr(hedge_error, "tool_trace", None),
-                    )
         raise
+
+
+def _provider_invocation_trace(outcomes: list[Any]) -> list[dict[str, Any]]:
+    """Bind derived Provider packets to their owning business-stage attempt."""
+    refs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for outcome in outcomes:
+        candidates = [(getattr(outcome, "invocation_id", None), getattr(outcome, "packet_sha256", None))]
+        arbitration = getattr(outcome, "arbitration", None)
+        if isinstance(arbitration, dict):
+            candidates.append((arbitration.get("invocation_id"), getattr(outcome, "packet_sha256", None)))
+        for invocation_id, packet_sha256 in candidates:
+            if not invocation_id or str(invocation_id) in seen:
+                continue
+            seen.add(str(invocation_id))
+            refs.append({
+                "kind": "provider_invocation", "invocation_id": str(invocation_id),
+                "packet_sha256": str(packet_sha256 or ""),
+            })
+    return refs
 
 
 def _deadline_timeout(cycle: dict[str, Any], requested: int) -> int:
@@ -332,15 +467,27 @@ def run_router_shadow(store: CompanionStore, job: dict[str, Any], execute: bool)
         runner_fingerprint="chat-completions-v1",
     )
     try:
-        result = provider_client().run(
-            RuntimePacketBuilder.prompt(packet), SCHEMAS / job["schema_name"], timeout=int(candidate["timeout_seconds"]),
-            search=bool(candidate["search"]), slot=str(candidate.get("model_slot") or "judgment"), effort=candidate["reasoning_effort"],
-        )
-        data = json.loads(result.text)
-        verifier = CognitiveRouter(load_settings(PATHS.home).provider).verify(job["stage"], packet, data)
+        request_packet = {key: value for key, value in packet.items() if key != "sha256"}
+        router = CognitiveRouter(load_settings(PATHS.home).provider)
+        outcome = provider_broker(store=store).invoke(StageRequest(
+            stage=job["stage"], packet=request_packet, packet_sha256=canonical_packet_hash(request_packet),
+            effort=str(candidate["reasoning_effort"]),
+            schema=json.loads((SCHEMAS / job["schema_name"]).read_text(encoding="utf-8")),
+            mode="race", required_capabilities=("race",), visible_stream=False,
+            absolute_deadline=time.monotonic() + int(candidate["timeout_seconds"]),
+            route_timeout_seconds=min(90, int(candidate["timeout_seconds"])),
+            verifier_name=f"router-shadow/{job['stage']}",
+            verifier=lambda output: router.verify(job["stage"], packet, output),
+            h0_forbidden=job["stage"] == "m1_judgment",
+        ))
+        if not outcome.winner_route or not isinstance(outcome.result, dict):
+            raise ProviderError("ProviderBroker produced no qualified shadow result", category="provider_exhausted")
+        data = outcome.result
+        verifier = dict((outcome.verifier or {}).get("business") or router.verify(job["stage"], packet, data))
+        output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(
-            attempt["attempt_id"], "succeeded", output_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(),
-            usage=result.usage, verifier=verifier,
+            attempt["attempt_id"], "succeeded", output_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
+            usage=outcome.usage, verifier=verifier, provider_request_id=outcome.request_id,
         )
         store.finish_router_shadow(job["job_id"], output=data, verifier=verifier)
     except Exception as exc:
@@ -365,14 +512,68 @@ def _fixture_attempt(store: CompanionStore, cycle_id: str, stage: str, packet_ha
     return attempt["attempt_id"]
 
 
+def _reuse_m0_evidence_attempt(
+    store: CompanionStore, cycle: dict[str, Any], packet: dict[str, Any], evidence: dict[str, Any],
+) -> str:
+    """Create an auditable M1 checkpoint without searching or calling a model.
+
+    M1 must judge the exact M0 evidence bundle. The synthetic stage attempt
+    preserves the existing publication/checkpoint contract while copying the
+    original acquisition trace so EvidenceGate can re-verify provenance.
+    """
+    source_attempt = next((
+        item for item in reversed(store.attempts(cycle["cycle_id"]))
+        if item.get("stage") == "m0_research" and item.get("status") == "succeeded"
+        and json.loads(item.get("output_json") or "null") == evidence
+    ), None)
+    if source_attempt is None:
+        raise EvidenceInsufficient({
+            "passed": False, "problems": ["frozen_m0_evidence_attempt_missing"],
+            "missing_requirements": ["current_market_state", "material_events_and_counterevidence"],
+        })
+    tool_trace = json.loads(source_attempt.get("tool_trace_json") or "[]")
+    contract = packet.get("evidence_contract") or packet.get("evidence_requirements") or []
+    evidence_verifier = EvidenceGate().evaluate(
+        evidence, contract, tool_trace, str(packet.get("as_of") or ""),
+        attempt_id=str(source_attempt["attempt_id"]),
+    )
+    business_verifier = CognitiveRouter().verify("m1_research", packet, evidence)
+    verifier = {
+        **business_verifier,
+        "passed": bool(business_verifier.get("passed")) and bool(evidence_verifier.get("passed")),
+        "evidence_gate": evidence_verifier,
+        "frozen_evidence_reuse": True,
+        "source_attempt_id": str(source_attempt["attempt_id"]),
+    }
+    if not verifier["passed"]:
+        verifier["problems"] = [
+            *list(business_verifier.get("problems") or []),
+            *list(evidence_verifier.get("problems") or []),
+        ]
+        raise EvidenceInsufficient(verifier)
+    attempt = store.begin_attempt(
+        cycle["cycle_id"], "m1_research", iso(datetime.now(timezone.utc)), packet.get("sha256"),
+        search_enabled=False, routing_reason="Reuse frozen M0 evidence bundle",
+        runner_fingerprint="runtime/frozen-evidence-reuse-v1", input_packet=packet,
+    )
+    output_text = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    store.finish_attempt(
+        attempt["attempt_id"], "succeeded",
+        output_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
+        output=evidence, verifier=verifier, tool_trace=tool_trace,
+    )
+    return str(attempt["attempt_id"])
+
+
 def run_research(
     engine: CompanionEngine,
     store: CompanionStore,
     cycle: dict[str, Any],
     execute: bool,
     on_progress: Any = None,
+    frozen_as_of: str | None = None,
 ) -> dict[str, Any]:
-    cycle = engine.research_started(cycle["cycle_id"])
+    cycle = engine.research_started(cycle["cycle_id"], as_of=frozen_as_of)
     if on_progress:
         on_progress()
     builder = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store)
@@ -452,6 +653,7 @@ def run_m1(
     portfolio: PortfolioService,
     cycle_id: str,
     execute: bool,
+    frozen_as_of: str | None = None,
 ) -> dict[str, Any]:
     cycle = store.get_cycle(cycle_id)
     if cycle["state"] == "waiting_for_repair":
@@ -472,31 +674,33 @@ def run_m1(
 
     policy = TASK_POLICIES[cycle["task_key"]]
     prior_evidence = _latest_json_artifact(store, cycle_id, "evidence") or {}
-    research_as_of = iso(datetime.now(timezone.utc))
+    if not prior_evidence:
+        raise EvidenceInsufficient({
+            "passed": False, "problems": ["frozen_m0_evidence_missing"],
+            "missing_requirements": ["current_market_state", "material_events_and_counterevidence"],
+        })
+    research_as_of = frozen_as_of or iso(datetime.now(timezone.utc))
+    public_packet = builder.build(
+        cycle, "m1_research", evidence=prior_evidence,
+        as_of=research_as_of,
+    )
+    checkpoint = store.stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"])
+    if checkpoint:
+        evidence = checkpoint["output"]
+        evidence_attempt_id = checkpoint["attempt_id"]
+    else:
+        evidence = prior_evidence
+        evidence_attempt_id = _reuse_m0_evidence_attempt(store, cycle, public_packet, evidence)
+        store.save_stage_checkpoint(
+            cycle_id, "m1_research", public_packet["sha256"], evidence_attempt_id, evidence,
+        )
+        store.append_artifact(
+            cycle_id, "m1_evidence", "runtime", json.dumps(evidence, ensure_ascii=False),
+            str(evidence.get("as_of") or research_as_of),
+            {"public_only": True, "attempt_id": evidence_attempt_id, "reused_from": "m0_research"},
+        )
     for number in range(1, 3):
         try:
-            public_packet = builder.build(
-                cycle, "m1_research", evidence=prior_evidence,
-                as_of=research_as_of,
-            )
-            checkpoint = store.stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"])
-            if checkpoint:
-                evidence = checkpoint["output"]
-                evidence_attempt_id = checkpoint["attempt_id"]
-            else:
-                evidence_stage = _call_stage(
-                    store, cycle, "m1_research", public_packet, "companion-evidence-result-v3.schema.json",
-                    search=True, timeout=_deadline_timeout(cycle, int(policy.m1_timeout.total_seconds())),
-                    retry_model_slot="fast" if number > 1 else None,
-                )
-                evidence = evidence_stage.output
-                evidence_attempt_id = evidence_stage.attempt_id
-                store.save_stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"], evidence_attempt_id, evidence)
-                store.record_evidence(cycle, "m1_research", evidence)
-                store.append_artifact(
-                    cycle_id, "m1_evidence", "model", json.dumps(evidence, ensure_ascii=False),
-                    evidence.get("as_of") or iso(datetime.now(timezone.utc)), {"public_only": True, "attempt_id": evidence_attempt_id},
-                )
             cycle = engine.m1_judgment_started(cycle_id)
             local_packet = builder.build(
                 cycle, "m1_judgment", evidence=evidence,
@@ -561,7 +765,8 @@ def run_preview_worker(source_cycle_id: str, preview_id: str, known_at: str, bun
     cycle = store.create_preview_cycle(source_cycle_id, known_at)
     failure = None
     try:
-        cycle = run_research(engine, store, cycle, True)
+        frozen_as_of = str(source["as_of"])
+        cycle = run_research(engine, store, cycle, True, frozen_as_of=frozen_as_of)
         preview_deadline = iso(datetime.now(timezone.utc) + timedelta(minutes=45))
         source_h0 = store.latest_artifact(source_cycle_id, "h0")
         if source_h0:
@@ -581,7 +786,7 @@ def run_preview_worker(source_cycle_id: str, preview_id: str, known_at: str, bun
                 cycle["cycle_id"], "researching_m1", h0_locked_at=known_at, has_h0=0,
                 m1_started_at=known_at, m1_publish_deadline=preview_deadline,
             )
-        cycle = run_m1(engine, store, portfolio, cycle["cycle_id"], True)
+        cycle = run_m1(engine, store, portfolio, cycle["cycle_id"], True, frozen_as_of=frozen_as_of)
         if cycle["state"] in {"synthesizing_m2", "m2_deferred"}:
             cycle = run_m2(engine, store, cycle["cycle_id"], True)
     except Exception as exc:
@@ -736,7 +941,7 @@ def run_chat_research(
             as_of=iso(datetime.now(timezone.utc)),
         )
         evidence, _ = _call_stage(
-            store, cycle, "chat_research", research_packet, "companion-evidence-result-v1.schema.json",
+            store, cycle, "chat_research", research_packet, "companion-evidence-result-v3.schema.json",
             search=True, timeout=300,
         )
         store.record_evidence(cycle, "chat_research", evidence)
@@ -1000,15 +1205,28 @@ def run_unified_cognition(
                     if on_progress:
                         on_progress()
 
-            result = provider_client().run(
-                cognition.prompt(cycle, messages, mode, memories),
-                SCHEMAS / "companion-cognition-result-v1.schema.json",
-                timeout=int(TASK_POLICIES.get(cycle["task_key"], TASK_POLICIES["daily.execution.0945"]).m1_timeout.total_seconds()),
-                search=mode != "h0", slot="fast",
-                effort=str(settings.provider.get("models", {}).get("fast", {}).get("effort") or "medium"),
+            request_packet = {
+                "mode": mode,
+                "cognition_prompt": cognition.prompt(cycle, messages, mode, memories),
+            }
+            timeout_seconds = int(TASK_POLICIES.get(
+                cycle["task_key"], TASK_POLICIES["daily.execution.0945"],
+            ).m1_timeout.total_seconds())
+            outcome = provider_broker(store=store).invoke(StageRequest(
+                stage="chat", packet=request_packet, packet_sha256=canonical_packet_hash(request_packet),
+                effort=str(settings.provider.get("efforts", {}).get("fast")
+                           or settings.provider.get("models", {}).get("fast", {}).get("effort") or "medium"),
+                schema=json.loads((SCHEMAS / "companion-cognition-result-v1.schema.json").read_text(encoding="utf-8")),
+                mode="race", required_capabilities=("race",), visible_stream=stream is not None,
                 on_delta=on_delta if stream else None,
-            )
-            data = json.loads(result.text)
+                absolute_deadline=time.monotonic() + timeout_seconds,
+                route_timeout_seconds=min(90, timeout_seconds),
+                verifier_name="unified-cognition/v1",
+                verifier=lambda _output: {"passed": True, "problems": []},
+            ))
+            if not outcome.winner_route or not isinstance(outcome.result, dict) or outcome.visible_incomplete:
+                raise ProviderError("ProviderBroker produced no qualified cognition result", category="provider_exhausted")
+            data = outcome.result
         outcome = cognition.apply(cycle, source, messages, mode, data)
     except Exception as exc:
         store.finish_cognition_job(job["job_id"], error=str(exc))
@@ -1205,7 +1423,7 @@ def consume(
                 continue
             if command.get("contract") == "companion-user-command/v1" and command.get("type") == "provider.probe":
                 try:
-                    result = {"configured": True, "probe": provider_client().probe()}
+                    result = {"configured": True, "probe": probe_provider_endpoints(store=store)}
                     exchange.send("to-client", str(command.get("command_id")), {"contract": "provider-client-event/v1", "event_id": str(command.get("command_id")), "type": "provider.probe.succeeded", "created_at": iso(datetime.now(timezone.utc)), "payload": result})
                 except Exception as exc:
                     category = exc.category if isinstance(exc, ProviderError) else "provider_error"
@@ -1255,6 +1473,13 @@ def consume(
 
 
 def main() -> int:
+    # Windows installations commonly inherit a GBK console even though every
+    # runtime artifact is UTF-8 JSON. A completed preview must not be reported
+    # as failed because a safe summary contains ordinary Unicode punctuation.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
     start = sub.add_parser("start")
@@ -1262,6 +1487,8 @@ def main() -> int:
     start.add_argument("--scheduled-for", required=True)
     start.add_argument("--as-of")
     start.add_argument("--execute", action="store_true")
+    gateway = sub.add_parser("serve-gateway")
+    gateway.add_argument("--execute", action="store_true")
     resume = sub.add_parser("synthesize")
     resume.add_argument("--cycle-id", required=True)
     resume.add_argument("--execute", action="store_true")
@@ -1280,6 +1507,7 @@ def main() -> int:
     preview_rerun = sub.add_parser("preview-rerun")
     preview_rerun.add_argument("--date", required=True)
     preview_rerun.add_argument("--cycle-id")
+    preview_rerun.add_argument("--known-at", help="ISO-8601 cutoff; defaults to the selected cycle's 15:20 Shanghai time")
     approve_preview = sub.add_parser("approve-preview")
     approve_preview.add_argument("--preview-id", required=True)
     preview_worker = sub.add_parser("_preview-worker")
@@ -1303,19 +1531,27 @@ def main() -> int:
     sub.add_parser("status")
     sub.add_parser("probe")
     provider_config = sub.add_parser("configure-provider")
+    provider_config.add_argument("--endpoint-id", default="cpa")
     provider_config.add_argument("--base-url")
-    provider_config.add_argument("--credential-target")
     provider_config.add_argument("--research-model")
     provider_config.add_argument("--judgment-model")
     provider_config.add_argument("--fast-model")
+    provider_config.add_argument("--research-route-id")
+    provider_config.add_argument("--judgment-route-id")
+    provider_config.add_argument("--fast-route-id")
     provider_config.add_argument("--api-key-stdin", action="store_true")
-    browser_bootstrap = sub.add_parser("bootstrap-browser-profile")
-    browser_bootstrap.add_argument("--source-user-data", type=Path)
+    gateway_config = sub.add_parser("configure-web-access-gateway")
+    gateway_config.add_argument("--mcp-url")
+    gateway_config.add_argument("--token-stdin", action="store_true")
+    sub.add_parser("migrate-provider-credentials")
     args = parser.parse_args()
     if args.cmd == "preview-rerun":
         source = {"cycle_id": args.cycle_id} if args.cycle_id else find_source_cycle(DB, args.date)
         preview_id = f"{args.date.replace('-', '')}-1520-{uuid.uuid4().hex[:10]}"
-        known_at = iso(datetime.now(timezone.utc))
+        # A historical preview must preserve the requested cycle's information
+        # cutoff.  Using the current clock would admit later evidence and make
+        # both the bundle and its approval fingerprint non-reproducible.
+        known_at = args.known_at or f"{args.date}T15:20:00+08:00"
         bundle = launch_preview(PATHS.home, DB, INSTALL_ROOT, source["cycle_id"], preview_id, known_at)
         print(json.dumps({
             "preview_id": bundle["preview_id"], "bundle_sha256": bundle["bundle_sha256"],
@@ -1345,25 +1581,74 @@ def main() -> int:
             )
         print(json.dumps(LegacyMigrator(PATHS, sources).run(), ensure_ascii=False, indent=2))
         return 0
+    if args.cmd == "migrate-provider-credentials":
+        print(json.dumps(migrate_embedded_provider_credentials(PATHS.home), ensure_ascii=False, indent=2))
+        return 0
     if args.cmd == "configure-provider":
         settings = load_settings(PATHS.home)
         candidate = json.loads(json.dumps(settings.provider))
         candidate["enabled"] = True
-        for key, value in (("base_url", args.base_url), ("credential_target", args.credential_target)):
-            if value:
-                candidate[key] = value.rstrip("/")
-        for slot, value in (("research", args.research_model), ("judgment", args.judgment_model), ("fast", args.fast_model)):
-            if value:
-                candidate.setdefault("models", {}).setdefault(slot, {})["id"] = value
+        endpoint = next((item for item in candidate["endpoints"] if item["id"] == args.endpoint_id), None)
+        if endpoint is None:
+            raise ValueError(f"unknown Provider endpoint: {args.endpoint_id}")
+        endpoint["enabled"] = True
+        if args.base_url:
+            endpoint["base_url"] = args.base_url.rstrip("/")
+        stage_slots = {
+            "research": {"research", "m0_research", "m1_research", "outcome_research", "chat_research"},
+            "judgment": {"judgment", "m1_judgment", "m2", "reflection", "workflow_feedback"},
+            "fast": {"fast", "m0_compose", "chat"},
+        }
+        for slot, value, selected_id in (
+            ("research", args.research_model, args.research_route_id),
+            ("judgment", args.judgment_model, args.judgment_route_id),
+            ("fast", args.fast_model, args.fast_route_id),
+        ):
+            matching = [route for route in candidate["routes"]
+                        if route["endpoint"] == args.endpoint_id and stage_slots[slot].intersection(route.get("stages", []))]
+            selected = next((route for route in matching if route["id"] == selected_id), None) if selected_id else None
+            if selected_id and selected is None:
+                raise ValueError(f"endpoint {args.endpoint_id} has no {slot} route: {selected_id}")
+            if selected is None:
+                enabled = [route for route in matching if route.get("enabled", True)]
+                selected = enabled[0] if len(enabled) == 1 else matching[0] if len(matching) == 1 else None
+            if value and selected is None:
+                raise ValueError(f"endpoint {args.endpoint_id} has multiple {slot} routes; specify --{slot}-route-id")
+            if selected is not None:
+                selected["enabled"] = True
+                if value:
+                    selected["model"] = value
+                    selected["model_family"] = "anthropic" if "claude" in value.lower() else "openai"
+        if not any(route.get("enabled", True) for route in candidate["routes"]):
+            raise ValueError("select at least one Provider route to enable")
         if args.api_key_stdin:
-            write_secret(str(candidate["credential_target"]), sys.stdin.read().strip())
-        probe = ProviderClient(candidate, settings.research, PATHS.home).probe()
+            api_key = sys.stdin.read().strip()
+            if not api_key:
+                raise ValueError("Provider API key stdin was empty")
+            # Runtime-local settings are the canonical operator-managed secret
+            # store. It is never emitted through the Gateway, logs, or UI.
+            endpoint["api_key"] = api_key
         save_provider_settings(PATHS.home, candidate, settings.research)
+        probe_store = CompanionStore(DB); probe_store.initialize()
+        probe = probe_provider_endpoints(endpoint_id=args.endpoint_id, store=probe_store)
         print(json.dumps({"configured": True, "probe": probe}, ensure_ascii=False, indent=2))
         return 0
-    if args.cmd == "bootstrap-browser-profile":
+    if args.cmd == "configure-web-access-gateway":
         settings = load_settings(PATHS.home)
-        print(json.dumps(ResearchTools(PATHS.home, settings.research).bootstrap_browser_profile(args.source_user_data), ensure_ascii=False, indent=2))
+        research = json.loads(json.dumps(settings.research))
+        gateway = research.setdefault("web_access_gateway", {})
+        if args.mcp_url:
+            gateway["mcp_url"] = args.mcp_url.rstrip("/")
+        if args.token_stdin:
+            token = sys.stdin.read().strip()
+            if not token:
+                raise ValueError("Gateway token stdin was empty")
+            gateway["token"] = token
+        save_provider_settings(PATHS.home, settings.provider, research)
+        print(json.dumps({"configured": True, "mcp_url": gateway.get("mcp_url"), "token_configured": bool(gateway.get("token"))}, ensure_ascii=False, indent=2))
+        return 0
+    if args.cmd == "serve-gateway":
+        run_gateway(args.execute)
         return 0
     engine, store, exchange, portfolio = runtime()
     if args.cmd == "approve-preview":
@@ -1374,7 +1659,7 @@ def main() -> int:
         print(json.dumps(approved, ensure_ascii=False, indent=2))
         return 0
     if args.cmd == "probe":
-        print(json.dumps(provider_client().probe(), ensure_ascii=False, indent=2))
+        print(json.dumps(probe_provider_endpoints(store=store), ensure_ascii=False, indent=2))
         return 0
     if args.cmd == "backup":
         _, store, _, _ = runtime()

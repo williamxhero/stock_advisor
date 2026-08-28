@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import csv
+import io
 import json
 import sqlite3
 import uuid
@@ -11,6 +13,7 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 from .secret_guard import assert_safe
+from .provider_stats import ProviderStatistics
 
 
 def now() -> str:
@@ -70,6 +73,11 @@ class CompanionStore:
             CREATE TABLE IF NOT EXISTS companion_outbox (
               event_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL,
               created_at TEXT NOT NULL, delivered_at TEXT);
+            CREATE TABLE IF NOT EXISTS client_event_log (
+              sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
+              contract TEXT NOT NULL, cycle_id TEXT, event_type TEXT NOT NULL,
+              payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_client_event_log_sequence ON client_event_log(sequence);
             CREATE TABLE IF NOT EXISTS portfolio_position (
               code TEXT PRIMARY KEY, name TEXT NOT NULL, shares INTEGER NOT NULL,
               average_cost REAL, last_price REAL, price_as_of TEXT, market_value REAL,
@@ -137,6 +145,44 @@ class CompanionStore:
               as_of TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT,
               input_sha256 TEXT, output_sha256 TEXT, error TEXT,
               UNIQUE(cycle_id, stage, attempt_number));
+            CREATE TABLE IF NOT EXISTS provider_llm_attempt (
+              attempt_id TEXT PRIMARY KEY, invocation_id TEXT NOT NULL,
+              packet_sha256 TEXT, stage TEXT NOT NULL, route_id TEXT NOT NULL,
+              endpoint_id TEXT NOT NULL, model TEXT NOT NULL, model_family TEXT NOT NULL,
+              tier INTEGER NOT NULL, cost_mode TEXT, preference INTEGER NOT NULL DEFAULT 0,
+              delayed_start INTEGER NOT NULL DEFAULT 0,
+              recorded_at TEXT NOT NULL, completed_recorded_at TEXT,
+              monotonic_started REAL, ttft_ms REAL, duration_ms REAL,
+              protocol_success INTEGER NOT NULL DEFAULT 0,
+              product_success INTEGER NOT NULL DEFAULT 0,
+              terminal_error TEXT, winner INTEGER NOT NULL DEFAULT 0,
+              cancellation_class TEXT, response_id TEXT, request_id TEXT,
+              input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+              output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+              estimated_cost REAL, actual_cost REAL, currency TEXT,
+              multiplier REAL, base_price_calibrated INTEGER NOT NULL DEFAULT 0,
+              cost_basis TEXT, effective_unit_price_json TEXT,
+              verifier_name TEXT, requested_level TEXT, actual_level TEXT,
+              upgrade_reason TEXT, runner_fingerprint TEXT);
+            CREATE TABLE IF NOT EXISTS provider_invocation (
+              invocation_id TEXT PRIMARY KEY, stage TEXT NOT NULL, mode TEXT NOT NULL,
+              packet_sha256 TEXT NOT NULL, recorded_at TEXT NOT NULL, completed_recorded_at TEXT,
+              absolute_deadline REAL, route_timeout_seconds REAL, verifier_name TEXT,
+              winner_route TEXT, winner_endpoint TEXT, winner_model TEXT, winner_family TEXT,
+              product_disposition TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
+              probe_count INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS ix_provider_llm_attempt_window
+              ON provider_llm_attempt(recorded_at,endpoint_id,model,model_family,stage);
+            CREATE TABLE IF NOT EXISTS provider_probe_attempt (
+              probe_id TEXT PRIMARY KEY, invocation_id TEXT NOT NULL,
+              endpoint_id TEXT NOT NULL, status TEXT NOT NULL,
+              recorded_at TEXT NOT NULL, duration_ms REAL);
+            CREATE INDEX IF NOT EXISTS ix_provider_probe_attempt_window
+              ON provider_probe_attempt(recorded_at,endpoint_id,status);
+            CREATE TABLE IF NOT EXISTS provider_probe_daily (
+              day TEXT NOT NULL, endpoint_id TEXT NOT NULL, status TEXT NOT NULL,
+              sample_count INTEGER NOT NULL, duration_ms_total REAL NOT NULL DEFAULT 0,
+              PRIMARY KEY(day,endpoint_id,status));
             CREATE TABLE IF NOT EXISTS stage_checkpoint (
               cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               stage TEXT NOT NULL, packet_sha256 TEXT NOT NULL, attempt_id TEXT NOT NULL REFERENCES llm_attempt(attempt_id),
@@ -264,7 +310,7 @@ class CompanionStore:
               imported_artifact_id TEXT, imported_at TEXT NOT NULL,
               detail_json TEXT NOT NULL,
               PRIMARY KEY(source_name, source_id));
-            PRAGMA user_version = 12;
+            PRAGMA user_version = 16;
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
@@ -295,6 +341,23 @@ class CompanionStore:
             }.items():
                 if name not in attempt_columns:
                     c.execute(f"ALTER TABLE llm_attempt ADD COLUMN {name} {declaration}")
+            provider_attempt_columns = {row[1] for row in c.execute("PRAGMA table_info(provider_llm_attempt)")}
+            for name, declaration in {
+                "cost_mode": "TEXT",
+                "preference": "INTEGER NOT NULL DEFAULT 0",
+                "cached_input_tokens": "INTEGER NOT NULL DEFAULT 0",
+                "reasoning_tokens": "INTEGER NOT NULL DEFAULT 0",
+                "runner_fingerprint": "TEXT",
+                "multiplier": "REAL",
+                "base_price_calibrated": "INTEGER NOT NULL DEFAULT 0",
+                "cost_basis": "TEXT",
+                "effective_unit_price_json": "TEXT",
+                "requested_level": "TEXT",
+                "actual_level": "TEXT",
+                "upgrade_reason": "TEXT",
+            }.items():
+                if name not in provider_attempt_columns:
+                    c.execute(f"ALTER TABLE provider_llm_attempt ADD COLUMN {name} {declaration}")
             artifact_columns = {row[1] for row in c.execute("PRAGMA table_info(narrative_artifact)")}
             if "occurred_at" not in artifact_columns:
                 c.execute("ALTER TABLE narrative_artifact ADD COLUMN occurred_at TEXT")
@@ -321,6 +384,7 @@ class CompanionStore:
                    FROM companion_message m WHERE m.state='submitted' AND m.batch_id IS NOT NULL
                    GROUP BY m.batch_id,m.cycle_id,m.phase"""
             )
+
             snapshot_columns = {row[1] for row in c.execute("PRAGMA table_info(judgment_snapshot)")}
             if "verification_status" not in snapshot_columns:
                 c.execute("ALTER TABLE judgment_snapshot ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'")
@@ -407,6 +471,33 @@ class CompanionStore:
                          ON r.schedule_id=t.schedule_id AND r.revision=t.current_revision WHERE t.task_key=companion_cycle.task_key)
                    WHERE schedule_id IS NULL AND EXISTS (SELECT 1 FROM schedule_template t WHERE t.task_key=companion_cycle.task_key)"""
             )
+
+    def history_page(self, *, before: str | None = None, limit: int = 31, search: str = "") -> dict[str, Any]:
+        """Authoritative compact history, deduplicated by task and scheduled time."""
+        self.initialize(); limit = max(1, min(limit, 90))
+        with self.connection() as c:
+            clauses, values = ["1=1"], []
+            if before: clauses.append("substr(c.scheduled_for,1,10)<?"); values.append(before)
+            if search:
+                clauses.append("(c.task_key LIKE ? OR EXISTS(SELECT 1 FROM narrative_artifact a WHERE a.cycle_id=c.cycle_id AND a.body_markdown LIKE ?))")
+                values.extend([f"%{search}%", f"%{search}%"])
+            rows = c.execute(f"""WITH ranked AS (
+              SELECT c.*,COUNT(DISTINCT a.artifact_id) artifact_count,COUNT(DISTINCT m.message_id) message_count,
+              ROW_NUMBER() OVER(PARTITION BY c.task_key,c.scheduled_for ORDER BY COUNT(DISTINCT a.artifact_id) DESC,COUNT(DISTINCT m.message_id) DESC,c.updated_at DESC,c.revision DESC) current_rank
+              FROM companion_cycle c LEFT JOIN narrative_artifact a ON a.cycle_id=c.cycle_id LEFT JOIN companion_message m ON m.cycle_id=c.cycle_id AND m.state!='withdrawn'
+              WHERE {' AND '.join(clauses)} GROUP BY c.cycle_id), dates AS (
+              SELECT DISTINCT substr(scheduled_for,1,10) date FROM ranked WHERE current_rank=1 ORDER BY date DESC LIMIT ?)
+              SELECT * FROM ranked WHERE current_rank=1 AND substr(scheduled_for,1,10) IN (SELECT date FROM dates) ORDER BY scheduled_for DESC,task_key""", (*values, limit)).fetchall()
+        items = [dict(row) for row in rows]
+        return {"contract":"companion-history-page/v1","items":items,"next_before":min((item["scheduled_for"][:10] for item in items), default=None)}
+
+    def client_events(self, after: int, limit: int = 500) -> list[dict[str, Any]]:
+        self.initialize()
+        with self.connection() as c:
+            return [dict(row) for row in c.execute("SELECT * FROM client_event_log WHERE sequence>? ORDER BY sequence LIMIT ?", (after, max(1, min(limit, 500))))]
+
+    def _queue_client_event(self, event_id: str, contract: str, cycle_id: str | None, event_type: str, payload_json: str, created_at: str, connection: sqlite3.Connection) -> None:
+        connection.execute("INSERT OR IGNORE INTO client_event_log(event_id,contract,cycle_id,event_type,payload_json,created_at) VALUES(?,?,?,?,?,?)", (event_id, contract, cycle_id, event_type, payload_json, created_at))
 
     def _schedule_snapshot(self) -> None:
         """Keep a small checksummed recovery aid after every schedule mutation."""
@@ -708,7 +799,7 @@ class CompanionStore:
                      cycle_id,task_key,scheduled_for,as_of,state,revision,schedule_id,schedule_revision,
                      schedule_snapshot_json,created_at,updated_at)
                    VALUES(?,?,?,?, 'queued',?,?,?,?,?,?)""",
-                (cycle_id, source["task_key"], source["scheduled_for"], known_at, revision,
+                (cycle_id, source["task_key"], source["scheduled_for"], source["as_of"], revision,
                  source.get("schedule_id"), source.get("schedule_revision"),
                  json.dumps(snapshot, ensure_ascii=False, sort_keys=True), at, at),
             )
@@ -1701,12 +1792,16 @@ class CompanionStore:
 
     def queue_event(self, cycle_id: str, event_type: str, payload: dict[str, Any], *, connection: sqlite3.Connection | None = None) -> str:
         event_id=str(uuid.uuid4())
-        values = (event_id,cycle_id,event_type,json.dumps(payload,ensure_ascii=False,sort_keys=True),now())
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        created_at = now()
+        values = (event_id, cycle_id, event_type, payload_json, created_at)
         if connection is not None:
             connection.execute("INSERT INTO companion_outbox VALUES(?,?,?,?,?,NULL)", values)
+            self._queue_client_event(event_id, "companion-client-event/v1", cycle_id, event_type, payload_json, created_at, connection)
         else:
             with self.connection() as c:
                 c.execute("INSERT INTO companion_outbox VALUES(?,?,?,?,?,NULL)", values)
+                self._queue_client_event(event_id, "companion-client-event/v1", cycle_id, event_type, payload_json, created_at, c)
         return event_id
 
     def pending_events(self) -> list[dict[str, Any]]:
@@ -1717,17 +1812,23 @@ class CompanionStore:
 
     def queue_portfolio_event(self, event_type: str, payload: dict[str, Any]) -> str:
         event_id = str(uuid.uuid4())
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        created_at = now()
         with self.connection() as c:
             c.execute(
                 "INSERT INTO portfolio_outbox VALUES(?,?,?,?,NULL)",
-                (event_id, event_type, json.dumps(payload, ensure_ascii=False, sort_keys=True), now()),
+                (event_id, event_type, payload_json, created_at),
             )
+            self._queue_client_event(event_id, "portfolio-client-event/v1", None, event_type, payload_json, created_at, c)
         return event_id
 
     def queue_schedule_event(self, event_type: str, payload: dict[str, Any]) -> str:
         event_id = str(uuid.uuid4())
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        created_at = now()
         with self.connection() as c:
-            c.execute("INSERT INTO schedule_outbox VALUES(?,?,?,?,NULL)", (event_id, event_type, json.dumps(payload, ensure_ascii=False, sort_keys=True), now()))
+            c.execute("INSERT INTO schedule_outbox VALUES(?,?,?,?,NULL)", (event_id, event_type, payload_json, created_at))
+            self._queue_client_event(event_id, "schedule-client-event/v1", None, event_type, payload_json, created_at, c)
         return event_id
 
     def pending_schedule_events(self) -> list[dict[str, Any]]:
@@ -1747,3 +1848,185 @@ class CompanionStore:
     def mark_portfolio_event_delivered(self, event_id: str) -> None:
         with self.connection() as c:
             c.execute("UPDATE portfolio_outbox SET delivered_at=? WHERE event_id=?", (now(), event_id))
+
+    def record_provider_audit(self, kind: str, payload: dict[str, Any], *, recorded_at: str | None = None) -> None:
+        """Persist an allowlisted technical audit event and ignore all content fields."""
+        observed = recorded_at or now()
+        if kind == "provider_invocation_started":
+            required = ("invocation_id", "stage", "mode", "packet_sha256")
+            if any(payload.get(key) is None for key in required):
+                raise ValueError("provider invocation start is missing technical identity")
+            with self.connection() as c:
+                c.execute(
+                    """INSERT OR IGNORE INTO provider_invocation(
+                         invocation_id,stage,mode,packet_sha256,recorded_at,absolute_deadline,
+                         route_timeout_seconds,verifier_name) VALUES(?,?,?,?,?,?,?,?)""",
+                    (str(payload["invocation_id"]), str(payload["stage"]), str(payload["mode"]),
+                     str(payload["packet_sha256"]), observed,
+                     float(payload["absolute_deadline"]) if payload.get("absolute_deadline") is not None else None,
+                     float(payload["route_timeout_seconds"]) if payload.get("route_timeout_seconds") is not None else None,
+                     str(payload.get("verifier_name") or "none/v1")),
+                )
+            return
+        if kind == "provider_invocation_finished":
+            with self.connection() as c:
+                result = c.execute(
+                    """UPDATE provider_invocation SET completed_recorded_at=?,winner_route=?,winner_endpoint=?,
+                         winner_model=?,winner_family=?,product_disposition=?,attempt_count=?,probe_count=?
+                       WHERE invocation_id=?""",
+                    (observed, payload.get("winner_route"), payload.get("winner_endpoint"), payload.get("winner_model"),
+                     payload.get("winner_family"), str(payload.get("product_disposition") or "failed"),
+                     int(payload.get("attempt_count") or 0), int(payload.get("probe_count") or 0),
+                     str(payload.get("invocation_id") or "")),
+                )
+                if result.rowcount != 1:
+                    raise ValueError("provider invocation finish has no matching start")
+            return
+        if kind == "provider_probe_attempt":
+            started, completed = payload.get("started_at"), payload.get("completed_at")
+            duration = max(0.0, (float(completed) - float(started)) * 1000) if started is not None and completed is not None else None
+            with self.connection() as c:
+                c.execute(
+                    """INSERT INTO provider_probe_attempt(
+                         probe_id,invocation_id,endpoint_id,status,recorded_at,duration_ms)
+                       VALUES(?,?,?,?,?,?)""",
+                    (str(uuid.uuid4()), str(payload.get("invocation_id") or ""), str(payload.get("endpoint_id") or ""),
+                     str(payload.get("status") or "inconclusive"), observed, duration),
+                )
+            return
+        if kind == "llm_attempt_started":
+            required = ("attempt_id", "invocation_id", "stage", "route_id", "endpoint_id", "model", "model_family", "tier")
+            if any(payload.get(key) is None for key in required):
+                raise ValueError("provider attempt start is missing technical identity")
+            with self.connection() as c:
+                c.execute(
+                    """INSERT OR IGNORE INTO provider_llm_attempt(
+                         attempt_id,invocation_id,packet_sha256,stage,route_id,endpoint_id,model,model_family,tier,
+                         cost_mode,preference,delayed_start,recorded_at,monotonic_started,estimated_cost,multiplier,
+                         base_price_calibrated,cost_basis,effective_unit_price_json,verifier_name,requested_level,
+                         actual_level,upgrade_reason,runner_fingerprint)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (str(payload["attempt_id"]), str(payload["invocation_id"]), str(payload.get("packet_sha256") or ""),
+                     str(payload["stage"]), str(payload["route_id"]), str(payload["endpoint_id"]), str(payload["model"]),
+                     str(payload["model_family"]), int(payload["tier"]), str(payload.get("cost_mode") or "relative"),
+                     int(payload.get("preference") or 0), int(bool(payload.get("delayed_start"))), observed,
+                     float(payload["started_at"]) if payload.get("started_at") is not None else None,
+                     float(payload["estimated_cost"]) if payload.get("estimated_cost") is not None else None,
+                     float(payload["multiplier"]) if payload.get("multiplier") is not None else None,
+                     int(bool(payload.get("base_price_calibrated"))),
+                     str(payload.get("cost_basis") or "unknown"),
+                     json.dumps(payload.get("effective_unit_price"), ensure_ascii=False, sort_keys=True)
+                     if isinstance(payload.get("effective_unit_price"), dict) else None,
+                     str(payload.get("verifier_name") or "none/v1"),
+                     str(payload.get("requested_level")) if payload.get("requested_level") else None,
+                     str(payload.get("actual_level")) if payload.get("actual_level") else None,
+                     str(payload.get("upgrade_reason")) if payload.get("upgrade_reason") else None,
+                     str(payload.get("runner_fingerprint") or "provider-broker/unknown-sse-v1")),
+                )
+            return
+        if kind != "llm_attempt_finished":
+            raise ValueError("unsupported provider audit event")
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        first, completed = payload.get("first_token_at"), payload.get("completed_at")
+        with self.connection() as c:
+            row = c.execute("SELECT monotonic_started FROM provider_llm_attempt WHERE attempt_id=?",
+                            (str(payload.get("attempt_id") or ""),)).fetchone()
+            if row is None:
+                raise ValueError("provider attempt finish has no matching start")
+            started = row["monotonic_started"]
+            ttft = max(0.0, (float(first) - float(started)) * 1000) if first is not None and started is not None else None
+            duration = max(0.0, (float(completed) - float(started)) * 1000) if completed is not None and started is not None else None
+            verifier = payload.get("verifier") if isinstance(payload.get("verifier"), dict) else {}
+            c.execute(
+                """UPDATE provider_llm_attempt SET
+                     model=COALESCE(?,model),completed_recorded_at=?,ttft_ms=?,duration_ms=?,protocol_success=?,product_success=?,
+                     terminal_error=?,winner=?,cancellation_class=?,response_id=?,request_id=?,input_tokens=?,
+                     cached_input_tokens=?,output_tokens=?,reasoning_tokens=?,
+                     estimated_cost=COALESCE(?,estimated_cost),actual_cost=?,currency=?,multiplier=COALESCE(?,multiplier),
+                     base_price_calibrated=?,cost_basis=COALESCE(?,cost_basis),effective_unit_price_json=COALESCE(?,effective_unit_price_json),
+                     verifier_name=?
+                   WHERE attempt_id=?""",
+                (str(payload["model"]) if payload.get("model") else None,
+                 observed, ttft, duration, int(bool(payload.get("protocol_success"))), int(bool(payload.get("product_success"))),
+                 str(payload["terminal_error"]) if payload.get("terminal_error") else None, int(bool(payload.get("winner"))),
+                 str(payload["cancellation_class"]) if payload.get("cancellation_class") else None,
+                 str(payload["response_id"]) if payload.get("response_id") else None,
+                 str(payload["request_id"]) if payload.get("request_id") else None,
+                 int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0),
+                 int(usage.get("cached_input_tokens") or usage.get("cached_tokens") or
+                     (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
+                 int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),
+                 int(usage.get("reasoning_tokens") or
+                     (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0),
+                 float(payload["estimated_cost"]) if payload.get("estimated_cost") is not None else None,
+                 float(payload["actual_cost"]) if payload.get("actual_cost") is not None else None,
+                 str(payload["currency"]) if payload.get("currency") else None,
+                 float(payload["multiplier"]) if payload.get("multiplier") is not None else None,
+                 int(bool(payload.get("base_price_calibrated"))),
+                 str(payload.get("cost_basis")) if payload.get("cost_basis") else None,
+                 json.dumps(payload.get("effective_unit_price"), ensure_ascii=False, sort_keys=True)
+                 if isinstance(payload.get("effective_unit_price"), dict) else None,
+                 str(verifier.get("name") or "none/v1"), str(payload["attempt_id"])),
+            )
+
+    def provider_quality(self, *, window: str = "24h", endpoint: str | None = None,
+                         model_family: str | None = None, stage: str | None = None,
+                         sort: str = "product_success_rate", descending: bool = True,
+                         as_of: datetime | None = None) -> dict[str, Any]:
+        with self.connection() as c:
+            rows = [dict(row) for row in c.execute("SELECT * FROM provider_llm_attempt")]
+        return ProviderStatistics(rows, as_of=as_of).summary(
+            window=window, endpoint=endpoint, model_family=model_family, stage=stage,
+            sort=sort, descending=descending,
+        )
+
+    def provider_history_score(self, route: dict[str, Any], stage: str) -> float:
+        """Return a deliberately small same-route soft signal; never a disable decision."""
+        with self.connection() as c:
+            row = c.execute(
+                """SELECT COUNT(*) AS samples,AVG(product_success) AS product_rate
+                   FROM provider_llm_attempt
+                   WHERE endpoint_id=? AND model=? AND model_family=? AND stage=?
+                     AND cancellation_class IS NULL""",
+                (str(route.get("endpoint") or ""), str(route.get("model") or ""),
+                 str(route.get("model_family") or ""), stage),
+            ).fetchone()
+        if not row or int(row["samples"] or 0) < 20:
+            return 0.0
+        return max(-0.05, min(0.05, (float(row["product_rate"] or 0) - 0.5) * 0.1))
+
+    def export_provider_quality(self, format: str, **filters: Any) -> str:
+        payload = self.provider_quality(**filters)
+        exported = {**payload, "contract": "provider-quality-export/v1"}
+        if format == "json":
+            return json.dumps(exported, ensure_ascii=False, sort_keys=True)
+        if format != "csv":
+            raise ValueError("unsupported provider quality export format")
+        output = io.StringIO()
+        columns = ["endpoint_id", "model", "model_family", "stage", "sample_size", "protocol_success_rate",
+                   "product_success_rate", "no_first_token_rate", "win_rate", "estimated_cost_total",
+                   "actual_cost_total", "average_cost_per_product_success", "average_actual_cost_per_product_success",
+                   "currency", "suspicious_cancel_count", "suspicious_cancel_estimated_cost",
+                   "suspicious_cancel_actual_cost"]
+        writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(exported["items"])
+        return output.getvalue()
+
+    def compact_provider_probes(self, *, as_of: datetime | None = None) -> dict[str, int]:
+        cutoff = ((as_of or datetime.now(timezone.utc)).astimezone(timezone.utc) - timedelta(days=90)).isoformat().replace("+00:00", "Z")
+        with self.connection() as c:
+            groups = list(c.execute(
+                """SELECT substr(recorded_at,1,10) AS day,endpoint_id,status,COUNT(*) AS sample_count,
+                          COALESCE(SUM(duration_ms),0) AS duration_ms_total
+                   FROM provider_probe_attempt WHERE recorded_at<? GROUP BY day,endpoint_id,status""", (cutoff,)))
+            for row in groups:
+                c.execute(
+                    """INSERT INTO provider_probe_daily(day,endpoint_id,status,sample_count,duration_ms_total)
+                       VALUES(?,?,?,?,?) ON CONFLICT(day,endpoint_id,status) DO UPDATE SET
+                       sample_count=provider_probe_daily.sample_count+excluded.sample_count,
+                       duration_ms_total=provider_probe_daily.duration_ms_total+excluded.duration_ms_total""",
+                    (row["day"], row["endpoint_id"], row["status"], row["sample_count"], row["duration_ms_total"]),
+                )
+            deleted = c.execute("DELETE FROM provider_probe_attempt WHERE recorded_at<?", (cutoff,)).rowcount
+        return {"aggregated": sum(int(row["sample_count"]) for row in groups), "deleted": deleted}

@@ -27,7 +27,7 @@ class EvidenceContractFactory:
         }
 
     def _requirements(self, task_key: str, stage: str, as_of: datetime) -> list[dict[str, Any]]:
-        if task_key == "daily.opportunity.0900" and stage == "m0_research":
+        if task_key == "daily.opportunity.0900" and stage in {"m0_research", "m1_research"}:
             close = self._latest_completed_close(as_of)
             close_text = self._iso(close)
             return [
@@ -43,7 +43,7 @@ class EvidenceContractFactory:
                     "negative_query_terms": ["公告", "政策", "风险"],
                 },
             ]
-        if task_key == "daily.review.1520" and stage == "m0_research":
+        if task_key == "daily.review.1520" and stage in {"m0_research", "m1_research"}:
             close = self._latest_completed_close(as_of)
             close_text = self._iso(close)
             prior_close_text = self._iso(self._latest_completed_close(close - timedelta(seconds=1)))

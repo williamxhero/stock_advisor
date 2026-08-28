@@ -74,6 +74,15 @@ class EvidenceV3Tests(TestCase):
         self.assertEqual("2026-08-26T07:00:00Z", events["window"]["start"])
         self.assertEqual("2026-08-27T07:20:02.555000Z", events["window"]["end"])
 
+    def test_m1_frozen_evidence_reuse_keeps_original_1520_windows(self):
+        as_of = "2026-08-27T07:20:02.555Z"
+        factory = EvidenceContractFactory(_WeekdayCalendar())
+
+        m0 = factory.build(task_key="daily.review.1520", stage="m0_research", as_of=as_of)
+        m1 = factory.build(task_key="daily.review.1520", stage="m1_research", as_of=as_of)
+
+        self.assertEqual(m0["requirements"], m1["requirements"])
+
     def test_rejects_foreign_reference_and_naive_runtime_time(self):
         foreign = EvidenceGate().evaluate(self._evidence("ev_other_1"), self.contract, self.observations, self.as_of, attempt_id="attempt-1")
         self.assertIn("source_ref_not_in_current_attempt", foreign["problems"])

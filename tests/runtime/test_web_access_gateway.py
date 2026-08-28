@@ -3,16 +3,22 @@ from __future__ import annotations
 import json
 import unittest
 from unittest import mock
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 from ai_trading_companion.web_access_gateway import WebAccessGatewayClient, WebAccessGatewayError, _fact_as_of
 
 
 class _Response:
-    headers = {}
-
-    def __init__(self, payload: dict) -> None:
+    def __init__(
+        self,
+        payload: dict | None = None,
+        *,
+        raw: str | None = None,
+        content_type: str = "application/json",
+    ) -> None:
         self.payload = payload
+        self.raw = raw
+        self.headers = {"Content-Type": content_type}
 
     def __enter__(self) -> "_Response":
         return self
@@ -21,7 +27,8 @@ class _Response:
         return None
 
     def read(self) -> bytes:
-        return json.dumps(self.payload).encode("utf-8")
+        value = self.raw if self.raw is not None else json.dumps(self.payload)
+        return value.encode("utf-8")
 
 
 class WebAccessGatewayTests(unittest.TestCase):
@@ -52,6 +59,83 @@ class WebAccessGatewayTests(unittest.TestCase):
         self.assertFalse(result["results"][0]["primary"])
         self.assertEqual([{"tool": "web_search", "status": "passed", "attempts": 1}], self.client.call_history)
 
+    def test_search_accepts_sse_data_jsonrpc_response(self) -> None:
+        inner = {"trace_id": "sse-trace", "results": [{
+            "url": "https://example.test", "title": "title", "content": "content",
+        }]}
+        outer = {"jsonrpc": "2.0", "id": "request", "result": {"content": [{
+            "type": "text", "text": json.dumps(inner),
+        }]}}
+        response = _Response(
+            raw=f"event: message\ndata: {json.dumps(outer)}\n\n",
+            content_type="text/event-stream; charset=utf-8",
+        )
+
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=response):
+            result = self.client.search("market close")
+
+        self.assertEqual("sse-trace", result["trace_id"])
+        self.assertEqual(1, len(result["results"]))
+
+    def test_unsupported_success_content_type_is_a_non_retryable_compatibility_error(self) -> None:
+        response = _Response(raw="not MCP", content_type="text/html; charset=utf-8")
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=response) as open_request:
+            with self.assertRaises(WebAccessGatewayError) as raised:
+                self.client.search("market close")
+
+        self.assertEqual("WAG_CLIENT_COMPATIBILITY_ERROR", raised.exception.category)
+        self.assertEqual(1, raised.exception.attempts)
+        self.assertEqual(1, open_request.call_count)
+
+    def test_jsonrpc_error_retries_then_becomes_wag_outage(self) -> None:
+        response = _Response({"jsonrpc": "2.0", "id": "request", "error": {
+            "code": -32000, "message": "sensitive upstream detail",
+        }})
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=response) as open_request:
+            with self.assertRaises(WebAccessGatewayError) as raised:
+                self.client.search("market close")
+
+        self.assertEqual("WAG_OUTAGE", raised.exception.category)
+        self.assertEqual(3, raised.exception.attempts)
+        self.assertNotIn("sensitive upstream detail", str(raised.exception))
+        self.assertEqual(3, open_request.call_count)
+
+    def test_result_is_error_retries_then_becomes_wag_outage(self) -> None:
+        response = _Response({"jsonrpc": "2.0", "id": "request", "result": {
+            "isError": True,
+            "content": [{"type": "text", "text": "sensitive tool detail"}],
+        }})
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=response) as open_request:
+            with self.assertRaises(WebAccessGatewayError) as raised:
+                self.client.search("market close")
+
+        self.assertEqual("WAG_OUTAGE", raised.exception.category)
+        self.assertEqual(3, raised.exception.attempts)
+        self.assertNotIn("sensitive tool detail", str(raised.exception))
+        self.assertEqual(3, open_request.call_count)
+
+    def test_missing_text_content_is_a_non_retryable_compatibility_error(self) -> None:
+        response = _Response({"jsonrpc": "2.0", "id": "request", "result": {
+            "content": [{"type": "image", "data": "not-relevant"}],
+        }})
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=response) as open_request:
+            with self.assertRaises(WebAccessGatewayError) as raised:
+                self.client.search("market close")
+
+        self.assertEqual("WAG_CLIENT_COMPATIBILITY_ERROR", raised.exception.category)
+        self.assertEqual(1, open_request.call_count)
+
+    def test_malformed_inner_json_is_a_non_retryable_compatibility_error(self) -> None:
+        response = _Response({"jsonrpc": "2.0", "id": "request", "result": {
+            "content": [{"type": "text", "text": "{not-json"}],
+        }})
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=response) as open_request:
+            with self.assertRaises(WebAccessGatewayError) as raised:
+                self.client.search("market close")
+
+        self.assertEqual("WAG_CLIENT_COMPATIBILITY_ERROR", raised.exception.category)
+        self.assertEqual(1, open_request.call_count)
+
     def test_empty_news_search_retries_general_discovery(self) -> None:
         empty = _Response({"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
             "trace_id": "news", "results": [],
@@ -64,6 +148,18 @@ class WebAccessGatewayTests(unittest.TestCase):
         self.assertEqual(1, len(result["results"]))
         calls = [json.loads(call.args[0].data.decode("utf-8")) for call in open_request.call_args_list]
         self.assertEqual(["news", "general"], [call["params"]["arguments"]["categories"] for call in calls])
+
+    def test_empty_news_and_general_search_raise_no_search_results_without_outage(self) -> None:
+        empty = _Response({"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
+            "trace_id": "empty", "results": [],
+        })}]}})
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=empty) as open_request:
+            with self.assertRaises(WebAccessGatewayError) as raised:
+                self.client.search("market close", "news")
+
+        self.assertEqual("WAG_NO_SEARCH_RESULTS", raised.exception.category)
+        self.assertEqual(1, raised.exception.attempts)
+        self.assertEqual(2, open_request.call_count)
 
     def test_tencent_history_read_removes_current_quote_after_frozen_cutoff(self) -> None:
         url = (
@@ -78,7 +174,7 @@ class WebAccessGatewayTests(unittest.TestCase):
             }},
         }).replace("[", "\\[").replace("]", "\\]")
         response = {"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
-            "trace_id": "trace", "url": url, "markdown": markdown,
+            "trace_id": "trace", "results": [{"url": url, "title": "history", "markdown": markdown}],
         })}]}}
         with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=_Response(response)):
             item = self.client.read(url, not_after="2026-08-27T07:20:00Z")["results"][0]
@@ -86,6 +182,29 @@ class WebAccessGatewayTests(unittest.TestCase):
         self.assertIn('"close":"3956.570"', item["excerpt_text"])
         self.assertNotIn("future-value", item["excerpt_text"])
         self.assertFalse(item["primary"])
+
+    def test_empty_read_results_raise_no_read_content_without_outage(self) -> None:
+        response = _Response({"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
+            "trace_id": "empty", "results": [],
+        })}]}})
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=response) as open_request:
+            with self.assertRaises(WebAccessGatewayError) as raised:
+                self.client.read("https://example.test")
+
+        self.assertEqual("WAG_NO_READ_CONTENT", raised.exception.category)
+        self.assertEqual(1, raised.exception.attempts)
+        self.assertEqual(1, open_request.call_count)
+
+    def test_blank_read_markdown_raises_no_read_content_without_outage(self) -> None:
+        response = _Response({"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
+            "trace_id": "empty", "results": [{"url": "https://example.test", "markdown": "  "}],
+        })}]}})
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=response) as open_request:
+            with self.assertRaises(WebAccessGatewayError) as raised:
+                self.client.read("https://example.test")
+
+        self.assertEqual("WAG_NO_READ_CONTENT", raised.exception.category)
+        self.assertEqual(1, open_request.call_count)
 
     def test_browser_rejects_any_mutating_action_before_network(self) -> None:
         with mock.patch("ai_trading_companion.web_access_gateway.urlopen") as open_request:
@@ -95,7 +214,7 @@ class WebAccessGatewayTests(unittest.TestCase):
 
     def test_browser_removes_schema_null_placeholders_before_gateway_call(self) -> None:
         response = {"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
-            "trace_id": "trace", "snapshot": "done",
+            "trace_id": "trace", "results": [{"snapshot": "done"}],
         })}]}}
         with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=_Response(response)) as open_request:
             self.client.browser(None, [{"type": "navigate", "url": "https://example.test", "ref": None,
@@ -110,7 +229,7 @@ class WebAccessGatewayTests(unittest.TestCase):
                 client.read("https://example.test")
         open_request.assert_not_called()
 
-    def test_three_consecutive_connection_failures_raise_explicit_awg_outage(self) -> None:
+    def test_three_consecutive_connection_failures_raise_explicit_wag_outage(self) -> None:
         with mock.patch(
             "ai_trading_companion.web_access_gateway.urlopen",
             side_effect=URLError("secret host detail must not escape"),
@@ -118,8 +237,43 @@ class WebAccessGatewayTests(unittest.TestCase):
             with self.assertRaises(WebAccessGatewayError) as raised:
                 self.client.read("https://example.test")
 
-        self.assertEqual("AWG_OUTAGE", raised.exception.category)
+        self.assertEqual("WAG_OUTAGE", raised.exception.category)
         self.assertEqual(3, raised.exception.attempts)
-        self.assertIn("AWG_OUTAGE", str(raised.exception))
+        self.assertIn("WAG_OUTAGE", str(raised.exception))
         self.assertNotIn("secret host detail", str(raised.exception))
         self.assertEqual(3, open_request.call_count)
+
+    def test_three_consecutive_timeouts_raise_explicit_wag_outage(self) -> None:
+        with mock.patch(
+            "ai_trading_companion.web_access_gateway.urlopen",
+            side_effect=TimeoutError("secret timeout detail must not escape"),
+        ) as open_request:
+            with self.assertRaises(WebAccessGatewayError) as raised:
+                self.client.search("market close")
+
+        self.assertEqual("WAG_OUTAGE", raised.exception.category)
+        self.assertEqual(3, raised.exception.attempts)
+        self.assertNotIn("secret timeout detail", str(raised.exception))
+        self.assertEqual(3, open_request.call_count)
+
+    def test_retryable_http_failure_retries_then_becomes_wag_outage(self) -> None:
+        error = HTTPError("http://gateway.test/mcp", 503, "secret upstream detail", {}, None)
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", side_effect=error) as open_request:
+            with self.assertRaises(WebAccessGatewayError) as raised:
+                self.client.search("market close")
+
+        self.assertEqual("WAG_OUTAGE", raised.exception.category)
+        self.assertEqual(3, raised.exception.attempts)
+        self.assertNotIn("secret upstream detail", str(raised.exception))
+        self.assertEqual(3, open_request.call_count)
+
+    def test_non_retryable_http_failure_is_not_an_outage(self) -> None:
+        error = HTTPError("http://gateway.test/mcp", 401, "secret auth detail", {}, None)
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", side_effect=error) as open_request:
+            with self.assertRaises(WebAccessGatewayError) as raised:
+                self.client.search("market close")
+
+        self.assertEqual("WAG_HTTP_ERROR", raised.exception.category)
+        self.assertEqual(1, raised.exception.attempts)
+        self.assertNotIn("secret auth detail", str(raised.exception))
+        self.assertEqual(1, open_request.call_count)

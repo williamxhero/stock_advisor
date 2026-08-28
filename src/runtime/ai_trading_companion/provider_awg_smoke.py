@@ -1,4 +1,4 @@
-"""Secret-safe Provider + AWG smoke chain composed from formal runtime seams.
+"""Secret-safe Provider + WAG smoke chain composed from formal runtime seams.
 
 It never opens the product database, Exchange, scheduler, or UI. Evidence and
 prompts remain in memory; the persisted report contains metadata and hashes.
@@ -68,7 +68,7 @@ def _broker(provider: dict[str, Any], research: dict[str, Any], home: Path, *, f
 
 
 def _invoke(broker: ProviderBroker, *, stage: str, packet: dict[str, Any], schema: dict[str, Any], timeout: float, mode: str = "race", verifier: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> ProviderOutcome:
-    request = StageRequest(stage=stage, packet=packet, packet_sha256=canonical_packet_hash(packet), effort="medium", schema=schema, mode=mode, required_capabilities=("duel",) if mode == "duel" else ("race",), absolute_deadline=time.monotonic() + timeout, route_timeout_seconds=timeout, verifier_name="provider-awg-smoke/v2", verifier=verifier, h0_forbidden=stage == "m1_judgment")
+    request = StageRequest(stage=stage, packet=packet, packet_sha256=canonical_packet_hash(packet), effort="medium", schema=schema, mode=mode, required_capabilities=("duel",) if mode == "duel" else ("race",), absolute_deadline=time.monotonic() + timeout, route_timeout_seconds=timeout, verifier_name="provider-wag-smoke/v3", verifier=verifier, h0_forbidden=stage == "m1_judgment")
     try: return broker.invoke(request)
     except ProviderError as exc:
         code = "PROVIDER_OUTAGE" if exc.category == "PROVIDER_OUTAGE" else "PROVIDER_INVOCATION_FAILED"
@@ -135,13 +135,13 @@ def missing_luna_terra_endpoints(provider: dict[str, Any], probes: list[dict[str
 def run_smoke(settings: dict[str, Any], output_dir: Path, *, query: str, probe_timeout: float, provider_timeout: float) -> dict[str, Any]:
     provider_raw = settings.get("provider") if isinstance(settings.get("provider"), dict) else {}
     research = settings.get("research") if isinstance(settings.get("research"), dict) else {}
-    awg_config = research.get("web_access_gateway") if isinstance(research.get("web_access_gateway"), dict) else {}
-    secrets = [*[str(item.get("api_key") or "") for item in provider_raw.get("endpoints", []) if isinstance(item, dict)], str(awg_config.get("token") or "")]
-    report: dict[str, Any] = {"contract": "provider-awg-smoke-report/v2", "run_id": str(uuid.uuid4()), "started_at": _utc_now(), "completed_at": None, "status": "running", "failure_code": None, "providers": {"probes": []}, "invocations": [], "upgrade_trace": [], "awg": {"status": "not_started", "calls": []}, "evidence": None, "duel": None}
+    wag_config = research.get("web_access_gateway") if isinstance(research.get("web_access_gateway"), dict) else {}
+    secrets = [*[str(item.get("api_key") or "") for item in provider_raw.get("endpoints", []) if isinstance(item, dict)], str(wag_config.get("token") or "")]
+    report: dict[str, Any] = {"contract": "provider-wag-smoke-report/v3", "run_id": str(uuid.uuid4()), "started_at": _utc_now(), "completed_at": None, "status": "running", "failure_code": None, "providers": {"probes": []}, "invocations": [], "upgrade_trace": [], "wag": {"status": "not_started", "calls": []}, "evidence": None, "duel": None}
     try:
         provider = normalize_provider(provider_raw, warn_legacy=False)
         if not provider.get("enabled") or not any(item.get("enabled") for item in provider.get("endpoints", [])): raise SmokeFailure("PROVIDER_OUTAGE", "No enabled Provider")
-        if not str(awg_config.get("mcp_url") or "").startswith(("http://", "https://")) or not awg_config.get("token"): raise SmokeFailure("AWG_OUTAGE", "AWG is not configured")
+        if not str(wag_config.get("mcp_url") or "").startswith(("http://", "https://")) or not wag_config.get("token"): raise SmokeFailure("WAG_CONFIGURATION_ERROR", "WAG is not configured")
         hedge = provider.get("hedge") if isinstance(provider.get("hedge"), dict) else {}; hedge_seconds = float(hedge.get("first_token_seconds") or 8)
         inventory_probes: list[dict[str, Any]] = []
         for family in ("openai", "anthropic"):
@@ -153,28 +153,35 @@ def run_smoke(settings: dict[str, Any], output_dir: Path, *, query: str, probe_t
         plan = _invoke(broker, stage="research", packet={"topic": query, "instruction": "Return a concise read-only web research plan."}, schema=PLAN_SCHEMA, timeout=provider_timeout)
         report["invocations"].append(_outcome("structured_research_plan", plan))
         if not isinstance(plan.result, dict) or not str(plan.result.get("query") or "").strip(): raise SmokeFailure("PROVIDER_INVOCATION_FAILED", "Research plan failed")
-        awg = WebAccessGatewayClient(research); awg_started = time.monotonic()
+        wag = WebAccessGatewayClient(research); wag_started = time.monotonic()
         try:
-            discovery = awg.search(str(plan.result["query"])); rows = [row for row in discovery.get("results") or [] if isinstance(row, dict)]
-            if not rows: raise WebAccessGatewayError("web_search returned no results")
+            discovery = wag.search(str(plan.result["query"])); rows = [row for row in discovery.get("results") or [] if isinstance(row, dict)]
             read = None
             for row in rows[:5]:
                 try:
-                    candidate = awg.read(str(row.get("url") or ""))
+                    candidate = wag.read(str(row.get("url") or ""))
                     if candidate.get("results"): read = candidate; break
-                except WebAccessGatewayError: continue
-            if read is None: raise WebAccessGatewayError("web_read returned no results")
+                except WebAccessGatewayError as exc:
+                    if exc.category == "WAG_NO_READ_CONTENT":
+                        continue
+                    raise
+            if read is None:
+                raise WebAccessGatewayError(
+                    "WAG web_read returned no usable content",
+                    category="WAG_NO_READ_CONTENT",
+                )
         except WebAccessGatewayError as exc:
-            report["awg"] = {
-                "status": "failed", "failure_code": "AWG_OUTAGE",
-                "duration_ms": round((time.monotonic() - awg_started) * 1000, 3),
-                "calls": list(awg.call_history),
+            report["wag"] = {
+                "status": "failed", "failure_code": exc.category,
+                "duration_ms": round((time.monotonic() - wag_started) * 1000, 3),
+                "calls": list(wag.call_history),
             }
-            raise SmokeFailure("AWG_OUTAGE", "AWG web_search/web_read failed") from exc
-        report["awg"] = {"status": "passed", "duration_ms": round((time.monotonic() - awg_started) * 1000, 3), "calls": list(awg.call_history)}
+            raise SmokeFailure(exc.category, "WAG web_search/web_read failed") from exc
+        report["wag"] = {"status": "passed", "duration_ms": round((time.monotonic() - wag_started) * 1000, 3), "calls": list(wag.call_history)}
         search_rows, read_rows = [_evidence(row) for row in rows], [_evidence(row) for row in read.get("results") or [] if isinstance(row, dict)]
-        if not search_rows or not read_rows or not read_rows[0]["text"].strip(): raise SmokeFailure("AWG_OUTAGE", "AWG evidence was empty")
-        bundle = {"contract": "provider-awg-smoke-evidence/v2", "frozen_at": _utc_now(), "research_question": plan.result.get("research_question"), "query": plan.result.get("query"), "checks": plan.result.get("checks"), "search_results": search_rows, "read_results": read_rows}
+        if not search_rows: raise SmokeFailure("WAG_NO_SEARCH_RESULTS", "WAG search evidence was empty")
+        if not read_rows or not read_rows[0]["text"].strip(): raise SmokeFailure("WAG_NO_READ_CONTENT", "WAG read evidence was empty")
+        bundle = {"contract": "provider-wag-smoke-evidence/v3", "frozen_at": _utc_now(), "research_question": plan.result.get("research_question"), "query": plan.result.get("query"), "checks": plan.result.get("checks"), "search_results": search_rows, "read_results": read_rows}
         bundle_bytes, bundle_hash = freeze_evidence_bundle(bundle); evidence_ids = {row["evidence_id"] for row in [*search_rows, *read_rows]}
         report["evidence"] = {"bundle_sha256": bundle_hash, "bundle_bytes": len(bundle_bytes), "coverage": {"search_results": len(search_rows), "read_results": len(read_rows), "unique_urls": len({row["url"] for row in [*search_rows, *read_rows] if row["url"]})}}
         fast_packet = {"frozen_evidence": bundle, "evidence_bundle_sha256": bundle_hash, "instruction": "Write an evidence-grounded note using only bundle evidence_ids."}

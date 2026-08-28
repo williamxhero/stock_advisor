@@ -36,9 +36,9 @@ M1 使用同一冻结公共证据包分别运行一个真实 L3 OpenAI 家族和
 
 ## 本地研究与证据冻结
 
-模型只通过严格 JSON Schema 生成研究计划。运行时通过 AWG MCP 本地执行 `web_search` 发现和 `web_read` 正文核验；不把其他数据系统作为旁路。AWG 单次工具调用连续三次失败，或 search/read 无法完成时产生 `AWG_OUTAGE` stage failure 并停止。EvidenceGate 按事实覆盖、时效、来源权威和冲突判断资格；覆盖不足最多产生两轮结构化修复。证据一旦冻结，成文、重试、竞技、duel 和仲裁复用同一 bundle，不重新搜索。
+模型只通过严格 JSON Schema 生成研究计划。运行时通过 WAG MCP 本地执行 `web_search` 发现和 `web_read` 正文核验；不把其他数据系统作为旁路。只有可重试 HTTP、连接、超时或明确工具错误连续三次失败才产生 `WAG_OUTAGE`；协议不兼容、搜索无结果和读取空内容分别保留 `WAG_CLIENT_COMPATIBILITY_ERROR`、`WAG_NO_SEARCH_RESULTS` 和 `WAG_NO_READ_CONTENT`。迁移期读取旧 `AWG_OUTAGE` 时归一化为 `WAG_OUTAGE`，新记录只写 WAG。EvidenceGate 按事实覆盖、时效、来源权威和冲突判断资格；覆盖不足最多产生两轮结构化修复。证据一旦冻结，成文、重试、竞技、duel 和仲裁复用同一 bundle，不重新搜索。
 
-`scripts/provider_awg_smoke.py` 只是正式 runtime smoke 组合器的 CLI 入口；它不实现第二套 Provider/AWG transport，不打开正式数据库、Exchange、日程或 UI。smoke 报告只保存真实模型目录、层级/协议/tier/倍率、TTFT/耗时、usage/成本、升级轨迹、AWG 状态、证据覆盖与 bundle hash，不保存提示词或证据正文。
+`scripts/provider_awg_smoke.py` 是迁移期保留路径的正式 runtime smoke 组合器 CLI 入口；它不实现第二套 Provider/WAG transport，不打开正式数据库、Exchange、日程或 UI。新 smoke 报告使用 `provider-wag-smoke-report/v3` 和 `wag` 字段，只保存真实模型目录、层级/协议/tier/倍率、TTFT/耗时、usage/成本、升级轨迹、WAG 状态、证据覆盖与 bundle hash，不保存提示词或证据正文。
 
 Playwright 只允许读取和受控下载，不允许上传、提交表单或修改外部状态。小电脑运行时地址仍由本机配置引用，默认 SearXNG 为 `http://yosef-server:8801`；CPA 和爬虫服务均指小电脑服务，不在本机启动替代服务。
 

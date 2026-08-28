@@ -1,4 +1,4 @@
-"""CLI wrapper for the formal Provider + AWG runtime smoke chain."""
+"""Legacy-path CLI wrapper for the formal Provider + WAG runtime smoke chain."""
 from __future__ import annotations
 
 import argparse
@@ -21,7 +21,7 @@ def _settings_path() -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Formal-runtime Provider + AWG MCP smoke chain")
+    parser = argparse.ArgumentParser(description="Formal-runtime Provider + WAG MCP smoke chain")
     parser.add_argument("--settings", type=Path, default=_settings_path())
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--query", default="A股市场 今日 重要消息")
@@ -32,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
         settings = json.loads(args.settings.read_text(encoding="utf-8"))
         if not isinstance(settings, dict): raise ValueError("settings root is not an object")
     except Exception:
-        report = {"contract": "provider-awg-smoke-report/v2", "status": "failed", "failure_code": "SETTINGS_MISSING_OR_INVALID"}
+        report = {"contract": "provider-wag-smoke-report/v3", "status": "failed", "failure_code": "SETTINGS_MISSING_OR_INVALID"}
         write_smoke_report(args.output_dir / "smoke-report.json", report, forbidden_values=[])
         print("SETTINGS_MISSING_OR_INVALID"); return 2
     report = run_smoke(settings, args.output_dir, query=str(args.query), probe_timeout=max(1.0, args.probe_timeout), provider_timeout=max(1.0, args.provider_timeout))

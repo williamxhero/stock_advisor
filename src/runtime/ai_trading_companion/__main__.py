@@ -336,10 +336,18 @@ def _call_stage(
             tool_trace = [*research.observations, *_provider_invocation_trace(planner.outcomes)]
             evidence_verifier = research.verifier
             if not research.qualified:
-                if any(item.get("category") == "AWG_OUTAGE" for item in research.stage_failures):
+                wag_failure = next((
+                    item for item in research.stage_failures
+                    if str(item.get("category") or "").startswith(("WAG_", "AWG_"))
+                ), None)
+                if wag_failure is not None:
+                    category = str(wag_failure.get("category") or "WAG_ERROR")
+                    if category == "AWG_OUTAGE":
+                        category = "WAG_OUTAGE"
                     raise WebAccessGatewayError(
-                        "Formal research stopped after persistent AWG failure",
-                        category="AWG_OUTAGE", attempts=3,
+                        "Formal research stopped after a WAG failure",
+                        category=category,
+                        attempts=3 if category == "WAG_OUTAGE" else 1,
                     )
                 raise EvidenceInsufficient(research.verifier)
             if schema_name.startswith("companion-evidence-result-"):

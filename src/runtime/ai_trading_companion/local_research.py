@@ -203,6 +203,7 @@ class ReadOnlyResearchExecutor:
         candidates = [row["backend"], *[item for item in row["fallback_backends"] if item != row["backend"]]]
         failures: list[str] = []
         categories: list[str] = []
+        gateway_errors: list[WebAccessGatewayError] = []
         for backend in candidates:
             adapter = self.backends.get(backend)
             if adapter is None:
@@ -217,11 +218,21 @@ class ReadOnlyResearchExecutor:
             except Exception as exc:
                 failures.append(f"{backend}:{type(exc).__name__}")
                 categories.append(str(getattr(exc, "category", type(exc).__name__)))
-        if categories and all(category == "AWG_OUTAGE" for category in categories):
+                if isinstance(exc, WebAccessGatewayError):
+                    gateway_errors.append(exc)
+        if categories and all(category in {"WAG_OUTAGE", "AWG_OUTAGE"} for category in categories):
             raise WebAccessGatewayError(
                 "All planned gateway reads hit the persistent outage gate",
-                category="AWG_OUTAGE", attempts=3,
+                category="WAG_OUTAGE", attempts=3,
             )
+        if len(candidates) == 1 and gateway_errors:
+            error = gateway_errors[0]
+            if error.category == "AWG_OUTAGE":
+                raise WebAccessGatewayError(
+                    "A legacy gateway outage record was normalized",
+                    category="WAG_OUTAGE", attempts=error.attempts,
+                ) from None
+            raise error
         raise RuntimeError("all research backends failed: " + ",".join(failures))
 
 
@@ -304,10 +315,26 @@ class LocalResearchChain:
                 bundle_bytes, bundle_hash = freeze_evidence_bundle(normalized)
                 return FrozenResearchResult(True, normalized, verifier, observations, bundle_bytes, bundle_hash, round_number)
         bundle_bytes, bundle_hash = freeze_evidence_bundle(evidence)
-        outage = any(item.get("error_category") == "AWG_OUTAGE" for item in observations)
+        failure_categories = [
+            str(item.get("error_category") or "")
+            for item in observations
+            if str(item.get("error_category") or "").startswith(("WAG_", "AWG_"))
+        ]
+        normalized_categories = [
+            "WAG_OUTAGE" if category == "AWG_OUTAGE" else category
+            for category in failure_categories
+        ]
+        priority = (
+            "WAG_OUTAGE", "WAG_CLIENT_COMPATIBILITY_ERROR", "WAG_HTTP_ERROR",
+            "WAG_NO_READ_CONTENT", "WAG_NO_SEARCH_RESULTS",
+        )
+        gateway_failure = next(
+            (category for category in priority if category in normalized_categories),
+            None,
+        )
         failure = {
             "type": "stage_failure", "stage": str(packet.get("stage") or "research"),
-            "category": "AWG_OUTAGE" if outage else "evidence_insufficient",
+            "category": gateway_failure or "evidence_insufficient",
             "problems": list(verifier.get("problems") or []),
         }
         return FrozenResearchResult(False, evidence, verifier, observations, bundle_bytes, bundle_hash,

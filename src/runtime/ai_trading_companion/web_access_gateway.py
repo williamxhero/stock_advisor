@@ -11,14 +11,24 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+_RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
 
 class WebAccessGatewayError(RuntimeError):
     """A sanitized gateway failure; credentials are never included."""
 
-    def __init__(self, message: str, *, category: str = "awg_error", attempts: int = 1) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "WAG_ERROR",
+        attempts: int = 1,
+        retryable: bool = False,
+    ) -> None:
         super().__init__(message)
         self.category = category
         self.attempts = attempts
+        self.retryable = retryable
 
     def __str__(self) -> str:
         return f"{self.category}: {super().__str__()}"
@@ -35,22 +45,39 @@ class WebAccessGatewayClient:
 
     def search(self, query: str, categories: str = "news") -> dict[str, Any]:
         value = self._call("web_search", {"query": query, "categories": categories}, self.search_timeout)
-        results = value.get("results") if isinstance(value, dict) else []
+        results = value["results"]
         if not results and categories != "general":
             value = self._call("web_search", {"query": query, "categories": "general"}, self.search_timeout)
-            results = value.get("results") if isinstance(value, dict) else []
+            results = value["results"]
+        if not results:
+            raise WebAccessGatewayError(
+                "Web Access Gateway search returned no results",
+                category="WAG_NO_SEARCH_RESULTS",
+            )
         return {"trace_id": _text(value, "trace_id"), "results": [_item(item) for item in results if isinstance(item, dict)]}
 
     def read(self, url: str, render: str = "auto", not_after: str | None = None) -> dict[str, Any]:
         if not url.startswith(("http://", "https://")):
             raise WebAccessGatewayError("web_read requires an http(s) URL")
         value = self._call("web_read", {"url": url, "render": render, "output": "markdown"}, self.read_timeout)
-        body = _text(value, "markdown")
-        title = _text(value, "title")
+        rows = [item for item in value["results"] if isinstance(item, dict)]
+        if not rows:
+            raise WebAccessGatewayError(
+                "Web Access Gateway read returned no content",
+                category="WAG_NO_READ_CONTENT",
+            )
+        row = rows[0]
+        body = _text(row, "markdown") or _text(row, "content") or _text(row, "text")
+        if not body.strip():
+            raise WebAccessGatewayError(
+                "Web Access Gateway read returned no content",
+                category="WAG_NO_READ_CONTENT",
+            )
+        title = _text(row, "title")
         frozen_market = _frozen_public_market_row(url, body, not_after)
         if frozen_market is not None:
             return {"trace_id": _text(value, "trace_id"), "results": [{
-                "url": _text(value, "url") or url,
+                "url": _text(row, "url") or url,
                 "title": frozen_market["title"],
                 "excerpt_text": frozen_market["excerpt_text"],
                 "fact_as_of": frozen_market["fact_as_of"],
@@ -59,7 +86,7 @@ class WebAccessGatewayClient:
             }]}
         detected_time = _fact_as_of(title + "\n" + body + "\n" + url, not_after=not_after)
         return {"trace_id": _text(value, "trace_id"), "results": [{
-            "url": _text(value, "url") or url, "title": title, "excerpt_text": body[:12000],
+            "url": _text(row, "url") or url, "title": title, "excerpt_text": body[:12000],
             "fact_as_of": detected_time, "published_at": detected_time, "primary": True,
         }]}
 
@@ -72,9 +99,16 @@ class WebAccessGatewayClient:
             for action in actions
         ]
         value = self._call("web_browser", {"session_id": session_id, "actions": normalized_actions}, self.read_timeout)
-        snapshot = _text(value, "snapshot") or _text(value, "markdown")
-        url = _text(value, "url")
-        return {"trace_id": _text(value, "trace_id"), "results": [{"url": url, "title": _text(value, "title"), "excerpt_text": snapshot[:12000], "fact_as_of": _fact_as_of(snapshot + "\n" + url), "primary": True}]}
+        rows = [item for item in value["results"] if isinstance(item, dict)]
+        if not rows:
+            raise WebAccessGatewayError(
+                "Web Access Gateway browser returned no content",
+                category="WAG_NO_READ_CONTENT",
+            )
+        row = rows[0]
+        snapshot = _text(row, "snapshot") or _text(row, "markdown") or _text(row, "content")
+        url = _text(row, "url")
+        return {"trace_id": _text(value, "trace_id"), "results": [{"url": url, "title": _text(row, "title"), "excerpt_text": snapshot[:12000], "fact_as_of": _fact_as_of(snapshot + "\n" + url), "primary": True}]}
 
     def _call(self, name: str, arguments: dict[str, Any], timeout: int) -> dict[str, Any]:
         if not self.url.startswith(("http://", "https://")):
@@ -86,12 +120,21 @@ class WebAccessGatewayClient:
                 value = self._call_once(name, arguments, timeout)
                 self.call_history.append({"tool": name, "status": "passed", "attempts": attempt})
                 return value
-            except WebAccessGatewayError:
+            except WebAccessGatewayError as exc:
+                if not exc.retryable:
+                    self.call_history.append({
+                        "tool": name, "status": "failed", "attempts": attempt,
+                        "category": exc.category,
+                    })
+                    raise
                 if attempt == 3:
-                    self.call_history.append({"tool": name, "status": "failed", "attempts": 3})
+                    self.call_history.append({
+                        "tool": name, "status": "failed", "attempts": 3,
+                        "category": "WAG_OUTAGE",
+                    })
                     raise WebAccessGatewayError(
                         "Web Access Gateway failed three consecutive read-only calls",
-                        category="AWG_OUTAGE", attempts=3,
+                        category="WAG_OUTAGE", attempts=3,
                     ) from None
         raise AssertionError("unreachable")
 
@@ -100,41 +143,114 @@ class WebAccessGatewayClient:
         request = Request(self.url, data=json.dumps(payload).encode("utf-8"), method="POST", headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
         try:
             with urlopen(request, timeout=max(1, timeout)) as response:
-                raw = response.read().decode("utf-8")
+                content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].strip().casefold()
+                raw_bytes = response.read()
         except HTTPError as exc:
-            raise WebAccessGatewayError(f"Web Access Gateway HTTP {exc.code}") from exc
+            raise WebAccessGatewayError(
+                f"Web Access Gateway HTTP {exc.code}",
+                category="WAG_HTTP_ERROR",
+                retryable=exc.code in _RETRYABLE_HTTP_STATUS,
+            ) from exc
         except (URLError, TimeoutError) as exc:
-            raise WebAccessGatewayError("Web Access Gateway is unavailable") from exc
-        response = _jsonrpc(raw)
-        if response.get("error"):
-            raise WebAccessGatewayError("Web Access Gateway rejected the read-only request")
-        result = response.get("result") or {}
-        content = result.get("content") if isinstance(result, dict) else None
+            raise WebAccessGatewayError(
+                "Web Access Gateway is unavailable",
+                category="WAG_CONNECTION_ERROR",
+                retryable=True,
+            ) from exc
+        if content_type not in {"application/json", "text/event-stream"}:
+            raise WebAccessGatewayError(
+                "Web Access Gateway returned an unsupported response media type",
+                category="WAG_CLIENT_COMPATIBILITY_ERROR",
+            )
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise WebAccessGatewayError(
+                "Web Access Gateway returned non-UTF-8 protocol data",
+                category="WAG_CLIENT_COMPATIBILITY_ERROR",
+            ) from exc
+        response = _jsonrpc(raw, content_type)
+        if response.get("jsonrpc") != "2.0":
+            raise WebAccessGatewayError(
+                "Web Access Gateway returned an incompatible JSON-RPC envelope",
+                category="WAG_CLIENT_COMPATIBILITY_ERROR",
+            )
+        if "error" in response and response.get("error") is not None:
+            raise WebAccessGatewayError(
+                "Web Access Gateway returned a JSON-RPC tool error",
+                category="WAG_TOOL_ERROR",
+                retryable=True,
+            )
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise WebAccessGatewayError(
+                "Web Access Gateway returned an incompatible JSON-RPC result",
+                category="WAG_CLIENT_COMPATIBILITY_ERROR",
+            )
+        if result.get("isError") is True:
+            raise WebAccessGatewayError(
+                "Web Access Gateway tool reported an error",
+                category="WAG_TOOL_ERROR",
+                retryable=True,
+            )
+        content = result.get("content")
         text = next((item.get("text") for item in content or [] if isinstance(item, dict) and item.get("type") == "text"), None)
         if not isinstance(text, str):
-            raise WebAccessGatewayError("Web Access Gateway returned no text result")
+            raise WebAccessGatewayError(
+                "Web Access Gateway returned no text result",
+                category="WAG_CLIENT_COMPATIBILITY_ERROR",
+            )
         try:
             value = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise WebAccessGatewayError("Web Access Gateway returned malformed tool data") from exc
+            raise WebAccessGatewayError(
+                "Web Access Gateway returned malformed tool data",
+                category="WAG_CLIENT_COMPATIBILITY_ERROR",
+            ) from exc
         if not isinstance(value, dict):
-            raise WebAccessGatewayError("Web Access Gateway tool data is not an object")
+            raise WebAccessGatewayError(
+                "Web Access Gateway tool data is not an object",
+                category="WAG_CLIENT_COMPATIBILITY_ERROR",
+            )
+        if not isinstance(value.get("results"), list):
+            raise WebAccessGatewayError(
+                "Web Access Gateway tool data has no results array",
+                category="WAG_CLIENT_COMPATIBILITY_ERROR",
+            )
+        if any(not isinstance(item, dict) for item in value["results"]):
+            raise WebAccessGatewayError(
+                "Web Access Gateway tool data has incompatible result items",
+                category="WAG_CLIENT_COMPATIBILITY_ERROR",
+            )
         return value
 
 
-def _jsonrpc(raw: str) -> dict[str, Any]:
-    for line in reversed(raw.splitlines()):
-        candidate = line.removeprefix("data:").strip()
-        if candidate.startswith("{"):
-            try:
-                value = json.loads(candidate)
-                if isinstance(value, dict): return value
-            except json.JSONDecodeError: pass
+def _jsonrpc(raw: str, content_type: str) -> dict[str, Any]:
+    candidate = raw
+    if content_type == "text/event-stream":
+        data_events = []
+        for block in re.split(r"\r?\n\r?\n", raw):
+            data = "\n".join(
+                line[5:].lstrip()
+                for line in block.splitlines()
+                if line.startswith("data:")
+            )
+            if data:
+                data_events.append(data)
+        candidate = next((item for item in reversed(data_events) if item != "[DONE]"), "")
     try:
-        value = json.loads(raw)
+        value = json.loads(candidate)
     except json.JSONDecodeError as exc:
-        raise WebAccessGatewayError("Web Access Gateway returned malformed MCP") from exc
-    return value if isinstance(value, dict) else {}
+        raise WebAccessGatewayError(
+            "Web Access Gateway returned malformed MCP",
+            category="WAG_CLIENT_COMPATIBILITY_ERROR",
+        ) from exc
+    if not isinstance(value, dict):
+        raise WebAccessGatewayError(
+            "Web Access Gateway MCP response is not an object",
+            category="WAG_CLIENT_COMPATIBILITY_ERROR",
+        )
+    return value
 
 
 def _text(value: Any, key: str) -> str:

@@ -145,7 +145,21 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual(1, result.observations[0]["secret_rejected_items"])
         self.assertNotIn("ABCDEFGHIJKLMNOPQRSTUVWXYZ123456", str(result.observations))
 
-    def test_persistent_gateway_failure_becomes_explicit_awg_stage_failure(self) -> None:
+    def test_persistent_gateway_failure_becomes_explicit_wag_stage_failure(self) -> None:
+        plan = {"version": 1, "operations": [row("web_search", query="收盘")]}
+
+        def unavailable(*_args):
+            raise WebAccessGatewayError("sanitized", category="WAG_OUTAGE", attempts=3)
+
+        result = LocalResearchChain(
+            lambda *_: plan, ReadOnlyResearchExecutor({"gateway": unavailable}), max_repairs=0,
+        ).run({"as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="x")
+
+        self.assertFalse(result.qualified)
+        self.assertEqual("WAG_OUTAGE", result.observations[0]["error_category"])
+        self.assertEqual("WAG_OUTAGE", result.stage_failures[0]["category"])
+
+    def test_legacy_awg_outage_is_read_once_and_normalized_to_wag(self) -> None:
         plan = {"version": 1, "operations": [row("web_search", query="收盘")]}
 
         def unavailable(*_args):
@@ -156,5 +170,19 @@ class LocalResearchTests(unittest.TestCase):
         ).run({"as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="x")
 
         self.assertFalse(result.qualified)
-        self.assertEqual("AWG_OUTAGE", result.observations[0]["error_category"])
-        self.assertEqual("AWG_OUTAGE", result.stage_failures[0]["category"])
+        self.assertEqual("WAG_OUTAGE", result.observations[0]["error_category"])
+        self.assertEqual("WAG_OUTAGE", result.stage_failures[0]["category"])
+
+    def test_wag_compatibility_failure_keeps_its_stage_category(self) -> None:
+        plan = {"version": 1, "operations": [row("web_search", query="收盘")]}
+
+        def incompatible(*_args):
+            raise WebAccessGatewayError("sanitized", category="WAG_CLIENT_COMPATIBILITY_ERROR")
+
+        result = LocalResearchChain(
+            lambda *_: plan, ReadOnlyResearchExecutor({"gateway": incompatible}), max_repairs=0,
+        ).run({"as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="x")
+
+        self.assertFalse(result.qualified)
+        self.assertEqual("WAG_CLIENT_COMPATIBILITY_ERROR", result.observations[0]["error_category"])
+        self.assertEqual("WAG_CLIENT_COMPATIBILITY_ERROR", result.stage_failures[0]["category"])

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import RuntimePaths
+from .observatory import EvaluationObservatory
 from .store import CompanionStore
 
 
@@ -62,6 +63,9 @@ class LegacyMigrator:
             "automation_messages": self._import_automation_history(store),
             "workspace_files": self._copy_workspace(),
             "ui_files": self._copy_ui_state(),
+            "observatory_backfill": EvaluationObservatory(
+                store, schedule_path=self.target.resources / "schedules" / "tasks.json",
+            )._backfill_legacy(),
         }
         manifest = self.target.home / "migration" / "legacy-migration-manifest.json"
         manifest.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

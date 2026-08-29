@@ -10,41 +10,16 @@
     "timeout_seconds": 20,
     "max_attempts_per_record": 3
   },
-  "provider": {
-    "enabled": false,
-    "store": true,
-    "hedge": {
-      "enabled": true,
-      "max_parallel": 0,
-      "availability_probe_timeout_seconds": 5,
-      "per_endpoint_timeout_seconds": 45,
-      "per_endpoint_max_attempts": 1
-    },
-    "endpoints": [
-      {
-        "id": "cpa",
-        "enabled": true,
-        "priority": 0,
-        "base_url": "http://yosef-server:8317/v1",
-        "api_key": "<paste-cpa-api-key-here>"
-      },
-      {
-        "id": "direct-provider-example",
-        "enabled": false,
-        "priority": 100,
-        "base_url": "https://provider.example/v1",
-        "api_key": "<paste-direct-provider-api-key-here>"
-      }
-    ],
-    "models": {
-      "research": { "id": "gpt-5.6-terra", "effort": "medium" },
-      "judgment": { "id": "gpt-5.6-sol", "effort": "medium" },
-      "fast": { "id": "gpt-5.6-terra", "effort": "medium" }
-    }
+  "broker": {
+    "url": "http://yosef-server:8817"
   },
   "research": {
-    "searxng": { "base_url": "http://yosef-server:8801", "timeout_seconds": 20 },
-    "playwright": { "edge_profile": "Profile 2", "profile_directory": "browser-profile", "download_limit_mb": 50 }
+    "web_access_gateway": {
+      "mcp_url": "http://yosef-server:8930/mcp",
+      "token": "__SET_IN_UNTRACKED_SETTINGS_LOCAL_JSON__",
+      "search_timeout_seconds": 35,
+      "read_timeout_seconds": 100
+    }
   },
   "experiments": {
     "material_quality_uplift": 0.1,

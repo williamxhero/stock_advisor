@@ -148,30 +148,30 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertEqual("applied", applied["state"])
         self.assertIn("传言真实性与传播价格影响分别评价", evolution.active_policy()["method_hypotheses"])
 
-    def test_cognitive_router_keeps_official_judgments_on_sol_baseline_and_shadows_major_candidate(self):
+    def test_cognitive_router_keeps_official_judgments_on_expert_and_shadows_effort(self):
         router = CognitiveRouter()
         routine = router.route("m1_judgment", {"task_key": "daily.execution.0945", "evidence": {"sources": [{}, {}, {}]}}, 300, False)
         impact = router.route("m1_judgment", {"task_key": "daily.execution.1430", "evidence": {"sources": [{}, {}, {}]}}, 300, False)
         plan = router.plan("m1_judgment", {"task_key": "daily.execution.1430", "evidence": {"sources": [{}, {}, {}]}}, 300, False)
         research = router.route("m0_research", {"task_key": "daily.opportunity.0900"}, 300, True)
-        self.assertIn("sol", routine.model)
+        self.assertEqual("expert", routine.intellect)
         self.assertEqual("medium", routine.reasoning_effort)
         self.assertEqual("medium", impact.reasoning_effort)
         self.assertIsNotNone(plan.candidate)
         self.assertEqual("xhigh", plan.candidate.reasoning_effort)
-        self.assertIn("terra", research.model)
+        self.assertEqual("smart", research.intellect)
 
         cycle = self.cycle("daily.execution.1430", "2026-08-25T14:30:00+08:00", "2026-08-25T06:30:00Z")
         attempt = self.store.begin_attempt(
             cycle["cycle_id"], "m1_judgment", cycle["as_of"], "hash",
-            model=impact.model, reasoning_effort=impact.reasoning_effort,
+            model=None, reasoning_effort=impact.reasoning_effort,
             search_enabled=False, timeout_seconds=impact.timeout_seconds,
             routing_reason=impact.reason,
         )
         audited = self.store.attempts(cycle["cycle_id"])[0]
         self.assertEqual("medium", audited["reasoning_effort"])
         self.assertEqual(0, audited["search_enabled"])
-        self.assertIn("正式判断基线", audited["routing_reason"])
+        self.assertIn("Broker expert", audited["routing_reason"])
 
     def test_cognitive_router_fails_closed_on_m1_human_leak_and_data_block(self):
         router = CognitiveRouter()
@@ -220,7 +220,7 @@ class CompanionLearningTests(unittest.TestCase):
             )
         verdict = RouterGovernance(self.store).promote_if_qualified(key)
         self.assertEqual("promote", verdict["action"])
-        self.assertEqual("promoted", self.store.router_policy_cell(key, {"reasoning_effort": "medium"}, {"reasoning_effort": "xhigh"})["mode"])
+        self.assertEqual("shadow", self.store.get_router_policy_cell(key)["mode"])
 
     def test_ai_risk_doctrine_is_versioned_and_not_a_user_account_setting(self):
         doctrine = self.store.risk_doctrine()

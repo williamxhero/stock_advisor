@@ -11,4 +11,7 @@ public static class ExpectedTaskCatalog
         new("daily.execution.1430", new TimeOnly(14, 30), "操作决策"),
         new("daily.review.1520", new TimeOnly(15, 20), "收盘复盘")
     ];
+
+    public static IReadOnlyList<ExpectedTask> ForTradingDay(bool isTradingDay) =>
+        isTradingDay ? AShareTasks : [AShareTasks[0]];
 }

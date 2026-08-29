@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "evaluation-observatory-snapshot/v1",
+  "title": "Evaluation Observatory exchange snapshot v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "contract_version", "message_id", "snapshot", "created_at", "sha256"],
+  "properties": {
+    "contract": { "const": "evaluation-observatory-snapshot/v1" },
+    "contract_version": { "const": 1 },
+    "message_id": { "type": "string", "minLength": 1 },
+    "snapshot": {
+      "type": "object",
+      "required": ["snapshot_id", "snapshot_kind", "created_at", "source_fingerprint"],
+      "properties": {
+        "snapshot_id": { "type": "string", "minLength": 1 },
+        "snapshot_kind": {
+          "enum": ["evaluation", "forecast", "forecast_calibration", "experiment"]
+        },
+        "created_at": { "type": "string", "format": "date-time" },
+        "source_fingerprint": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "sha256": { "type": "string", "minLength": 64, "maxLength": 64 }
+  }
+}

@@ -26,3 +26,17 @@
 - `tests/`、`docs/`、`scripts/`、`resources/` 等目录采用最小提交原则：测试只保留可复现关键行为或回归的用例，文档只保留当前共享约束与使用说明，脚本只保留其他用户能直接复用的正式工作流，资源只保留运行时实际读取的文件。
 - 个人构思、下一步计划、临时调研、运行产物、调试助手和仅对当前机器有意义的文件必须留在本地，不得提交，也不得为了清理 Git 状态而删除。除非用户明确逐文件授权，尤其不得提交 `docs/AI 做事 效率流.md`、`docs/记忆库.md` 及同类个人计划文档的新增或修改。
 - 提交前必须运行 `git diff --cached --name-status`，逐项审核所有非 `src/` 文件；发现无法说明其他用户收益的文件时先取消暂存。禁止使用 `git add .`、`git add -A` 或等价的无差别暂存命令。
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked in GitHub Issues for `williamxhero/stock_advisor`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the canonical five-role triage vocabulary. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use the single-context layout rooted at `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.

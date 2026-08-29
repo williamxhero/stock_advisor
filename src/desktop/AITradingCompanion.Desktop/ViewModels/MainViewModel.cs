@@ -13,6 +13,7 @@ public sealed class MainViewModel : ObservableObject
     private readonly DesktopNotificationService _notifications;
     private readonly AppPaths _paths;
     private readonly AppSettings _settings;
+    private readonly ICompanionGateway _gateway;
     private readonly List<TaskMessage> _allHistory = [];
     private TaskRowViewModel? _selectedTask;
     private HistoryRecordViewModel? _selectedHistory;
@@ -26,21 +27,29 @@ public sealed class MainViewModel : ObservableObject
     private bool _starredOnly;
     private bool _includeArchived;
     private string _noteText = string.Empty;
+    private bool _gatewayHistoryAvailable;
+    private DateOnly _currentTradingDate;
+    private DateOnly? _todayBoardDate;
+    private DateOnly? _todayBoardRequestInFlight;
+    private bool _isTradingDay;
+    private static readonly TimeZoneInfo ShanghaiTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Asia/Shanghai");
 
     public MainViewModel(
         ITaskMessageStore store,
         LocalInboxService inbox,
         DesktopNotificationService notifications,
         AppPaths paths,
-        AppSettings settings)
+        AppSettings settings,
+        ICompanionGateway gateway)
     {
         _store = store;
         _inbox = inbox;
         _notifications = notifications;
         _paths = paths;
         _settings = settings;
+        _gateway = gateway;
         _startupEnabled = StartupRegistrationService.IsEnabled();
-        TodayText = DateTime.Today.ToString("yyyy 年 M 月 d 日 · dddd", CultureInfo.GetCultureInfo("zh-CN"));
+        _currentTradingDate = ShanghaiDateNow();
 
         ScanCommand = new AsyncCommand(ScanAsync, () => !IsBusy);
         ToggleReadCommand = new AsyncCommand(ToggleReadAsync, () => SelectedMessage is not null);
@@ -53,6 +62,8 @@ public sealed class MainViewModel : ObservableObject
     }
 
     public ObservableCollection<TaskRowViewModel> Tasks { get; } = [];
+
+    public ICompanionGateway Gateway => _gateway;
 
     public ObservableCollection<HistoryRecordViewModel> History { get; } = [];
     public ObservableCollection<HistoryDateGroupViewModel> HistoryByDate { get; } = [];
@@ -205,7 +216,8 @@ public sealed class MainViewModel : ObservableObject
         ? $"本地 Inbox · {count} 条死信"
         : "本地 Inbox 已连接";
 
-    public string TodayText { get; }
+    public string TodayText => _currentTradingDate.ToDateTime(TimeOnly.MinValue).ToString("yyyy 年 M 月 d 日 · dddd", CultureInfo.GetCultureInfo("zh-CN"));
+    public DateOnly CurrentTradingDate => _currentTradingDate;
     public int CompletedCount => Tasks.Count(task => task.IsComplete);
     public int UnreadCount => Tasks.Count(task => task.IsUnread);
     public int HistoryCount => History.Count;
@@ -228,13 +240,50 @@ public sealed class MainViewModel : ObservableObject
     {
         await _store.InitializeAsync().ConfigureAwait(true);
         var batch = await _inbox.ImportAvailableAsync().ConfigureAwait(true);
-        await RefreshAsync().ConfigureAwait(true);
+        await RefreshGatewayHistoryAsync().ConfigureAwait(true);
+        await RefreshTodayBoardAsync().ConfigureAwait(true);
         StatusText = batch.ReconciliationErrorCount > 0
             ? $"归档对账失败 {batch.ReconciliationErrorCount} 条"
             : batch.RecoveredCount > 0
                 ? $"启动时从归档补收 {batch.RecoveredCount} 条消息"
                 : batch.Added.Count > 0 ? $"启动时补收 {batch.Added.Count} 条消息" : string.Empty;
         OnPropertyChanged(nameof(ConnectionText));
+    }
+
+    private async Task RefreshGatewayHistoryAsync()
+    {
+        for (var attempt = 0; attempt < 12; attempt++)
+        {
+            try
+            {
+                var page = await _gateway.GetSnapshotAsync("history", new Dictionary<string, string> { ["limit"] = "90" }).ConfigureAwait(true);
+                if (page["items"] is not System.Text.Json.Nodes.JsonArray items) return;
+                foreach (var node in items.OfType<System.Text.Json.Nodes.JsonObject>())
+                {
+                    var cycleId = node["cycle_id"]?.GetValue<string>();
+                    var scheduled = node["scheduled_for"]?.GetValue<string>();
+                    var taskKey = node["task_key"]?.GetValue<string>();
+                    if (string.IsNullOrWhiteSpace(cycleId) || string.IsNullOrWhiteSpace(scheduled) || string.IsNullOrWhiteSpace(taskKey)) continue;
+                    var at = DateTimeOffset.Parse(scheduled, CultureInfo.InvariantCulture);
+                    var expected = ExpectedTaskCatalog.AShareTasks.FirstOrDefault(item => item.TaskKey == taskKey);
+                    var state = node["state"]?.GetValue<string>() ?? "queued";
+                    var status = state is "failed" or "waiting_for_repair" ? TaskMessageStatus.Failed : TaskMessageStatus.Succeeded;
+                    await _store.AddAsync(new IncomingTaskMessage($"gateway:{cycleId}", "gateway", cycleId, "AI Trading Companion", taskKey,
+                        expected?.Name ?? taskKey, at, at, at, status, string.Empty, string.Empty,
+                        $"运行时状态：{state}", $"# {expected?.Name ?? taskKey}\n\n运行时状态：{state}", node.ToJsonString(), cycleId)).ConfigureAwait(true);
+                }
+                _gatewayHistoryAvailable = true;
+                return;
+            }
+            catch (Exception) when (attempt < 11)
+            {
+                await Task.Delay(250).ConfigureAwait(true);
+            }
+            catch (Exception exception)
+            {
+                StatusText = $"运行时历史暂不可用：{exception.Message}";
+            }
+        }
     }
 
     public async Task HandleImportBatchAsync(InboxImportBatch batch)
@@ -274,6 +323,45 @@ public sealed class MainViewModel : ObservableObject
     }
 
     public void RefreshCompanionSummary() => OnPropertyChanged(nameof(CompletedCount));
+
+    public async Task RefreshTodayBoardAsync()
+    {
+        var today = ShanghaiDateNow();
+        if (_currentTradingDate != today)
+        {
+            _currentTradingDate = today;
+            OnPropertyChanged(nameof(CurrentTradingDate));
+            OnPropertyChanged(nameof(TodayText));
+        }
+        if (_todayBoardDate == today) return;
+        if (_todayBoardRequestInFlight == today) return;
+        _todayBoardRequestInFlight = today;
+
+        try
+        {
+            var snapshot = await _gateway.GetSnapshotAsync("today", new Dictionary<string, string>
+            {
+                ["date"] = today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+            }).ConfigureAwait(true);
+            _isTradingDay = snapshot["is_trading_day"]?.GetValue<bool>() ?? false;
+            _todayBoardDate = today;
+        }
+        catch (Exception exception)
+        {
+            _isTradingDay = false;
+            _todayBoardDate = null;
+            StatusText = $"交易日状态暂不可用：{exception.Message}";
+        }
+        finally
+        {
+            _todayBoardRequestInFlight = null;
+        }
+
+        await RefreshAsync().ConfigureAwait(true);
+    }
+
+    public bool IsCurrentTradingDate(DateTimeOffset value) =>
+        DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(value, ShanghaiTimeZone).DateTime) == _currentTradingDate;
 
     private async Task ScanAsync()
     {
@@ -366,7 +454,7 @@ public sealed class MainViewModel : ObservableObject
 
     private async Task RefreshAsync(long? selectMessageId = null)
     {
-        var today = DateOnly.FromDateTime(DateTime.Today);
+        var today = _currentTradingDate;
         var todayMessages = await _store.GetForDateAsync(today).ConfigureAwait(true);
         var all = await _store.GetAllAsync().ConfigureAwait(true);
         _allHistory.Clear();
@@ -374,7 +462,7 @@ public sealed class MainViewModel : ObservableObject
 
         var previousTaskKey = SelectedTask?.Expected.TaskKey;
         Tasks.Clear();
-        foreach (var expected in ExpectedTaskCatalog.AShareTasks)
+        foreach (var expected in ExpectedTaskCatalog.ForTradingDay(_isTradingDay))
         {
             var message = todayMessages
                 .Where(candidate => string.Equals(candidate.TaskKey, expected.TaskKey, StringComparison.Ordinal) ||
@@ -400,6 +488,7 @@ public sealed class MainViewModel : ObservableObject
     {
         var previousId = selectMessageId ?? SelectedHistory?.Message.Id;
         IEnumerable<TaskMessage> query = _allHistory;
+        if (_gatewayHistoryAvailable) query = query.Where(message => message.Source == "gateway");
         if (!IncludeArchived) query = query.Where(message => !message.IsArchived);
         if (UnreadOnly) query = query.Where(message => !message.IsRead);
         if (StarredOnly) query = query.Where(message => message.IsStarred);
@@ -466,4 +555,7 @@ public sealed class MainViewModel : ObservableObject
         "gmail-legacy" => "历史导入",
         _ => "本地记录",
     };
+
+    private static DateOnly ShanghaiDateNow() =>
+        DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, ShanghaiTimeZone).DateTime);
 }

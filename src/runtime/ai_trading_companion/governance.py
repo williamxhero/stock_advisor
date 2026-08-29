@@ -3,11 +3,46 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import uuid
 from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
+
+from .runtime_strategy_policy import RuntimeStrategyPolicy
 
 
 REGIMES = ("trend_expansion", "divergence", "risk_contraction")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+@dataclass(frozen=True)
+class GovernanceDecision:
+    decision_id: str
+    decision_version: int
+    evidence_snapshot_id: str
+    cell_key: str
+    recommendation: str
+    state: str
+    approver: str
+    target_policy_version: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class StrategyApplicationReceipt:
+    receipt_id: str
+    decision_id: str
+    evidence_snapshot_id: str
+    target_policy_version: str
+    cell_key: str
+    previous_mode: str
+    applied_mode: str
+    state: str
+    applied_at: str
 
 
 def classify_regime(metrics: dict[str, Any]) -> str:
@@ -40,6 +75,26 @@ def executable_value(snapshot: dict[str, Any], observations: list[dict[str, Any]
     return {"value": value, "direction_value": value, "execution_boundary": execution, "mean_excess_return": move}
 
 
+def _attempt_dimensions(attempt: dict[str, Any] | None) -> dict[str, Any]:
+    if not attempt:
+        return {}
+    verifier = json.loads(attempt.get("verifier_json") or "{}")
+    passed = attempt.get("status") == "succeeded" and bool(verifier.get("passed"))
+    gate = verifier.get("evidence_gate") if isinstance(verifier.get("evidence_gate"), dict) else None
+    problems = list((gate or verifier).get("problems") or [])
+    quality = (1.0 if passed else 0.0) if gate is None else max(0.0, (1.0 if gate.get("passed") else .5) - .1 * len(problems))
+    dimensions: dict[str, Any] = {
+        "qualified": passed,
+        "research_quality": quality,
+        "stability": 1.0 if passed else 0.0,
+    }
+    if attempt.get("duration_ms") is not None:
+        dimensions["duration_seconds"] = max(0.0, float(attempt["duration_ms"]) / 1000.0)
+    if attempt.get("broker_cost_estimate") is not None:
+        dimensions["cost"] = float(attempt["broker_cost_estimate"])
+    return dimensions
+
+
 class RouterGovernance:
     """Evaluates candidate routes. It has no permission to change prompts, tools or budgets."""
 
@@ -58,8 +113,16 @@ class RouterGovernance:
         for job in jobs:
             output = json.loads(job["output_json"])
             candidate = output.get("snapshot") if isinstance(output.get("snapshot"), dict) else {}
-            base_score = executable_value(baseline_snapshot, observations)
-            candidate_score = executable_value(candidate, observations)
+            with self.store.connection() as c:
+                attempts = [dict(row) for row in c.execute(
+                    """SELECT * FROM llm_attempt WHERE route_decision_id=? AND stage=?
+                         ORDER BY started_at,attempt_number""",
+                    (job["decision_id"], job["stage"]),
+                )]
+            baseline_attempt = next((attempt for attempt in reversed(attempts) if not attempt.get("is_shadow")), None)
+            candidate_attempt = next((attempt for attempt in reversed(attempts) if attempt.get("is_shadow")), None)
+            base_score = {**executable_value(baseline_snapshot, observations), **_attempt_dimensions(baseline_attempt)}
+            candidate_score = {**executable_value(candidate, observations), **_attempt_dimensions(candidate_attempt)}
             if base_score["value"] is None or candidate_score["value"] is None:
                 state = "deferred"
             else:
@@ -95,15 +158,198 @@ class RouterGovernance:
         return {"action":"continue_shadow","reason":"当前证据尚不能区分材料性提升与噪声","pairs":n,"mean_delta":mean,"lower_bound":lower,"upper_bound":upper,"regime_coverage":coverage}
 
     def promote_if_qualified(self, cell_key: str) -> dict[str, Any]:
+        """Compatibility read: return evidence only; governance applies any change."""
         verdict = self.promotion_verdict(cell_key)
-        if verdict["action"] == "promote":
-            self.store.set_router_policy_mode(cell_key, "promoted", verdict["fingerprint"])
-        elif verdict["action"] == "reject":
-            self.store.set_router_policy_mode(cell_key, "rolled_back", verdict["fingerprint"])
         return verdict
 
     def immediate_rollback(self, cell_key: str, reason: str) -> dict[str, Any]:
-        # Security, deadline and data-isolation faults are never averaged away.
+        # Compatibility read: hard faults become recommendations and still
+        # require a versioned governance decision plus executor receipt.
         if reason not in {"security", "deadline", "m1_blindness", "data_isolation"}:
             raise ValueError("only hard safety faults support immediate rollback")
-        return self.store.set_router_policy_mode(cell_key, "rolled_back", f"hard_fault:{reason}")
+        return {"action": "recommend_rollback", "cell_key": cell_key, "reason": f"hard_fault:{reason}"}
+
+    def record_effort_capability_fault(
+        self, decision_id: str, cycle_id: str, fault_id: str,
+    ) -> str:
+        """Project a Broker capability rejection as a hard protection fault."""
+        with self.store.connection() as connection:
+            decision = connection.execute(
+                "SELECT cell_key FROM cognitive_route_decision WHERE decision_id=?", (decision_id,),
+            ).fetchone()
+            if not decision:
+                raise ValueError("unknown cognitive route decision")
+            regime_row = connection.execute(
+                "SELECT regime FROM market_regime_snapshot WHERE cycle_id=?", (cycle_id,),
+            ).fetchone()
+            baseline_attempt = connection.execute(
+                """SELECT a.* FROM llm_attempt a
+                     JOIN cognitive_route_decision d ON d.decision_id=a.route_decision_id
+                    WHERE d.cell_key=? AND a.is_shadow=0 AND a.status='succeeded'
+                    ORDER BY a.completed_at DESC,a.started_at DESC LIMIT 1""",
+                (decision["cell_key"],),
+            ).fetchone()
+        baseline = _attempt_dimensions(dict(baseline_attempt) if baseline_attempt else None)
+        candidate = {
+            "qualified": False,
+            "research_quality": 0.0,
+            "stability": 0.0,
+            "hard_fault": True,
+            "fault": "broker_effort_unsupported",
+        }
+        self.store.record_router_evaluation(
+            decision["cell_key"], cycle_id, "effort_capability", regime_row["regime"] if regime_row else "unknown",
+            None, fault_id, baseline, candidate, "resolved",
+        )
+        return str(decision["cell_key"])
+
+
+class EvolutionGovernance:
+    """Own immutable approve/reject decisions; never applies strategy state."""
+
+    def __init__(self, store: Any) -> None:
+        self.store = store
+        self._ensure_schema()
+        RuntimeStrategyPolicy(store)
+
+    def _ensure_schema(self) -> None:
+        with self.store.connection() as connection:
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS evolution_governance_decision (
+                  decision_id TEXT PRIMARY KEY,
+                  decision_version INTEGER NOT NULL,
+                  evidence_snapshot_id TEXT NOT NULL,
+                  cell_key TEXT NOT NULL,
+                  recommendation TEXT NOT NULL,
+                  state TEXT NOT NULL,
+                  approver TEXT NOT NULL,
+                  target_policy_version TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  UNIQUE(evidence_snapshot_id,state,approver)
+                );
+                CREATE TABLE IF NOT EXISTS strategy_application_receipt (
+                  receipt_id TEXT PRIMARY KEY,
+                  decision_id TEXT NOT NULL UNIQUE,
+                  evidence_snapshot_id TEXT NOT NULL,
+                  target_policy_version TEXT NOT NULL,
+                  cell_key TEXT NOT NULL,
+                  previous_mode TEXT NOT NULL,
+                  applied_mode TEXT NOT NULL,
+                  state TEXT NOT NULL,
+                  applied_at TEXT NOT NULL
+                );
+            """)
+
+    def decide(self, evidence_snapshot_id: str, action: str, *, approver: str) -> GovernanceDecision:
+        if action not in {"approve", "reject"}:
+            raise ValueError("governance action must be approve or reject")
+        if not approver.strip():
+            raise ValueError("governance decision requires an approver")
+        with self.store.connection() as connection:
+            snapshot = connection.execute(
+                "SELECT snapshot_kind,payload_json FROM observatory_snapshot WHERE snapshot_id=?",
+                (evidence_snapshot_id,),
+            ).fetchone()
+            if not snapshot or snapshot["snapshot_kind"] != "experiment":
+                raise ValueError("governance evidence must be an experiment assessment")
+            payload = json.loads(snapshot["payload_json"])
+            recommendation = str(payload.get("decision") or "insufficient_evidence")
+            if action == "approve" and recommendation not in {"recommend_promotion", "recommend_rollback", "ask_user"}:
+                raise ValueError("assessment does not authorize an approval")
+            if action == "approve" and recommendation == "ask_user" and approver == "automatic-governance":
+                raise ValueError("tradeoff decisions require an explicit user approver")
+            if action == "approve" and approver == "automatic-governance" and payload.get("source_kind") != "live_paired_shadow" and recommendation != "recommend_rollback":
+                raise ValueError("automatic promotion requires live paired shadow evidence")
+            runtime_cell = connection.execute(
+                "SELECT policy_kind,revision FROM runtime_strategy_cell WHERE cell_key=?",
+                (payload["experiment_key"],),
+            ).fetchone()
+            if runtime_cell:
+                target_policy_version = f"runtime-strategy/{runtime_cell['policy_kind']}/v{runtime_cell['revision']}"
+            else:
+                policy = connection.execute(
+                    "SELECT policy_version FROM cognitive_effort_policy WHERE state='active' ORDER BY activated_at DESC LIMIT 1",
+                ).fetchone()
+                if not policy:
+                    raise ValueError("no active cognitive effort policy")
+                target_policy_version = policy["policy_version"]
+            state = "approved" if action == "approve" else "rejected"
+            decision_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"governance|{evidence_snapshot_id}|{state}|{approver}"))
+            at = _now()
+            connection.execute(
+                """INSERT OR IGNORE INTO evolution_governance_decision(
+                     decision_id,decision_version,evidence_snapshot_id,cell_key,recommendation,state,
+                     approver,target_policy_version,created_at) VALUES(?,1,?,?,?,?,?,?,?)""",
+                (decision_id, evidence_snapshot_id, payload["experiment_key"], recommendation,
+                 state, approver, target_policy_version, at),
+            )
+            row = connection.execute(
+                "SELECT * FROM evolution_governance_decision WHERE decision_id=?", (decision_id,),
+            ).fetchone()
+        return GovernanceDecision(**dict(row))
+
+
+class StrategyPolicyExecutor:
+    """Apply an approved reversible strategy decision and append its receipt."""
+
+    def __init__(self, store: Any) -> None:
+        self.store = store
+        EvolutionGovernance(store)
+        RuntimeStrategyPolicy(store)
+
+    def apply(self, decision_id: str) -> StrategyApplicationReceipt:
+        with self.store.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM strategy_application_receipt WHERE decision_id=?", (decision_id,),
+            ).fetchone()
+            if existing:
+                return StrategyApplicationReceipt(**dict(existing))
+            decision = connection.execute(
+                "SELECT * FROM evolution_governance_decision WHERE decision_id=?", (decision_id,),
+            ).fetchone()
+            if not decision:
+                raise ValueError("unknown governance decision")
+            if decision["state"] != "approved":
+                raise ValueError("only approved governance decisions can be applied")
+            recommendation = decision["recommendation"]
+            if recommendation == "recommend_promotion":
+                target_mode, receipt_state = "promoted", "applied"
+            elif recommendation == "recommend_rollback":
+                target_mode, receipt_state = "rolled_back", "rollback_applied"
+            elif recommendation == "ask_user":
+                target_mode, receipt_state = "promoted", "user_tradeoff_applied"
+            else:
+                raise ValueError("governance recommendation is not executable")
+            cell = connection.execute(
+                "SELECT * FROM router_policy_cell WHERE cell_key=?", (decision["cell_key"],),
+            ).fetchone()
+            table = "router_policy_cell"
+            if not cell:
+                cell = connection.execute(
+                    "SELECT * FROM runtime_strategy_cell WHERE cell_key=?", (decision["cell_key"],),
+                ).fetchone()
+                table = "runtime_strategy_cell"
+            if not cell:
+                raise ValueError("unknown reversible strategy cell")
+            previous_mode = str(cell["mode"])
+            applied_at = _now()
+            connection.execute(
+                f"""UPDATE {table} SET previous_json=?,mode=?,revision=revision+1,
+                     qualification_fingerprint=?,updated_at=? WHERE cell_key=?""",
+                (json.dumps(dict(cell), ensure_ascii=False, sort_keys=True), target_mode,
+                 f"assessment:{decision['evidence_snapshot_id']}", applied_at, decision["cell_key"]),
+            )
+            receipt = StrategyApplicationReceipt(
+                receipt_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"strategy-receipt|{decision_id}")),
+                decision_id=decision_id, evidence_snapshot_id=decision["evidence_snapshot_id"],
+                target_policy_version=decision["target_policy_version"], cell_key=decision["cell_key"],
+                previous_mode=previous_mode, applied_mode=target_mode, state=receipt_state, applied_at=applied_at,
+            )
+            connection.execute(
+                """INSERT INTO strategy_application_receipt(
+                     receipt_id,decision_id,evidence_snapshot_id,target_policy_version,cell_key,
+                     previous_mode,applied_mode,state,applied_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                tuple(receipt.__dict__.values()),
+            )
+        return receipt

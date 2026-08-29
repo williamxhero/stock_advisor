@@ -5,7 +5,11 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+from ai_trading_companion.__main__ import run_unified_cognition
+from ai_trading_companion.broker_client import BrokerResponse
 from ai_trading_companion.cognition import ReplyMarkdownStream, UnifiedCognition
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.packet_builder import RuntimePacketBuilder
@@ -53,6 +57,41 @@ class UnifiedCognitionTests(unittest.TestCase):
         ]
 
         self.assertEqual("你好\n世界\"好", "".join(chunks))
+
+    def test_unified_cognition_uses_visible_provider_broker_without_native_search(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-08-27")
+        text = "请记住我偏好长线"
+        self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="m")
+        batch_id, messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        created = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text, conversation["as_of"], {"batch_id": batch_id}
+        )
+        source = next(item for item in self.store.artifacts(conversation["cycle_id"])
+                      if item["artifact_id"] == created["artifact_id"])
+        result = {
+            "reply_markdown": "记住了",
+            "needs_fresh_search": False,
+            "public_search_request": None,
+            "propositions": [],
+            "actions": [],
+        }
+        broker = Mock()
+        broker.invoke.return_value = BrokerResponse(
+            output_text=json.dumps(result, ensure_ascii=False), result=result, actual_model="test",
+            provider="fake", intellect="standard", fulfilled_intellect="standard", request_id="request",
+        )
+
+        with patch("ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker):
+            output = run_unified_cognition(
+                self.engine, self.store, self.portfolio, conversation["cycle_id"], source,
+                messages, [batch_id], True, mode="conversation",
+            )
+
+        request = broker.invoke.call_args.args[0]
+        self.assertTrue(request.visible_stream)
+        self.assertEqual("standard", request.intellect)
+        self.assertNotIn("tools", json.dumps(request.packet, ensure_ascii=False))
+        self.assertEqual("记住了", output["reply_markdown"])
 
     def test_auto_submit_claim_is_once_per_formal_task(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-08-27")

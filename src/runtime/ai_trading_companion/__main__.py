@@ -12,22 +12,24 @@ import time
 import sys
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .backup import BackupManager
 from .cognition import ReplyMarkdownStream, UnifiedCognition
-from .config import load_settings, save_provider_settings
-from .credentials import write_secret
-from .provider_client import CurrentInformationUnavailable, ProviderClient, ProviderError, ProviderResult
+from .broker_client import BrokerError, BrokerRequest, BrokerResponse, ProviderBrokerClient, canonical_packet_hash
+from .config import load_settings, remove_legacy_provider_settings, save_research_settings
 from .engine import CompanionEngine, iso
 from .evidence_gate import EvidenceGate, EvidenceInsufficient
+from .effort_policy import CognitiveEffortPolicy
 from .exchange import LocalExchange
-from .governance import RouterGovernance, classify_regime
+from .governance import EvolutionGovernance, RouterGovernance, StrategyPolicyExecutor, classify_regime
+from .gateway import RuntimeGateway, serve as serve_gateway
 from .learning import JudgmentLifecycle, WorkflowEvolution
 from .migration import LegacyMigrator, LegacySources
 from .models import TASK_POLICIES
+from .observatory import EvaluationObservatory, EvaluationRequest, ExperimentRequest, ForecastRequest
 from .packet_builder import RuntimePacketBuilder
 from .paths import RuntimePaths
 from .portfolio import PortfolioService
@@ -36,7 +38,12 @@ from .projection import LearningProjectionRenderer
 from .scheduler import SHANGHAI, conversation_auto_submit_at, ensure_registered_policy, run_registry_schedule
 from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
-from .research_tools import ResearchTools
+from .runtime_strategy_policy import RuntimeStrategyPolicy
+from .web_access_gateway import WebAccessGatewayClient
+from .local_research import (
+    BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
+    ReadOnlyResearchExecutor, WebAccessGatewayBackend,
+)
 from .store import CompanionStore
 from .trading_calendar import XshgTradingCalendar
 
@@ -52,22 +59,101 @@ SCHEMAS = PATHS.contracts
 @dataclass(frozen=True)
 class VerifiedStageResult:
     output: dict[str, Any]
-    provider: ProviderResult
+    broker: BrokerResponse
     attempt_id: str
     packet_hash: str
     verifier: dict[str, Any]
 
     def __iter__(self):
         yield self.output
-        yield self.provider
+        yield self.broker
 
 
 def exchange_root() -> Path:
     return PATHS.exchange
 
 
+def publish_observatory_evaluation(store: CompanionStore, cycle_id: str) -> None:
+    cycle = store.get_cycle(cycle_id)
+    if cycle["task_key"] != "daily.execution.0945":
+        return
+    try:
+        EvaluationObservatory(store, exchange=LocalExchange(exchange_root()), schedule_path=PATHS.resources / "schedules" / "tasks.json").evaluate(
+            EvaluationRequest(
+                cycle_id=cycle_id, observed_at=str(cycle.get("updated_at") or iso(datetime.now(timezone.utc))),
+                request_id=f"m0-terminal:{cycle_id}",
+            ),
+        )
+        publish_observatory_forecast(store, cycle_id, trigger="m0_terminal")
+    except Exception as exc:
+        store.queue_event(cycle_id, "observatory.failed", {
+            "cycle_id": cycle_id, "reason": str(exc)[:1000],
+        })
+
+
+def publish_observatory_forecast(store: CompanionStore, cycle_id: str, *, trigger: str) -> None:
+    """Publish a new forecast only when the target's factual context changed.
+
+    Stage and dependency owners call this seam after they append their fact.
+    The Observatory derives a stable context fingerprint and suppresses a
+    duplicate trigger without mutating a historical forecast.
+    """
+    cycle = store.get_cycle(cycle_id)
+    if cycle["task_key"] != "daily.execution.0945":
+        return
+    try:
+        EvaluationObservatory(store, exchange=LocalExchange(exchange_root()), schedule_path=PATHS.resources / "schedules" / "tasks.json").forecast(
+            ForecastRequest(
+                task_key=cycle["task_key"], cycle_id=cycle_id,
+                observed_at=str(cycle.get("updated_at") or iso(datetime.now(timezone.utc))),
+                trigger=trigger,
+            ),
+        )
+    except Exception as exc:
+        store.queue_event(cycle_id, "observatory.forecast_failed", {
+            "cycle_id": cycle_id, "trigger": trigger, "reason": str(exc)[:1000],
+        })
+
+
+def handle_effort_capability_fault(
+    store: CompanionStore, *, decision_id: str, cycle_id: str, fault_id: str, promoted: bool,
+) -> None:
+    """Reject an unsupported shadow candidate or roll back a promoted effort through governance."""
+    try:
+        cell_key = RouterGovernance(store).record_effort_capability_fault(
+            decision_id, cycle_id, fault_id,
+        )
+        source_kind = "post_promotion_monitoring" if promoted else "shadow"
+        assessment = EvaluationObservatory(
+            store, exchange=LocalExchange(exchange_root()),
+        ).assess_experiment(ExperimentRequest(
+            cell_key, source_kind=source_kind,
+            request_id=f"effort-capability:{source_kind}:{fault_id}",
+        ))
+        receipt = None
+        if promoted:
+            decision = EvolutionGovernance(store).decide(
+                assessment.snapshot_id, "approve", approver="automatic-governance",
+            )
+            receipt = StrategyPolicyExecutor(store).apply(decision.decision_id)
+        store.queue_event(cycle_id, "effort.capability_fault", {
+            "cell_key": cell_key,
+            "assessment_snapshot_id": assessment.snapshot_id,
+            "decision": assessment.decision,
+            "receipt_id": receipt.receipt_id if receipt else None,
+        })
+    except Exception as recovery_error:
+        store.queue_event(cycle_id, "effort.capability_fault_recovery_failed", {
+            "decision_id": decision_id, "fault_id": fault_id,
+            "reason": str(recovery_error)[:1000],
+        })
+
+
 def runtime() -> tuple[CompanionEngine, CompanionStore, LocalExchange, PortfolioService]:
     PATHS.ensure()
+    # The old direct-provider block can contain API keys.  Erase it before any
+    # runtime work and never copy it into a backup or another configuration.
+    remove_legacy_provider_settings(PATHS.home)
     _backup_before_schedule_migration()
     store = CompanionStore(DB)
     store.initialize()
@@ -91,9 +177,9 @@ def _backup_before_schedule_migration() -> None:
     source = sqlite3.connect(DB)
     try:
         version = source.execute("PRAGMA user_version").fetchone()[0]
-        if version >= 12:
+        if version >= 13:
             return
-        target = RUNTIME / "backups" / "migrations" / f"before-unified-cognition-v12-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sqlite3"
+        target = RUNTIME / "backups" / "migrations" / f"before-provider-broker-v13-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sqlite3"
         target.parent.mkdir(parents=True, exist_ok=True)
         destination = sqlite3.connect(target)
         try:
@@ -149,11 +235,61 @@ def render_learning(store: CompanionStore) -> None:
     LearningProjectionRenderer(WORKSPACE, store).render()
 
 
-def provider_client() -> ProviderClient:
-    settings = load_settings(PATHS.home)
-    if not settings.provider_enabled:
-        raise ProviderError("Provider is not enabled", category="provider_not_configured")
-    return ProviderClient(settings.provider, settings.research, PATHS.home)
+def broker_client(settings: Any | None = None) -> ProviderBrokerClient:
+    """Create the only LLM transport from the local Broker base-URL setting."""
+    active = settings if settings is not None else load_settings(PATHS.home)
+    return ProviderBrokerClient(str(active.broker["url"]))
+
+
+def _gateway_snapshot(engine: CompanionEngine, store: CompanionStore, portfolio: PortfolioService, kind: str, query: dict[str, str]) -> dict[str, Any]:
+    if kind == "history":
+        return store.history_page(before=query.get("before"), limit=int(query.get("limit", "31")), search=query.get("search", ""))
+    if kind == "today":
+        scheduled_date = query.get("date") or datetime.now(SHANGHAI).date().isoformat()
+        registry = _schedule_registry(store)
+        return {"contract": "companion-today/v1", "scheduled_date": scheduled_date,
+                "is_trading_day": registry.calendar.is_trading_day(date.fromisoformat(scheduled_date)),
+                "projections": [engine._projection(cycle) for cycle in store.latest_cycles_for_date(scheduled_date)]}
+    if kind == "cycle":
+        cycle_id = query.get("cycle_id")
+        if not cycle_id:
+            raise ValueError("cycle_id is required")
+        return {"contract": "companion-cycle-projection/v1", "projection": engine._projection(store.get_cycle(cycle_id))}
+    if kind == "portfolio":
+        return {"contract": "portfolio-snapshot/v1", "snapshot": portfolio.snapshot()}
+    if kind == "schedules":
+        return {"contract": "schedule-list/v1", "schedules": _schedule_registry(store).list()}
+    raise ValueError("unknown snapshot kind")
+
+
+def run_gateway(execute: bool = False) -> None:
+    """Serve desktop requests without granting the desktop database access."""
+    engine, store, exchange, portfolio = runtime()
+    def command(payload: dict[str, Any]) -> dict[str, Any]:
+        contract = payload.get("contract")
+        if contract == "schedule-user-command/v1":
+            result = _schedule_command(store, payload)
+        elif contract == "portfolio-user-command/v1":
+            result = _portfolio_command(store, portfolio, payload)
+        else:
+            result = engine.command(payload)
+        flush(store, exchange)
+        return result
+    def snapshot(kind: str, request: Any) -> dict[str, Any]:
+        return _gateway_snapshot(engine, store, portfolio, kind, dict(request.query))
+    def tick() -> None:
+        run_schedules(engine, store, datetime.now(timezone.utc), execute, exchange, portfolio)
+        for cycle in store.claim_scheduled_workers(limit=2):
+            run_scheduled_cycle(engine, store, exchange, portfolio, cycle["cycle_id"], execute)
+        for projection in engine.run_due():
+            cycle_id = projection["cycle"]["cycle_id"]
+            run_m1(engine, store, portfolio, cycle_id, execute)
+            process_h0_cognition(engine, store, portfolio, cycle_id, execute)
+        consume(engine, store, exchange, portfolio, execute)
+        run_background(engine, store, execute)
+        flush(store, exchange)
+    import asyncio
+    asyncio.run(serve_gateway(RuntimeGateway(PATHS.home, store, command, snapshot, tick)))
 
 
 def _call_stage(
@@ -166,9 +302,28 @@ def _call_stage(
     search: bool,
     timeout: int,
     retry_model_slot: str | None = None,
+    runtime_strategy_shadow_cell: str | None = None,
 ) -> VerifiedStageResult:
     settings = load_settings(PATHS.home)
-    router = CognitiveRouter(settings.provider)
+    runtime_strategy = RuntimeStrategyPolicy(store)
+    controls = (
+        runtime_strategy.shadow_controls(runtime_strategy_shadow_cell, stage, timeout_seconds=timeout, search=search)
+        if runtime_strategy_shadow_cell
+        else runtime_strategy.controls(stage, timeout_seconds=timeout, search=search)
+    )
+    timeout = controls.timeout_seconds
+    search = bool(search and controls.max_operations > 0 and controls.enabled_backends)
+    packet = {
+        **packet,
+        "runtime_strategy_controls": {
+            "timeout_seconds": controls.timeout_seconds,
+            "max_operations": controls.max_operations,
+            "enabled_backends": list(controls.enabled_backends),
+            "revisions": list(controls.revisions),
+        },
+        "allowed_research_backends": list(controls.enabled_backends),
+    }
+    router = CognitiveRouter(effort_policy=CognitiveEffortPolicy.load(store))
     preliminary = router.plan(stage, packet, timeout, search)
     cell = store.router_policy_cell(
         preliminary.profile.cell_key, preliminary.baseline.as_json(),
@@ -176,134 +331,146 @@ def _call_stage(
     )
     plan = router.plan(stage, packet, timeout, search, str(cell["mode"]))
     decision = plan.selected
-    if retry_model_slot:
-        configured = settings.provider.get("models") if isinstance(settings.provider.get("models"), dict) else {}
-        retry_model = configured.get(retry_model_slot) if isinstance(configured.get(retry_model_slot), dict) else {}
-        decision = decision.__class__(
-            str(retry_model.get("id") or decision.model),
-            str(retry_model.get("effort") or decision.reasoning_effort),
-            decision.search, decision.timeout_seconds,
-            f"{decision.reason}；前次 Provider 超时，改用 {retry_model_slot} 模型槽执行冻结同包恢复",
-            retry_model_slot,
-        )
     decision_id = store.record_route_decision(
         cycle["cycle_id"], stage, plan.profile.cell_key, plan.mode, plan.profile.as_json(),
         plan.baseline.as_json(), plan.candidate.as_json() if plan.candidate else None, decision.as_json(),
     )
     attempt = store.begin_attempt(
         cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), packet.get("sha256"),
-        model=decision.model, reasoning_effort=decision.reasoning_effort,
-        search_enabled=decision.search, timeout_seconds=decision.timeout_seconds,
-        routing_reason=decision.reason, route_decision_id=decision_id,
-        runner_fingerprint="chat-completions-v1",
+        model=None, reasoning_effort=decision.reasoning_effort,
+        search_enabled=search, timeout_seconds=min(timeout, decision.timeout_seconds),
+        routing_reason="Provider Broker intellect/effort routing", route_decision_id=decision_id,
+        is_shadow=runtime_strategy_shadow_cell is not None,
+        runner_fingerprint="provider-broker/v1",
+        effort_policy_version=decision.effort_policy_version,
+        effort_input_fingerprint=decision.effort_input_fingerprint,
         input_packet=packet,
     )
-    started = time.monotonic()
     attempt_finished = False
+    tool_trace: list[dict[str, Any]] = []
+    planner: BrokerResearchPlanner | None = None
     try:
-        contract = packet.get("evidence_contract") if search else None
-        def research_validator_for(active_attempt_id: str):
-            return lambda output, trace: EvidenceGate().evaluate(
-                output, contract or {}, trace, str(packet.get("as_of") or ""), attempt_id=active_attempt_id,
+        broker = broker_client(settings)
+        deadline = time.monotonic() + max(1, min(timeout, decision.timeout_seconds))
+        evidence_verifier: dict[str, Any] | None = None
+        outcome: BrokerResponse | None = None
+        request_packet = {key: value for key, value in packet.items() if key != "sha256"}
+        request_hash = str(packet.get("sha256") or canonical_packet_hash(request_packet))
+
+        if search:
+            contract = packet.get("evidence_contract")
+            if not isinstance(contract, dict):
+                contract = {
+                    "version": 3, "as_of": packet.get("as_of"),
+                    "requirements": packet.get("evidence_requirements") or [],
+                }
+            planner = BrokerResearchPlanner(
+                broker, deadline=lambda: deadline, intellect=decision.intellect, effort=decision.reasoning_effort,
             )
-        research_validator = research_validator_for(attempt["attempt_id"]) if contract else None
-        result = provider_client().run(
-            RuntimePacketBuilder.prompt(packet), SCHEMAS / schema_name,
-            timeout=decision.timeout_seconds,
-            search=decision.search, slot=decision.model_slot, effort=decision.reasoning_effort,
-            research_validator=research_validator,
-            research_contract=contract,
-            # Research/tool-loop output is internal and never user-visible.
-            # Keep it non-streaming so CPA can retry a whole idempotent request
-            # when an upstream closes or stalls before returning a response.
-            on_delta=None,
-            retry_stream_after_delta=False,
-            attempt_id=attempt["attempt_id"],
-        )
-        data = json.loads(result.text)
-        if result.validation and result.validation.get("normalized_evidence"):
-            data = result.validation["normalized_evidence"]
-        verifier = router.verify(stage, packet, data)
-        if result.validation is not None:
-            verifier = {
-                **verifier,
-                "passed": bool(verifier.get("passed")) and bool(result.validation.get("passed")),
-                "problems": list(dict.fromkeys([*(verifier.get("problems") or []), *(result.validation.get("problems") or [])])),
-                "evidence_gate": result.validation,
-            }
-        status = "succeeded" if verifier["passed"] else "rejected"
+            web = WebAccessGatewayBackend(
+                WebAccessGatewayClient(settings.research), as_of=str(packet.get("as_of") or "") or None,
+            )
+            market_facts = packet.get("deterministic_market_facts")
+            backends = {"gateway": web} if "gateway" in controls.enabled_backends else {}
+            if "market" in controls.enabled_backends and isinstance(market_facts, dict) and market_facts:
+                backends["market"] = DeterministicMarketBackend(market_facts)
+            executor = ReadOnlyResearchExecutor(backends, max_operations=controls.max_operations)
+            research = LocalResearchChain(planner, executor, max_repairs=2).run(
+                packet, contract, attempt_id=attempt["attempt_id"],
+            )
+            tool_trace = [*research.observations, *_broker_call_trace(planner.outcomes)]
+            evidence_verifier = research.verifier
+            if not research.qualified:
+                raise EvidenceInsufficient(research.verifier)
+            if schema_name.startswith("companion-evidence-result-"):
+                data = research.evidence
+                outcome = planner.outcomes[-1] if planner.outcomes else None
+                verifier = research.verifier
+            else:
+                request_packet = {
+                    **request_packet,
+                    "frozen_evidence": research.evidence,
+                    "evidence_bundle_sha256": research.bundle_sha256,
+                }
+                request_hash = canonical_packet_hash(request_packet)
+
+        if not search or not schema_name.startswith("companion-evidence-result-"):
+            schema = json.loads((SCHEMAS / schema_name).read_text(encoding="utf-8"))
+            request = BrokerRequest(
+                stage=stage, packet=request_packet, packet_sha256=request_hash,
+                intellect=decision.intellect, effort=decision.reasoning_effort, schema=schema,
+                visible_stream=False, absolute_deadline=deadline,
+                verifier_name=f"cognitive-router/{stage}",
+                verifier=lambda output: router.verify(stage, packet, output),
+                h0_forbidden=stage == "m1_judgment",
+            )
+            outcome = broker.invoke(request)
+            if not isinstance(outcome.result, dict):
+                raise BrokerError(f"Broker produced no qualified result for {stage}", category="broker_output_invalid")
+            data = outcome.result
+            verifier = router.verify(stage, packet, data)
+            if evidence_verifier is not None:
+                verifier["evidence_gate"] = evidence_verifier
+                verifier["passed"] = bool(verifier.get("passed")) and bool(evidence_verifier.get("passed"))
+
+        if outcome is None:
+            raise BrokerError("Broker produced no auditable outcome", category="broker_protocol")
+        status = "succeeded" if verifier.get("passed") else "rejected"
+        output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(
             attempt["attempt_id"],
             status,
-            output_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(),
+            output_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
             output=data,
-            usage=result.usage, verifier=verifier, provider_response_id=result.response_id,
-            provider_request_id=result.request_id, tool_trace=result.tool_trace,
+            usage=outcome.usage, verifier=verifier,
+            broker_metadata=outcome.audit_metadata(),
+            tool_trace=[*tool_trace, outcome.audit_metadata()], actual_model=outcome.actual_model,
         )
         attempt_finished = True
-        if not verifier["passed"]:
+        if not verifier.get("passed"):
             raise EvidenceInsufficient(verifier)
-        if not retry_model_slot and plan.mode == "shadow" and plan.candidate and verifier["passed"]:
+        if runtime_strategy_shadow_cell is None:
+            runtime_strategy.queue_shadows(
+                cycle["cycle_id"], stage, packet, schema_name, attempt["attempt_id"],
+            )
+        if runtime_strategy_shadow_cell is None and not retry_model_slot and plan.mode == "shadow" and plan.candidate and verifier["passed"]:
             store.queue_router_shadow(
                 decision_id, cycle["cycle_id"], stage, packet, schema_name, plan.candidate.as_json(),
                 priority=1 if plan.profile.major else 0,
             )
-        return VerifiedStageResult(data, result, attempt["attempt_id"], str(packet.get("sha256") or ""), verifier)
+        return VerifiedStageResult(data, outcome, attempt["attempt_id"], str(packet.get("sha256") or ""), verifier)
     except Exception as exc:
         if not attempt_finished:
+            if planner is not None:
+                known_requests = {
+                    str(item.get("request_id")) for item in tool_trace
+                    if isinstance(item, dict) and item.get("kind") == "broker_call"
+                }
+                tool_trace.extend(
+                    item for item in _broker_call_trace(planner.outcomes)
+                    if str(item.get("request_id")) not in known_requests
+                )
             status = "timed_out" if isinstance(exc, TimeoutError) else "failed"
             store.finish_attempt(
                 attempt["attempt_id"], status, error=str(exc),
-                provider_request_id=exc.request_id if isinstance(exc, ProviderError) else None,
-                tool_trace=getattr(exc, "tool_trace", None),
+                broker_metadata=exc.metadata or {"request_id": exc.request_id, "attempts": exc.attempts} if isinstance(exc, BrokerError) else None,
+                actual_model=exc.metadata.get("actual_model") if isinstance(exc, BrokerError) else None,
+                tool_trace=getattr(exc, "tool_trace", None) or tool_trace,
             )
-        # A promoted major XHigh route has a deliberately reserved Medium hedge
-        # window.  It is sequential (not a duplicate parallel opinion), uses
-        # the identical frozen packet, and is only used after the first run
-        # failed before publication.
-        remaining = timeout - int(time.monotonic() - started)
-        if plan.mode == "promoted" and decision.reasoning_effort == "xhigh" and remaining >= 30:
-            hedge = plan.baseline
-            hedge_attempt = store.begin_attempt(
-                cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), packet.get("sha256"),
-                model=hedge.model, reasoning_effort=hedge.reasoning_effort,
-                search_enabled=hedge.search, timeout_seconds=remaining,
-                routing_reason="XHigh 未在预留窗口内完成，使用冻结同包 Medium 回退",
-                route_decision_id=decision_id, runner_fingerprint="chat-completions-v1",
-                input_packet=packet,
+        if (
+            isinstance(exc, BrokerError) and exc.category == "broker_effort_unsupported"
+            and plan.mode == "promoted"
+        ):
+            handle_effort_capability_fault(
+                store, decision_id=decision_id, cycle_id=cycle["cycle_id"],
+                fault_id=f"production:{attempt['attempt_id']}", promoted=True,
             )
-            hedge_finished = False
-            try:
-                result = provider_client().run(
-                    RuntimePacketBuilder.prompt(packet), SCHEMAS / schema_name, timeout=remaining,
-                    search=hedge.search, slot=hedge.model_slot, effort=hedge.reasoning_effort,
-                    research_validator=research_validator_for(hedge_attempt["attempt_id"]) if contract and hedge.search else None,
-                    research_contract=contract,
-                    on_delta=None,
-                    retry_stream_after_delta=False,
-                    attempt_id=hedge_attempt["attempt_id"],
-                )
-                data = json.loads(result.text)
-                if result.validation and result.validation.get("normalized_evidence"):
-                    data = result.validation["normalized_evidence"]
-                verifier = router.verify(stage, packet, data)
-                if result.validation is not None:
-                    verifier = {**verifier, "passed": bool(verifier.get("passed")) and bool(result.validation.get("passed")), "problems": list(dict.fromkeys([*(verifier.get("problems") or []), *(result.validation.get("problems") or [])])), "evidence_gate": result.validation}
-                hedge_status = "succeeded" if verifier["passed"] else "rejected"
-                store.finish_attempt(hedge_attempt["attempt_id"], hedge_status, output_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(), output=data, usage=result.usage, verifier=verifier, provider_response_id=result.response_id, provider_request_id=result.request_id, tool_trace=result.tool_trace)
-                hedge_finished = True
-                if not verifier["passed"]:
-                    raise EvidenceInsufficient(verifier)
-                return VerifiedStageResult(data, result, hedge_attempt["attempt_id"], str(packet.get("sha256") or ""), verifier)
-            except Exception as hedge_error:
-                if not hedge_finished:
-                    hedge_status = "timed_out" if isinstance(hedge_error, TimeoutError) else "failed"
-                    store.finish_attempt(
-                        hedge_attempt["attempt_id"], hedge_status, error=str(hedge_error),
-                        provider_request_id=hedge_error.request_id if isinstance(hedge_error, ProviderError) else None,
-                        tool_trace=getattr(hedge_error, "tool_trace", None),
-                    )
         raise
+
+
+def _broker_call_trace(outcomes: list[BrokerResponse]) -> list[dict[str, Any]]:
+    """Bind each derived Broker request to the owning business-stage attempt."""
+    return [outcome.audit_metadata() for outcome in outcomes]
 
 
 def _deadline_timeout(cycle: dict[str, Any], requested: int) -> int:
@@ -326,27 +493,92 @@ def run_router_shadow(store: CompanionStore, job: dict[str, Any], execute: bool)
         return
     attempt = store.begin_attempt(
         cycle["cycle_id"], job["stage"], iso(datetime.now(timezone.utc)), job["packet_sha256"],
-        model=candidate["model"], reasoning_effort=candidate["reasoning_effort"],
+        model=None, reasoning_effort=candidate["reasoning_effort"],
         search_enabled=bool(candidate["search"]), timeout_seconds=int(candidate["timeout_seconds"]),
         routing_reason=candidate["reason"], route_decision_id=job["decision_id"], is_shadow=True,
-        runner_fingerprint="chat-completions-v1",
+        runner_fingerprint="provider-broker/v1",
+        effort_policy_version=candidate.get("effort_policy_version"),
+        effort_input_fingerprint=candidate.get("effort_input_fingerprint"),
     )
     try:
-        result = provider_client().run(
-            RuntimePacketBuilder.prompt(packet), SCHEMAS / job["schema_name"], timeout=int(candidate["timeout_seconds"]),
-            search=bool(candidate["search"]), slot=str(candidate.get("model_slot") or "judgment"), effort=candidate["reasoning_effort"],
-        )
-        data = json.loads(result.text)
-        verifier = CognitiveRouter(load_settings(PATHS.home).provider).verify(job["stage"], packet, data)
+        request_packet = {key: value for key, value in packet.items() if key != "sha256"}
+        router = CognitiveRouter()
+        outcome = broker_client().invoke(BrokerRequest(
+            stage=job["stage"], packet=request_packet, packet_sha256=canonical_packet_hash(request_packet),
+            intellect=str(candidate["intellect"]), effort=str(candidate["reasoning_effort"]),
+            schema=json.loads((SCHEMAS / job["schema_name"]).read_text(encoding="utf-8")),
+            visible_stream=False,
+            absolute_deadline=time.monotonic() + int(candidate["timeout_seconds"]),
+            verifier_name=f"router-shadow/{job['stage']}",
+            verifier=lambda output: router.verify(job["stage"], packet, output),
+            h0_forbidden=job["stage"] == "m1_judgment",
+        ))
+        if not isinstance(outcome.result, dict):
+            raise BrokerError("Broker produced no qualified shadow result", category="broker_output_invalid")
+        data = outcome.result
+        verifier = router.verify(job["stage"], packet, data)
+        output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(
-            attempt["attempt_id"], "succeeded", output_sha256=hashlib.sha256(result.text.encode("utf-8")).hexdigest(),
-            usage=result.usage, verifier=verifier,
+            attempt["attempt_id"], "succeeded", output_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
+            usage=outcome.usage, verifier=verifier, broker_metadata=outcome.audit_metadata(),
+            tool_trace=[outcome.audit_metadata()], actual_model=outcome.actual_model,
         )
         store.finish_router_shadow(job["job_id"], output=data, verifier=verifier)
     except Exception as exc:
         status = "timed_out" if isinstance(exc, TimeoutError) else "failed"
-        store.finish_attempt(attempt["attempt_id"], status, error=str(exc))
+        store.finish_attempt(
+            attempt["attempt_id"], status, error=str(exc),
+            broker_metadata=exc.metadata if isinstance(exc, BrokerError) else None,
+        )
         store.finish_router_shadow(job["job_id"], error=str(exc))
+        if isinstance(exc, BrokerError) and exc.category == "broker_effort_unsupported":
+            handle_effort_capability_fault(
+                store, decision_id=job["decision_id"], cycle_id=cycle["cycle_id"],
+                fault_id=f"shadow:{job['job_id']}", promoted=False,
+            )
+
+
+def run_runtime_strategy_shadow(store: CompanionStore, job: dict[str, Any], execute: bool) -> None:
+    """Evaluate one reversible runtime control on a frozen packet without publishing it."""
+    policy = RuntimeStrategyPolicy(store)
+    if not execute:
+        policy.finish_shadow(job["job_id"])
+        return
+    cycle = store.get_cycle(job["cycle_id"])
+    packet = json.loads(job["packet_json"])
+    frozen_controls = packet.get("runtime_strategy_controls") if isinstance(packet.get("runtime_strategy_controls"), dict) else {}
+    requested_timeout = int(frozen_controls.get("timeout_seconds") or 300)
+    search = bool(frozen_controls.get("enabled_backends"))
+    try:
+        candidate = _call_stage(
+            store, cycle, job["stage"], packet, job["schema_name"],
+            search=search, timeout=requested_timeout,
+            runtime_strategy_shadow_cell=job["cell_key"],
+        )
+        attempts = {row["attempt_id"]: row for row in store.attempts(cycle["cycle_id"])}
+        from .governance import _attempt_dimensions
+        baseline_score = _attempt_dimensions(attempts.get(job["baseline_attempt_id"]))
+        candidate_score = _attempt_dimensions(attempts.get(candidate.attempt_id))
+        with store.connection() as connection:
+            regime = connection.execute(
+                "SELECT regime FROM market_regime_snapshot WHERE cycle_id=?", (cycle["cycle_id"],),
+            ).fetchone()
+        receipt = policy.record_evaluation(
+            job["cell_key"], cycle["cycle_id"], f"stage:{job['stage']}",
+            regime["regime"] if regime else "unknown", baseline_score, candidate_score,
+        )
+        policy.finish_shadow(job["job_id"], candidate_attempt_id=candidate.attempt_id)
+        store.queue_event(cycle["cycle_id"], "runtime_strategy.shadow_completed", {
+            "cell_key": job["cell_key"], "stage": job["stage"], "job_id": job["job_id"],
+            "candidate_attempt_id": candidate.attempt_id,
+            "application_receipt_id": receipt.receipt_id if receipt else None,
+        })
+    except Exception as exc:
+        policy.finish_shadow(job["job_id"], error=str(exc))
+        store.queue_event(cycle["cycle_id"], "runtime_strategy.shadow_failed", {
+            "cell_key": job["cell_key"], "stage": job["stage"], "job_id": job["job_id"],
+            "reason": str(exc)[:1000],
+        })
 
 
 def _latest_json_artifact(store: CompanionStore, cycle_id: str, kind: str) -> dict[str, Any] | None:
@@ -365,14 +597,69 @@ def _fixture_attempt(store: CompanionStore, cycle_id: str, stage: str, packet_ha
     return attempt["attempt_id"]
 
 
+def _reuse_m0_evidence_attempt(
+    store: CompanionStore, cycle: dict[str, Any], packet: dict[str, Any], evidence: dict[str, Any],
+) -> str:
+    """Create an auditable M1 checkpoint without searching or calling a model.
+
+    M1 must judge the exact M0 evidence bundle. The synthetic stage attempt
+    preserves the existing publication/checkpoint contract while copying the
+    original acquisition trace so EvidenceGate can re-verify provenance.
+    """
+    source_attempt = next((
+        item for item in reversed(store.attempts(cycle["cycle_id"]))
+        if item.get("stage") == "m0_research" and item.get("status") == "succeeded"
+        and json.loads(item.get("output_json") or "null") == evidence
+    ), None)
+    if source_attempt is None:
+        raise EvidenceInsufficient({
+            "passed": False, "problems": ["frozen_m0_evidence_attempt_missing"],
+            "missing_requirements": ["current_market_state", "material_events_and_counterevidence"],
+        })
+    tool_trace = json.loads(source_attempt.get("tool_trace_json") or "[]")
+    contract = packet.get("evidence_contract") or packet.get("evidence_requirements") or []
+    evidence_verifier = EvidenceGate().evaluate(
+        evidence, contract, tool_trace, str(packet.get("as_of") or ""),
+        attempt_id=str(source_attempt["attempt_id"]),
+    )
+    business_verifier = CognitiveRouter().verify("m1_research", packet, evidence)
+    verifier = {
+        **business_verifier,
+        "passed": bool(business_verifier.get("passed")) and bool(evidence_verifier.get("passed")),
+        "evidence_gate": evidence_verifier,
+        "frozen_evidence_reuse": True,
+        "source_attempt_id": str(source_attempt["attempt_id"]),
+    }
+    if not verifier["passed"]:
+        verifier["problems"] = [
+            *list(business_verifier.get("problems") or []),
+            *list(evidence_verifier.get("problems") or []),
+        ]
+        raise EvidenceInsufficient(verifier)
+    attempt = store.begin_attempt(
+        cycle["cycle_id"], "m1_research", iso(datetime.now(timezone.utc)), packet.get("sha256"),
+        search_enabled=False, routing_reason="Reuse frozen M0 evidence bundle",
+        runner_fingerprint="runtime/frozen-evidence-reuse-v1", input_packet=packet,
+    )
+    output_text = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    store.finish_attempt(
+        attempt["attempt_id"], "succeeded",
+        output_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
+        output=evidence, verifier=verifier, tool_trace=tool_trace,
+    )
+    return str(attempt["attempt_id"])
+
+
 def run_research(
     engine: CompanionEngine,
     store: CompanionStore,
     cycle: dict[str, Any],
     execute: bool,
     on_progress: Any = None,
+    frozen_as_of: str | None = None,
 ) -> dict[str, Any]:
-    cycle = engine.research_started(cycle["cycle_id"])
+    cycle = engine.research_started(cycle["cycle_id"], as_of=frozen_as_of)
+    publish_observatory_forecast(store, cycle["cycle_id"], trigger="stage:m0_started")
     if on_progress:
         on_progress()
     builder = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store)
@@ -381,12 +668,14 @@ def run_research(
         store.append_artifact(cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False), cycle["as_of"])
         evidence_hash = "fixture-m0-research"
         compose_hash = "fixture-m0-compose"
-        return engine.research_ready(
+        result = engine.research_ready(
             cycle["cycle_id"], "Fixture 模式：这里会显示自然、无方向的 M0 客观观察。",
             evidence_attempt_id=_fixture_attempt(store, cycle["cycle_id"], "m0_research", evidence_hash, evidence),
             compose_attempt_id=_fixture_attempt(store, cycle["cycle_id"], "m0_compose", compose_hash, {"m0_markdown": "Fixture 模式：这里会显示自然、无方向的 M0 客观观察。"}),
             evidence_packet_hash=evidence_hash, packet_hash=compose_hash,
         )
+        publish_observatory_evaluation(store, cycle["cycle_id"])
+        return result
 
     policy = TASK_POLICIES[cycle["task_key"]]
     public_packet = builder.build(cycle, "m0_research")
@@ -421,25 +710,30 @@ def run_research(
                 )
                 m0_output, compose_attempt_id = compose_stage.output, compose_stage.attempt_id
                 store.save_stage_checkpoint(cycle["cycle_id"], "m0_compose", local_packet["sha256"], compose_attempt_id, m0_output)
-            return engine.research_ready(
+            ready = engine.research_ready(
                 cycle["cycle_id"], m0_output["m0_markdown"],
                 evidence_attempt_id=evidence_attempt_id, compose_attempt_id=compose_attempt_id,
                 evidence_packet_hash=public_packet["sha256"], packet_hash=local_packet["sha256"],
                 evidence_as_of=evidence.get("as_of"),
             )
+            publish_observatory_evaluation(store, cycle["cycle_id"])
+            return ready
         except Exception as exc:
             if isinstance(exc, EvidenceInsufficient):
                 engine.research_failed(cycle["cycle_id"], str(exc), details=exc.verifier)
+                publish_observatory_evaluation(store, cycle["cycle_id"])
                 if on_progress:
                     on_progress()
                 raise
             if number < 2:
                 engine.research_retrying(cycle["cycle_id"], str(exc), number + 1)
+                publish_observatory_forecast(store, cycle["cycle_id"], trigger="stage:m0_retrying")
                 if on_progress:
                     on_progress()
                 time.sleep(2)
                 continue
             engine.research_failed(cycle["cycle_id"], str(exc))
+            publish_observatory_evaluation(store, cycle["cycle_id"])
             if on_progress:
                 on_progress()
             raise
@@ -452,6 +746,7 @@ def run_m1(
     portfolio: PortfolioService,
     cycle_id: str,
     execute: bool,
+    frozen_as_of: str | None = None,
 ) -> dict[str, Any]:
     cycle = store.get_cycle(cycle_id)
     if cycle["state"] == "waiting_for_repair":
@@ -472,31 +767,33 @@ def run_m1(
 
     policy = TASK_POLICIES[cycle["task_key"]]
     prior_evidence = _latest_json_artifact(store, cycle_id, "evidence") or {}
-    research_as_of = iso(datetime.now(timezone.utc))
+    if not prior_evidence:
+        raise EvidenceInsufficient({
+            "passed": False, "problems": ["frozen_m0_evidence_missing"],
+            "missing_requirements": ["current_market_state", "material_events_and_counterevidence"],
+        })
+    research_as_of = frozen_as_of or iso(datetime.now(timezone.utc))
+    public_packet = builder.build(
+        cycle, "m1_research", evidence=prior_evidence,
+        as_of=research_as_of,
+    )
+    checkpoint = store.stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"])
+    if checkpoint:
+        evidence = checkpoint["output"]
+        evidence_attempt_id = checkpoint["attempt_id"]
+    else:
+        evidence = prior_evidence
+        evidence_attempt_id = _reuse_m0_evidence_attempt(store, cycle, public_packet, evidence)
+        store.save_stage_checkpoint(
+            cycle_id, "m1_research", public_packet["sha256"], evidence_attempt_id, evidence,
+        )
+        store.append_artifact(
+            cycle_id, "m1_evidence", "runtime", json.dumps(evidence, ensure_ascii=False),
+            str(evidence.get("as_of") or research_as_of),
+            {"public_only": True, "attempt_id": evidence_attempt_id, "reused_from": "m0_research"},
+        )
     for number in range(1, 3):
         try:
-            public_packet = builder.build(
-                cycle, "m1_research", evidence=prior_evidence,
-                as_of=research_as_of,
-            )
-            checkpoint = store.stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"])
-            if checkpoint:
-                evidence = checkpoint["output"]
-                evidence_attempt_id = checkpoint["attempt_id"]
-            else:
-                evidence_stage = _call_stage(
-                    store, cycle, "m1_research", public_packet, "companion-evidence-result-v3.schema.json",
-                    search=True, timeout=_deadline_timeout(cycle, int(policy.m1_timeout.total_seconds())),
-                    retry_model_slot="fast" if number > 1 else None,
-                )
-                evidence = evidence_stage.output
-                evidence_attempt_id = evidence_stage.attempt_id
-                store.save_stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"], evidence_attempt_id, evidence)
-                store.record_evidence(cycle, "m1_research", evidence)
-                store.append_artifact(
-                    cycle_id, "m1_evidence", "model", json.dumps(evidence, ensure_ascii=False),
-                    evidence.get("as_of") or iso(datetime.now(timezone.utc)), {"public_only": True, "attempt_id": evidence_attempt_id},
-                )
             cycle = engine.m1_judgment_started(cycle_id)
             local_packet = builder.build(
                 cycle, "m1_judgment", evidence=evidence,
@@ -561,7 +858,8 @@ def run_preview_worker(source_cycle_id: str, preview_id: str, known_at: str, bun
     cycle = store.create_preview_cycle(source_cycle_id, known_at)
     failure = None
     try:
-        cycle = run_research(engine, store, cycle, True)
+        frozen_as_of = str(source["as_of"])
+        cycle = run_research(engine, store, cycle, True, frozen_as_of=frozen_as_of)
         preview_deadline = iso(datetime.now(timezone.utc) + timedelta(minutes=45))
         source_h0 = store.latest_artifact(source_cycle_id, "h0")
         if source_h0:
@@ -581,7 +879,7 @@ def run_preview_worker(source_cycle_id: str, preview_id: str, known_at: str, bun
                 cycle["cycle_id"], "researching_m1", h0_locked_at=known_at, has_h0=0,
                 m1_started_at=known_at, m1_publish_deadline=preview_deadline,
             )
-        cycle = run_m1(engine, store, portfolio, cycle["cycle_id"], True)
+        cycle = run_m1(engine, store, portfolio, cycle["cycle_id"], True, frozen_as_of=frozen_as_of)
         if cycle["state"] in {"synthesizing_m2", "m2_deferred"}:
             cycle = run_m2(engine, store, cycle["cycle_id"], True)
     except Exception as exc:
@@ -692,12 +990,28 @@ def run_outcome(
             "SELECT DISTINCT cell_key FROM router_evaluation WHERE cycle_id=? AND horizon=?", (cycle["cycle_id"], checkpoint["horizon"])
         )]
     for cell_key in cells:
-        verdict = governance.promote_if_qualified(cell_key)
-        if verdict["action"] == "promote":
+        assessment = EvaluationObservatory(
+            store, exchange=LocalExchange(exchange_root()),
+        ).assess_experiment(ExperimentRequest(
+            cell_key, request_id=f"experiment:{cell_key}:{checkpoint['checkpoint_id']}",
+        ))
+        if assessment.decision in {"recommend_promotion", "recommend_rollback"}:
+            decision = EvolutionGovernance(store).decide(
+                assessment.snapshot_id, "approve", approver="automatic-governance",
+            )
+            receipt = StrategyPolicyExecutor(store).apply(decision.decision_id)
+        else:
+            receipt = None
+        if receipt and receipt.state == "applied":
             engine.chat_ready(
                 cycle["cycle_id"],
                 "这段时间我把同一批判断用不同思考深度反复对照了。更深入的那条路径在不同市场状态下都更稳，"
                 "我会把它作为这类判断的优先习惯；以后如果它不再经得起结果检验，我会主动退回并告诉你。",
+            )
+        elif receipt and receipt.state == "rollback_applied":
+            engine.chat_ready(
+                cycle["cycle_id"],
+                "晋升后的思考深度触发了保护维度故障，我已经按已批准的回滚决定恢复上一版本。",
             )
     engine.emit(cycle, "outcome.ready", {
         "cycle": cycle, "text": result["summary"], "horizon": checkpoint["horizon"],
@@ -736,7 +1050,7 @@ def run_chat_research(
             as_of=iso(datetime.now(timezone.utc)),
         )
         evidence, _ = _call_stage(
-            store, cycle, "chat_research", research_packet, "companion-evidence-result-v1.schema.json",
+            store, cycle, "chat_research", research_packet, "companion-evidence-result-v3.schema.json",
             search=True, timeout=300,
         )
         store.record_evidence(cycle, "chat_research", evidence)
@@ -930,6 +1244,13 @@ def run_background(
             engine.m2_deferred(cycle["cycle_id"], str(exc))
             return {"action": "m2_deferred", "cycle_id": cycle["cycle_id"]}
     if until_next >= 12 * 60:
+        runtime_shadow = RuntimeStrategyPolicy(store).next_shadow()
+        if runtime_shadow:
+            try:
+                run_runtime_strategy_shadow(store, runtime_shadow, execute)
+                return {"action": "runtime_strategy_shadow", "job_id": runtime_shadow["job_id"]}
+            except Exception as exc:
+                return {"action": "runtime_strategy_shadow_failed", "job_id": runtime_shadow["job_id"], "error": str(exc)}
         shadow = store.next_router_shadow()
         if shadow:
             try:
@@ -989,7 +1310,6 @@ def run_unified_cognition(
                 "subject": item["subject"], "predicate": item["predicate"],
                 "object": json.loads(item["object_json"]), "known_at": item["known_at"],
             } for item in store.current_propositions(iso(datetime.now(timezone.utc)), limit=80)]
-            settings = load_settings(PATHS.home)
             stream = engine.chat_stream_started(cycle_id, batch_ids, reply_kind) if mode != "h0" else None
             reply_stream = ReplyMarkdownStream()
 
@@ -1000,15 +1320,29 @@ def run_unified_cognition(
                     if on_progress:
                         on_progress()
 
-            result = provider_client().run(
-                cognition.prompt(cycle, messages, mode, memories),
-                SCHEMAS / "companion-cognition-result-v1.schema.json",
-                timeout=int(TASK_POLICIES.get(cycle["task_key"], TASK_POLICIES["daily.execution.0945"]).m1_timeout.total_seconds()),
-                search=mode != "h0", slot="fast",
-                effort=str(settings.provider.get("models", {}).get("fast", {}).get("effort") or "medium"),
+            request_packet = {
+                "mode": mode,
+                "cognition_prompt": cognition.prompt(cycle, messages, mode, memories),
+            }
+            timeout_seconds = int(TASK_POLICIES.get(
+                cycle["task_key"], TASK_POLICIES["daily.execution.0945"],
+            ).m1_timeout.total_seconds())
+            chat_decision = CognitiveRouter(
+                effort_policy=CognitiveEffortPolicy.load(store),
+            ).route("chat", {**request_packet, "task_key": cycle["task_key"]}, timeout_seconds, False)
+            outcome = broker_client().invoke(BrokerRequest(
+                stage="chat", packet=request_packet, packet_sha256=canonical_packet_hash(request_packet),
+                intellect=chat_decision.intellect, effort=chat_decision.reasoning_effort,
+                schema=json.loads((SCHEMAS / "companion-cognition-result-v1.schema.json").read_text(encoding="utf-8")),
+                visible_stream=stream is not None,
                 on_delta=on_delta if stream else None,
-            )
-            data = json.loads(result.text)
+                absolute_deadline=time.monotonic() + timeout_seconds,
+                verifier_name="unified-cognition/v1",
+                verifier=lambda _output: {"passed": True, "problems": []},
+            ))
+            if not isinstance(outcome.result, dict):
+                raise BrokerError("Broker produced no qualified cognition result", category="broker_output_invalid")
+            data = outcome.result
         outcome = cognition.apply(cycle, source, messages, mode, data)
     except Exception as exc:
         store.finish_cognition_job(job["job_id"], error=str(exc))
@@ -1203,17 +1537,6 @@ def consume(
                 exchange.acknowledge("to-runtime", path)
                 results.append(result)
                 continue
-            if command.get("contract") == "companion-user-command/v1" and command.get("type") == "provider.probe":
-                try:
-                    result = {"configured": True, "probe": provider_client().probe()}
-                    exchange.send("to-client", str(command.get("command_id")), {"contract": "provider-client-event/v1", "event_id": str(command.get("command_id")), "type": "provider.probe.succeeded", "created_at": iso(datetime.now(timezone.utc)), "payload": result})
-                except Exception as exc:
-                    category = exc.category if isinstance(exc, ProviderError) else "provider_error"
-                    result = {"configured": False, "error_category": category}
-                    exchange.send("to-client", str(command.get("command_id")), {"contract": "provider-client-event/v1", "event_id": str(command.get("command_id")), "type": "provider.probe.failed", "created_at": iso(datetime.now(timezone.utc)), "payload": result})
-                exchange.acknowledge("to-runtime", path)
-                results.append(result)
-                continue
             result = engine.command(command)
             exchange.acknowledge("to-runtime", path)
             # Publish deterministic state changes before a potentially long LLM call.
@@ -1255,6 +1578,13 @@ def consume(
 
 
 def main() -> int:
+    # Windows installations commonly inherit a GBK console even though every
+    # runtime artifact is UTF-8 JSON. A completed preview must not be reported
+    # as failed because a safe summary contains ordinary Unicode punctuation.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
     start = sub.add_parser("start")
@@ -1262,6 +1592,8 @@ def main() -> int:
     start.add_argument("--scheduled-for", required=True)
     start.add_argument("--as-of")
     start.add_argument("--execute", action="store_true")
+    gateway = sub.add_parser("serve-gateway")
+    gateway.add_argument("--execute", action="store_true")
     resume = sub.add_parser("synthesize")
     resume.add_argument("--cycle-id", required=True)
     resume.add_argument("--execute", action="store_true")
@@ -1280,6 +1612,7 @@ def main() -> int:
     preview_rerun = sub.add_parser("preview-rerun")
     preview_rerun.add_argument("--date", required=True)
     preview_rerun.add_argument("--cycle-id")
+    preview_rerun.add_argument("--known-at", help="ISO-8601 cutoff; defaults to the selected cycle's 15:20 Shanghai time")
     approve_preview = sub.add_parser("approve-preview")
     approve_preview.add_argument("--preview-id", required=True)
     preview_worker = sub.add_parser("_preview-worker")
@@ -1301,21 +1634,17 @@ def main() -> int:
     background.add_argument("--execute", action="store_true")
     sub.add_parser("dispatch")
     sub.add_parser("status")
-    sub.add_parser("probe")
-    provider_config = sub.add_parser("configure-provider")
-    provider_config.add_argument("--base-url")
-    provider_config.add_argument("--credential-target")
-    provider_config.add_argument("--research-model")
-    provider_config.add_argument("--judgment-model")
-    provider_config.add_argument("--fast-model")
-    provider_config.add_argument("--api-key-stdin", action="store_true")
-    browser_bootstrap = sub.add_parser("bootstrap-browser-profile")
-    browser_bootstrap.add_argument("--source-user-data", type=Path)
+    gateway_config = sub.add_parser("configure-web-access-gateway")
+    gateway_config.add_argument("--mcp-url")
+    gateway_config.add_argument("--token-stdin", action="store_true")
     args = parser.parse_args()
     if args.cmd == "preview-rerun":
         source = {"cycle_id": args.cycle_id} if args.cycle_id else find_source_cycle(DB, args.date)
         preview_id = f"{args.date.replace('-', '')}-1520-{uuid.uuid4().hex[:10]}"
-        known_at = iso(datetime.now(timezone.utc))
+        # A historical preview must preserve the requested cycle's information
+        # cutoff.  Using the current clock would admit later evidence and make
+        # both the bundle and its approval fingerprint non-reproducible.
+        known_at = args.known_at or f"{args.date}T15:20:00+08:00"
         bundle = launch_preview(PATHS.home, DB, INSTALL_ROOT, source["cycle_id"], preview_id, known_at)
         print(json.dumps({
             "preview_id": bundle["preview_id"], "bundle_sha256": bundle["bundle_sha256"],
@@ -1345,25 +1674,22 @@ def main() -> int:
             )
         print(json.dumps(LegacyMigrator(PATHS, sources).run(), ensure_ascii=False, indent=2))
         return 0
-    if args.cmd == "configure-provider":
+    if args.cmd == "configure-web-access-gateway":
         settings = load_settings(PATHS.home)
-        candidate = json.loads(json.dumps(settings.provider))
-        candidate["enabled"] = True
-        for key, value in (("base_url", args.base_url), ("credential_target", args.credential_target)):
-            if value:
-                candidate[key] = value.rstrip("/")
-        for slot, value in (("research", args.research_model), ("judgment", args.judgment_model), ("fast", args.fast_model)):
-            if value:
-                candidate.setdefault("models", {}).setdefault(slot, {})["id"] = value
-        if args.api_key_stdin:
-            write_secret(str(candidate["credential_target"]), sys.stdin.read().strip())
-        probe = ProviderClient(candidate, settings.research, PATHS.home).probe()
-        save_provider_settings(PATHS.home, candidate, settings.research)
-        print(json.dumps({"configured": True, "probe": probe}, ensure_ascii=False, indent=2))
+        research = json.loads(json.dumps(settings.research))
+        gateway = research.setdefault("web_access_gateway", {})
+        if args.mcp_url:
+            gateway["mcp_url"] = args.mcp_url.rstrip("/")
+        if args.token_stdin:
+            token = sys.stdin.read().strip()
+            if not token:
+                raise ValueError("Gateway token stdin was empty")
+            gateway["token"] = token
+        save_research_settings(PATHS.home, research)
+        print(json.dumps({"configured": True, "mcp_url": gateway.get("mcp_url"), "token_configured": bool(gateway.get("token"))}, ensure_ascii=False, indent=2))
         return 0
-    if args.cmd == "bootstrap-browser-profile":
-        settings = load_settings(PATHS.home)
-        print(json.dumps(ResearchTools(PATHS.home, settings.research).bootstrap_browser_profile(args.source_user_data), ensure_ascii=False, indent=2))
+    if args.cmd == "serve-gateway":
+        run_gateway(args.execute)
         return 0
     engine, store, exchange, portfolio = runtime()
     if args.cmd == "approve-preview":
@@ -1372,9 +1698,6 @@ def main() -> int:
         approved = approve_bundle(store, bundle)
         flush(store, exchange)
         print(json.dumps(approved, ensure_ascii=False, indent=2))
-        return 0
-    if args.cmd == "probe":
-        print(json.dumps(provider_client().probe(), ensure_ascii=False, indent=2))
         return 0
     if args.cmd == "backup":
         _, store, _, _ = runtime()
@@ -1431,7 +1754,7 @@ def main() -> int:
             failed_cycle = store.get_cycle(changed["cycle_id"])
             flush(store, exchange)
             render_learning(store)
-            error_category = exc.category if isinstance(exc, ProviderError) else "runtime_error"
+            error_category = exc.category if isinstance(exc, BrokerError) else "runtime_error"
             print(json.dumps({
                 "status": "failed",
                 "cycle": failed_cycle,

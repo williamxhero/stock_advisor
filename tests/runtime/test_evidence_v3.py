@@ -7,11 +7,10 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from ai_trading_companion.__main__ import _call_stage
-from ai_trading_companion.config import DEFAULT_PROVIDER
+from ai_trading_companion.broker_client import BrokerError
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.evidence_gate import EvidenceGate
 from ai_trading_companion.engine import CompanionEngine
-from ai_trading_companion.provider_client import ProviderError
 from ai_trading_companion.store import CompanionStore
 
 
@@ -60,12 +59,36 @@ class EvidenceV3Tests(TestCase):
         self.assertEqual("2026-08-25T07:00:00Z", self.events["window"]["start"])
         self.assertEqual(self.as_of, self.events["window"]["end"])
 
+    def test_1520_review_binds_market_to_completed_close_and_events_to_cycle(self):
+        as_of = "2026-08-27T07:20:02.555Z"
+        contract = EvidenceContractFactory(_WeekdayCalendar()).build(
+            task_key="daily.review.1520", stage="m0_research", as_of=as_of,
+        )
+        market, events = contract["requirements"]
+
+        self.assertEqual(
+            {"start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z", "mode": "exact"},
+            market["window"],
+        )
+        self.assertEqual("2026-08-26T07:00:00Z", events["window"]["start"])
+        self.assertEqual("2026-08-27T07:20:02.555000Z", events["window"]["end"])
+
     def test_rejects_foreign_reference_and_naive_runtime_time(self):
         foreign = EvidenceGate().evaluate(self._evidence("ev_other_1"), self.contract, self.observations, self.as_of, attempt_id="attempt-1")
         self.assertIn("source_ref_not_in_current_attempt", foreign["problems"])
         self.observations[0]["evidence_items"][0]["fact_as_of"] = "2026-08-25T15:00:00"
         naive = EvidenceGate().evaluate(self._evidence(), self.contract, self.observations, self.as_of, attempt_id="attempt-1")
         self.assertIn("source_fact_as_of_missing_timezone", naive["problems"])
+
+    def test_historical_replay_allows_acquisition_after_frozen_as_of(self):
+        self.observations[0]["evidence_items"][0]["acquired_at"] = "2026-08-27T07:20:00Z"
+        self.observations[0]["evidence_items"][1]["acquired_at"] = "2026-08-27T07:20:00Z"
+
+        result = EvidenceGate().evaluate(
+            self._evidence(), self.contract, self.observations, self.as_of, attempt_id="attempt-1",
+        )
+
+        self.assertTrue(result["passed"], result["problems"])
 
     def test_checked_no_change_requires_matching_current_attempt_query(self):
         self.observations[0]["arguments"] = {"query": "A股 公告"}
@@ -105,7 +128,7 @@ class EvidenceV3Tests(TestCase):
 
     def test_failed_research_attempt_persists_completed_tool_trace(self):
         trace = [{
-            "backend": "searxng", "tool": "search_searxng", "status": "succeeded",
+            "backend": "gateway", "tool": "web_read", "status": "succeeded",
             "non_empty": True, "arguments": {"query": "A股 盘前 公告"},
         }]
         with TemporaryDirectory() as temporary:
@@ -113,20 +136,19 @@ class EvidenceV3Tests(TestCase):
             cycle = CompanionEngine(store).start_cycle(
                 "daily.opportunity.0900", "2026-08-26T09:00:00+08:00", self.as_of,
             )
-            client = Mock()
-            client.run.side_effect = ProviderError(
+            broker = Mock()
+            broker.invoke.side_effect = BrokerError(
                 "research stopped", category="research_loop_limit", tool_trace=trace,
             )
-            settings = SimpleNamespace(provider=DEFAULT_PROVIDER)
+            settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
             packet = {
                 "task_key": "daily.opportunity.0900", "stage": "m0_research", "as_of": self.as_of,
-                "sha256": "frozen-packet", "evidence_contract": self.contract,
+                "evidence_contract": self.contract,
             }
-
             with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
-                "ai_trading_companion.__main__.provider_client", return_value=client,
+                "ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker,
             ):
-                with self.assertRaisesRegex(ProviderError, "research stopped"):
+                with self.assertRaisesRegex(BrokerError, "research stopped"):
                     _call_stage(
                         store, cycle, "m0_research", packet,
                         "companion-research-evidence-v2.schema.json", search=True, timeout=60,
@@ -136,31 +158,33 @@ class EvidenceV3Tests(TestCase):
             self.assertEqual("failed", attempt["status"])
             self.assertEqual(trace, json.loads(attempt["tool_trace_json"]))
 
-    def test_internal_research_tool_loop_does_not_use_provider_streaming(self):
+    def test_research_planning_uses_broker_and_never_calls_legacy_provider_tool_loop(self):
         with TemporaryDirectory() as temporary:
             store = CompanionStore(Path(temporary) / "companion.sqlite3")
             cycle = CompanionEngine(store).start_cycle(
                 "daily.opportunity.0900", "2026-08-26T09:00:00+08:00", self.as_of,
             )
-            client = Mock()
-            client.run.side_effect = ProviderError("stop after inspecting request", category="test")
-            settings = SimpleNamespace(provider=DEFAULT_PROVIDER)
+            settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
             packet = {
                 "task_key": "daily.opportunity.0900", "stage": "m0_research", "as_of": self.as_of,
-                "sha256": "frozen-packet", "evidence_contract": self.contract,
+                "evidence_contract": self.contract,
             }
 
+            broker = Mock()
+            broker.invoke.side_effect = BrokerError("stop after inspecting request", category="test")
             with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
-                "ai_trading_companion.__main__.provider_client", return_value=client,
+                "ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker,
             ):
-                with self.assertRaisesRegex(ProviderError, "stop after inspecting request"):
+                with self.assertRaisesRegex(BrokerError, "stop after inspecting request"):
                     _call_stage(
                         store, cycle, "m0_research", packet,
                         "companion-research-evidence-v2.schema.json", search=True, timeout=60,
                     )
 
-            self.assertIsNone(client.run.call_args.kwargs["on_delta"])
-            self.assertFalse(client.run.call_args.kwargs["retry_stream_after_delta"])
+            request = broker.invoke.call_args.args[0]
+            self.assertEqual("research", request.stage)
+            self.assertFalse(request.visible_stream)
+            self.assertIsNotNone(request.schema)
 
 
 class _WeekdayCalendar:

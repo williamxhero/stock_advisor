@@ -70,6 +70,11 @@ class CompanionStore:
             CREATE TABLE IF NOT EXISTS companion_outbox (
               event_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL,
               created_at TEXT NOT NULL, delivered_at TEXT);
+            CREATE TABLE IF NOT EXISTS client_event_log (
+              sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
+              contract TEXT NOT NULL, cycle_id TEXT, event_type TEXT NOT NULL,
+              payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_client_event_log_sequence ON client_event_log(sequence);
             CREATE TABLE IF NOT EXISTS portfolio_position (
               code TEXT PRIMARY KEY, name TEXT NOT NULL, shares INTEGER NOT NULL,
               average_cost REAL, last_price REAL, price_as_of TEXT, market_value REAL,
@@ -177,6 +182,14 @@ class CompanionStore:
               source_url TEXT, source_title TEXT, body_text TEXT NOT NULL,
               occurred_at TEXT, known_at TEXT NOT NULL, metadata_json TEXT NOT NULL,
               stage TEXT, content_sha256 TEXT, coverage_state TEXT NOT NULL DEFAULT 'observed');
+            CREATE TABLE IF NOT EXISTS evidence_cycle_use (
+              cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              evidence_id TEXT NOT NULL REFERENCES evidence_ledger_entry(evidence_id),
+              stage TEXT NOT NULL,
+              used_at TEXT NOT NULL,
+              PRIMARY KEY(cycle_id,evidence_id,stage));
+            CREATE INDEX IF NOT EXISTS ix_evidence_cycle_use_evidence
+              ON evidence_cycle_use(evidence_id,cycle_id,used_at);
             CREATE TABLE IF NOT EXISTS judgment_snapshot (
               snapshot_id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL UNIQUE,
               cycle_id TEXT NOT NULL, kind TEXT NOT NULL, snapshot_json TEXT NOT NULL,
@@ -239,6 +252,22 @@ class CompanionStore:
               baseline_score_json TEXT NOT NULL, candidate_score_json TEXT NOT NULL,
               state TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT,
               UNIQUE(cycle_id,horizon,shadow_job_id));
+            CREATE TABLE IF NOT EXISTS runtime_strategy_cell (
+              cell_key TEXT PRIMARY KEY, policy_kind TEXT NOT NULL, mode TEXT NOT NULL,
+              baseline_json TEXT NOT NULL, candidate_json TEXT, automatic_authorized INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL,
+              previous_json TEXT, qualification_fingerprint TEXT, updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS runtime_strategy_evaluation (
+              evaluation_id TEXT PRIMARY KEY, cell_key TEXT NOT NULL REFERENCES runtime_strategy_cell(cell_key),
+              cycle_id TEXT NOT NULL, horizon TEXT NOT NULL, regime TEXT,
+              baseline_score_json TEXT NOT NULL, candidate_score_json TEXT NOT NULL,
+              source_kind TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT,
+              UNIQUE(cycle_id,horizon,cell_key));
+            CREATE TABLE IF NOT EXISTS runtime_strategy_shadow_job (
+              job_id TEXT PRIMARY KEY, cell_key TEXT NOT NULL REFERENCES runtime_strategy_cell(cell_key),
+              cycle_id TEXT NOT NULL, stage TEXT NOT NULL, packet_json TEXT NOT NULL, schema_name TEXT NOT NULL,
+              baseline_attempt_id TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT,
+              completed_at TEXT, candidate_attempt_id TEXT, error TEXT,
+              UNIQUE(cell_key,cycle_id,stage,baseline_attempt_id));
             CREATE TABLE IF NOT EXISTS evolution_hypothesis (
               hypothesis_id TEXT PRIMARY KEY, family TEXT NOT NULL, title TEXT NOT NULL,
               spec_json TEXT NOT NULL, state TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -264,7 +293,7 @@ class CompanionStore:
               imported_artifact_id TEXT, imported_at TEXT NOT NULL,
               detail_json TEXT NOT NULL,
               PRIMARY KEY(source_name, source_id));
-            PRAGMA user_version = 12;
+            PRAGMA user_version = 15;
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
@@ -289,8 +318,12 @@ class CompanionStore:
                     c.execute(f"ALTER TABLE companion_cycle ADD COLUMN {name} {declaration}")
             attempt_columns = {row[1] for row in c.execute("PRAGMA table_info(llm_attempt)")}
             for name, declaration in {
-                "provider_response_id": "TEXT",
-                "provider_request_id": "TEXT",
+                "broker_provider": "TEXT",
+                "broker_intellect": "TEXT",
+                "broker_fulfilled_intellect": "TEXT",
+                "broker_request_id": "TEXT",
+                "broker_cost_estimate": "REAL",
+                "broker_attempts_json": "TEXT",
                 "tool_trace_json": "TEXT",
             }.items():
                 if name not in attempt_columns:
@@ -321,6 +354,7 @@ class CompanionStore:
                    FROM companion_message m WHERE m.state='submitted' AND m.batch_id IS NOT NULL
                    GROUP BY m.batch_id,m.cycle_id,m.phase"""
             )
+
             snapshot_columns = {row[1] for row in c.execute("PRAGMA table_info(judgment_snapshot)")}
             if "verification_status" not in snapshot_columns:
                 c.execute("ALTER TABLE judgment_snapshot ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'")
@@ -354,6 +388,8 @@ class CompanionStore:
                 "runner_fingerprint": "TEXT",
                 "input_packet_json": "TEXT",
                 "output_json": "TEXT",
+                "effort_policy_version": "TEXT",
+                "effort_input_fingerprint": "TEXT",
             }.items():
                 if name not in attempt_columns:
                     c.execute(f"ALTER TABLE llm_attempt ADD COLUMN {name} {declaration}")
@@ -407,6 +443,33 @@ class CompanionStore:
                          ON r.schedule_id=t.schedule_id AND r.revision=t.current_revision WHERE t.task_key=companion_cycle.task_key)
                    WHERE schedule_id IS NULL AND EXISTS (SELECT 1 FROM schedule_template t WHERE t.task_key=companion_cycle.task_key)"""
             )
+
+    def history_page(self, *, before: str | None = None, limit: int = 31, search: str = "") -> dict[str, Any]:
+        """Authoritative compact history, deduplicated by task and scheduled time."""
+        self.initialize(); limit = max(1, min(limit, 90))
+        with self.connection() as c:
+            clauses, values = ["1=1"], []
+            if before: clauses.append("substr(c.scheduled_for,1,10)<?"); values.append(before)
+            if search:
+                clauses.append("(c.task_key LIKE ? OR EXISTS(SELECT 1 FROM narrative_artifact a WHERE a.cycle_id=c.cycle_id AND a.body_markdown LIKE ?))")
+                values.extend([f"%{search}%", f"%{search}%"])
+            rows = c.execute(f"""WITH ranked AS (
+              SELECT c.*,COUNT(DISTINCT a.artifact_id) artifact_count,COUNT(DISTINCT m.message_id) message_count,
+              ROW_NUMBER() OVER(PARTITION BY c.task_key,c.scheduled_for ORDER BY COUNT(DISTINCT a.artifact_id) DESC,COUNT(DISTINCT m.message_id) DESC,c.updated_at DESC,c.revision DESC) current_rank
+              FROM companion_cycle c LEFT JOIN narrative_artifact a ON a.cycle_id=c.cycle_id LEFT JOIN companion_message m ON m.cycle_id=c.cycle_id AND m.state!='withdrawn'
+              WHERE {' AND '.join(clauses)} GROUP BY c.cycle_id), dates AS (
+              SELECT DISTINCT substr(scheduled_for,1,10) date FROM ranked WHERE current_rank=1 ORDER BY date DESC LIMIT ?)
+              SELECT * FROM ranked WHERE current_rank=1 AND substr(scheduled_for,1,10) IN (SELECT date FROM dates) ORDER BY scheduled_for DESC,task_key""", (*values, limit)).fetchall()
+        items = [dict(row) for row in rows]
+        return {"contract":"companion-history-page/v1","items":items,"next_before":min((item["scheduled_for"][:10] for item in items), default=None)}
+
+    def client_events(self, after: int, limit: int = 500) -> list[dict[str, Any]]:
+        self.initialize()
+        with self.connection() as c:
+            return [dict(row) for row in c.execute("SELECT * FROM client_event_log WHERE sequence>? ORDER BY sequence LIMIT ?", (after, max(1, min(limit, 500))))]
+
+    def _queue_client_event(self, event_id: str, contract: str, cycle_id: str | None, event_type: str, payload_json: str, created_at: str, connection: sqlite3.Connection) -> None:
+        connection.execute("INSERT OR IGNORE INTO client_event_log(event_id,contract,cycle_id,event_type,payload_json,created_at) VALUES(?,?,?,?,?,?)", (event_id, contract, cycle_id, event_type, payload_json, created_at))
 
     def _schedule_snapshot(self) -> None:
         """Keep a small checksummed recovery aid after every schedule mutation."""
@@ -708,7 +771,7 @@ class CompanionStore:
                      cycle_id,task_key,scheduled_for,as_of,state,revision,schedule_id,schedule_revision,
                      schedule_snapshot_json,created_at,updated_at)
                    VALUES(?,?,?,?, 'queued',?,?,?,?,?,?)""",
-                (cycle_id, source["task_key"], source["scheduled_for"], known_at, revision,
+                (cycle_id, source["task_key"], source["scheduled_for"], source["as_of"], revision,
                  source.get("schedule_id"), source.get("schedule_revision"),
                  json.dumps(snapshot, ensure_ascii=False, sort_keys=True), at, at),
             )
@@ -1106,6 +1169,7 @@ class CompanionStore:
         search_enabled: bool | None = None, timeout_seconds: int | None = None,
         routing_reason: str | None = None, route_decision_id: str | None = None,
         is_shadow: bool = False, runner_fingerprint: str | None = None,
+        effort_policy_version: str | None = None, effort_input_fingerprint: str | None = None,
         input_packet: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         attempt_id = str(uuid.uuid4())
@@ -1119,30 +1183,36 @@ class CompanionStore:
                 """INSERT INTO llm_attempt(
                      attempt_id,cycle_id,stage,attempt_number,status,as_of,started_at,completed_at,
                      input_sha256,output_sha256,error,model,reasoning_effort,search_enabled,
-                     timeout_seconds,routing_reason,route_decision_id,is_shadow,runner_fingerprint,input_packet_json)
-                   VALUES(?,?,?,?,?,?,?,NULL,?,NULL,NULL,?,?,?,?,?,?,?,?,?)""",
+                     timeout_seconds,routing_reason,route_decision_id,is_shadow,runner_fingerprint,input_packet_json,
+                     effort_policy_version,effort_input_fingerprint)
+                   VALUES(?,?,?,?,?,?,?,NULL,?,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?)""",
                 (attempt_id, cycle_id, stage, number, "running", as_of, started, input_sha256,
                  model, reasoning_effort, None if search_enabled is None else int(search_enabled),
                  timeout_seconds, routing_reason, route_decision_id, int(is_shadow), runner_fingerprint,
-                 json.dumps(input_packet, ensure_ascii=False, sort_keys=True) if input_packet is not None else None),
+                 json.dumps(input_packet, ensure_ascii=False, sort_keys=True) if input_packet is not None else None,
+                 effort_policy_version, effort_input_fingerprint),
             )
         return {"attempt_id": attempt_id, "attempt_number": number, "started_at": started}
 
-    def finish_attempt(self, attempt_id: str, status: str, *, output_sha256: str | None = None, output: dict[str, Any] | None = None, error: str | None = None, usage: dict[str, Any] | None = None, verifier: dict[str, Any] | None = None, provider_response_id: str | None = None, provider_request_id: str | None = None, tool_trace: list[dict[str, Any]] | None = None) -> None:
+    def finish_attempt(self, attempt_id: str, status: str, *, output_sha256: str | None = None, output: dict[str, Any] | None = None, error: str | None = None, usage: dict[str, Any] | None = None, verifier: dict[str, Any] | None = None, broker_metadata: dict[str, Any] | None = None, tool_trace: list[dict[str, Any]] | None = None, actual_model: str | None = None) -> None:
         if status not in {"succeeded", "rejected", "failed", "timed_out"}:
             raise ValueError(f"invalid attempt status: {status}")
         with self.connection() as c:
             cursor = c.execute(
                 """UPDATE llm_attempt SET status=?,completed_at=?,output_sha256=?,error=?,usage_json=?,
                    input_tokens=?,cached_input_tokens=?,output_tokens=?,reasoning_tokens=?,verifier_json=?,
-                   provider_response_id=?,provider_request_id=?,tool_trace_json=?,
+                   broker_provider=?,broker_intellect=?,broker_fulfilled_intellect=?,broker_request_id=?,
+                   broker_cost_estimate=?,broker_attempts_json=?,tool_trace_json=?,model=COALESCE(?,model),
                    output_json=?,duration_ms=CAST((julianday(?) - julianday(started_at))*86400000 AS INTEGER) WHERE attempt_id=? AND status='running'""",
                 (status, now(), output_sha256, error[-2000:] if error else None,
                  json.dumps(usage or {}, ensure_ascii=False, sort_keys=True),
                  (usage or {}).get("input_tokens"), (usage or {}).get("cached_input_tokens"),
                  (usage or {}).get("output_tokens"), (usage or {}).get("reasoning_tokens"),
-                  json.dumps(verifier or {}, ensure_ascii=False, sort_keys=True), provider_response_id, provider_request_id,
-                  json.dumps(tool_trace or [], ensure_ascii=False, sort_keys=True),
+                  json.dumps(verifier or {}, ensure_ascii=False, sort_keys=True),
+                  (broker_metadata or {}).get("provider"), (broker_metadata or {}).get("intellect"),
+                  (broker_metadata or {}).get("fulfilled_intellect"), (broker_metadata or {}).get("request_id"),
+                  (broker_metadata or {}).get("cost_estimate"), json.dumps((broker_metadata or {}).get("attempts") or [], ensure_ascii=False, sort_keys=True),
+                  json.dumps(tool_trace or [], ensure_ascii=False, sort_keys=True), actual_model,
                   json.dumps(output, ensure_ascii=False, sort_keys=True) if output is not None else None,
                   now(), attempt_id),
             )
@@ -1401,6 +1471,13 @@ class CompanionStore:
             )
             return dict(c.execute("SELECT * FROM router_policy_cell WHERE cell_key=?", (cell_key,)).fetchone())
 
+    def get_router_policy_cell(self, cell_key: str) -> dict[str, Any]:
+        with self.connection() as c:
+            row = c.execute("SELECT * FROM router_policy_cell WHERE cell_key=?", (cell_key,)).fetchone()
+        if not row:
+            raise ValueError("unknown router policy cell")
+        return dict(row)
+
     def record_evidence(self, cycle: dict[str, Any], stage: str, evidence: dict[str, Any]) -> list[str]:
         trading_date = cycle["scheduled_for"][:10]
         known_at = now()
@@ -1445,6 +1522,11 @@ class CompanionStore:
                            VALUES(?,?,?,?,?,'pending',?)""",
                         (str(uuid.uuid4()), "evidence", evidence_id, fingerprint, known_at, now()),
                     )
+                c.execute(
+                    """INSERT OR IGNORE INTO evidence_cycle_use(cycle_id,evidence_id,stage,used_at)
+                       VALUES(?,?,?,?)""",
+                    (cycle["cycle_id"], evidence_id, stage, known_at),
+                )
             for gap in evidence.get("critical_gaps") or []:
                 body = str(gap).strip()
                 if not body:
@@ -1469,6 +1551,11 @@ class CompanionStore:
                            VALUES(?,?,?,?,?,'pending',?)""",
                         (str(uuid.uuid4()), "evidence", evidence_id, fingerprint, known_at, now()),
                     )
+                c.execute(
+                    """INSERT OR IGNORE INTO evidence_cycle_use(cycle_id,evidence_id,stage,used_at)
+                       VALUES(?,?,?,?)""",
+                    (cycle["cycle_id"], evidence_id, stage, known_at),
+                )
         return inserted
 
     def evidence_for_day(self, trading_date: str, known_at: str, *, limit: int = 120) -> list[dict[str, Any]]:
@@ -1610,39 +1697,12 @@ class CompanionStore:
         return {"policy": policy, "revision": int(row["revision"]) + 1, "updated_at": at}
 
     def effective_m1_reserve(self, task_key: str, default_seconds: int) -> tuple[int, int]:
+        """Read the governed timing policy; statistics never mutate policy state."""
         with self.connection() as c:
             current = c.execute("SELECT * FROM timing_policy WHERE task_key=?", (task_key,)).fetchone()
-            samples = [float(row[0]) for row in c.execute(
-                """SELECT SUM((julianday(completed_at)-julianday(started_at))*86400.0)
-                   FROM llm_attempt a JOIN companion_cycle c ON c.cycle_id=a.cycle_id
-                   WHERE c.task_key=? AND a.stage IN ('m1_research','m1_judgment')
-                     AND a.status='succeeded' AND a.completed_at IS NOT NULL
-                   GROUP BY a.cycle_id ORDER BY MAX(a.completed_at) DESC LIMIT 20""",
-                (task_key,),
-            ) if row[0] is not None]
             if current:
-                reserve = int(current["reserve_seconds"])
-                revision = int(current["revision"])
-            else:
-                reserve = default_seconds
-                revision = 1
-                c.execute(
-                    "INSERT INTO timing_policy(task_key,reserve_seconds,previous_reserve_seconds,revision,updated_at) VALUES(?,?,NULL,1,?)",
-                    (task_key, reserve, now()),
-                )
-            if len(samples) >= 5:
-                ordered = sorted(samples)
-                p90 = ordered[min(len(ordered) - 1, int((len(ordered) - 1) * 0.9 + 0.999))]
-                recommended = max(8 * 60, min(15 * 60, int(p90 + 60)))
-                if abs(recommended - reserve) >= 30:
-                    c.execute(
-                        """UPDATE timing_policy SET previous_reserve_seconds=reserve_seconds,
-                           reserve_seconds=?,revision=revision+1,updated_at=? WHERE task_key=?""",
-                        (recommended, now(), task_key),
-                    )
-                    reserve = recommended
-                    revision += 1
-        return reserve, revision
+                return int(current["reserve_seconds"]), int(current["revision"])
+        return int(default_seconds), 1
 
     def rollback_timing_policy(self, task_key: str) -> tuple[int, int] | None:
         with self.connection() as c:
@@ -1701,12 +1761,16 @@ class CompanionStore:
 
     def queue_event(self, cycle_id: str, event_type: str, payload: dict[str, Any], *, connection: sqlite3.Connection | None = None) -> str:
         event_id=str(uuid.uuid4())
-        values = (event_id,cycle_id,event_type,json.dumps(payload,ensure_ascii=False,sort_keys=True),now())
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        created_at = now()
+        values = (event_id, cycle_id, event_type, payload_json, created_at)
         if connection is not None:
             connection.execute("INSERT INTO companion_outbox VALUES(?,?,?,?,?,NULL)", values)
+            self._queue_client_event(event_id, "companion-client-event/v1", cycle_id, event_type, payload_json, created_at, connection)
         else:
             with self.connection() as c:
                 c.execute("INSERT INTO companion_outbox VALUES(?,?,?,?,?,NULL)", values)
+                self._queue_client_event(event_id, "companion-client-event/v1", cycle_id, event_type, payload_json, created_at, c)
         return event_id
 
     def pending_events(self) -> list[dict[str, Any]]:
@@ -1717,17 +1781,23 @@ class CompanionStore:
 
     def queue_portfolio_event(self, event_type: str, payload: dict[str, Any]) -> str:
         event_id = str(uuid.uuid4())
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        created_at = now()
         with self.connection() as c:
             c.execute(
                 "INSERT INTO portfolio_outbox VALUES(?,?,?,?,NULL)",
-                (event_id, event_type, json.dumps(payload, ensure_ascii=False, sort_keys=True), now()),
+                (event_id, event_type, payload_json, created_at),
             )
+            self._queue_client_event(event_id, "portfolio-client-event/v1", None, event_type, payload_json, created_at, c)
         return event_id
 
     def queue_schedule_event(self, event_type: str, payload: dict[str, Any]) -> str:
         event_id = str(uuid.uuid4())
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        created_at = now()
         with self.connection() as c:
-            c.execute("INSERT INTO schedule_outbox VALUES(?,?,?,?,NULL)", (event_id, event_type, json.dumps(payload, ensure_ascii=False, sort_keys=True), now()))
+            c.execute("INSERT INTO schedule_outbox VALUES(?,?,?,?,NULL)", (event_id, event_type, payload_json, created_at))
+            self._queue_client_event(event_id, "schedule-client-event/v1", None, event_type, payload_json, created_at, c)
         return event_id
 
     def pending_schedule_events(self) -> list[dict[str, Any]]:

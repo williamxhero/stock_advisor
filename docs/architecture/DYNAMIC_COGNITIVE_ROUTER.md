@@ -1,37 +1,46 @@
-# 动态认知 Router
+# 动态认知策略 interface
 
-状态：已实现；2026-08-25。
+## 模块位置
 
-本模块落实 `APP_DEVELOPMENT_PRINCIPLES.md` 的“只为真正需要认知的步骤付费”。它不改变投资观点，不获得工具、联网、权限或自动化控制权；它只在既定边界内选择一次调用应使用的模型和思考深度。
+`CognitiveEffortPolicy` 是任务事实与 Provider Broker 调用之间的深模块。它拥有探索深度选择和候选生成；Broker adapter 只执行不可变决定，不拥有生产默认值，也不选择应用内认知策略。
 
-## 固定边界
+```text
+冻结 Stage Packet + 任务期限 + 证据状态
+                    │
+                    ▼
+          CognitiveEffortPolicy
+             select / propose_shadow
+                    │ EffortDecision
+                    ▼
+            Provider Broker adapter
+                    │ attempt facts
+                    ▼
+ EvaluationObservatory → EvolutionGovernance
+                    │ approved policy version
+                    └───────────────┐
+                                    ▼
+                          CognitivePolicyExecutor
+```
 
-- 公开搜索固定为 Terra Medium。搜索覆盖、来源和时限由协议与确定性代码控制，Router 不因传言、网页文本或用户意见扩大范围。
-- 正式判断和复盘固定在 Sol；默认是 Medium。
-- M0 及 M1 的公开研究、M1 判断、M2和复盘是分开的 packet 与审计阶段；普通聊天使用统一认知 packet，一次产出自然回复、命题和受控动作，不再为持仓另开语义调用。
-- M1 的 Router profile 只读取 M1 已冻结的盲 packet。出现任何当前周期人类文字或派生字段，即不得产生候选升级。
-- 网络、时点、数据缺失或隔离错误不能靠更高 effort 补救；候选直接禁止。
+## 公开 interface
 
-## 候选与正式输出
+```python
+class CognitiveEffortPolicy:
+    def select(self, request: EffortSelectionRequest) -> EffortDecision: ...
+    def propose_shadow(self, decision: EffortDecision) -> EffortCandidate | None: ...
+```
 
-每个“阶段 × 任务”是独立 policy cell。新 cell 先处于 `shadow`：Sol Medium 的正式结果照常发布；若候选与基线不同，则后台用完全相同的输入包运行一次候选，候选永不直接显示给用户。
+调用者提供任务键、阶段、冻结 profile、剩余期限、搜索要求和当前政策版本，不提供目标 effort。`EffortDecision` 冻结 intellect、effort、政策版本、规则 ID、选择原因、期限护栏和已验证 fallback 链；正式 LLM attempt 必须引用决定 ID。
 
-- 普通证据稀疏、关键缺口或复盘：候选为 Sol High。
-- 14:30/收盘/周期任务，或出现显著事件、两项以上关键冲突且剩余至少 240 秒：候选为 Sol XHigh；正式 Sol Medium 是时效回退。
-- 不存在永久 10% 对照或每日固定影子配额。`adaptive sentinel` 仅在尚有区分价值的 shadow cell 上运行；一旦顺序证据已晋升或拒绝即停止，模型、schema、prompt 或市场状态漂移会重新唤醒一个新 cell。影子永不进入正式记忆或用户时间线。
+## 策略与进化
 
-候选需要通过 packet 隔离、schema、方向与触发/失效边界的确定性校验，才可进入后续对照。CLI 用量、时长、模型、effort、路由理由、输入/输出 hash 和校验结果写入 SQLite 审计。
+- Intellect 表示认知上限，首版按任务族选择 `standard`、`smart` 或 `expert`；Effort 表示本次探索深度，首版候选集合为 `medium`、`high`、`xhigh`。
+- bootstrap policy 只复现迁移时的当前行为，不构成永久代码默认。普通聊天、研究规划和后台任务也必须通过同一 interface。
+- 稳定 profile stratum 至少包括 routine、major、evidence_sparse、deadline_tight 和 data_blocked。数据阻塞不能通过提高 effort 修复。
+- shadow 只比较一个相邻 effort，保持冻结 packet、intellect、工具、Schema、EvidenceGate 和时点一致，且永不发布。
+- EvaluationObservatory 分别比较质量、判断结果、窗口内合格概率、交付时间、稳定性和成本；无综合总分。EvolutionGovernance 是唯一晋升和回滚裁决者，CognitivePolicyExecutor 是唯一策略写入者。
+- Broker 不支持、M1 隔离、Schema/数据隔离、EvidenceGate 或 deadline 的硬退化触发回滚建议或自动回滚回执，不能被平均收益抵消。
 
-## 结果验证、晋升和回退
+## 测试 seam
 
-结果周期到期后，系统用原判断的公开观察对正式与候选快照分别计算方向/超额收益与执行边界分数；不让 LLM 选择胜负。可用观察必须有独立公开来源，冲突或缺失不结案。
-
-市场状态是冻结的确定性分类：`trend_expansion`、`divergence`、`risk_contraction`；无法得到指数趋势、广度、成交变化和波动率时记为 `unknown`，不参与晋升。
-
-自动晋升使用可反复查看的顺序配对置信边界，不存在预设样本量：候选相对基线的下界必须达到本机配置的材料性质量提升（初始 10%），上界明确低于零则拒绝；单侧 alpha 与跨 cell FDR 同样由本机配置提供。每个 cell 保留冻结市场状态覆盖，时限与安全故障仍是一票否决。晋升时只在相关任务时间线发一条自然语言说明，不显示模型、分数或工程术语。
-
-安全、时限、M1 盲隔离或数据隔离故障可立即回退。重大 XHigh 的正式运行应预留到期前的 Medium 对冲窗口，而不是固定并行双跑；模型、CLI、prompt、schema 或 Router 版本变化会冻结旧证据并让新 cell 重新从 shadow 开始。
-
-## 进化边界
-
-系统可以保存工作流和市场假说的成功、失败、无结论与替代状态，自动调整既有公开研究顺序、问题模板、来源配比、反证顺序和记忆权重。新增代码、工具、权限、联网范围、调用预算或自动化只能形成待用户批准的提案。
+外部测试通过 `select` 和 `propose_shadow` 验证生产选择与候选，不直接测试规则存储或 profile 分类细节。Broker 使用记录请求的本地 adapter；Observatory 和执行器分别以不可变决定、实验评估和执行回执作为合同，不共享可写状态。

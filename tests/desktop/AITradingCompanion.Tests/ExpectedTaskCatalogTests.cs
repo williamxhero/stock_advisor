@@ -16,4 +16,13 @@ public sealed class ExpectedTaskCatalogTests
             task => Assert.Equal(("daily.execution.1430", new TimeOnly(14, 30)), (task.TaskKey, task.Slot)),
             task => Assert.Equal(("daily.review.1520", new TimeOnly(15, 20)), (task.TaskKey, task.Slot)));
     }
+
+    [Fact]
+    public void NonTradingDayBoardKeepsConversationButOmitsMarketTasks()
+    {
+        var tasks = ExpectedTaskCatalog.ForTradingDay(isTradingDay: false);
+
+        Assert.Collection(tasks,
+            task => Assert.Equal(("conversation.daily", new TimeOnly(0, 0)), (task.TaskKey, task.Slot)));
+    }
 }

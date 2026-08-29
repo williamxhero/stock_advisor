@@ -57,7 +57,7 @@ class CompanionEngine:
         })
         return cycle
 
-    def research_started(self, cycle_id: str) -> dict[str, Any]:
+    def research_started(self, cycle_id: str, *, as_of: str | None = None) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
         if cycle["state"] != "queued":
             raise ValueError(f"cycle is not queued: {cycle['state']}")
@@ -70,7 +70,7 @@ class CompanionEngine:
                 "pre_m0",
                 "human",
                 body,
-                iso(utc_now()),
+                as_of or iso(utc_now()),
                 {
                     "batch_id": batch_id,
                     "message_ids": [message["message_id"] for message in messages],
@@ -86,7 +86,7 @@ class CompanionEngine:
                 "messages": messages,
                 "source_artifact_id": artifact["artifact_id"],
             })
-        cycle = self.store.transition(cycle_id, "researching_m0", as_of=iso(utc_now()))
+        cycle = self.store.transition(cycle_id, "researching_m0", as_of=as_of or iso(utc_now()))
         self.emit(cycle, "m0.started", cycle)
         return cycle
 
@@ -647,14 +647,12 @@ class CompanionEngine:
     def _diagnostic_code(reason: str) -> str:
         lowered = reason.lower()
         if "invalid_json_schema" in lowered: return "output_schema_invalid"
-        if "provider_timeout" in lowered: return "provider_timeout"
+        if "broker_unavailable" in lowered: return "broker_unavailable"
+        if "broker_timeout" in lowered: return "broker_timeout"
+        if "broker_stream_incomplete" in lowered: return "broker_stream_incomplete"
         if "timed out" in lowered or "timeout" in lowered: return "timeout"
         if "current_information_unavailable" in lowered: return "current_information_unavailable"
         if "evidence_insufficient" in lowered: return "evidence_insufficient"
-        if "provider_not_configured" in lowered: return "provider_not_configured"
-        if "provider_auth" in lowered: return "provider_auth"
-        if "provider_quota" in lowered or "provider_rate_limited" in lowered: return "provider_quota"
-        if "provider_http" in lowered: return "provider_http"
         if "network" in lowered or "connection" in lowered or "dns" in lowered: return "network_unavailable"
         return "llm_runtime_error"
 
@@ -666,11 +664,9 @@ class CompanionEngine:
             "timeout": f"{stage} 本次运行超时，当前信息可能不完整；系统会在时效窗口内重试。",
             "current_information_unavailable": f"{stage} 的当前信息后端都没有取得可用资料，系统不会据此生成市场结论。",
             "evidence_insufficient": f"{stage} 的关键事实仍未达到可核验标准，系统只保留缺口记录，不生成正式研判。",
-            "provider_not_configured": f"{stage} 尚未配置可用的 Provider，系统没有生成结论。",
-            "provider_auth": f"{stage} 的 Provider 认证失败，系统没有生成结论。",
-            "provider_quota": f"{stage} 的 Provider 当前额度或限流不可用，系统没有生成结论。",
-            "provider_http": f"{stage} 的 Provider 返回了 HTTP 错误，系统没有生成结论；请检查 Provider 上游状态。",
-            "provider_timeout": f"{stage} 的 Provider 在时限内没有返回，系统没有生成结论；请检查 Provider 上游状态。",
+            "broker_unavailable": f"{stage} 的 LLM 服务当前没有可用上游，系统没有生成结论；稍后会按阶段策略重试。",
+            "broker_timeout": f"{stage} 的 LLM 服务在时限内没有返回，系统没有生成结论；稍后会按阶段策略重试。",
+            "broker_stream_incomplete": f"{stage} 的回复未完整结束；已显示的文本会保留，系统将记录独立失败。",
             "network_unavailable": f"{stage} 因网络连接异常没能取得当下公开信息，需要先恢复网络后再判断。",
             "llm_runtime_error": f"{stage} 遇到技术故障，未能完成。详细诊断已保留在本地审计记录中。",
         }[code]

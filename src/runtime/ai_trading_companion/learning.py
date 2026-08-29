@@ -127,6 +127,13 @@ class JudgmentLifecycle:
         as_of = reference_at or artifact.get("as_of") or artifact.get("sealed_at") or now()
         frozen = normalize_snapshot(snapshot, text, reference_at=as_of, qualified=qualified)
         cycle = self.store.get_cycle(artifact["cycle_id"], connection=connection)
+        # The outcome evaluator must quote the conclusion that was actually
+        # published, rather than reconstruct it from a later interpretation.
+        frozen["original_judgment_text"] = text
+        attempts = self.store.attempts(artifact["cycle_id"])
+        judgment_attempt = next((item for item in reversed(attempts) if item.get("stage") == "m1_judgment"), None)
+        if judgment_attempt and judgment_attempt.get("effort_policy_version"):
+            frozen["strategy_policy_version"] = judgment_attempt["effort_policy_version"]
         default_horizon = {
                 "daily.opportunity.0900": "开盘至09:45，并跟踪T+1/T+3/T+5",
                 "daily.execution.0945": "09:45至10:30，并跟踪T+1/T+3/T+5",

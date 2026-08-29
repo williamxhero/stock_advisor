@@ -64,10 +64,6 @@ class RuntimePaths:
     def evidence(self) -> Path:
         return self.home / "evidence"
 
-    @property
-    def browser_profile(self) -> Path:
-        return self.home / "browser-profile"
-
     def ensure(self) -> None:
         for directory in (
             self.home / "data", self.workspace / "portfolio", self.workspace / "state",

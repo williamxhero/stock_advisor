@@ -42,9 +42,22 @@
             <Setter Property="Background" Value="{StaticResource CardBrush}" />
             <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
         </Style>
+        <Style TargetType="CalendarItem">
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Setter Property="Background" Value="{StaticResource CardBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+        </Style>
+        <Style TargetType="CalendarButton">
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Setter Property="Background" Value="{StaticResource CardBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Style.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#273B59" /></Trigger></Style.Triggers>
+        </Style>
         <Style TargetType="CalendarDayButton">
             <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
             <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Style.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#273B59" /></Trigger><Trigger Property="IsSelected" Value="True"><Setter Property="Background" Value="#223552" /></Trigger></Style.Triggers>
         </Style>
         <Style TargetType="ListBoxItem">
             <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />

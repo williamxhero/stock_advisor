@@ -318,20 +318,20 @@ class CompanionEngineTests(unittest.TestCase):
         self.assertIn("输出格式配置错误", payload["reason"])
         self.assertNotIn("C:\\Users", payload["reason"])
 
-    def test_provider_http_failure_has_explicit_user_category(self):
+    def test_broker_unavailable_has_explicit_user_category(self):
         self.ready()
         self.engine.command({"command_id": "commit-http", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0"})
 
         self.engine.m1_failed(
             self.cycle["cycle_id"],
-            "provider_http: Provider HTTP 400: Upstream request failed",
+            "broker_unavailable: Broker HTTP 503",
             retryable=False,
         )
 
         events = [event for event in self.store.pending_events() if event["event_type"] == "m1.failed"]
         payload = json.loads(events[-1]["payload_json"])
-        self.assertEqual("provider_http", payload["diagnostic_code"])
-        self.assertIn("Provider 返回了 HTTP 错误", payload["reason"])
+        self.assertEqual("broker_unavailable", payload["diagnostic_code"])
+        self.assertIn("LLM 服务当前没有可用上游", payload["reason"])
 
     def test_chat_batch_is_separate_from_frozen_h0(self):
         self.ready()
@@ -440,6 +440,15 @@ class CompanionEngineTests(unittest.TestCase):
         self.assertIn("机器人板块昨晚讨论明显升温", json.dumps(public_packet, ensure_ascii=False))
         self.assertIn("pre_m0", [item["kind"] for item in compose_packet["artifacts"]])
         self.assertFalse(started["has_h0"])
+
+    def test_historical_research_start_preserves_explicit_frozen_as_of(self):
+        cycle = self.engine.start_cycle(
+            "daily.review.1520", "2026-08-27T15:20:00+08:00", "2026-08-27T07:20:02.555Z"
+        )
+
+        started = self.engine.research_started(cycle["cycle_id"], as_of=cycle["as_of"])
+
+        self.assertEqual("2026-08-27T07:20:02.555Z", started["as_of"])
 
     def test_pre_m0_messages_can_be_submitted_in_batches_before_research(self):
         cycle = self.engine.start_cycle(

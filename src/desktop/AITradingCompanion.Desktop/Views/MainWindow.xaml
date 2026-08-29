@@ -50,8 +50,8 @@
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
                 <TextBlock Text="{Binding StatusText}" Foreground="{StaticResource SecondaryTextBrush}" FontSize="12"
                            VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="260" />
-                <Button Content="运行配置" Click="ProviderSettingsButton_Click" Padding="12,6" Margin="12,0,0,0" />
                 <Button Content="任务管理" Click="TaskButton_Click" Padding="12,6" Margin="12,0,0,0" />
+                <Button Content="评测与进化中心" Click="ObservatoryButton_Click" Padding="12,6" Margin="12,0,0,0" />
                 <Button Content="持仓" Click="PortfolioButton_Click" Padding="12,6" Margin="12,0,0,0" />
                 <Button Command="{Binding ToggleStartupCommand}" Padding="12,6" Margin="12,0,0,0">
                     <TextBlock><Run Text="开机启动：" /><Run Text="{Binding StartupStateText, Mode=OneWay}" /></TextBlock>
@@ -140,7 +140,7 @@
 
                     <TabItem>
                         <TabItem.Header>
-                            <TextBlock FontSize="14" FontWeight="SemiBold"><Run Text="历史列表  " /><Run Text="{Binding HistoryCount, Mode=OneWay}" /></TextBlock>
+                            <TextBlock FontSize="14" FontWeight="SemiBold" Text="历史列表" />
                         </TabItem.Header>
                         <Grid Margin="0,14,0,0">
                             <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
@@ -151,14 +151,21 @@
                                 <TreeView.Resources>
                                     <Style TargetType="{x:Type TreeViewItem}">
                                         <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+                                        <Setter Property="Background" Value="Transparent" />
                                         <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                        <Style.Triggers>
+                                            <Trigger Property="IsSelected" Value="True">
+                                                <Setter Property="Background" Value="{StaticResource BlueBrush}" />
+                                                <Setter Property="Foreground" Value="White" />
+                                            </Trigger>
+                                        </Style.Triggers>
                                     </Style>
                                     <HierarchicalDataTemplate DataType="{x:Type local:HistoryDateGroupViewModel}" ItemsSource="{Binding Records}">
                                         <TextBlock Text="{Binding DateText}" FontWeight="SemiBold" Foreground="{StaticResource BlueBrush}" />
                                     </HierarchicalDataTemplate>
                                     <DataTemplate DataType="{x:Type local:HistoryRecordViewModel}">
                                         <TextBlock Width="154" Margin="0,6,0,5" Text="{Binding TaskType}"
-                                                   Foreground="{StaticResource PrimaryTextBrush}" TextTrimming="CharacterEllipsis" />
+                                                   TextTrimming="CharacterEllipsis" />
                                     </DataTemplate>
                                 </TreeView.Resources>
                             </TreeView>

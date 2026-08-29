@@ -42,10 +42,10 @@ public partial class MainWindow : Window, IDisposable
     private PortfolioWorkspaceProjection? _portfolioProjection;
     private PortfolioWindow? _portfolioWindow;
     private TaskManagementWindow? _taskManagementWindow;
+    private EvaluationObservatoryWindow? _evaluationObservatoryWindow;
     private string? _activeAiMarkdown;
     private string? _requestedProjectionCycleId;
     private string? _editingStagedMessageId;
-    private DateOnly? _todayProjectionRequestedDate;
     private DateTimeOffset _nextRuntimeHealthCheck = DateTimeOffset.MinValue;
     private VoiceInputState _voiceState;
     private string? _displayedDraftCycleId;
@@ -182,11 +182,6 @@ public partial class MainWindow : Window, IDisposable
         UpdateInputState();
     }
 
-    private void ProviderSettingsButton_Click(object sender, RoutedEventArgs e)
-    {
-        new ProviderSettingsWindow(_paths, _companionExchange) { Owner = this }.ShowDialog();
-    }
-
     private void EditStaged_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not Button { Tag: CompanionTimelineEntry entry } || entry.MessageId is null) return;
@@ -279,13 +274,13 @@ public partial class MainWindow : Window, IDisposable
         foreach (var task in _viewModel.Tasks)
         {
             var taskProjection = CompanionEventProjection.ProjectForTask(events, task.Expected.TaskKey);
-            if (taskProjection?.ScheduledFor is { } scheduled && scheduled.LocalDateTime.Date != DateTime.Today) taskProjection = null;
+            if (taskProjection?.ScheduledFor is { } scheduled && !_viewModel.IsCurrentTradingDate(scheduled)) taskProjection = null;
             task.UpdateCompanionStatus(taskProjection?.State, taskProjection?.ErrorText);
         }
         _viewModel.RefreshCompanionSummary();
         var taskKey = _viewModel.SelectedTask?.Expected.TaskKey;
         var projection = CompanionEventProjection.ProjectForTask(events, taskKey);
-        if (projection?.ScheduledFor is { } projectionScheduled && projectionScheduled.LocalDateTime.Date != DateTime.Today) projection = null;
+        if (projection?.ScheduledFor is { } projectionScheduled && !_viewModel.IsCurrentTradingDate(projectionScheduled)) projection = null;
         _companionProjection = projection;
         SwitchDraft(taskKey == "conversation.daily" && projection is not null ? CompanionDraftStore.ConversationDraftKey : projection?.CycleId);
         if (projection is null)
@@ -528,20 +523,12 @@ public partial class MainWindow : Window, IDisposable
 
     private async void RequestTodayProjectionsAsync()
     {
-        var today = DateOnly.FromDateTime(DateTime.Today);
-        if (_todayProjectionRequestedDate == today) return;
-        _todayProjectionRequestedDate = today;
         try
         {
-            await _companionExchange.SendAsync(new
-            {
-                contract = "companion-user-command/v1", command_id = Guid.NewGuid().ToString(),
-                type = "request_today_projections", scheduled_date = today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
-            });
+            await _viewModel.RefreshTodayBoardAsync();
         }
         catch (Exception exception)
         {
-            _todayProjectionRequestedDate = null;
             _viewModel.ReportInboxFailure(exception);
         }
     }
@@ -762,6 +749,22 @@ public partial class MainWindow : Window, IDisposable
         {
             if (_taskManagementWindow.WindowState == WindowState.Minimized) _taskManagementWindow.WindowState = WindowState.Normal;
             _taskManagementWindow.Activate();
+        }
+    }
+
+    private void ObservatoryButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_evaluationObservatoryWindow is null)
+        {
+            _evaluationObservatoryWindow = new EvaluationObservatoryWindow(_companionExchange) { Owner = this };
+            _evaluationObservatoryWindow.Closed += (_, _) => _evaluationObservatoryWindow = null;
+            _evaluationObservatoryWindow.Show();
+        }
+        else
+        {
+            if (_evaluationObservatoryWindow.WindowState == WindowState.Minimized)
+                _evaluationObservatoryWindow.WindowState = WindowState.Normal;
+            _evaluationObservatoryWindow.Activate();
         }
     }
 

@@ -13,10 +13,33 @@
         <SolidColorBrush x:Key="PanelBrush" Color="#111A2A" />
         <SolidColorBrush x:Key="CardBrush" Color="#162235" />
         <SolidColorBrush x:Key="BorderBrush" Color="#263550" />
-        <SolidColorBrush x:Key="PrimaryTextBrush" Color="#E8EEF8" />
-        <SolidColorBrush x:Key="SecondaryTextBrush" Color="#A6B2C7" />
+        <SolidColorBrush x:Key="PrimaryTextBrush" Color="#FFFFFF" />
+        <SolidColorBrush x:Key="SecondaryTextBrush" Color="#FFFFFF" />
         <SolidColorBrush x:Key="AccentBrush" Color="#46D3A6" />
         <SolidColorBrush x:Key="BlueBrush" Color="#6A9EFF" />
+        <!-- Native WPF ComboBox popups use SystemColors rather than the
+             control's Background setter. Keep the closed control and its
+             drop-down on the same dark surface. -->
+        <SolidColorBrush x:Key="{x:Static SystemColors.WindowBrushKey}" Color="#111A2A" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.WindowTextBrushKey}" Color="#FFFFFF" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.ControlBrushKey}" Color="#111A2A" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.ControlTextBrushKey}" Color="#FFFFFF" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.ControlLightBrushKey}" Color="#162235" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.ControlLightLightBrushKey}" Color="#162235" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.ControlDarkBrushKey}" Color="#263550" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.ControlDarkDarkBrushKey}" Color="#0B111D" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}" Color="#223552" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}" Color="#FFFFFF" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightBrushKey}" Color="#1D2B42" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightTextBrushKey}" Color="#FFFFFF" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.GrayTextBrushKey}" Color="#AAB7CC" />
+
+        <Style TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+        </Style>
+        <Style TargetType="Label">
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+        </Style>
 
         <Style TargetType="Button">
             <Setter Property="Background" Value="#1D2B42" />
@@ -52,6 +75,122 @@
             <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
             <Setter Property="Padding" Value="9,7" />
             <Setter Property="CaretBrush" Value="{StaticResource PrimaryTextBrush}" />
+        </Style>
+
+        <Style TargetType="PasswordBox">
+            <Setter Property="Background" Value="#0E1726" />
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Setter Property="Padding" Value="9,7" />
+            <Setter Property="CaretBrush" Value="{StaticResource PrimaryTextBrush}" />
+        </Style>
+
+        <Style TargetType="CheckBox">
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+        </Style>
+
+        <Style TargetType="ComboBox">
+            <Setter Property="Background" Value="#0E1726" />
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Setter Property="Padding" Value="7,4" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid SnapsToDevicePixels="True">
+                            <ToggleButton x:Name="ToggleButton" Focusable="False" ClickMode="Press"
+                                          IsChecked="{Binding IsDropDownOpen, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}"
+                                          Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                                          BorderThickness="1" Foreground="{TemplateBinding Foreground}">
+                                <Grid>
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="24"/></Grid.ColumnDefinitions>
+                                    <ContentPresenter x:Name="SelectionPresenter" Margin="7,3,2,3" VerticalAlignment="Center"
+                                                      Content="{TemplateBinding SelectionBoxItem}" ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                                      ContentStringFormat="{TemplateBinding SelectionBoxItemStringFormat}" />
+                                    <TextBox x:Name="PART_EditableTextBox" Grid.Column="0" Margin="5,1,2,1" Padding="3,1"
+                                             Background="#0E1726" Foreground="#FFFFFF" BorderThickness="0"
+                                             CaretBrush="#FFFFFF" Visibility="Hidden"
+                                             Text="{Binding Text, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    <Path Grid.Column="1" Margin="7,0" Fill="#FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                          Data="M 0 0 L 8 0 L 4 5 Z" />
+                                </Grid>
+                            </ToggleButton>
+                            <Popup x:Name="PART_Popup" Placement="Bottom" AllowsTransparency="True" Focusable="False"
+                                   IsOpen="{TemplateBinding IsDropDownOpen}" PopupAnimation="Fade">
+                                <Border x:Name="DropDownBorder" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
+                                        MaxHeight="300" Background="#111A2A" BorderBrush="#263550" BorderThickness="1" Padding="1">
+                                    <ScrollViewer CanContentScroll="True" Background="#111A2A" Foreground="#FFFFFF">
+                                        <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Contained" />
+                                    </ScrollViewer>
+                                </Border>
+                            </Popup>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsEditable" Value="True">
+                                <Setter TargetName="SelectionPresenter" Property="Visibility" Value="Hidden" />
+                                <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible" />
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="ToggleButton" Property="Background" Value="#162235" /></Trigger>
+                            <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.45" /></Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Setter Property="ItemContainerStyle">
+                <Setter.Value>
+                    <Style TargetType="ComboBoxItem">
+                        <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+                        <Setter Property="Background" Value="#111A2A" />
+                        <Setter Property="Padding" Value="8,5" />
+                        <Style.Triggers>
+                            <Trigger Property="IsHighlighted" Value="True"><Setter Property="Background" Value="#273B59" /></Trigger>
+                            <Trigger Property="IsSelected" Value="True"><Setter Property="Background" Value="#1D3854" /></Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style TargetType="ListBox">
+            <Setter Property="Background" Value="#0E1726" />
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+        </Style>
+        <Style TargetType="ListBoxItem">
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Padding" Value="8,7" />
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#1D2B42" /></Trigger>
+                <Trigger Property="IsSelected" Value="True"><Setter Property="Background" Value="#1D3854" /></Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style TargetType="DataGrid">
+            <Setter Property="Background" Value="#0E1726" />
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Setter Property="RowBackground" Value="#111A2A" />
+            <Setter Property="AlternatingRowBackground" Value="#0E1726" />
+            <Setter Property="GridLinesVisibility" Value="Horizontal" />
+            <Setter Property="HorizontalGridLinesBrush" Value="{StaticResource BorderBrush}" />
+        </Style>
+        <Style TargetType="DataGridColumnHeader">
+            <Setter Property="Background" Value="#162235" />
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Setter Property="Padding" Value="8,6" />
+        </Style>
+        <Style TargetType="DataGridCell">
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Setter Property="Padding" Value="5,3" />
+        </Style>
+        <Style TargetType="DataGridRow">
+            <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Style.Triggers>
+                <Trigger Property="IsSelected" Value="True"><Setter Property="Background" Value="#1D3854" /></Trigger>
+            </Style.Triggers>
         </Style>
 
         <Style x:Key="ThinScrollBarStyle" TargetType="ScrollBar">

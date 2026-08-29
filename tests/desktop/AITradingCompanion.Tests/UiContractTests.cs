@@ -111,6 +111,52 @@ public sealed class UiContractTests
     }
 
     [Fact]
+    public void DesktopDoesNotExposeLegacyProviderConfigurationOrQualityControls()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln")))
+            root = root.Parent;
+        Assert.NotNull(root);
+        var desktop = Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop");
+        var source = string.Join("\n", Directory.EnumerateFiles(desktop, "*.*", SearchOption.AllDirectories)
+            .Where(path => !path.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+            .Where(path => !path.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+            .Where(path => path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".xaml", StringComparison.OrdinalIgnoreCase))
+            .Select(File.ReadAllText));
+
+        Assert.DoesNotContain("ProviderSettings", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("ProviderQuality", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("configure-provider", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void HistoryListHeaderDoesNotDisplayTheRecordCount()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln")))
+            root = root.Parent;
+        Assert.NotNull(root);
+        var xaml = File.ReadAllText(Path.Combine(root.FullName!,
+            "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml"));
+
+        Assert.Contains("Text=\"历史列表\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Binding HistoryCount", xaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SelectedHistoryItemUsesAReadableForegroundAndBackground()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln"))) root = root.Parent;
+        Assert.NotNull(root);
+        var xaml = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml"));
+
+        Assert.Contains("Property=\"IsSelected\" Value=\"True\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Value=\"{StaticResource BlueBrush}\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Foreground\" Value=\"White\"", xaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void EveryRenderedAiAndUserMessageGetsAnOriginalTextCopyButton()
     {
         var root = new DirectoryInfo(AppContext.BaseDirectory);
@@ -174,12 +220,30 @@ public sealed class UiContractTests
         Assert.Contains("x:Name=\"EndDatePicker\"", xaml, StringComparison.Ordinal);
         Assert.Contains("Style TargetType=\"DatePickerTextBox\"", xaml, StringComparison.Ordinal);
         Assert.Contains("Style TargetType=\"Calendar\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Style TargetType=\"CalendarItem\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Style TargetType=\"CalendarButton\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Style TargetType=\"CalendarDayButton\"", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("x:Name=\"TimeBox\"", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("x:Name=\"StartDateBox\"", xaml, StringComparison.Ordinal);
         Assert.Contains("SelectedDate", taskWindowCode, StringComparison.Ordinal);
         var mainViewModel = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "ViewModels", "MainViewModel.cs"));
         Assert.DoesNotContain("· {SelectedMessage.Source}", mainViewModel, StringComparison.Ordinal);
         Assert.Contains("SourceTextFor", mainViewModel, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DesktopUsesRuntimeTradingDayProjectionForTodaysTaskList()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln"))) root = root.Parent;
+        Assert.NotNull(root);
+        var main = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml.cs"));
+        var viewModel = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "ViewModels", "MainViewModel.cs"));
+
+        Assert.Contains("RefreshTodayBoardAsync", main, StringComparison.Ordinal);
+        Assert.Contains("GetSnapshotAsync(\"today\"", viewModel, StringComparison.Ordinal);
+        Assert.Contains("is_trading_day", viewModel, StringComparison.Ordinal);
+        Assert.Contains("ForTradingDay", viewModel, StringComparison.Ordinal);
     }
 
     private static IEnumerable<T> Descendants<T>(DependencyObject root) where T : DependencyObject

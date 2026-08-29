@@ -13,7 +13,7 @@
 
 安装版位于 `%LOCALAPPDATA%\AITradingCompanion\app`；用户数据、数据库、草稿、窗口状态、运行日志和 Exchange 位于 `%LOCALAPPDATA%\AITradingCompanion`，均不写回安装目录。
 
-首次安装会创建隔离 Python 运行环境，并从 `scripts/requirements-runtime.txt` 安装本地交易日历依赖。Codex CLI 仍是研究阶段的本地 LLM 执行器；日程、投递、持久化、Markdown 投影和故障恢复均由应用自己的确定性运行时负责。
+首次安装会创建隔离 Python 运行环境，并从 `scripts/requirements-runtime.txt` 安装本地交易日历依赖。LLM 统一通过小电脑的 Provider Broker 调用；Broker 根 URL 仅由 `%LOCALAPPDATA%\AITradingCompanion\config\settings.local.json` 的 `broker.url` 设置（默认 `http://yosef-server:8817`），不使用 CPA、Provider API Key 或本地模型配置。日程、投递、持久化、Markdown 投影和故障恢复均由应用自己的确定性运行时负责。
 
 ## 目录
 

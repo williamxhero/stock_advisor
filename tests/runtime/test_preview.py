@@ -1,6 +1,7 @@
 import hashlib
 import copy
 import json
+import os
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -8,7 +9,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ai_trading_companion.engine import CompanionEngine
-from ai_trading_companion.preview import approve_bundle, prepare_preview_home, seal_bundle, source_fingerprint
+from ai_trading_companion.preview import (
+    BUNDLE_SCHEMA_VERSION, approve_bundle, build_bundle, prepare_preview_home, preview_signing_key, seal_bundle,
+    source_fingerprint,
+)
 from ai_trading_companion.store import CompanionStore
 
 
@@ -16,6 +20,8 @@ class PreviewTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.home = Path(self.temp.name) / "home"
+        self.environment = patch.dict(os.environ, {"AI_TRADING_COMPANION_HOME": str(self.home)})
+        self.environment.start()
         self.database = self.home / "data" / "trading-companion.sqlite3"
         self.store = CompanionStore(self.database)
         self.engine = CompanionEngine(self.store)
@@ -24,6 +30,7 @@ class PreviewTests(unittest.TestCase):
         )
 
     def tearDown(self):
+        self.environment.stop()
         self.temp.cleanup()
 
     def test_preview_database_snapshot_does_not_change_authoritative_files(self):
@@ -38,6 +45,26 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual("unchanged", marker.read_text(encoding="utf-8"))
         self.assertTrue((work / "data" / "trading-companion.sqlite3").exists())
         self.assertTrue(str(root).endswith("runtime\\previews\\preview-1"))
+
+    def test_default_preview_signer_stays_in_isolated_local_settings(self):
+        bundle = {"schema_version": BUNDLE_SCHEMA_VERSION, "preview_id": "signing-key-test"}
+        seal_bundle(bundle)
+        saved = json.loads((self.home / "config" / "settings.local.json").read_text(encoding="utf-8"))
+        self.assertTrue(saved["preview"]["signing_key"])
+        self.assertNotIn("signing_key", bundle)
+
+    def test_preview_signer_can_be_read_from_an_explicit_isolated_home(self):
+        isolated_home = self.home / "runtime" / "previews" / "preview-1" / "work"
+        isolated_home.mkdir(parents=True)
+        seal_bundle({"schema_version": BUNDLE_SCHEMA_VERSION})
+        settings = self.home / "config" / "settings.local.json"
+        target = isolated_home / "config" / "settings.local.json"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(settings.read_bytes())
+        self.assertEqual(
+            json.loads(settings.read_text(encoding="utf-8"))["preview"]["signing_key"],
+            preview_signing_key(create=False, home=isolated_home),
+        )
 
     def test_approval_is_provider_free_exact_and_idempotent(self):
         known_at = "2026-08-26T08:30:00Z"
@@ -62,7 +89,7 @@ class PreviewTests(unittest.TestCase):
             "coverage": [], "critical_gaps": [], "conflicts": [], "high_impact_events": [],
         }
         observation = {
-            "observation_id": "obs-1", "backend": "search_searxng", "status": "succeeded",
+            "observation_id": "obs-1", "backend": "gateway", "status": "succeeded",
             "non_empty": True, "result_urls": [source["url"]], "arguments": {"query": "8月26日收盘"},
             "result_items": [{
                 "url": source["url"], "title": source["title"], "result_item_hash": "item-1",
@@ -101,12 +128,12 @@ class PreviewTests(unittest.TestCase):
                 "output_sha256": hashlib.sha256(raw.encode()).hexdigest(), "created_at": known_at,
             })
         bundle = {
-            "schema_version": 1, "preview_id": "preview-approval", "source_cycle_id": self.source["cycle_id"],
+            "schema_version": BUNDLE_SCHEMA_VERSION, "preview_id": "preview-approval", "source_cycle_id": self.source["cycle_id"],
             "source_task_key": self.source["task_key"], "source_scheduled_for": self.source["scheduled_for"],
             "source_fingerprint": source_fingerprint(self.store, self.source["cycle_id"], known_at),
             "preview_cycle_id": "preview-cycle", "task_key": "daily.review.1520",
             "scheduled_for": self.source["scheduled_for"], "known_at": known_at,
-            "replay_mode": "current_reassessment", "qualification_version": 2, "cycle_state": "complete",
+            "replay_mode": "original_cycle_inputs", "qualification_version": 2, "cycle_state": "complete",
             "preview_status": "passed",
             "schedule_snapshot": {},
             "artifacts": [
@@ -165,7 +192,7 @@ class PreviewTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "qualified frozen M1"):
             approve_bundle(self.store, invalid_m2, signing_key=signing_key)
 
-        with patch("ai_trading_companion.provider_client.ProviderClient.run", side_effect=AssertionError("provider must not run")):
+        with patch("ai_trading_companion.broker_client.ProviderBrokerClient.invoke", side_effect=AssertionError("broker must not run")):
             with ThreadPoolExecutor(max_workers=2) as executor:
                 results = list(executor.map(
                     lambda _index: approve_bundle(self.store, bundle, signing_key=signing_key), range(2),
@@ -189,6 +216,42 @@ class PreviewTests(unittest.TestCase):
         self.store.transition(self.source["cycle_id"], "researching_m0")
         after = source_fingerprint(self.store, self.source["cycle_id"], known_at)
         self.assertNotEqual(before, after)
+
+    def test_preview_replays_original_cycle_as_of_and_tracks_current_known_at(self):
+        known_at = "2026-08-26T08:30:00Z"
+        preview = self.store.create_preview_cycle(self.source["cycle_id"], known_at)
+
+        self.assertEqual(self.source["as_of"], preview["as_of"])
+        snapshot = json.loads(preview["schedule_snapshot_json"])
+        self.assertEqual(known_at, snapshot["preview_known_at"])
+        self.assertEqual(self.source["scheduled_for"], snapshot["original_scheduled_for"])
+
+    def test_bundle_reports_broker_metadata_and_evidence_coverage(self):
+        known_at = "2026-08-26T08:30:00Z"
+        preview = self.store.create_preview_cycle(self.source["cycle_id"], known_at)
+        packet = {"stage": "m0_research", "as_of": known_at}
+        packet_raw = json.dumps(packet, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        packet_hash = hashlib.sha256(packet_raw.encode()).hexdigest()
+        packet["sha256"] = packet_hash
+        attempt = self.store.begin_attempt(
+            preview["cycle_id"], "m0_research", known_at, packet_hash, input_packet=packet,
+        )
+        output = {"coverage": [{"fact": "close", "covered": True}], "critical_gaps": [], "sources": [{"url": "https://example.test"}]}
+        self.store.finish_attempt(
+            attempt["attempt_id"], "succeeded", output=output, verifier={"passed": True},
+            broker_metadata={"provider": "broker-upstream", "intellect": "smart", "fulfilled_intellect": "expert",
+                             "request_id": "req-1", "cost_estimate": 0.25, "attempts": [{"provider": "broker-upstream", "status": "completed"}]},
+            actual_model="broker-selected-model",
+        )
+
+        bundle = build_bundle(
+            self.store, preview["cycle_id"], self.source["cycle_id"], "preview-report", known_at,
+        )
+
+        self.assertNotIn("provider_summary", bundle)
+        self.assertEqual("broker-selected-model", bundle["attempts"][0]["model"])
+        self.assertEqual("expert", bundle["attempts"][0]["broker_fulfilled_intellect"])
+        self.assertEqual(1, bundle["evidence_coverage"][0]["source_count"])
 
 
 if __name__ == "__main__":

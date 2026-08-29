@@ -15,15 +15,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .credentials import read_secret, write_secret
+from .config import settings_path
 from .evidence_gate import EvidenceGate
 from .router import CognitiveRouter
 from .secret_guard import assert_safe
 from .store import CompanionStore, digest, now
 
 
-BUNDLE_SCHEMA_VERSION = 1
-PREVIEW_SIGNING_CREDENTIAL = "AITradingCompanion/PreviewSigningKey"
+BUNDLE_SCHEMA_VERSION = 3
+PREVIEW_SIGNING_KEY_FIELD = "signing_key"
 
 
 def canonical_hash(value: dict[str, Any]) -> str:
@@ -35,14 +35,38 @@ def canonical_hash(value: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def preview_signing_key(*, create: bool) -> str:
-    key = read_secret(PREVIEW_SIGNING_CREDENTIAL)
+def preview_signing_key(*, create: bool, home: Path | None = None) -> str:
+    """Read the preview signer from the runtime-local settings file.
+
+    Preview approval must work from a copied, isolated runtime home.  Keeping the
+    signer in the same local configuration also removes the Windows Credential
+    Manager dependency without ever returning the value through a UI, audit, or
+    bundle payload.
+    """
+    configured_home = os.environ.get("AI_TRADING_COMPANION_HOME")
+    if home is None and configured_home:
+        home = Path(configured_home)
+    elif home is None:
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if not local_app_data:
+            raise RuntimeError("LOCALAPPDATA is required")
+        home = Path(local_app_data) / "AITradingCompanion"
+    path = settings_path(home)
+    data: dict[str, Any] = {}
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+    preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
+    key = str(preview.get(PREVIEW_SIGNING_KEY_FIELD) or "").strip()
     if key:
         return key
     if not create:
-        raise ValueError("preview signing credential is unavailable")
+        raise ValueError("preview signing key is unavailable from local settings")
     key = secrets.token_hex(32)
-    write_secret(PREVIEW_SIGNING_CREDENTIAL, key)
+    data["preview"] = {**preview, PREVIEW_SIGNING_KEY_FIELD: key}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
     return key
 
 
@@ -115,12 +139,6 @@ def prepare_preview_home(product_home: Path, database: Path, preview_id: str) ->
         source_path = product_home / relative
         if source_path.exists():
             shutil.copytree(source_path, work / relative, dirs_exist_ok=True)
-    browser_profile = product_home / "browser-profile"
-    if browser_profile.exists():
-        shutil.copytree(
-            browser_profile, work / "browser-profile", dirs_exist_ok=True,
-            ignore=shutil.ignore_patterns("Singleton*", "LOCK", "*.tmp", "Cache", "Code Cache", "GPUCache"),
-        )
     return root, work
 
 
@@ -149,7 +167,10 @@ def launch_preview(
     if completed.returncode != 0:
         raise RuntimeError((completed.stderr or completed.stdout or "preview worker failed")[-4000:])
     bundle = json.loads((root / "bundle.json").read_text(encoding="utf-8"))
-    verify_bundle(bundle)
+    # The worker seals the bundle with the signer copied into its isolated
+    # runtime home.  Verify with that same signer; the formal runtime must not
+    # need a signing key merely to inspect an isolated preview.
+    verify_bundle(bundle, signing_key=preview_signing_key(create=False, home=work))
     shutil.rmtree(work, ignore_errors=True)
     return bundle
 
@@ -166,8 +187,8 @@ def build_bundle(
     artifacts = store.artifacts(preview_cycle_id)
     attempts = store.attempts(preview_cycle_id)
     for attempt in attempts:
-        for key in ("usage_json", "verifier_json", "tool_trace_json", "input_packet_json", "output_json"):
-            attempt[key.removesuffix("_json")] = json.loads(attempt.get(key) or ("[]" if key == "tool_trace_json" else "{}"))
+        for key in ("usage_json", "verifier_json", "broker_attempts_json", "tool_trace_json", "input_packet_json", "output_json"):
+            attempt[key.removesuffix("_json")] = json.loads(attempt.get(key) or ("[]" if key in {"tool_trace_json", "broker_attempts_json"} else "{}"))
     with store.connection() as connection:
         snapshots = [dict(row) for row in connection.execute(
             "SELECT * FROM judgment_snapshot WHERE cycle_id=? ORDER BY created_at", (preview_cycle_id,),
@@ -186,6 +207,23 @@ def build_bundle(
     for artifact in artifacts:
         if artifact["kind"] in {"evidence", "m1_evidence"}:
             evidence[artifact["kind"]] = json.loads(artifact["body_markdown"])
+    evidence_coverage = []
+    for attempt in attempts:
+        if attempt.get("stage") not in {"m0_research", "m1_research"}:
+            continue
+        output = attempt.get("output") or {}
+        evidence_coverage.append({
+            "stage": attempt.get("stage"),
+            "packet_sha256": attempt.get("input_sha256"),
+            "qualified": bool((attempt.get("verifier") or {}).get("passed")),
+            "coverage": output.get("coverage") or [],
+            "critical_gaps": output.get("critical_gaps") or [],
+            "source_count": len(output.get("sources") or []),
+        })
+    report_body = {
+        item["kind"]: item["body_markdown"] for item in artifacts
+        if item["kind"] in {"m0", "m1", "m2", "stage_failure"}
+    }
     bundle: dict[str, Any] = {
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "preview_id": preview_id,
@@ -197,13 +235,15 @@ def build_bundle(
         "task_key": cycle["task_key"],
         "scheduled_for": cycle["scheduled_for"],
         "known_at": known_at,
-        "replay_mode": "current_reassessment",
+        "replay_mode": "original_cycle_inputs",
         "qualification_version": 2,
         "cycle_state": cycle["state"],
         "preview_status": "passed" if {"evidence", "m0", "m1_evidence", "m1"}.issubset({item["kind"] for item in artifacts}) else "failed",
         "schedule_snapshot": json.loads(cycle.get("schedule_snapshot_json") or "{}"),
         "artifacts": artifacts,
         "attempts": attempts,
+        "evidence_coverage": evidence_coverage,
+        "report_body": report_body,
         "stage_checkpoints": checkpoints,
         "evidence_ledger": ledger,
         "judgment_snapshots": snapshots,
@@ -324,7 +364,7 @@ def verify_bundle(
 def approve_bundle(
     store: CompanionStore, bundle: dict[str, Any], *, signing_key: str | None = None,
 ) -> dict[str, Any]:
-    """Import exact frozen outputs. This function never constructs a Provider client."""
+    """Import exact frozen outputs. This function never invokes the Broker."""
     verify_bundle(bundle, require_qualified=True, signing_key=signing_key)
     preview_id = str(bundle["preview_id"])
     with store.connection() as connection:
@@ -392,8 +432,9 @@ def approve_bundle(
                      attempt_id,cycle_id,stage,attempt_number,status,as_of,started_at,completed_at,input_sha256,
                      output_sha256,error,model,reasoning_effort,search_enabled,timeout_seconds,routing_reason,
                      is_shadow,duration_ms,usage_json,input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,
-                     verifier_json,runner_fingerprint,provider_response_id,provider_request_id,tool_trace_json,input_packet_json,output_json)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     verifier_json,runner_fingerprint,broker_provider,broker_intellect,broker_fulfilled_intellect,
+                     broker_request_id,broker_cost_estimate,broker_attempts_json,tool_trace_json,input_packet_json,output_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (new_id, cycle_id, original["stage"], original["attempt_number"], original["status"], original["as_of"],
                  original["started_at"], original["completed_at"], original.get("input_sha256"), original.get("output_sha256"),
                  original.get("error"), original.get("model"), original.get("reasoning_effort"), original.get("search_enabled"),
@@ -401,7 +442,8 @@ def approve_bundle(
                  json.dumps(original.get("usage") or {}, ensure_ascii=False, sort_keys=True), original.get("input_tokens"),
                  original.get("cached_input_tokens"), original.get("output_tokens"), original.get("reasoning_tokens"),
                  json.dumps(original.get("verifier") or {}, ensure_ascii=False, sort_keys=True), original.get("runner_fingerprint"),
-                 original.get("provider_response_id"), original.get("provider_request_id"),
+                 original.get("broker_provider"), original.get("broker_intellect"), original.get("broker_fulfilled_intellect"),
+                 original.get("broker_request_id"), original.get("broker_cost_estimate"), json.dumps(original.get("broker_attempts") or [], ensure_ascii=False, sort_keys=True),
                  json.dumps(original.get("tool_trace") or [], ensure_ascii=False, sort_keys=True),
                  json.dumps(original.get("input_packet") or {}, ensure_ascii=False, sort_keys=True),
                  json.dumps(original.get("output") or {}, ensure_ascii=False, sort_keys=True)),

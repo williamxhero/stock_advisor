@@ -382,6 +382,97 @@ class CompanionEngineTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(1, count)
 
+    def test_manual_analysis_request_creates_or_reuses_an_independent_formal_cycle(self):
+        request = {
+            "command_id": "manual-analysis-command-1",
+            "type": "request_formal_analysis",
+            "request_id": "analysis-request-1",
+            "task_key": "daily.review.1520",
+            "requested_at": "2026-08-29T10:00:00+08:00",
+            "source": {"conversation_cycle_id": "conversation-2026-08-29", "batch_id": "batch-1"},
+            "task_profile": {"profile_id": "non_trading_research", "version": 1},
+        }
+
+        created = self.engine.command(request)
+        replayed = self.engine.command({**request, "command_id": "manual-analysis-command-1-replay"})
+        another = self.engine.command({
+            **request,
+            "command_id": "manual-analysis-command-2",
+            "request_id": "analysis-request-2",
+            "source": {"conversation_cycle_id": "conversation-2026-08-29", "batch_id": "batch-2"},
+        })
+
+        self.assertEqual("created", created["receipt"]["state"])
+        self.assertEqual("reused", replayed["receipt"]["state"])
+        self.assertEqual(created["receipt"]["cycle_id"], replayed["receipt"]["cycle_id"])
+        self.assertEqual("created", another["receipt"]["state"])
+        self.assertNotEqual(created["receipt"]["cycle_id"], another["receipt"]["cycle_id"])
+        self.assertEqual("manual_chat", created["projection"]["cycle"]["trigger"])
+        self.assertEqual("analysis-request-1", created["projection"]["cycle"]["request_id"])
+        self.assertEqual("non_trading_research", created["projection"]["cycle"]["task_profile_id"])
+
+        today = self.engine.command({
+            "command_id": "manual-analysis-today", "type": "request_today_projections",
+            "scheduled_date": "2026-08-29",
+        })
+        self.assertEqual(
+            {created["receipt"]["cycle_id"], another["receipt"]["cycle_id"]},
+            {item["cycle"]["cycle_id"] for item in today["projections"]},
+        )
+
+    def test_manual_analysis_request_never_consumes_a_scheduled_occurrence(self):
+        manual = self.engine.command({
+            "command_id": "manual-at-scheduled-time",
+            "type": "request_formal_analysis",
+            "request_id": "analysis-request-at-scheduled-time",
+            "task_key": "daily.review.1520",
+            "requested_at": "2026-08-29T15:20:00+08:00",
+            "source": {"conversation_cycle_id": "conversation-2026-08-29", "batch_id": "batch-3"},
+            "task_profile": {"profile_id": "post_close_review", "version": 1},
+        })
+
+        scheduled = self.engine.start_cycle(
+            "daily.review.1520", "2026-08-29T15:20:00+08:00", "2026-08-29T15:20:00+08:00",
+        )
+
+        self.assertNotEqual(manual["receipt"]["cycle_id"], scheduled["cycle_id"])
+        self.assertEqual("manual_chat", manual["projection"]["cycle"]["trigger"])
+        self.assertEqual("scheduled", scheduled["trigger"])
+
+    def test_rejected_manual_analysis_request_returns_a_receipt_without_a_cycle(self):
+        result = self.engine.command({
+            "command_id": "rejected-manual-analysis",
+            "type": "request_formal_analysis",
+            "request_id": "invalid-analysis-request",
+            "task_key": "not-a-task-profile",
+            "requested_at": "2026-08-29T15:20:00+08:00",
+            "source": {"conversation_cycle_id": "conversation-2026-08-29", "batch_id": "batch-invalid"},
+            "task_profile": {"profile_id": "post_close_review", "version": 1},
+        })
+
+        self.assertEqual("rejected", result["receipt"]["state"])
+        self.assertEqual("invalid-analysis-request", result["receipt"]["request_id"])
+        self.assertIn("unregistered task_key", result["receipt"]["reason"])
+        today = self.engine.command({
+            "command_id": "rejected-manual-analysis-today", "type": "request_today_projections",
+            "scheduled_date": "2026-08-29",
+        })
+        self.assertEqual([], today["projections"])
+
+    def test_manual_analysis_request_requires_a_non_empty_stable_request_id(self):
+        result = self.engine.command({
+            "command_id": "empty-request-id",
+            "type": "request_formal_analysis",
+            "request_id": "",
+            "task_key": "daily.review.1520",
+            "requested_at": "2026-08-29T15:20:00+08:00",
+            "source": {"conversation_cycle_id": "conversation-2026-08-29", "batch_id": "batch-empty-id"},
+            "task_profile": {"profile_id": "post_close_review", "version": 1},
+        })
+
+        self.assertEqual("rejected", result["receipt"]["state"])
+        self.assertIn("request_id", result["receipt"]["reason"])
+
     def test_today_projection_request_replays_the_latest_cycle_per_task(self):
         ready = self.ready()
         with self.store.connection() as connection:

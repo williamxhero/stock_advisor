@@ -48,6 +48,9 @@ class CompanionStore:
               cycle_id TEXT PRIMARY KEY, task_key TEXT NOT NULL, scheduled_for TEXT NOT NULL,
               as_of TEXT NOT NULL, state TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
               kind TEXT NOT NULL DEFAULT 'scheduled', work_start_at TEXT,
+              trigger TEXT NOT NULL DEFAULT 'scheduled', request_id TEXT,
+              requested_at TEXT, request_source_json TEXT,
+              task_profile_id TEXT, task_profile_version INTEGER,
               human_deadline TEXT, voice_grace_deadline TEXT, m0_revealed_at TEXT,
               codex_session_id TEXT, packet_hash TEXT,
               m1_publish_deadline TEXT, h0_auto_submit_at TEXT, h0_locked_at TEXT,
@@ -114,6 +117,9 @@ class CompanionStore:
             CREATE TABLE IF NOT EXISTS companion_schedule_claim (
               task_key TEXT NOT NULL, scheduled_for TEXT NOT NULL, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               claimed_at TEXT NOT NULL, PRIMARY KEY(task_key, scheduled_for), UNIQUE(cycle_id));
+            CREATE TABLE IF NOT EXISTS companion_manual_analysis_claim (
+              request_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL UNIQUE REFERENCES companion_cycle(cycle_id),
+              claimed_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS companion_message (
               message_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               actor TEXT NOT NULL, state TEXT NOT NULL, phase TEXT NOT NULL,
@@ -293,7 +299,7 @@ class CompanionStore:
               imported_artifact_id TEXT, imported_at TEXT NOT NULL,
               detail_json TEXT NOT NULL,
               PRIMARY KEY(source_name, source_id));
-            PRAGMA user_version = 15;
+            PRAGMA user_version = 16;
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
@@ -313,6 +319,12 @@ class CompanionStore:
                 "private_context_json": "TEXT",
                 "private_context_sha256": "TEXT",
                 "private_context_frozen_at": "TEXT",
+                "trigger": "TEXT NOT NULL DEFAULT 'scheduled'",
+                "request_id": "TEXT",
+                "requested_at": "TEXT",
+                "request_source_json": "TEXT",
+                "task_profile_id": "TEXT",
+                "task_profile_version": "INTEGER",
             }.items():
                 if name not in cycle_columns:
                     c.execute(f"ALTER TABLE companion_cycle ADD COLUMN {name} {declaration}")
@@ -625,7 +637,10 @@ class CompanionStore:
             if claimed:
                 cycle_id = claimed["cycle_id"]
             else:
-                existing = c.execute("SELECT * FROM companion_cycle WHERE task_key=? AND scheduled_for=? ORDER BY created_at LIMIT 1", (task_key, scheduled_for)).fetchone()
+                existing = c.execute(
+                    "SELECT * FROM companion_cycle WHERE task_key=? AND scheduled_for=? AND trigger='scheduled' ORDER BY created_at LIMIT 1",
+                    (task_key, scheduled_for),
+                ).fetchone()
                 if existing:
                     cycle_id = existing["cycle_id"]
                 else:
@@ -639,6 +654,70 @@ class CompanionStore:
                     )
                 c.execute("INSERT INTO companion_schedule_claim(task_key,scheduled_for,cycle_id,claimed_at) VALUES(?,?,?,?)", (task_key, scheduled_for, cycle_id, at))
         return self.get_cycle(cycle_id)
+
+    def create_manual_analysis_cycle(
+        self,
+        *,
+        request_id: str,
+        task_key: str,
+        requested_at: str,
+        source: dict[str, Any],
+        task_profile_id: str,
+        task_profile_version: int,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create one manual formal-analysis occurrence without claiming a schedule slot.
+
+        The immutable request id, rather than wording or wall-clock time, is the
+        idempotency key.  A separately submitted request must remain free to
+        create another occurrence even when it is made at the same instant.
+        """
+        self.initialize()
+        cycle_id = str(uuid.uuid4())
+        claimed_at = now()
+        with self.connection() as c:
+            c.execute("BEGIN IMMEDIATE")
+            claim = c.execute(
+                "SELECT cycle_id FROM companion_manual_analysis_claim WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if claim:
+                return self.get_cycle(claim["cycle_id"], connection=c), False
+
+            # `scheduled_for` remains the existing cycle ordering/projection key.
+            # A manual occurrence has no schedule slot, so reserve a private
+            # microsecond key and retain the exact user-visible request time in
+            # `requested_at`.  This prevents it from consuming a future or
+            # recovery-created scheduled occurrence at the same wall-clock time.
+            scheduled_for = (
+                datetime.fromisoformat(requested_at.replace("Z", "+00:00")) + timedelta(microseconds=1)
+            ).isoformat(timespec="microseconds")
+            offset = 1
+            while c.execute(
+                "SELECT 1 FROM companion_cycle WHERE task_key=? AND scheduled_for=? AND revision=1",
+                (task_key, scheduled_for),
+            ).fetchone():
+                offset += 1
+                value = datetime.fromisoformat(requested_at.replace("Z", "+00:00")) + timedelta(microseconds=offset)
+                scheduled_for = value.isoformat(timespec="microseconds")
+
+            c.execute(
+                """INSERT INTO companion_cycle(
+                     cycle_id,task_key,scheduled_for,as_of,state,revision,kind,work_start_at,
+                     trigger,request_id,requested_at,request_source_json,task_profile_id,task_profile_version,
+                     created_at,updated_at
+                   ) VALUES(?,?,?,?, 'queued',1,'manual',?,?,?,?,?,?,?,?,?)""",
+                (
+                    cycle_id, task_key, scheduled_for, requested_at, requested_at,
+                    "manual_chat", request_id, requested_at,
+                    json.dumps(source, ensure_ascii=False, sort_keys=True), task_profile_id, task_profile_version,
+                    claimed_at, claimed_at,
+                ),
+            )
+            c.execute(
+                "INSERT INTO companion_manual_analysis_claim(request_id,cycle_id,claimed_at) VALUES(?,?,?)",
+                (request_id, cycle_id, claimed_at),
+            )
+            return self.get_cycle(cycle_id, connection=c), True
 
     def find_cycle(self, task_key: str, scheduled_for: str) -> dict[str, Any] | None:
         self.initialize()
@@ -660,8 +739,8 @@ class CompanionStore:
                        SELECT c.*,
                               COALESCE(a.artifact_count, 0) AS artifact_count,
                               COALESCE(m.message_count, 0) AS message_count,
-                              ROW_NUMBER() OVER (
-                                  PARTITION BY task_key
+                               ROW_NUMBER() OVER (
+                                  PARTITION BY CASE WHEN c.trigger='manual_chat' THEN c.cycle_id ELSE c.task_key END
                                   ORDER BY
                                       CASE WHEN c.state IN (
                                           'queued','researching_m0','awaiting_h0','voice_grace',

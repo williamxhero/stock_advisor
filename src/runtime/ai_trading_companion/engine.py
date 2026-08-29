@@ -49,6 +49,50 @@ class CompanionEngine:
         self.emit(cycle, "cycle.created", cycle)
         return cycle
 
+    def request_formal_analysis(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Create or reuse one manual formal-analysis occurrence from a stable request."""
+        missing = {"request_id", "task_key", "requested_at", "source", "task_profile"} - request.keys()
+        if missing:
+            raise ValueError(f"formal analysis request missing: {sorted(missing)}")
+        if not str(request["request_id"] or "").strip():
+            raise ValueError("formal analysis request request_id is required")
+        task_key = str(request["task_key"])
+        if task_key not in TASK_POLICIES:
+            raise ValueError(f"unregistered task_key: {task_key}")
+        requested_at = str(request["requested_at"])
+        requested = parse(requested_at)
+        if requested.tzinfo is None:
+            raise ValueError("requested_at must be timezone-aware")
+        source = request["source"]
+        if not isinstance(source, dict) or not source:
+            raise ValueError("formal analysis request source must be a non-empty object")
+        profile = request["task_profile"]
+        if not isinstance(profile, dict) or not str(profile.get("profile_id") or ""):
+            raise ValueError("formal analysis request task_profile.profile_id is required")
+        try:
+            profile_version = int(profile["version"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("formal analysis request task_profile.version is required") from exc
+        if profile_version < 1:
+            raise ValueError("formal analysis request task_profile.version must be positive")
+
+        cycle, created = self.store.create_manual_analysis_cycle(
+            request_id=str(request["request_id"]),
+            task_key=task_key,
+            requested_at=requested_at,
+            source=source,
+            task_profile_id=str(profile["profile_id"]),
+            task_profile_version=profile_version,
+        )
+        receipt = {
+            "kind": "analysis.request",
+            "state": "created" if created else "reused",
+            "request_id": str(request["request_id"]),
+            "cycle_id": cycle["cycle_id"],
+        }
+        self.emit(cycle, f"analysis.request.{receipt['state']}", {"cycle": cycle, "receipt": receipt})
+        return {"receipt": receipt, "projection": self._projection(cycle)}
+
     def start_diagnostic_rerun(self, source_cycle_id: str) -> dict[str, Any]:
         cycle = self.store.create_diagnostic_cycle(source_cycle_id)
         self.emit(cycle, "cycle.diagnostic_rerun.created", {
@@ -189,6 +233,20 @@ class CompanionEngine:
             result = {"scheduled_date": scheduled_date, "projections": projections}
         elif typ == "start_cycle":
             result = self.start_cycle(command["task_key"], command["scheduled_for"], command.get("as_of"))
+        elif typ == "request_formal_analysis":
+            try:
+                result = self.request_formal_analysis(command)
+            except ValueError as exc:
+                result = {
+                    "receipt": {
+                        "kind": "analysis.request",
+                        "state": "rejected",
+                        "request_id": str(command.get("request_id") or ""),
+                        "reason": str(exc),
+                    }
+                }
+            else:
+                cycle_id = result["receipt"]["cycle_id"]
         else:
             if not cycle_id:
                 raise ValueError("cycle_id required")

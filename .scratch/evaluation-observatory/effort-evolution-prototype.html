@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>动态 Effort 进化状态机原型</title>
+  <style>
+    :root { color-scheme: light; --ink:#17211b; --muted:#66736b; --line:#d7ded9; --paper:#f7f8f5; --card:#fff; --accent:#176b4d; --warn:#9c5a11; --bad:#a33434; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--paper); color:var(--ink); font:15px/1.55 Inter, "Segoe UI", "Microsoft YaHei", sans-serif; }
+    main { max-width:1080px; margin:0 auto; padding:44px 24px 72px; }
+    h1 { font-size:32px; line-height:1.15; margin:0 0 12px; letter-spacing:-.02em; }
+    h2 { font-size:19px; margin:0 0 16px; }
+    p { margin:0; }
+    .intro { max-width:850px; color:var(--muted); margin-bottom:28px; }
+    .panel { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:22px; margin-top:18px; }
+    .state-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+    .metric { border-left:3px solid var(--line); padding:4px 10px; min-height:58px; }
+    .metric strong { display:block; font-size:17px; margin-top:3px; overflow-wrap:anywhere; }
+    .label { color:var(--muted); font-size:12px; letter-spacing:.03em; }
+    .decision { border-left-color:var(--accent); }
+    .notice { margin-top:18px; padding:12px 14px; background:#edf5f0; border-radius:8px; color:#24543f; }
+    .notice.warn { background:#fff5e8; color:var(--warn); }
+    .notice.bad { background:#fff0ef; color:var(--bad); }
+    .button-row { display:flex; flex-wrap:wrap; gap:9px; }
+    button { appearance:none; border:1px solid var(--line); border-radius:8px; background:#fff; color:var(--ink); padding:9px 12px; font:inherit; cursor:pointer; }
+    button:hover { border-color:var(--accent); }
+    button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .tabs { display:flex; flex-wrap:wrap; gap:6px; border-bottom:1px solid var(--line); margin-bottom:18px; }
+    .tab { border:0; border-bottom:3px solid transparent; border-radius:0; background:transparent; color:var(--muted); }
+    .tab.active { border-bottom-color:var(--accent); color:var(--ink); }
+    .scenario p { color:var(--muted); margin-bottom:14px; }
+    .steps { display:grid; gap:8px; }
+    .step { display:flex; align-items:center; gap:12px; text-align:left; }
+    .step span { display:grid; place-items:center; flex:0 0 26px; height:26px; border-radius:50%; background:#e8ece9; font-size:12px; }
+    .step.done span { background:var(--accent); color:#fff; }
+    details { margin-top:18px; }
+    pre { overflow:auto; padding:14px; background:#111813; color:#dfe9e2; border-radius:8px; font:12px/1.55 Consolas, monospace; }
+    .history { margin:0; padding-left:21px; color:var(--muted); }
+    @media (max-width:760px) { .state-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>动态 Effort 进化状态机</h1>
+  <p class="intro">要验证的问题：在不使用“至少运行 4/6 次”这类固定门槛的前提下，系统能否依据置信区间宽度、数据完整性、市场状态覆盖和保护维度，安全地推荐 effort 晋升或回滚；并在“更快但质量下降”时把决定交给用户。</p>
+
+  <section class="panel">
+    <h2>当前认知策略</h2>
+    <div class="state-grid" id="stateGrid"></div>
+    <div class="notice" id="notice"></div>
+    <details>
+      <summary>查看完整状态（用于核对数据边界）</summary>
+      <pre id="rawState"></pre>
+    </details>
+  </section>
+
+  <section class="panel">
+    <h2>自由试验</h2>
+    <div class="button-row">
+      <button data-action="good_pair">加入：质量改善且准时</button>
+      <button data-action="fast_bad_pair">加入：更快但质量下降</button>
+      <button data-action="slow_good_pair">加入：质量提高但明显延迟</button>
+      <button data-action="new_regime_pair">加入：新市场状态的非劣结果</button>
+      <button data-action="incomplete_pair">加入：事实不完整的结果</button>
+      <button data-action="hard_fault">加入：硬性质量故障</button>
+      <button data-action="promote">应用获批晋升</button>
+      <button data-action="monitor_good">晋升后：稳定结果</button>
+      <button data-action="monitor_fault">晋升后：保护维度故障</button>
+      <button data-action="reset">重置</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>引导场景</h2>
+    <div class="tabs" id="tabs"></div>
+    <div class="scenario" id="scenario"></div>
+  </section>
+
+  <section class="panel">
+    <h2>状态变化记录</h2>
+    <ol class="history" id="history"></ol>
+  </section>
+</main>
+
+<script>
+// 可移植的纯逻辑模块。页面只负责 dispatch 和渲染。
+const EffortEvolution = (() => {
+  const initialState = () => ({
+    activePolicyVersion: "effort-policy/1",
+    activeEffort: "medium",
+    candidatePolicyVersion: "effort-policy/2-shadow",
+    candidateEffort: "high",
+    lifecycle: "shadow",
+    pairs: [],
+    postPromotion: [],
+    decision: "insufficient_evidence",
+    rationale: ["尚无足够信息判断候选策略"],
+    maturity: { effectiveWeight: 0, intervalWidth: null, completeness: 0, regimes: [], requiredRegimes: ["normal", "volatile"] },
+    history: ["开始 shadow：medium 对比 high"]
+  });
+
+  const samples = {
+    good_pair: { qualityDelta:.10, latencyDelta:-3, qualifiedBase:true, qualifiedCandidate:true, complete:true, regime:"normal", hardFault:false, label:"质量改善且准时" },
+    fast_bad_pair: { qualityDelta:-.12, latencyDelta:-11, qualifiedBase:true, qualifiedCandidate:true, complete:true, regime:"normal", hardFault:false, label:"更快但质量下降" },
+    slow_good_pair: { qualityDelta:.11, latencyDelta:13, qualifiedBase:true, qualifiedCandidate:true, complete:true, regime:"normal", hardFault:false, label:"质量提高但明显延迟" },
+    new_regime_pair: { qualityDelta:.07, latencyDelta:-1, qualifiedBase:true, qualifiedCandidate:true, complete:true, regime:"volatile", hardFault:false, label:"新市场状态非劣" },
+    incomplete_pair: { qualityDelta:.08, latencyDelta:-2, qualifiedBase:true, qualifiedCandidate:true, complete:false, regime:"normal", hardFault:false, label:"事实不完整" },
+    hard_fault: { qualityDelta:-1, latencyDelta:-2, qualifiedBase:true, qualifiedCandidate:false, complete:true, regime:"normal", hardFault:true, label:"硬性质量故障" },
+    monitor_good: { qualityDelta:.06, latencyDelta:-1, qualifiedBase:true, qualifiedCandidate:true, complete:true, regime:"volatile", hardFault:false, label:"晋升后稳定结果" },
+    monitor_fault: { qualityDelta:-1, latencyDelta:0, qualifiedBase:true, qualifiedCandidate:false, complete:true, regime:"volatile", hardFault:true, label:"晋升后保护维度故障" }
+  };
+
+  const round = n => Number(n.toFixed(3));
+  const mean = xs => xs.length ? xs.reduce((a,b) => a+b, 0) / xs.length : 0;
+  const effectivePairs = pairs => pairs.filter(p => p.complete);
+
+  function summarize(pairs) {
+    const usable = effectivePairs(pairs);
+    const totalWeight = usable.length;
+    const completeness = pairs.length ? usable.length / pairs.length : 0;
+    const regimes = [...new Set(usable.map(p => p.regime))].sort();
+    const qualityMean = mean(usable.map(p => p.qualityDelta));
+    // 原型使用有界差值的 anytime 风格保守宽度，只验证门的形状，不声明生产统计精度。
+    const intervalWidth = totalWeight ? Math.min(2, 1.45 / Math.sqrt(totalWeight)) : null;
+    const hardFault = usable.some(p => p.hardFault);
+    const fasterButWorse = usable.length > 0 && mean(usable.map(p => p.latencyDelta)) < -5 && qualityMean < -.03;
+    const slowerButBetter = usable.length > 0 && mean(usable.map(p => p.latencyDelta)) > 8 && qualityMean > .03;
+    const protectionNonInferior = !hardFault && qualityMean >= -.03 && usable.every(p => p.qualifiedCandidate || !p.qualifiedBase);
+    const materialImprovement = qualityMean >= .06 || (mean(usable.map(p => p.latencyDelta)) <= -5 && qualityMean >= -.01);
+    const requiredRegimes = ["normal", "volatile"];
+    const regimeCoverage = requiredRegimes.every(r => regimes.includes(r));
+    const mature = totalWeight > 0 && intervalWidth <= .52 && completeness >= .8 && regimeCoverage;
+    return {
+      maturity: { effectiveWeight:totalWeight, intervalWidth:intervalWidth === null ? null : round(intervalWidth), completeness:round(completeness), regimes, requiredRegimes },
+      qualityMean:round(qualityMean), latencyMean:round(mean(usable.map(p => p.latencyDelta))),
+      hardFault, fasterButWorse, slowerButBetter, protectionNonInferior, materialImprovement, mature
+    };
+  }
+
+  function assess(state) {
+    const s = summarize(state.lifecycle === "promoted" || state.lifecycle === "monitoring" ? state.postPromotion : state.pairs);
+    if ((state.lifecycle === "promoted" || state.lifecycle === "monitoring") && s.hardFault) {
+      return { ...state, lifecycle:"rolled_back", activePolicyVersion:"effort-policy/1", activeEffort:"medium", decision:"recommend_rollback", rationale:["晋升后保护维度出现硬性故障", "恢复上一可用策略版本"], maturity:s.maturity };
+    }
+    if (s.hardFault) return { ...state, lifecycle:"rejected", decision:"reject", rationale:["候选触发硬性质量故障", "固定次数不能覆盖保护维度退化"], maturity:s.maturity };
+    if (s.fasterButWorse) return { ...state, decision:"ask_user", rationale:["候选更快，但研究质量下降", "不同目标之间没有综合总分，需用户选择"], maturity:s.maturity };
+    if (s.slowerButBetter) return { ...state, decision:"ask_user", rationale:["研究质量改善，但交付明显延迟", "需确认是否接受价值窗口风险"], maturity:s.maturity };
+    if (!s.mature) {
+      const reasons = [];
+      if (s.maturity.intervalWidth === null || s.maturity.intervalWidth > .52) reasons.push("置信区间仍过宽");
+      if (s.maturity.completeness < .8) reasons.push("数据完整性不足");
+      if (!s.maturity.requiredRegimes.every(r => s.maturity.regimes.includes(r))) reasons.push("市场状态覆盖不足");
+      return { ...state, decision:"insufficient_evidence", rationale:reasons, maturity:s.maturity };
+    }
+    if (!s.protectionNonInferior) return { ...state, decision:"reject", rationale:["至少一个保护维度不满足非劣门"], maturity:s.maturity };
+    if (!s.materialImprovement) return { ...state, decision:"insufficient_evidence", rationale:["证据已成熟，但尚无材料性改善"], maturity:s.maturity };
+    return { ...state, lifecycle:"recommended", decision:"recommend_promotion", rationale:["至少一个维度材料性改善", "全部保护维度非劣", "成熟度由证据质量决定，而非固定运行次数"], maturity:s.maturity };
+  }
+
+  function reduce(state, action) {
+    if (action.type === "reset") return initialState();
+    if (samples[action.type]) {
+      if (["rejected", "rolled_back"].includes(state.lifecycle)) return { ...state, history:[...state.history, `忽略“${samples[action.type].label}”：当前生命周期已结束`] };
+      const target = ["promoted", "monitoring"].includes(state.lifecycle) ? "postPromotion" : "pairs";
+      return assess({ ...state, [target]:[...state[target], samples[action.type]], lifecycle:target === "postPromotion" ? "monitoring" : state.lifecycle, history:[...state.history, `记录：${samples[action.type].label}`] });
+    }
+    if (action.type === "promote") {
+      if (state.decision !== "recommend_promotion") return { ...state, history:[...state.history, "拒绝晋升：尚无可应用的晋升建议"] };
+      return { ...state, lifecycle:"promoted", activePolicyVersion:"effort-policy/2", activeEffort:state.candidateEffort, decision:"insufficient_evidence", rationale:["晋升已由治理链路应用，进入保护期监控"], postPromotion:[], history:[...state.history, "治理批准并应用候选策略"] };
+    }
+    return state;
+  }
+
+  return { initialState, reduce };
+})();
+
+const scenarios = [
+  { title:"4 次也可否决", description:"先累积三个好结果，再出现一次硬性质量故障。观察系统立即 reject，而不是因为‘还没到固定次数’继续等待。", actions:["good_pair","good_pair","new_regime_pair","hard_fault"] },
+  { title:"6 次仍可不足", description:"连续六次只覆盖 normal 市场。即使样本看起来不少，volatile 缺失仍使证据不足。", actions:["good_pair","good_pair","good_pair","good_pair","good_pair","good_pair"] },
+  { title:"成熟后推荐", description:"持续加入完整、跨市场状态的非劣结果，直到区间宽度和覆盖同时满足动态成熟度。", actions:["good_pair","new_regime_pair","good_pair","new_regime_pair","good_pair","new_regime_pair","good_pair","new_regime_pair"] },
+  { title:"晋升后回滚", description:"先取得推荐并应用，再在监控期加入硬性质量故障。观察策略回到上一版本。", actions:["good_pair","new_regime_pair","good_pair","new_regime_pair","good_pair","new_regime_pair","good_pair","new_regime_pair","promote","monitor_good","monitor_fault"] },
+  { title:"更快但质量下降", description:"候选持续更快，但质量明显下降。系统不计算综合总分，决定进入 ask_user。", actions:["fast_bad_pair","fast_bad_pair"] }
+];
+
+let state = EffortEvolution.initialState();
+let activeScenario = 0;
+let scenarioStep = 0;
+const labels = { shadow:"Shadow 验证", recommended:"等待治理批准", promoted:"已晋升", monitoring:"晋升后监控", rejected:"候选已拒绝", rolled_back:"已回滚" };
+
+function render() {
+  const fields = [
+    ["当前策略", `${state.activePolicyVersion} · ${state.activeEffort}`],
+    ["候选策略", `${state.candidatePolicyVersion} · ${state.candidateEffort}`],
+    ["生命周期", labels[state.lifecycle] || state.lifecycle],
+    ["治理建议", state.decision],
+    ["有效权重", state.maturity.effectiveWeight],
+    ["区间宽度", state.maturity.intervalWidth ?? "尚不可估"],
+    ["数据完整性", `${Math.round(state.maturity.completeness * 100)}%`],
+    ["市场状态", state.maturity.regimes.length ? state.maturity.regimes.join("、") : "尚无"]
+  ];
+  document.querySelector("#stateGrid").innerHTML = fields.map((f,i) => `<div class="metric ${i===3?'decision':''}"><span class="label">${f[0]}</span><strong>${f[1]}</strong></div>`).join("");
+  const notice = document.querySelector("#notice");
+  notice.className = `notice ${["reject","recommend_rollback"].includes(state.decision)?'bad':state.decision==='ask_user'?'warn':''}`;
+  notice.textContent = state.rationale.join("；");
+  document.querySelector("#rawState").textContent = JSON.stringify(state, null, 2);
+  document.querySelector("#history").innerHTML = state.history.map(x => `<li>${x}</li>`).join("");
+  renderScenario();
+}
+
+function dispatch(type) { state = EffortEvolution.reduce(state, {type}); render(); }
+
+function selectScenario(index) {
+  activeScenario = index; scenarioStep = 0; state = EffortEvolution.initialState(); render();
+}
+
+function renderScenario() {
+  document.querySelector("#tabs").innerHTML = scenarios.map((s,i) => `<button class="tab ${i===activeScenario?'active':''}" data-tab="${i}">${s.title}</button>`).join("");
+  const s = scenarios[activeScenario];
+  document.querySelector("#scenario").innerHTML = `<p>${s.description}</p><div class="steps">${s.actions.map((a,i) => `<button class="step ${i<scenarioStep?'done':''}" data-step="${i}" ${i!==scenarioStep?'disabled':''}><span>${i<scenarioStep?'✓':i+1}</span>${actionLabel(a)}</button>`).join("")}</div>`;
+}
+
+function actionLabel(action) {
+  return ({good_pair:"记录质量改善且准时",new_regime_pair:"记录 volatile 市场非劣",hard_fault:"记录硬性质量故障",fast_bad_pair:"记录更快但质量下降",promote:"治理批准并应用晋升",monitor_good:"记录晋升后稳定结果",monitor_fault:"记录晋升后保护维度故障"})[action] || action;
+}
+
+document.addEventListener("click", event => {
+  const action = event.target.closest("[data-action]")?.dataset.action;
+  if (action) dispatch(action);
+  const tab = event.target.closest("[data-tab]")?.dataset.tab;
+  if (tab !== undefined) selectScenario(Number(tab));
+  const step = event.target.closest("[data-step]")?.dataset.step;
+  if (step !== undefined && Number(step) === scenarioStep) {
+    dispatch(scenarios[activeScenario].actions[scenarioStep]);
+    scenarioStep += 1;
+    render();
+  }
+});
+
+render();
+</script>
+</body>
+</html>

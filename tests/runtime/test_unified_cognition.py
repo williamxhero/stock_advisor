@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -12,12 +12,19 @@ from ai_trading_companion.__main__ import run_unified_cognition
 from ai_trading_companion.broker_client import BrokerResponse
 from ai_trading_companion.cognition import ReplyMarkdownStream, UnifiedCognition
 from ai_trading_companion.engine import CompanionEngine
+from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.packet_builder import RuntimePacketBuilder
 from ai_trading_companion.portfolio import PortfolioService
 from ai_trading_companion.store import CompanionStore
+from ai_trading_companion.task_profiles import ManualAnalysisProfileResolver
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+class _WeekdayCalendar:
+    def is_trading_day(self, value: date) -> bool:
+        return value.weekday() < 5
 
 
 class UnifiedCognitionTests(unittest.TestCase):
@@ -25,7 +32,11 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.store = CompanionStore(self.root / "runtime.sqlite3")
-        self.engine = CompanionEngine(self.store)
+        calendar = _WeekdayCalendar()
+        self.engine = CompanionEngine(
+            self.store, task_profiles=ManualAnalysisProfileResolver(calendar),
+            evidence_contract_factory=EvidenceContractFactory(calendar),
+        )
         self.portfolio = PortfolioService(self.root, self.store)
 
     def tearDown(self) -> None:
@@ -92,6 +103,8 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.assertEqual("standard", request.intellect)
         self.assertNotIn("tools", json.dumps(request.packet, ensure_ascii=False))
         self.assertEqual("记住了", output["reply_markdown"])
+        with self.store.connection() as connection:
+            self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM companion_cycle WHERE trigger='manual_chat'").fetchone()[0])
 
     def test_auto_submit_claim_is_once_per_formal_task(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-08-27")
@@ -196,6 +209,127 @@ class UnifiedCognitionTests(unittest.TestCase):
         with self.store.connection() as connection:
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM portfolio_interpretation_job").fetchone()[0])
 
+    def test_explicit_analysis_intent_creates_a_formal_cycle_after_its_receipt(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-08-27")
+        text = "Analyze the AI sector for the current session."
+        self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="analysis")
+        batch_id, messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        artifact = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text, conversation["as_of"], {"batch_id": batch_id}
+        )
+
+        outcome = UnifiedCognition(self.store, self.portfolio, self.engine).apply(
+            conversation, artifact, messages, "conversation",
+            {"reply_markdown": "I will verify it.", "needs_fresh_search": False, "public_search_request": None,
+             "propositions": [], "actions": [self._analysis_action("analysis", text)]},
+        )
+
+        receipt = outcome.receipts[0]
+        self.assertEqual("created", receipt["state"], receipt)
+        cycle = self.store.get_cycle(receipt["cycle_id"])
+        self.assertEqual("manual_chat", cycle["trigger"])
+        self.assertEqual("analysis", json.loads(cycle["request_source_json"])["message_id"])
+        self.assertIn("正式研判任务已创建", outcome.reply_markdown)
+
+    def test_brokered_natural_language_analysis_request_uses_the_formal_orchestrator(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-08-27")
+        text = "Analyze the AI sector for the current session."
+        self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="broker-analysis")
+        batch_id, messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        created = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text, conversation["as_of"], {"batch_id": batch_id}
+        )
+        source = next(item for item in self.store.artifacts(conversation["cycle_id"])
+                      if item["artifact_id"] == created["artifact_id"])
+        model_result = {
+            "reply_markdown": "I will verify it.", "needs_fresh_search": False, "public_search_request": None,
+            "propositions": [], "actions": [self._analysis_action("broker-analysis", text)],
+        }
+        broker = Mock()
+        broker.invoke.return_value = BrokerResponse(
+            output_text=json.dumps(model_result), result=model_result, actual_model="test", provider="fake",
+            intellect="standard", fulfilled_intellect="standard", request_id="analysis-request",
+        )
+
+        with patch("ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker):
+            output = run_unified_cognition(
+                self.engine, self.store, self.portfolio, conversation["cycle_id"], source,
+                messages, [batch_id], True, mode="conversation",
+            )
+
+        self.assertEqual("created", output["receipts"][0]["state"])
+        self.assertIn("正式研判任务已创建", output["reply_markdown"])
+        with self.store.connection() as connection:
+            self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM companion_cycle WHERE trigger='manual_chat'").fetchone()[0])
+
+    def test_ambiguous_analysis_intent_needs_clarification_without_creating_a_cycle(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-08-27")
+        text = "Analyze this."
+        self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="ambiguous")
+        batch_id, messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        artifact = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text, conversation["as_of"], {"batch_id": batch_id}
+        )
+        action = self._analysis_action("ambiguous", text)
+        action["subject"] = ""
+
+        outcome = UnifiedCognition(self.store, self.portfolio, self.engine).apply(
+            conversation, artifact, messages, "conversation",
+            {"reply_markdown": "Please clarify.", "needs_fresh_search": False, "public_search_request": None,
+             "propositions": [], "actions": [action]},
+        )
+
+        self.assertEqual("needs_clarification", outcome.receipts[0]["state"])
+        with self.store.connection() as connection:
+            self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM companion_cycle WHERE trigger='manual_chat'").fetchone()[0])
+
+    def test_invalid_analysis_span_is_local_and_does_not_block_a_valid_portfolio_action(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-08-27")
+        text = "总资产是24万元；分析AI板块。"
+        self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="mixed")
+        batch_id, messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        artifact = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text, conversation["as_of"], {"batch_id": batch_id}
+        )
+        analysis = self._analysis_action("mixed", text)
+        analysis["source_span"]["quote"] = "not in the immutable source"
+
+        outcome = UnifiedCognition(self.store, self.portfolio, self.engine).apply(
+            conversation, artifact, messages, "conversation",
+            {"reply_markdown": "Received.", "needs_fresh_search": False, "public_search_request": None,
+             "propositions": [], "actions": [self._asset_action("mixed", text), analysis]},
+        )
+
+        self.assertEqual("applied", outcome.receipts[0]["state"])
+        self.assertEqual("rejected", outcome.receipts[1]["state"])
+        self.assertEqual(240000, self.portfolio.snapshot()["total_assets"])
+        with self.store.connection() as connection:
+            self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM companion_cycle WHERE trigger='manual_chat'").fetchone()[0])
+
+    def test_one_batch_can_record_a_fact_apply_portfolio_and_create_analysis(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-08-27")
+        text = "总资产是24万元；分析AI板块。"
+        self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="complete-mixed")
+        batch_id, messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        artifact = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text, conversation["as_of"], {"batch_id": batch_id}
+        )
+        proposition = {
+            "kind": "user_fact", "subject": "user.account", "predicate": "total_assets",
+            "object_json": "240000", "confidence": 1.0, "supersedes_id": None,
+            "source_span": {"message_id": "complete-mixed", "start": 0, "end": len(text), "quote": text},
+        }
+
+        outcome = UnifiedCognition(self.store, self.portfolio, self.engine).apply(
+            conversation, artifact, messages, "conversation",
+            {"reply_markdown": "Received.", "needs_fresh_search": False, "public_search_request": None,
+             "propositions": [proposition],
+             "actions": [self._asset_action("complete-mixed", text), self._analysis_action("complete-mixed", text)]},
+        )
+
+        self.assertEqual(1, outcome.propositions_recorded)
+        self.assertEqual(["applied", "created"], [item["state"] for item in outcome.receipts])
+
     def test_user_correction_supersedes_only_the_same_personal_fact(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-08-27")
         first_text = "我喜欢短线"
@@ -244,6 +378,14 @@ class UnifiedCognitionTests(unittest.TestCase):
                              "average_cost": None, "total_assets": "24万元"},
             }],
             "workflow_proposal": None,
+            "source_span": {"message_id": message_id, "start": 0, "end": len(text), "quote": text},
+        }
+
+    @staticmethod
+    def _analysis_action(message_id: str, text: str) -> dict:
+        return {
+            "action_type": "analysis.request", "subject": "AI sector", "time_scope": "current_session",
+            "goal": "verify current risks and opportunities",
             "source_span": {"message_id": message_id, "start": 0, "end": len(text), "quote": text},
         }
 

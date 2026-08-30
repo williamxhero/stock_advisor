@@ -6,128 +6,62 @@
   "properties": {
     "reply_markdown": {"type": ["string", "null"]},
     "needs_fresh_search": {"type": "boolean"},
-    "public_search_request": {
-      "anyOf": [
-        {"type": "null"},
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["topics", "questions"],
-          "properties": {
-            "topics": {"type": "array", "items": {"type": "string"}},
-            "questions": {"type": "array", "items": {"type": "string"}}
-          }
-        }
-      ]
-    },
-    "propositions": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["kind", "subject", "predicate", "object_json", "confidence", "supersedes_id", "source_span"],
-        "properties": {
-          "kind": {"enum": ["user_fact", "user_view", "external_claim", "ai_inference"]},
-          "subject": {"type": "string"},
-          "predicate": {"type": "string"},
-          "object_json": {"type": "string"},
-          "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
-          "supersedes_id": {"type": ["string", "null"]},
-          "source_span": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["message_id", "start", "end", "quote"],
-            "properties": {
-              "message_id": {"type": "string"},
-              "start": {"type": "integer", "minimum": 0},
-              "end": {"type": "integer", "minimum": 0},
-              "quote": {"type": "string", "minLength": 1}
-            }
-          }
-        }
-      }
-    },
-    "actions": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["action_type", "statement_type", "changes", "workflow_proposal", "source_span"],
-        "properties": {
-          "action_type": {"enum": ["portfolio.apply", "portfolio.replace_complete_snapshot", "workflow.propose"]},
-          "statement_type": {"enum": ["executed", "current_state", "planned", "none"]},
-          "changes": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["action", "code", "name", "shares", "price", "average_cost", "total_assets", "occurred_at", "evidence"],
-              "properties": {
-                "action": {"enum": ["buy", "sell", "sell_all", "position_correction", "asset_correction"]},
-                "code": {"type": ["string", "null"]},
-                "name": {"type": ["string", "null"]},
-                "shares": {"type": ["integer", "null"]},
-                "price": {"type": ["number", "null"]},
-                "average_cost": {"type": ["number", "null"]},
-                "total_assets": {"type": ["number", "null"]},
-                "occurred_at": {"type": ["string", "null"]},
-                "evidence": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["instrument", "action", "shares", "price", "average_cost", "total_assets"],
-                  "properties": {
-                    "instrument": {"type": ["string", "null"]},
-                    "action": {"type": ["string", "null"]},
-                    "shares": {"type": ["string", "null"]},
-                    "price": {"type": ["string", "null"]},
-                    "average_cost": {"type": ["string", "null"]},
-                    "total_assets": {"type": ["string", "null"]}
-                  }
-                }
-              }
-            }
-          },
-          "workflow_proposal": {
-            "anyOf": [
-              {"type": "null"},
-              {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["category", "title", "problem", "change", "evidence", "policy_patch"],
-                "properties": {
-                  "category": {"enum": ["workflow_efficiency", "search_coverage", "investment_method"]},
-                  "title": {"type": "string"},
-                  "problem": {"type": "string"},
-                  "change": {"type": "string"},
-                  "evidence": {"type": "array", "items": {"type": "string"}},
-                  "policy_patch": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["add_categories", "add_standing_questions", "add_counterevidence_questions", "add_method_hypotheses"],
-                    "properties": {
-                      "add_categories": {"type": "array", "items": {"type": "string"}},
-                      "add_standing_questions": {"type": "array", "items": {"type": "string"}},
-                      "add_counterevidence_questions": {"type": "array", "items": {"type": "string"}},
-                      "add_method_hypotheses": {"type": "array", "items": {"type": "string"}}
-                    }
-                  }
-                }
-              }
-            ]
-          },
-          "source_span": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["message_id", "start", "end", "quote"],
-            "properties": {
-              "message_id": {"type": "string"},
-              "start": {"type": "integer", "minimum": 0},
-              "end": {"type": "integer", "minimum": 0},
-              "quote": {"type": "string", "minLength": 1}
-            }
-          }
-        }
-      }
-    }
+    "public_search_request": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/search_request"}]},
+    "propositions": {"type": "array", "items": {"$ref": "#/$defs/proposition"}},
+    "actions": {"type": "array", "items": {"oneOf": [
+      {"$ref": "#/$defs/portfolio_apply"},
+      {"$ref": "#/$defs/portfolio_snapshot"},
+      {"$ref": "#/$defs/workflow_proposal"},
+      {"$ref": "#/$defs/analysis_request"}
+    ]}}
+  },
+  "$defs": {
+    "search_request": {"type": "object", "additionalProperties": false, "required": ["topics", "questions"], "properties": {
+      "topics": {"type": "array", "items": {"type": "string"}},
+      "questions": {"type": "array", "items": {"type": "string"}}
+    }},
+    "source_span": {"type": "object", "additionalProperties": false, "required": ["message_id", "start", "end", "quote"], "properties": {
+      "message_id": {"type": "string"}, "start": {"type": "integer", "minimum": 0},
+      "end": {"type": "integer", "minimum": 0}, "quote": {"type": "string", "minLength": 1}
+    }},
+    "proposition": {"type": "object", "additionalProperties": false, "required": ["kind", "subject", "predicate", "object_json", "confidence", "supersedes_id", "source_span"], "properties": {
+      "kind": {"enum": ["user_fact", "user_view", "external_claim", "ai_inference"]},
+      "subject": {"type": "string"}, "predicate": {"type": "string"}, "object_json": {"type": "string"},
+      "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "supersedes_id": {"type": ["string", "null"]},
+      "source_span": {"$ref": "#/$defs/source_span"}
+    }},
+    "evidence": {"type": "object", "additionalProperties": false, "required": ["instrument", "action", "shares", "price", "average_cost", "total_assets"], "properties": {
+      "instrument": {"type": ["string", "null"]}, "action": {"type": ["string", "null"]}, "shares": {"type": ["string", "null"]},
+      "price": {"type": ["string", "null"]}, "average_cost": {"type": ["string", "null"]}, "total_assets": {"type": ["string", "null"]}
+    }},
+    "change": {"type": "object", "additionalProperties": false, "required": ["action", "code", "name", "shares", "price", "average_cost", "total_assets", "occurred_at", "evidence"], "properties": {
+      "action": {"enum": ["buy", "sell", "sell_all", "position_correction", "asset_correction"]},
+      "code": {"type": ["string", "null"]}, "name": {"type": ["string", "null"]}, "shares": {"type": ["integer", "null"]},
+      "price": {"type": ["number", "null"]}, "average_cost": {"type": ["number", "null"]}, "total_assets": {"type": ["number", "null"]},
+      "occurred_at": {"type": ["string", "null"]}, "evidence": {"$ref": "#/$defs/evidence"}
+    }},
+    "portfolio_apply": {"type": "object", "additionalProperties": false, "required": ["action_type", "statement_type", "changes", "source_span"], "properties": {
+      "action_type": {"const": "portfolio.apply"}, "statement_type": {"enum": ["executed", "current_state", "planned", "none"]},
+      "changes": {"type": "array", "items": {"$ref": "#/$defs/change"}}, "source_span": {"$ref": "#/$defs/source_span"}
+    }},
+    "portfolio_snapshot": {"type": "object", "additionalProperties": false, "required": ["action_type", "changes", "source_span"], "properties": {
+      "action_type": {"const": "portfolio.replace_complete_snapshot"}, "changes": {"type": "array", "items": {"$ref": "#/$defs/change"}},
+      "source_span": {"$ref": "#/$defs/source_span"}
+    }},
+    "workflow_patch": {"type": "object", "additionalProperties": false, "required": ["add_categories", "add_standing_questions", "add_counterevidence_questions", "add_method_hypotheses"], "properties": {
+      "add_categories": {"type": "array", "items": {"type": "string"}}, "add_standing_questions": {"type": "array", "items": {"type": "string"}},
+      "add_counterevidence_questions": {"type": "array", "items": {"type": "string"}}, "add_method_hypotheses": {"type": "array", "items": {"type": "string"}}
+    }},
+    "workflow_payload": {"type": "object", "additionalProperties": false, "required": ["category", "title", "problem", "change", "evidence", "policy_patch"], "properties": {
+      "category": {"enum": ["workflow_efficiency", "search_coverage", "investment_method"]}, "title": {"type": "string"}, "problem": {"type": "string"},
+      "change": {"type": "string"}, "evidence": {"type": "array", "items": {"type": "string"}}, "policy_patch": {"$ref": "#/$defs/workflow_patch"}
+    }},
+    "workflow_proposal": {"type": "object", "additionalProperties": false, "required": ["action_type", "workflow_proposal", "source_span"], "properties": {
+      "action_type": {"const": "workflow.propose"}, "workflow_proposal": {"$ref": "#/$defs/workflow_payload"}, "source_span": {"$ref": "#/$defs/source_span"}
+    }},
+    "analysis_request": {"type": "object", "additionalProperties": false, "required": ["action_type", "subject", "time_scope", "goal", "source_span"], "properties": {
+      "action_type": {"const": "analysis.request"}, "subject": {"type": "string", "minLength": 1},
+      "time_scope": {"type": "string", "minLength": 1}, "goal": {"type": "string", "minLength": 1}, "source_span": {"$ref": "#/$defs/source_span"}
+    }}
   }
 }

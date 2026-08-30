@@ -1296,7 +1296,7 @@ def run_unified_cognition(
     if not messages:
         raise RuntimeError("no submitted messages for cognition")
     cycle = store.get_cycle(cycle_id)
-    cognition = UnifiedCognition(store, portfolio)
+    cognition = UnifiedCognition(store, portfolio, engine)
     job = store.start_cognition_job(cycle_id, source["artifact_id"], mode, source["body_markdown"])
     stream = None
     try:

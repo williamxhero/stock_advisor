@@ -8,6 +8,7 @@ from typing import Any
 from .learning import WorkflowEvolution
 from .portfolio import explicit_fixture_extraction, is_portfolio_statement
 from .store import digest
+from .task_profiles import AnalysisClarificationRequired
 
 
 @dataclass(frozen=True)
@@ -81,9 +82,10 @@ class ReplyMarkdownStream:
 class UnifiedCognition:
     """One semantic pass, followed by small deterministic capability executors."""
 
-    def __init__(self, store: Any, portfolio: Any) -> None:
+    def __init__(self, store: Any, portfolio: Any, engine: Any | None = None) -> None:
         self.store = store
         self.portfolio = portfolio
+        self.engine = engine
 
     @staticmethod
     def prompt(cycle: dict[str, Any], messages: list[dict[str, Any]], mode: str, memories: list[dict[str, Any]]) -> str:
@@ -92,7 +94,8 @@ class UnifiedCognition:
             "你是用户长期使用的同一个炒股伙伴。逐命题区分：用户自己的持仓、成交、资金、偏好和经历，"
             "以用户陈述为个人事实；用户对市场和外部世界的判断只是待核验观点，你必须独立判断。"
             "混合句按命题拆开，歧义只阻塞依赖它的动作。一次输出自然回复、可长期记住的命题和受控动作。"
-            "动作只能是 portfolio.apply、portfolio.replace_complete_snapshot 或 workflow.propose。持仓表默认是局部更新；"
+            "动作只能是 portfolio.apply、portfolio.replace_complete_snapshot、workflow.propose 或 analysis.request。"
+            "analysis.request 只表达明确的 subject、time_scope 和 goal；不得指定任务键、日程、证据策略或内部 ID。持仓表默认是局部更新；"
             "只有原文明确说明这是完整账户/全部持仓快照时，才能使用 replace_complete_snapshot；否则绝不能把缺失股票推成零。"
             "普通聊天绝不修订正式 M1/M2。"
             "不得宣称动作已经成功，系统会在本地执行后追加真实回执。每个命题和动作必须引用单条原消息的精确字符区间，"
@@ -137,7 +140,7 @@ class UnifiedCognition:
                 })
             actions.append({
                 "action_type": "portfolio.apply", "statement_type": extraction.get("statement_type", "none"),
-                "changes": changes, "workflow_proposal": None,
+                "changes": changes,
                 "source_span": {"message_id": message["message_id"], "start": 0, "end": len(text), "quote": text},
             })
         return {
@@ -232,6 +235,34 @@ class UnifiedCognition:
                 message["body_text"], action.get("changes") or [], cycle["cycle_id"], source_artifact["artifact_id"]
             )
             return {"action_id": action_id, "action_type": action_type, **applied}
+        if action_type == "analysis.request":
+            if self.engine is None:
+                return {"action_id": action_id, "action_type": action_type, "state": "failed", "reason": "formal analysis orchestrator is unavailable"}
+            try:
+                result = self.engine.request_formal_analysis({
+                    "request_id": f"analysis:{action_id}",
+                    "requested_at": message["known_at"],
+                    "source": {
+                        "conversation_cycle_id": cycle["cycle_id"],
+                        "batch_id": message.get("batch_id"),
+                        "message_id": message["message_id"],
+                        "source_artifact_id": source_artifact["artifact_id"],
+                        "source_span": action["source_span"],
+                    },
+                    "analysis": {
+                        "subject": action.get("subject"),
+                        "time_scope": action.get("time_scope"),
+                        "goal": action.get("goal"),
+                    },
+                })
+            except AnalysisClarificationRequired as exc:
+                return {"action_id": action_id, "action_type": action_type, "state": "needs_clarification", "reason": str(exc)}
+            receipt = result["receipt"]
+            return {
+                "action_id": action_id, "action_type": action_type,
+                "state": receipt["state"], "request_id": receipt["request_id"],
+                "cycle_id": receipt["cycle_id"],
+            }
         if action_type == "workflow.propose":
             proposal = action.get("workflow_proposal")
             if not proposal:
@@ -252,6 +283,10 @@ class UnifiedCognition:
                 summaries.append("相关事实已通过本地校验并更新，保留了可撤回记录")
             elif state == "proposed":
                 summaries.append("工作流改进已形成待确认提案，尚未自动生效")
+            elif receipt.get("action_type") == "analysis.request" and state in {"created", "reused"}:
+                summaries.append("正式研判任务已创建并进入任务列表" if state == "created" else "该正式研判任务已存在，已恢复其状态")
+            elif receipt.get("action_type") == "analysis.request" and state == "needs_clarification":
+                summaries.append("正式研判还需要澄清：" + str(receipt.get("reason") or "请说明要分析的对象、时间范围和目标"))
             elif state == "needs_input":
                 summaries.append("有一项变更信息不足，未修改；还需要：" + "、".join(receipt.get("missing_fields") or []))
             elif state in {"failed", "rejected"}:

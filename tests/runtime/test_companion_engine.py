@@ -440,6 +440,33 @@ class CompanionEngineTests(unittest.TestCase):
         self.assertEqual("manual_chat", manual["projection"]["cycle"]["trigger"])
         self.assertEqual("scheduled", scheduled["trigger"])
 
+    def test_manual_cycle_survives_store_restart_and_keeps_schedule_claims_separate(self):
+        manual = self.engine.command({
+            "command_id": "restart-manual", "type": "request_formal_analysis",
+            "request_id": "restart-manual-request", "task_key": "daily.review.1520",
+            "requested_at": "2026-08-29T15:20:00+08:00",
+            "source": {"conversation_cycle_id": "conversation-restart", "batch_id": "batch-restart"},
+            "task_profile": {"profile_id": "post_close_review", "version": 1},
+        })
+        scheduled = self.engine.start_cycle(
+            "daily.review.1520", "2026-08-29T15:20:00+08:00", "2026-08-29T15:20:00+08:00",
+        )
+        reopened = CompanionEngine(CompanionStore(self.store.database))
+
+        cycles = reopened.store.latest_cycles_for_date("2026-08-29")
+        self.assertEqual({manual["receipt"]["cycle_id"], scheduled["cycle_id"]}, {item["cycle_id"] for item in cycles})
+        with reopened.store.connection() as connection:
+            self.assertEqual(1, connection.execute(
+                "SELECT COUNT(*) FROM companion_schedule_claim WHERE task_key=? AND scheduled_for=?",
+                ("daily.review.1520", "2026-08-29T15:20:00+08:00"),
+            ).fetchone()[0])
+            self.assertEqual(1, connection.execute(
+                "SELECT COUNT(*) FROM companion_manual_analysis_claim WHERE request_id=?",
+                ("restart-manual-request",),
+            ).fetchone()[0])
+        history = reopened.store.history_page(limit=20)
+        self.assertIn(manual["receipt"]["cycle_id"], [item["cycle_id"] for item in history["items"]])
+
     def test_structured_manual_request_freezes_selected_profile_contract_and_manual_deadlines(self):
         engine = CompanionEngine(
             self.store,

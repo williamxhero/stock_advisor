@@ -1298,6 +1298,10 @@ def run_unified_cognition(
     cycle = store.get_cycle(cycle_id)
     cognition = UnifiedCognition(store, portfolio, engine)
     job = store.start_cognition_job(cycle_id, source["artifact_id"], mode, source["body_markdown"])
+    if job["state"] != "completed":
+        job = store.claim_cognition_job(job["job_id"])
+        if not job["claimed"]:
+            return {"cycle_id": cycle_id, "job_id": job["job_id"], "state": job["state"], "receipts": []}
     stream = None
     try:
         if not execute:

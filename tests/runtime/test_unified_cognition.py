@@ -58,6 +58,48 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.assertEqual("staged", moved["state"])
         self.assertEqual("closed", self.store.get_cycle(first["cycle_id"])["state"])
 
+    def test_cognition_job_claim_allows_one_worker_and_a_failed_retry(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-08-27")
+        artifact = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", "Analyze AI.", conversation["as_of"], {}
+        )
+        job = self.store.start_cognition_job(conversation["cycle_id"], artifact["artifact_id"], "conversation", "Analyze AI.")
+
+        first = self.store.claim_cognition_job(job["job_id"])
+        second = self.store.claim_cognition_job(job["job_id"])
+        self.store.finish_cognition_job(job["job_id"], error="temporary failure")
+        retry = self.store.claim_cognition_job(job["job_id"])
+
+        self.assertTrue(first["claimed"])
+        self.assertFalse(second["claimed"])
+        self.assertEqual("running", second["state"])
+        self.assertTrue(retry["claimed"])
+        self.assertEqual(2, retry["attempt_count"])
+
+    def test_h0_analysis_request_creates_a_separate_cycle_without_entering_current_m1_packet(self) -> None:
+        cycle = self.engine.start_cycle("daily.execution.0945", "2026-08-27T09:45:00+08:00", "2026-08-27T01:45:00Z")
+        text = "Analyze the AI sector for the current session."
+        self.store.stage_message(cycle["cycle_id"], text, "h0", message_id="h0-analysis")
+        batch_id, messages = self.store.commit_staged_messages(cycle["cycle_id"], "h0")
+        artifact = self.store.append_artifact(
+            cycle["cycle_id"], "h0", "human", text, cycle["as_of"], {"batch_id": batch_id}
+        )
+
+        outcome = UnifiedCognition(self.store, self.portfolio, self.engine).apply(
+            cycle, artifact, messages, "h0",
+            {"reply_markdown": None, "needs_fresh_search": False, "public_search_request": None,
+             "propositions": [], "actions": [self._analysis_action("h0-analysis", text)]},
+        )
+        packet = RuntimePacketBuilder(PROJECT_ROOT / "resources", self.root, self.store).build(
+            self.store.get_cycle(cycle["cycle_id"]), "m1_judgment", evidence={}, as_of="2026-08-27T02:00:00Z"
+        )
+
+        self.assertEqual("created", outcome.receipts[0]["state"])
+        self.assertNotEqual(cycle["cycle_id"], outcome.receipts[0]["cycle_id"])
+        rendered = json.dumps(packet, ensure_ascii=False)
+        self.assertNotIn(text, rendered)
+        self.assertNotIn(outcome.receipts[0]["cycle_id"], rendered)
+
     def test_structured_cognition_stream_exposes_only_reply_text(self) -> None:
         parser = ReplyMarkdownStream()
 

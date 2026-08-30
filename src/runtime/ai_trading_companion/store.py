@@ -167,7 +167,7 @@ class CompanionStore:
               job_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               source_artifact_id TEXT NOT NULL, mode TEXT NOT NULL, state TEXT NOT NULL,
               source_sha256 TEXT NOT NULL, result_json TEXT, created_at TEXT NOT NULL,
-              completed_at TEXT, error TEXT,
+              claimed_at TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, completed_at TEXT, error TEXT,
               UNIQUE(source_artifact_id, mode));
             CREATE TABLE IF NOT EXISTS companion_action_receipt (
               action_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES companion_cognition_job(job_id),
@@ -301,7 +301,7 @@ class CompanionStore:
               imported_artifact_id TEXT, imported_at TEXT NOT NULL,
               detail_json TEXT NOT NULL,
               PRIMARY KEY(source_name, source_id));
-            PRAGMA user_version = 17;
+            PRAGMA user_version = 18;
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
@@ -346,6 +346,10 @@ class CompanionStore:
             }.items():
                 if name not in attempt_columns:
                     c.execute(f"ALTER TABLE llm_attempt ADD COLUMN {name} {declaration}")
+            cognition_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cognition_job)")}
+            for name, declaration in {"claimed_at": "TEXT", "attempt_count": "INTEGER NOT NULL DEFAULT 0"}.items():
+                if name not in cognition_columns:
+                    c.execute(f"ALTER TABLE companion_cognition_job ADD COLUMN {name} {declaration}")
             artifact_columns = {row[1] for row in c.execute("PRAGMA table_info(narrative_artifact)")}
             if "occurred_at" not in artifact_columns:
                 c.execute("ALTER TABLE narrative_artifact ADD COLUMN occurred_at TEXT")
@@ -1050,6 +1054,20 @@ class CompanionStore:
             )
             row = c.execute("SELECT * FROM companion_cognition_job WHERE job_id=?", (job_id,)).fetchone()
         return dict(row)
+
+    def claim_cognition_job(self, job_id: str) -> dict[str, Any]:
+        """Atomically lease a queued/failed cognition result for one worker."""
+        with self.connection() as c:
+            claimed = c.execute(
+                """UPDATE companion_cognition_job
+                     SET state='running', claimed_at=?, attempt_count=attempt_count+1, error=NULL
+                   WHERE job_id=? AND state IN ('queued','failed')""",
+                (now(), job_id),
+            )
+            row = c.execute("SELECT * FROM companion_cognition_job WHERE job_id=?", (job_id,)).fetchone()
+        if row is None:
+            raise ValueError("unknown cognition job")
+        return {**dict(row), "claimed": claimed.rowcount == 1}
 
     def action_receipt(self, action_id: str) -> dict[str, Any] | None:
         with self.connection() as c:

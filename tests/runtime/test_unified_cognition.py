@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from ai_trading_companion.__main__ import run_unified_cognition
-from ai_trading_companion.broker_client import BrokerResponse
+from ai_trading_companion.broker_client import BrokerError, BrokerResponse
 from ai_trading_companion.cognition import ReplyMarkdownStream, UnifiedCognition
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
@@ -99,6 +99,52 @@ class UnifiedCognitionTests(unittest.TestCase):
         rendered = json.dumps(packet, ensure_ascii=False)
         self.assertNotIn(text, rendered)
         self.assertNotIn(outcome.receipts[0]["cycle_id"], rendered)
+
+    def test_failed_stream_keeps_only_prefix_without_unreceipted_success_claim(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-08-27")
+        text = "Analyze the AI sector."
+        self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="stream")
+        batch_id, messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        created = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text, conversation["as_of"], {"batch_id": batch_id}
+        )
+        source = next(item for item in self.store.artifacts(conversation["cycle_id"])
+                      if item["artifact_id"] == created["artifact_id"])
+        broker = Mock()
+
+        def interrupted(request):
+            request.on_delta('{"reply_markdown":"Checking market first. Task created"}')
+            raise BrokerError("connection lost", category="broker_unavailable")
+
+        broker.invoke.side_effect = interrupted
+        with patch("ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker), self.assertRaises(BrokerError):
+            run_unified_cognition(self.engine, self.store, self.portfolio, conversation["cycle_id"], source, messages, [batch_id], True, mode="conversation")
+
+        stream = self.store.stream_messages(conversation["cycle_id"])[0]
+        self.assertEqual("failed", stream["state"])
+        self.assertEqual("Checking market first.", stream["text"])
+        self.assertNotIn("Task created", stream["text"])
+
+    def test_relevant_memory_keeps_matching_and_necessary_facts_but_excludes_unrelated(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-08-27")
+        records = [
+            ("ai", "AI semiconductor exposure", "market.ai", "topic", '"semiconductor"'),
+            ("oil", "Oil price observation", "market.oil", "topic", '"crude"'),
+            ("assets", "Total assets", "user.account", "total_assets", "240000"),
+        ]
+        for message_id, text, subject, predicate, object_json in records:
+            message = self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id=message_id)
+            self.store.record_proposition(
+                f"proposition-{message_id}",
+                {"kind": "user_fact", "subject": subject, "predicate": predicate,
+                 "object": json.loads(object_json), "confidence": 1.0, "supersedes_id": None,
+                 "source_span": {"message_id": message_id, "start": 0, "end": len(text), "quote": text}},
+                message,
+            )
+
+        rows = self.store.relevant_propositions(datetime.now(timezone.utc).isoformat(), "AI semiconductor outlook")
+
+        self.assertEqual({"market.ai", "user.account"}, {item["subject"] for item in rows})
 
     def test_structured_cognition_stream_exposes_only_reply_text(self) -> None:
         parser = ReplyMarkdownStream()

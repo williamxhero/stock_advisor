@@ -1278,6 +1278,18 @@ def run_background(
     return {"action": "idle"}
 
 
+def _receipt_safe_stream_prefix(text: str) -> str:
+    """Do not expose a success assertion before deterministic action receipts exist."""
+    lowered = text.lower()
+    markers = (
+        "task created", "task successfully created", "analysis created", "analysis request succeeded",
+        "portfolio updated", "portfolio has been updated", "proposal registered", "proposal has been registered",
+        "正式研判任务已创建", "任务已创建", "持仓已更新", "提案已登记",
+    )
+    indexes = [index for marker in markers if (index := lowered.find(marker.lower())) >= 0]
+    return text[:min(indexes)].rstrip() if indexes else text
+
+
 def run_unified_cognition(
     engine: CompanionEngine,
     store: CompanionStore,
@@ -1309,20 +1321,20 @@ def run_unified_cognition(
         elif job["state"] == "completed" and job.get("result_json"):
             data = {"reply_markdown": None, "needs_fresh_search": False, "public_search_request": None, "propositions": [], "actions": []}
         else:
+            query_text = "\n".join(item["body_text"] for item in messages)
             memories = [{
                 "proposition_id": item["proposition_id"], "kind": item["proposition_kind"],
                 "subject": item["subject"], "predicate": item["predicate"],
                 "object": json.loads(item["object_json"]), "known_at": item["known_at"],
-            } for item in store.current_propositions(iso(datetime.now(timezone.utc)), limit=80)]
+            } for item in store.relevant_propositions(iso(datetime.now(timezone.utc)), query_text, limit=20)]
             stream = engine.chat_stream_started(cycle_id, batch_ids, reply_kind) if mode != "h0" else None
             reply_stream = ReplyMarkdownStream()
+            streamed_reply = ""
 
             def on_delta(delta: str) -> None:
+                nonlocal streamed_reply
                 visible = reply_stream.feed(delta)
-                if visible and stream:
-                    engine.chat_stream_delta(cycle_id, stream["stream_id"], visible)
-                    if on_progress:
-                        on_progress()
+                streamed_reply += visible
 
             request_packet = {
                 "mode": mode,
@@ -1351,6 +1363,9 @@ def run_unified_cognition(
     except Exception as exc:
         store.finish_cognition_job(job["job_id"], error=str(exc))
         if stream:
+            safe_prefix = _receipt_safe_stream_prefix(streamed_reply)
+            if safe_prefix:
+                engine.chat_stream_delta(cycle_id, stream["stream_id"], safe_prefix)
             engine.chat_stream_failed(cycle_id, stream["stream_id"], str(exc))
             if on_progress:
                 on_progress()

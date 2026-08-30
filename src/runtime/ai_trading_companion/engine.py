@@ -6,8 +6,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .learning import JudgmentLifecycle
+from .evidence_contract import EvidenceContractFactory
 from .models import TASK_POLICIES
 from .secret_guard import assert_safe
+from .task_profiles import ManualAnalysisProfileResolver
 
 
 def utc_now() -> datetime:
@@ -25,10 +27,15 @@ def parse(value: str) -> datetime:
 class CompanionEngine:
     """Deep module for cycle commands, invariants, immutable artifacts and client events."""
 
-    def __init__(self, store: Any) -> None:
+    def __init__(
+        self, store: Any, *, task_profiles: ManualAnalysisProfileResolver | None = None,
+        evidence_contract_factory: EvidenceContractFactory | None = None,
+    ) -> None:
         self.store = store
         self.store.initialize()
         self.judgments = JudgmentLifecycle(store)
+        self.task_profiles = task_profiles or ManualAnalysisProfileResolver()
+        self.evidence_contract_factory = evidence_contract_factory or EvidenceContractFactory(self.task_profiles.calendar)
 
     def start_cycle(
         self, task_key: str, scheduled_for: str, as_of: str | None = None, *,
@@ -51,14 +58,11 @@ class CompanionEngine:
 
     def request_formal_analysis(self, request: dict[str, Any]) -> dict[str, Any]:
         """Create or reuse one manual formal-analysis occurrence from a stable request."""
-        missing = {"request_id", "task_key", "requested_at", "source", "task_profile"} - request.keys()
+        missing = {"request_id", "requested_at", "source"} - request.keys()
         if missing:
             raise ValueError(f"formal analysis request missing: {sorted(missing)}")
         if not str(request["request_id"] or "").strip():
             raise ValueError("formal analysis request request_id is required")
-        task_key = str(request["task_key"])
-        if task_key not in TASK_POLICIES:
-            raise ValueError(f"unregistered task_key: {task_key}")
         requested_at = str(request["requested_at"])
         requested = parse(requested_at)
         if requested.tzinfo is None:
@@ -66,7 +70,24 @@ class CompanionEngine:
         source = request["source"]
         if not isinstance(source, dict) or not source:
             raise ValueError("formal analysis request source must be a non-empty object")
-        profile = request["task_profile"]
+        profile_snapshot: dict[str, Any] | None = None
+        evidence_contract: dict[str, Any] | None = None
+        if "analysis" in request:
+            profile_snapshot = self.task_profiles.resolve(requested_at, request["analysis"])
+            task_key = str(profile_snapshot["task_key"])
+            profile = profile_snapshot
+            evidence_contract = self.evidence_contract_factory.build(
+                task_key=task_key, stage="m0_research", as_of=requested_at,
+                task_profile=profile_snapshot,
+            )
+        else:
+            missing = {"task_key", "task_profile"} - request.keys()
+            if missing:
+                raise ValueError(f"formal analysis request missing: {sorted(missing)}")
+            task_key = str(request["task_key"])
+            profile = request["task_profile"]
+        if task_key not in TASK_POLICIES:
+            raise ValueError(f"unregistered task_key: {task_key}")
         if not isinstance(profile, dict) or not str(profile.get("profile_id") or ""):
             raise ValueError("formal analysis request task_profile.profile_id is required")
         try:
@@ -83,6 +104,8 @@ class CompanionEngine:
             source=source,
             task_profile_id=str(profile["profile_id"]),
             task_profile_version=profile_version,
+            task_profile=profile_snapshot,
+            evidence_contract=evidence_contract,
         )
         receipt = {
             "kind": "analysis.request",
@@ -186,13 +209,20 @@ class CompanionEngine:
         if json.loads(compose_attempt.get("output_json") or "null") != {"m0_markdown": m0}:
             raise ValueError("M0 body does not match the verified compose attempt")
         ready_at = utc_now()
-        policy = TASK_POLICIES[cycle["task_key"]]
-        reserve_seconds, timing_version = self.store.effective_m1_reserve(
-            cycle["task_key"], int(policy.m1_reserve.total_seconds()),
-        )
-        auto_submit, publish = policy.deadlines(
-            cycle["scheduled_for"], ready_at, reserve=timedelta(seconds=reserve_seconds),
-        )
+        profile_json = cycle.get("task_profile_json")
+        if cycle.get("trigger") == "manual_chat" and profile_json:
+            deadlines = self.task_profiles.delivery_deadlines(json.loads(profile_json), iso(ready_at))
+            auto_submit, publish = parse(deadlines["h0_auto_submit_at"]), parse(deadlines["m1_publish_deadline"])
+            reserve_seconds = int((publish - auto_submit).total_seconds())
+            timing_version = int(cycle.get("task_profile_version") or 1)
+        else:
+            policy = TASK_POLICIES[cycle["task_key"]]
+            reserve_seconds, timing_version = self.store.effective_m1_reserve(
+                cycle["task_key"], int(policy.m1_reserve.total_seconds()),
+            )
+            auto_submit, publish = policy.deadlines(
+                cycle["scheduled_for"], ready_at, reserve=timedelta(seconds=reserve_seconds),
+            )
         with self.store.connection() as connection:
             artifact = self.store.append_artifact(
                 cycle_id, "m0", "model", m0, evidence_as_of or cycle["as_of"],

@@ -1,6 +1,8 @@
 """Task-semantic, frozen Evidence v3 contracts."""
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -17,16 +19,33 @@ class EvidenceContractFactory:
     def __init__(self, calendar: Any | None = None) -> None:
         self.calendar = calendar or XshgTradingCalendar()
 
-    def build(self, *, task_key: str, stage: str, as_of: str) -> dict[str, Any]:
+    def build(
+        self, *, task_key: str, stage: str, as_of: str,
+        task_profile: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         frozen = self._aware(as_of)
-        requirements = self._requirements(task_key, stage, frozen)
-        return {
+        requirements = self._requirements(task_key, stage, frozen, task_profile)
+        contract = {
             "version": 3,
             "as_of": frozen.isoformat().replace("+00:00", "Z"),
             "requirements": requirements,
         }
+        if task_profile is not None:
+            contract["task_profile"] = {
+                "profile_id": str(task_profile["profile_id"]),
+                "version": int(task_profile["version"]),
+                "evidence_family": str(task_profile["evidence_family"]),
+                "stage_strategy": str(task_profile["stage_strategy"]),
+            }
+        contract["contract_hash"] = self.contract_hash(contract)
+        return contract
 
-    def _requirements(self, task_key: str, stage: str, as_of: datetime) -> list[dict[str, Any]]:
+    def _requirements(
+        self, task_key: str, stage: str, as_of: datetime,
+        task_profile: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if task_profile is not None and stage == "m0_research":
+            return self._manual_requirements(as_of, str(task_profile["evidence_family"]))
         if task_key == "daily.opportunity.0900" and stage == "m0_research":
             close = self._latest_completed_close(as_of)
             close_text = self._iso(close)
@@ -74,6 +93,32 @@ class EvidenceContractFactory:
             },
         ]
 
+    def _manual_requirements(self, as_of: datetime, evidence_family: str) -> list[dict[str, Any]]:
+        if evidence_family == "intraday_snapshot":
+            market_at = as_of
+            events_start = as_of
+        elif evidence_family == "morning_close":
+            local = as_of.astimezone(_SHANGHAI)
+            market_at = datetime.combine(local.date(), time(11, 30), _SHANGHAI).astimezone(ZoneInfo("UTC"))
+            events_start = market_at
+        else:
+            market_at = self._latest_completed_close(as_of)
+            events_start = market_at
+        market_text = self._iso(market_at)
+        return [
+            {
+                "key": "current_market_state", "blocking": True,
+                "allowed_coverage": ["covered"],
+                "window": {"start": market_text, "end": market_text, "mode": "exact"},
+            },
+            {
+                "key": "material_events_and_counterevidence", "blocking": True,
+                "allowed_coverage": ["covered", "checked_no_change"],
+                "window": {"start": self._iso(events_start), "end": self._iso(as_of), "mode": "after_start_to_end"},
+                "negative_query_terms": ["鍏憡", "鏀跨瓥", "椋庨櫓"],
+            },
+        ]
+
     def _latest_completed_close(self, as_of: datetime) -> datetime:
         local = as_of.astimezone(_SHANGHAI)
         candidate = local.date()
@@ -93,3 +138,9 @@ class EvidenceContractFactory:
     @staticmethod
     def _iso(value: datetime) -> str:
         return value.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def contract_hash(contract: dict[str, Any]) -> str:
+        payload = {key: value for key, value in contract.items() if key != "contract_hash"}
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()

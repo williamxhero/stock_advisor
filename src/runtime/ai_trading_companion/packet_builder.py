@@ -56,9 +56,15 @@ class RuntimePacketBuilder:
         memory_cards = self._memory_cards(cycle, stage, packet_as_of, evidence)
         if stage in PUBLIC_STAGES:
             if stage in {"m0_research", "m1_research"}:
-                packet["evidence_contract"] = self.evidence_contract_factory.build(
-                    task_key=cycle["task_key"], stage=stage, as_of=packet_as_of,
-                )
+                frozen_contract = cycle.get("evidence_contract_json") if stage == "m0_research" else None
+                if frozen_contract:
+                    packet["evidence_contract"] = json.loads(frozen_contract)
+                else:
+                    profile = json.loads(cycle["task_profile_json"]) if cycle.get("task_profile_json") else None
+                    packet["evidence_contract"] = self.evidence_contract_factory.build(
+                        task_key=cycle["task_key"], stage=stage, as_of=packet_as_of,
+                        task_profile=profile,
+                    )
             else:
                 packet["evidence_requirements"] = self._evidence_requirements(cycle, stage)
             packet["public_research_scope"] = self._public_scope(cycle, stage, evidence, context, packet_as_of, memory_cards)

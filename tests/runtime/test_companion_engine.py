@@ -14,6 +14,7 @@ from ai_trading_companion.packet_builder import RuntimePacketBuilder
 from ai_trading_companion.scheduler import conversation_auto_submit_at, load_schedules, run_daily_schedule, run_periodic_schedule
 from ai_trading_companion.store import CompanionStore
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
+from ai_trading_companion.task_profiles import ManualAnalysisProfileResolver
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -438,6 +439,41 @@ class CompanionEngineTests(unittest.TestCase):
         self.assertNotEqual(manual["receipt"]["cycle_id"], scheduled["cycle_id"])
         self.assertEqual("manual_chat", manual["projection"]["cycle"]["trigger"])
         self.assertEqual("scheduled", scheduled["trigger"])
+
+    def test_structured_manual_request_freezes_selected_profile_contract_and_manual_deadlines(self):
+        engine = CompanionEngine(
+            self.store,
+            task_profiles=ManualAnalysisProfileResolver(_WeekdayCalendar()),
+            evidence_contract_factory=EvidenceContractFactory(_WeekdayCalendar()),
+        )
+        result = engine.command({
+            "command_id": "structured-manual-analysis",
+            "type": "request_formal_analysis",
+            "request_id": "structured-analysis-request",
+            "requested_at": "2026-08-28T14:58:00+08:00",
+            "source": {"conversation_cycle_id": "conversation-1", "batch_id": "batch-1"},
+            "analysis": {"subject": "人工智能", "time_scope": "current_session", "goal": "核验风险"},
+        })
+        cycle = result["projection"]["cycle"]
+
+        self.assertEqual("intraday_execution", cycle["task_profile_id"])
+        self.assertEqual("daily.execution.0945", cycle["task_key"])
+        self.assertEqual("2026-08-28T14:58:00+08:00", cycle["requested_at"])
+        self.assertEqual(64, len(cycle["evidence_contract_hash"]))
+        packet = packet_builder(self.store).build(cycle, "m0_research")
+        self.assertEqual(cycle["evidence_contract_hash"], packet["evidence_contract"]["contract_hash"])
+
+        engine.research_started(cycle["cycle_id"])
+        evidence_hash, compose_hash = "structured-evidence", "structured-compose"
+        with patch("ai_trading_companion.engine.utc_now", return_value=datetime(2026, 8, 28, 7, 8, tzinfo=timezone.utc)):
+            ready = engine.research_ready(
+                cycle["cycle_id"], "M0",
+                evidence_attempt_id=self.qualified("m0_research", evidence_hash, cycle["cycle_id"], {}),
+                compose_attempt_id=self.qualified("m0_compose", compose_hash, cycle["cycle_id"], {"m0_markdown": "M0"}),
+                evidence_packet_hash=evidence_hash, packet_hash=compose_hash,
+            )
+        self.assertEqual("2026-08-28T07:28:00.000Z", ready["h0_auto_submit_at"])
+        self.assertEqual("2026-08-28T07:38:00.000Z", ready["m1_publish_deadline"])
 
     def test_rejected_manual_analysis_request_returns_a_receipt_without_a_cycle(self):
         result = self.engine.command({

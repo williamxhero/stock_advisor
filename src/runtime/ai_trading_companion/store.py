@@ -51,6 +51,8 @@ class CompanionStore:
               trigger TEXT NOT NULL DEFAULT 'scheduled', request_id TEXT,
               requested_at TEXT, request_source_json TEXT,
               task_profile_id TEXT, task_profile_version INTEGER,
+              task_profile_json TEXT, evidence_contract_version INTEGER,
+              evidence_contract_hash TEXT, evidence_contract_json TEXT,
               human_deadline TEXT, voice_grace_deadline TEXT, m0_revealed_at TEXT,
               codex_session_id TEXT, packet_hash TEXT,
               m1_publish_deadline TEXT, h0_auto_submit_at TEXT, h0_locked_at TEXT,
@@ -299,7 +301,7 @@ class CompanionStore:
               imported_artifact_id TEXT, imported_at TEXT NOT NULL,
               detail_json TEXT NOT NULL,
               PRIMARY KEY(source_name, source_id));
-            PRAGMA user_version = 16;
+            PRAGMA user_version = 17;
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
@@ -325,6 +327,10 @@ class CompanionStore:
                 "request_source_json": "TEXT",
                 "task_profile_id": "TEXT",
                 "task_profile_version": "INTEGER",
+                "task_profile_json": "TEXT",
+                "evidence_contract_version": "INTEGER",
+                "evidence_contract_hash": "TEXT",
+                "evidence_contract_json": "TEXT",
             }.items():
                 if name not in cycle_columns:
                     c.execute(f"ALTER TABLE companion_cycle ADD COLUMN {name} {declaration}")
@@ -664,6 +670,8 @@ class CompanionStore:
         source: dict[str, Any],
         task_profile_id: str,
         task_profile_version: int,
+        task_profile: dict[str, Any] | None = None,
+        evidence_contract: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Create one manual formal-analysis occurrence without claiming a schedule slot.
 
@@ -704,12 +712,17 @@ class CompanionStore:
                 """INSERT INTO companion_cycle(
                      cycle_id,task_key,scheduled_for,as_of,state,revision,kind,work_start_at,
                      trigger,request_id,requested_at,request_source_json,task_profile_id,task_profile_version,
+                     task_profile_json,evidence_contract_version,evidence_contract_hash,evidence_contract_json,
                      created_at,updated_at
-                   ) VALUES(?,?,?,?, 'queued',1,'manual',?,?,?,?,?,?,?,?,?)""",
+                   ) VALUES(?,?,?,?, 'queued',1,'manual',?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     cycle_id, task_key, scheduled_for, requested_at, requested_at,
                     "manual_chat", request_id, requested_at,
                     json.dumps(source, ensure_ascii=False, sort_keys=True), task_profile_id, task_profile_version,
+                    json.dumps(task_profile, ensure_ascii=False, sort_keys=True) if task_profile else None,
+                    int(evidence_contract["version"]) if evidence_contract else None,
+                    str(evidence_contract["contract_hash"]) if evidence_contract else None,
+                    json.dumps(evidence_contract, ensure_ascii=False, sort_keys=True) if evidence_contract else None,
                     claimed_at, claimed_at,
                 ),
             )

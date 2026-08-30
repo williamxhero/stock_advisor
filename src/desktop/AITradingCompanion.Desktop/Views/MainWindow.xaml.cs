@@ -259,6 +259,7 @@ public partial class MainWindow : Window, IDisposable
         var events = _companionExchange.ReadLatestEvents(1000);
         _taskManagementWindow?.UpdateEvents(events);
         RequestTodayProjectionsAsync();
+        _viewModel.SynchronizeManualCycles(CompanionEventProjection.ProjectAll(events));
         _portfolioProjection = PortfolioEventProjection.Project(events);
         _portfolioWindow?.UpdateProjection(_portfolioProjection);
         if (_viewModel.SelectedSectionIndex != 0)
@@ -273,13 +274,18 @@ public partial class MainWindow : Window, IDisposable
 
         foreach (var task in _viewModel.Tasks)
         {
-            var taskProjection = CompanionEventProjection.ProjectForTask(events, task.Expected.TaskKey);
+            var taskProjection = task.CycleId is { } cycleId
+                ? CompanionEventProjection.ProjectForCycle(events, cycleId)
+                : CompanionEventProjection.ProjectForTask(events, task.Expected.TaskKey);
             if (taskProjection?.ScheduledFor is { } scheduled && !_viewModel.IsCurrentTradingDate(scheduled)) taskProjection = null;
             task.UpdateCompanionStatus(taskProjection?.State, taskProjection?.ErrorText);
         }
         _viewModel.RefreshCompanionSummary();
-        var taskKey = _viewModel.SelectedTask?.Expected.TaskKey;
-        var projection = CompanionEventProjection.ProjectForTask(events, taskKey);
+        var selected = _viewModel.SelectedTask;
+        var taskKey = selected?.Expected.TaskKey;
+        var projection = selected?.CycleId is { } selectedCycleId
+            ? CompanionEventProjection.ProjectForCycle(events, selectedCycleId)
+            : CompanionEventProjection.ProjectForTask(events, taskKey);
         if (projection?.ScheduledFor is { } projectionScheduled && !_viewModel.IsCurrentTradingDate(projectionScheduled)) projection = null;
         _companionProjection = projection;
         SwitchDraft(taskKey == "conversation.daily" && projection is not null ? CompanionDraftStore.ConversationDraftKey : projection?.CycleId);

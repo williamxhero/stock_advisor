@@ -29,7 +29,11 @@ public sealed record CompanionWorkspaceProjection(
     string? State,
     string? ErrorText,
     IReadOnlyList<CompanionAiTimelineEntry> AiMessages,
-    IReadOnlyList<CompanionTimelineEntry> UserMessages)
+    IReadOnlyList<CompanionTimelineEntry> UserMessages,
+    string? TaskKey = null,
+    string? Trigger = null,
+    DateTimeOffset? RequestedAt = null,
+    string? TaskProfileId = null)
 {
     public bool IsH0Locked => H0LockedAt is not null;
     public bool HasStagedMessages => UserMessages.Any(message => message.State == "staged");
@@ -54,6 +58,24 @@ public static class CompanionEventProjection
             .OrderBy(item => item.At).ToArray();
         if (!string.IsNullOrWhiteSpace(taskKey))
             parsed = parsed.Where(item => string.Equals(item.TaskKey, taskKey, StringComparison.Ordinal)).ToArray();
+        return ProjectEvents(parsed);
+    }
+
+    public static CompanionWorkspaceProjection? ProjectForCycle(IEnumerable<string> events, string cycleId) =>
+        ProjectEvents(events.Select(TryParse).Where(item => item is not null).Cast<CompanionEvent>()
+            .Where(item => string.Equals(item.CycleId, cycleId, StringComparison.Ordinal))
+            .OrderBy(item => item.At).ToArray());
+
+    public static IReadOnlyList<CompanionWorkspaceProjection> ProjectAll(IEnumerable<string> events) =>
+        events.Select(TryParse).Where(item => item is not null).Cast<CompanionEvent>()
+            .GroupBy(item => item.CycleId, StringComparer.Ordinal)
+            .Select(group => ProjectEvents(group.OrderBy(item => item.At).ToArray()))
+            .Where(item => item is not null).Cast<CompanionWorkspaceProjection>()
+            .OrderBy(item => item.RequestedAt ?? item.ScheduledFor ?? DateTimeOffset.MinValue)
+            .ToArray();
+
+    private static CompanionWorkspaceProjection? ProjectEvents(CompanionEvent[] parsed)
+    {
         if (parsed.Length == 0) return null;
 
         var current = parsed[^1];
@@ -65,8 +87,12 @@ public static class CompanionEventProjection
         DateTimeOffset? m0StartedAt = null;
         DateTimeOffset? m1StartedAt = null;
         DateTimeOffset? m2StartedAt = null;
+        DateTimeOffset? requestedAt = null;
         string? state = null;
         string? errorText = null;
+        string? taskKey = null;
+        string? trigger = null;
+        string? taskProfileId = null;
         var ai = new Dictionary<string, CompanionAiTimelineEntry>(StringComparer.Ordinal);
         var users = new Dictionary<string, CompanionTimelineEntry>(StringComparer.Ordinal);
 
@@ -74,6 +100,10 @@ public static class CompanionEventProjection
         {
             var payload = item.Payload;
             state = ReadCycleString(payload, "state") ?? state;
+            taskKey = ReadCycleString(payload, "task_key") ?? taskKey;
+            trigger = ReadCycleString(payload, "trigger") ?? trigger;
+            requestedAt = ReadDate(ReadCycleString(payload, "requested_at")) ?? requestedAt;
+            taskProfileId = ReadCycleString(payload, "task_profile_id") ?? taskProfileId;
             scheduledFor = ReadDate(ReadCycleString(payload, "scheduled_for")) ?? scheduledFor;
             autoSubmit = ReadDate(ReadCycleString(payload, "h0_auto_submit_at"))
                 ?? ReadDate(ReadString(payload, "h0_auto_submit_at")) ?? autoSubmit;
@@ -188,7 +218,8 @@ public static class CompanionEventProjection
                         ReadString(payload, "text"), item.At, item.At);
                     break;
                 case "projection.ready":
-                    ReadProjection(payload, ai, users, ref scheduledFor, ref autoSubmit, ref m1Deadline, ref h0LockedAt);
+                    ReadProjection(payload, ai, users, ref scheduledFor, ref autoSubmit, ref m1Deadline, ref h0LockedAt,
+                        ref taskKey, ref trigger, ref requestedAt, ref taskProfileId);
                     break;
                 case "research.failed":
                 case "cycle.missed":
@@ -214,7 +245,11 @@ public static class CompanionEventProjection
             state,
             errorText,
             ai.Values.OrderBy(message => message.At).ToArray(),
-            users.Values.OrderBy(message => message.At).ToArray());
+            users.Values.OrderBy(message => message.At).ToArray(),
+            taskKey,
+            trigger,
+            requestedAt,
+            taskProfileId);
     }
 
     private static void ReadProjection(
@@ -224,8 +259,16 @@ public static class CompanionEventProjection
         ref DateTimeOffset? scheduledFor,
         ref DateTimeOffset? autoSubmit,
         ref DateTimeOffset? m1Deadline,
-        ref DateTimeOffset? h0LockedAt)
+        ref DateTimeOffset? h0LockedAt,
+        ref string? taskKey,
+        ref string? trigger,
+        ref DateTimeOffset? requestedAt,
+        ref string? taskProfileId)
     {
+        taskKey = ReadNestedString(payload, "cycle", "task_key") ?? taskKey;
+        trigger = ReadNestedString(payload, "cycle", "trigger") ?? trigger;
+        requestedAt = ReadDate(ReadNestedString(payload, "cycle", "requested_at")) ?? requestedAt;
+        taskProfileId = ReadNestedString(payload, "cycle", "task_profile_id") ?? taskProfileId;
         scheduledFor = ReadDate(ReadNestedString(payload, "cycle", "scheduled_for")) ?? scheduledFor;
         autoSubmit = ReadDate(ReadNestedString(payload, "cycle", "h0_auto_submit_at")) ?? autoSubmit;
         m1Deadline = ReadDate(ReadNestedString(payload, "cycle", "m1_publish_deadline")) ?? m1Deadline;

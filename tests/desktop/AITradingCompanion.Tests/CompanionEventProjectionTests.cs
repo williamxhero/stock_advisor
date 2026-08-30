@@ -19,6 +19,23 @@ public sealed class CompanionEventProjectionTests
     }
 
     [Fact]
+    public void ProjectsEveryManualCycleByCycleIdentity()
+    {
+        var events = new[]
+        {
+            """{"contract":"companion-client-event/v1","event_id":"manual-1","cycle_id":"manual-1","type":"analysis.request.created","created_at":"2026-08-29T02:00:00Z","payload":{"cycle":{"task_key":"daily.review.1520","state":"queued","scheduled_for":"2026-08-29T10:00:00.000001+08:00","trigger":"manual_chat","requested_at":"2026-08-29T10:00:00+08:00","task_profile_id":"non_trading_research"}}}""",
+            """{"contract":"companion-client-event/v1","event_id":"manual-2","cycle_id":"manual-2","type":"analysis.request.created","created_at":"2026-08-29T02:01:00Z","payload":{"cycle":{"task_key":"daily.review.1520","state":"queued","scheduled_for":"2026-08-29T10:01:00.000001+08:00","trigger":"manual_chat","requested_at":"2026-08-29T10:01:00+08:00","task_profile_id":"non_trading_research"}}}"""
+        };
+
+        var projections = CompanionEventProjection.ProjectAll(events);
+
+        Assert.Equal(["manual-1", "manual-2"], projections.Select(item => item.CycleId));
+        Assert.All(projections, item => Assert.Equal("manual_chat", item.Trigger));
+        Assert.All(projections, item => Assert.Equal("daily.review.1520", item.TaskKey));
+        Assert.Equal(DateTimeOffset.Parse("2026-08-29T10:00:00+08:00", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind), projections[0].RequestedAt);
+    }
+
+    [Fact]
     public void IgnoresMalformedAndOtherContractEvents()
     {
         var events = new[] { "not-json", """{"contract":"other/v1","cycle_id":"wrong"}""" };

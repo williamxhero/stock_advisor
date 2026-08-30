@@ -324,6 +324,28 @@ public sealed class MainViewModel : ObservableObject
 
     public void RefreshCompanionSummary() => OnPropertyChanged(nameof(CompletedCount));
 
+    public void SynchronizeManualCycles(IEnumerable<CompanionWorkspaceProjection> projections)
+    {
+        var timeout = TimeSpan.FromMinutes(Math.Max(1, _settings.Display.NodeTimeoutMinutes));
+        foreach (var projection in projections.Where(item => item.Trigger == "manual_chat" && item.RequestedAt is not null && IsCurrentTradingDate(item.RequestedAt!.Value)))
+        {
+            var existing = Tasks.FirstOrDefault(task => task.CycleId == projection.CycleId);
+            if (existing is not null)
+            {
+                existing.UpdateCompanionStatus(projection.State, projection.ErrorText);
+                continue;
+            }
+            var requested = TimeZoneInfo.ConvertTime(projection.RequestedAt!.Value, ShanghaiTimeZone);
+            var expected = new ExpectedTask(
+                projection.TaskKey ?? "manual.analysis",
+                TimeOnly.FromDateTime(requested.DateTime),
+                projection.TaskProfileId ?? "手动研判");
+            var row = new TaskRowViewModel(expected, null, timeout, projection.CycleId);
+            row.UpdateCompanionStatus(projection.State, projection.ErrorText);
+            Tasks.Add(row);
+        }
+    }
+
     public async Task RefreshTodayBoardAsync()
     {
         var today = ShanghaiDateNow();

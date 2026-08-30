@@ -11,16 +11,19 @@ public sealed class TaskRowViewModel : ObservableObject
     private string? _companionState;
     private string? _companionError;
 
-    public TaskRowViewModel(ExpectedTask expected, TaskMessage? message, TimeSpan nodeTimeout)
+    public TaskRowViewModel(ExpectedTask expected, TaskMessage? message, TimeSpan nodeTimeout, string? cycleId = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(nodeTimeout, TimeSpan.Zero);
         Expected = expected;
         _message = message;
         _nodeTimeout = nodeTimeout;
         _statusAsOf = DateTime.Now;
+        CycleId = cycleId;
     }
 
     public ExpectedTask Expected { get; }
+
+    public string? CycleId { get; }
 
     public TaskMessage? Message
     {

@@ -66,6 +66,12 @@ class CompanionEngine:
                 },
             })
 
+    def recover_interrupted_streams(self) -> int:
+        streams = self.store.interrupted_stream_messages()
+        for stream in streams:
+            self.chat_stream_failed(stream["cycle_id"], stream["stream_id"], "runtime restarted")
+        return len(streams)
+
     def start_cycle(
         self, task_key: str, scheduled_for: str, as_of: str | None = None, *,
         schedule_id: str | None = None, schedule_revision: int | None = None,

@@ -45,3 +45,20 @@ def test_failed_stream_keeps_visible_prefix_as_incomplete_memory_message(tmp_pat
     assert item["body"] == "已经核验一半。"
     assert item["metadata"]["message_id"] == stream["stream_id"]
     assert item["metadata"]["state"] == "incomplete"
+
+
+def test_restart_recovers_visible_stream_prefix_without_changing_its_id(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    memory = InMemoryMemoryAdapter()
+    engine = CompanionEngine(store, memory=memory, memory_space_id="acceptance")
+    cycle = store.ensure_daily_conversation("2026-09-01")
+    stream = engine.chat_stream_started(cycle["cycle_id"], ["batch-1"], "ai_chat")
+    engine.chat_stream_delta(cycle["cycle_id"], stream["stream_id"], "重启前已显示。")
+
+    restarted = CompanionEngine(store, memory=memory, memory_space_id="acceptance")
+    restarted.recover_interrupted_streams()
+
+    item = memory.timeline("acceptance")[0]
+    assert item["metadata"]["message_id"] == stream["stream_id"]
+    assert item["body"] == "重启前已显示。"
+    assert store.stream_message(stream["stream_id"])["state"] == "failed"

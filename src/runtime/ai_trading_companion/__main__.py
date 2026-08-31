@@ -256,6 +256,7 @@ def runtime() -> tuple[CompanionEngine, CompanionStore, LocalExchange, Portfolio
         memory=HttpMemoryAdapter(os.environ.get("MEMORYHUB_URL", "http://yosef-server:8820")),
         memory_space_id=os.environ.get("MEMORYHUB_SPACE_ID", "ai-trading-companion"),
     )
+    engine.recover_interrupted_streams()
     JudgmentLifecycle(store).backfill()
     exchange = LocalExchange(exchange_root())
     exchange.ensure()

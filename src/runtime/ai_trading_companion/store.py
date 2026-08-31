@@ -1323,6 +1323,15 @@ class CompanionStore:
             ids = [row["stream_id"] for row in c.execute("SELECT stream_id FROM companion_stream_message WHERE cycle_id=? ORDER BY created_at", (cycle_id,))]
         return [self.stream_message(stream_id) for stream_id in ids]
 
+    def interrupted_stream_messages(self) -> list[dict[str, Any]]:
+        with self.connection() as c:
+            ids = [
+                row["stream_id"] for row in c.execute(
+                    "SELECT stream_id FROM companion_stream_message WHERE state='streaming' ORDER BY created_at"
+                )
+            ]
+        return [self.stream_message(stream_id) for stream_id in ids]
+
     def link_messages_to_artifact(self, message_ids: list[str], artifact_id: str) -> None:
         if not message_ids:
             return

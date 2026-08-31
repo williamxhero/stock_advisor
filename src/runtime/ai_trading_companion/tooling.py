@@ -425,7 +425,7 @@ class ToolRunner:
         health["attempts"] = int(health.get("attempts") or 0) + 1
         if result.succeeded:
             health["successes"] = int(health.get("successes") or 0) + 1
-        elif result.error_code in {"tool_stdout_invalid_json", "tool_result_invalid", "tool_fact_as_of_invalid"} or (result.error_code or "").startswith("tool_quote_"):
+        elif result.error_code in {"tool_stdout_invalid_json", "tool_result_invalid", "tool_fact_as_of_invalid"} or (result.error_code or "").startswith(("tool_quote_", "tool_market_")):
             health["degraded"] = True
             health["degrade_reason"] = result.error_code
         else:
@@ -451,6 +451,10 @@ class ToolRunner:
 
 def _validate_capability_result(request: FactRequest, output: dict[str, Any]) -> str | None:
     """Reject quote data whose identity, session date, or finality cannot meet the request."""
+    if request.capability == "cn_market_index_batch":
+        return _validate_market_indices(request, output["data"])
+    if request.capability == "cn_market_snapshot":
+        return _validate_market_snapshot(request, output["data"], str(output["fact_as_of"]))
     if request.capability != "cn_equity_quote_batch":
         return None
     data = output["data"]
@@ -490,6 +494,77 @@ def _validate_capability_result(request: FactRequest, output: dict[str, Any]) ->
                 return "tool_quote_finality_invalid"
     if set(seen) != set(expected_symbols) or data.get("finality") != request.finality:
         return "tool_quote_finality_invalid" if data.get("finality") != request.finality else "tool_quote_symbol_mismatch"
+    return None
+
+
+def _validate_market_indices(request: FactRequest, data: dict[str, Any]) -> str | None:
+    indices = data.get("indices")
+    expected = request.inputs.get("symbols")
+    if not isinstance(indices, list) or not isinstance(expected, list) or not indices:
+        return "tool_market_result_invalid"
+    expected_date = _parse_timestamp(request.required_at).astimezone(_SHANGHAI).date().isoformat()
+    seen: list[str] = []
+    for index in indices:
+        if not isinstance(index, dict) or not isinstance(index.get("symbol"), str):
+            return "tool_market_result_invalid"
+        symbol = index["symbol"]
+        if symbol not in expected or symbol in seen:
+            return "tool_market_identity_invalid"
+        seen.append(symbol)
+        if index.get("trading_date") != expected_date or index.get("exchange") not in {"SSE", "SZSE"}:
+            return "tool_market_trading_date_mismatch"
+        if not isinstance(index.get("name"), str) or not index["name"].strip() or not isinstance(index.get("source"), str):
+            return "tool_market_identity_invalid"
+        try:
+            moment = _parse_timestamp(str(index.get("quote_at") or "")).astimezone(_SHANGHAI)
+            price = float(index.get("price"))
+        except (TypeError, ValueError):
+            return "tool_market_result_invalid"
+        if moment.date().isoformat() != expected_date or price <= 0:
+            return "tool_market_trading_date_mismatch"
+        if request.finality in {"close", "official_close"} and (moment.time().hour < 15 or index.get("status") != "closed"):
+            return "tool_market_finality_invalid"
+    if set(seen) != {str(value) for value in expected} or data.get("finality") != request.finality:
+        return "tool_market_identity_invalid"
+    return None
+
+
+def _validate_market_snapshot(request: FactRequest, data: dict[str, Any], fact_as_of: str) -> str | None:
+    expected_date = _parse_timestamp(request.required_at).astimezone(_SHANGHAI).date().isoformat()
+    if data.get("is_trading_day") is False:
+        return "tool_market_non_trading_day"
+    if data.get("trading_date") != expected_date or data.get("finality") != request.finality:
+        return "tool_market_trading_date_mismatch"
+    try:
+        observed = _parse_timestamp(fact_as_of).astimezone(_SHANGHAI)
+    except ValueError:
+        return "tool_market_result_invalid"
+    if observed.date().isoformat() != expected_date:
+        return "tool_market_trading_date_mismatch"
+    if request.finality in {"close", "official_close"} and observed.time().hour < 15:
+        return "tool_market_finality_invalid"
+    if not isinstance(data.get("source"), str) or not data["source"].strip():
+        return "tool_market_identity_invalid"
+    breadth = data.get("breadth")
+    if not isinstance(breadth, dict):
+        return "tool_market_result_invalid"
+    try:
+        if any(float(breadth[field]) < 0 for field in ("up", "down", "flat", "limit_up", "limit_down")):
+            return "tool_market_result_invalid"
+    except (KeyError, TypeError, ValueError):
+        return "tool_market_result_invalid"
+    for field in ("indices", "industries", "themes"):
+        entries = data.get(field)
+        if not isinstance(entries, list):
+            return "tool_market_result_invalid"
+    for field in ("industries", "themes"):
+        for entry in data[field]:
+            if not isinstance(entry, dict) or not str(entry.get("id") or "").strip() or not str(entry.get("name") or "").strip():
+                return "tool_market_identity_invalid"
+            try:
+                float(entry.get("strength"))
+            except (TypeError, ValueError):
+                return "tool_market_result_invalid"
     return None
 
 

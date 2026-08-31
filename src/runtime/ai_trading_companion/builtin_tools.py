@@ -16,6 +16,8 @@ _CAPABILITIES = {
     "article_range": "article_range",
     "cn_equity_identity": "cn_equity_identity",
     "cn_equity_quote_batch": "cn_equity_quote_batch",
+    "cn_market_index_batch": "cn_market_index_batch",
+    "cn_market_snapshot": "cn_market_snapshot",
 }
 
 
@@ -160,6 +162,67 @@ def quote_payload(body: str, symbols: list[dict[str, str]], finality: str) -> tu
     return {"quotes": quotes, "finality": finality, "source": "tencent_quote"}, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def index_identity(symbol: object) -> dict[str, str]:
+    code = str(symbol or "").strip()
+    known = {
+        "000001": ("SSE", "sh000001"), "000300": ("SSE", "sh000300"), "000905": ("SSE", "sh000905"),
+        "399001": ("SZSE", "sz399001"), "399006": ("SZSE", "sz399006"),
+    }
+    if code not in known:
+        fail(64, "unsupported market index")
+    exchange, vendor_symbol = known[code]
+    return {"symbol": code, "exchange": exchange, "vendor_symbol": vendor_symbol}
+
+
+def index_payload(body: str, symbols: list[dict[str, str]], finality: str) -> tuple[dict[str, object], str]:
+    records = {match.group(1): match.group(2).split("~") for match in re.finditer(r'v_([a-z]{2}\d{6})="([^"]*)"', body)}
+    indices: list[dict[str, object]] = []
+    latest: dt.datetime | None = None
+    for item in symbols:
+        fields = records.get(item["vendor_symbol"])
+        if not fields or len(fields) < 5 or fields[2] != item["symbol"]:
+            fail(75, "index response has missing or mismatched symbol")
+        timestamp = next((field for field in fields if re.fullmatch(r"20\d{12}", field)), "")
+        quote_at, trading_date = china_timestamp(timestamp)
+        moment = dt.datetime.fromisoformat(quote_at)
+        latest = max(latest, moment) if latest else moment
+        try:
+            price = float(fields[3])
+            previous_close = float(fields[4])
+        except ValueError:
+            fail(75, "index price is invalid")
+        if price <= 0 or not fields[1].strip():
+            fail(75, "index identity or price is invalid")
+        close_ready = moment.time() >= dt.time(15, 0)
+        if finality in {"close", "official_close"} and not close_ready:
+            fail(75, "index does not meet close finality")
+        indices.append({
+            "symbol": item["symbol"], "name": fields[1].strip(), "exchange": item["exchange"], "price": price,
+            "previous_close": previous_close, "quote_at": quote_at, "trading_date": trading_date,
+            "status": "closed" if close_ready else "trading", "source": "tencent_quote",
+        })
+    if latest is None:
+        fail(64, "at least one market index is required")
+    return {"indices": indices, "finality": finality, "source": "tencent_quote"}, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def market_snapshot_payload(body: str, finality: str) -> tuple[dict[str, object], str]:
+    try:
+        snapshot = json.loads(body)
+    except json.JSONDecodeError:
+        fail(75, "market snapshot response is not JSON")
+    if not isinstance(snapshot, dict):
+        fail(75, "market snapshot response is not an object")
+    fact_as_of = str(snapshot.get("fact_as_of") or "")
+    try:
+        moment = dt.datetime.fromisoformat(fact_as_of.replace("Z", "+00:00"))
+    except ValueError:
+        fail(75, "market snapshot fact time is invalid")
+    data = {key: snapshot.get(key) for key in ("is_trading_day", "trading_date", "source", "indices", "breadth", "industries", "themes")}
+    data["finality"] = finality
+    return data, moment.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         fail(64, "tool mode is required")
@@ -189,6 +252,28 @@ def main() -> None:
         separator = "" if quote_url.endswith(("=", ",")) else "&q="
         _url, body = fetch(quote_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
         payload, fact_as_of = quote_payload(body, normalized, finality)
+        result(payload, fact_as_of=fact_as_of)
+        return
+    if mode == "cn_market_index_batch":
+        symbols = inputs.get("symbols")
+        if not isinstance(symbols, list) or not symbols:
+            fail(64, "symbols must be a non-empty array")
+        finality = str(request.get("finality") or "observed")
+        if finality not in {"intraday", "realtime", "close", "official_close"}:
+            fail(64, "unsupported index finality")
+        normalized = [index_identity(symbol) for symbol in symbols]
+        index_url = safe_url(inputs.get("index_url") or "https://qt.gtimg.cn/q=")
+        separator = "" if index_url.endswith(("=", ",")) else "&q="
+        _url, body = fetch(index_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
+        payload, fact_as_of = index_payload(body, normalized, finality)
+        result(payload, fact_as_of=fact_as_of)
+        return
+    if mode == "cn_market_snapshot":
+        finality = str(request.get("finality") or "observed")
+        if finality not in {"intraday", "realtime", "close", "official_close"}:
+            fail(64, "unsupported market finality")
+        _url, body = fetch(safe_url(inputs.get("url")))
+        payload, fact_as_of = market_snapshot_payload(body, finality)
         result(payload, fact_as_of=fact_as_of)
         return
     if mode in {"cninfo_search", "article_range"}:

@@ -432,6 +432,79 @@ class ToolRunnerTests(unittest.TestCase):
             self.assertFalse(intraday.succeeded)
             self.assertEqual("tool_quote_finality_invalid", intraday.error_code)
 
+    def test_market_tools_return_indices_breadth_and_theme_snapshot_with_fact_time(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/index"):
+                    body = (
+                        'v_sh000001="1~上证指数~000001~3500.0~3490.0~~~~~~~~~~~~20260901150100";\n'
+                        'v_sz399001="51~深证成指~399001~12000.0~11900.0~~~~~~~~~~~~20260901150100";\n'
+                    ).encode("gb18030")
+                    content_type = "text/plain; charset=gb18030"
+                else:
+                    body = json.dumps({
+                        "fact_as_of": "2026-09-01T15:01:00+08:00", "trading_date": "2026-09-01", "source": "public_snapshot",
+                        "indices": [{"symbol": "000001", "name": "上证指数", "exchange": "SSE", "price": 3500.0}],
+                        "breadth": {"up": 3210, "down": 1100, "flat": 120, "limit_up": 58, "limit_down": 4},
+                        "industries": [{"id": "801780", "name": "银行", "strength": 1.2}],
+                        "themes": [{"id": "ai", "name": "人工智能", "strength": 2.1}],
+                    }, ensure_ascii=False).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                runner = ToolRunner(ToolCatalog(root))
+                indexes = runner.resolve_with_fallback(FactRequest(
+                    1, "cn_market_index_batch", "2026-09-01T07:01:00Z", 2.0,
+                    {"symbols": ["000001", "399001"], "index_url": f"{base}/index?q="}, finality="official_close",
+                ))
+                snapshot = runner.resolve_with_fallback(FactRequest(
+                    1, "cn_market_snapshot", "2026-09-01T07:01:00Z", 2.0,
+                    {"url": f"{base}/snapshot"}, finality="official_close",
+                ))
+
+                self.assertTrue(indexes.succeeded, indexes.error_code)
+                self.assertEqual(["000001", "399001"], [item["symbol"] for item in indexes.data["indices"]])
+                self.assertTrue(snapshot.succeeded, snapshot.error_code)
+                self.assertEqual(3210, snapshot.data["breadth"]["up"])
+                self.assertEqual("人工智能", snapshot.data["themes"][0]["name"])
+                self.assertEqual("2026-09-01T07:01:00Z", snapshot.fact_as_of)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_market_snapshot_rejects_nontrading_or_stale_data(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            self.publish_tool(root, "cn_market_snapshot", """
+                import json
+                print(json.dumps({
+                    "contract": "ai-trading-tool-result/v1", "fact_as_of": "2026-08-31T07:01:00Z",
+                    "data": {"finality": "official_close", "is_trading_day": False, "trading_date": "2026-08-31", "source": "test",
+                    "indices": [{"symbol": "000001", "name": "上证指数", "exchange": "SSE", "price": 1}],
+                    "breadth": {"up": 1, "down": 1, "flat": 0, "limit_up": 0, "limit_down": 0}, "industries": [], "themes": []},
+                }))
+            """)
+            result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                1, "cn_market_snapshot", "2026-09-01T07:01:00Z", 2.0, {}, finality="official_close",
+            ))
+
+            self.assertFalse(result.succeeded)
+            self.assertEqual("tool_market_non_trading_day", result.error_code)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using AITradingCompanion.Desktop.Converters;
 using AITradingCompanion.Desktop.Services;
@@ -37,6 +38,7 @@ public partial class MainWindow : Window, IDisposable
     private readonly HashSet<string> _locallyLockedCycles = new(StringComparer.Ordinal);
     private readonly HashSet<string> _editGraceRequestedCycles = new(StringComparer.Ordinal);
     private readonly Dictionary<string, FrameworkElement> _aiAnchors = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, CompanionAiTimelineEntry> _localAiNoticesByCycle = new(StringComparer.Ordinal);
     private readonly Queue<double> _waveformLevels = new();
     private CompanionWorkspaceProjection? _companionProjection;
     private PortfolioWorkspaceProjection? _portfolioProjection;
@@ -167,7 +169,8 @@ public partial class MainWindow : Window, IDisposable
         if (!CompanionInputPolicy.CanCommit(_companionProjection.State, h0Locked, staged)) return;
         var type = isConversation ? "commit_conversation_batch" : isPreM0 ? "commit_pre_m0" : isH0 ? "commit_h0" : "commit_chat_batch";
         if (!isH0 && staged == 0) return;
-        if (!await SendCompanionCommandAsync(type, null)) return;
+        SetLocalAiNotice(_companionProjection.CycleId, "chat_pending", "AI 正在回复中");
+        if (!await SendCompanionCommandAsync(type, null, showAiError: true)) return;
         if (isH0) _locallyLockedCycles.Add(_companionProjection.CycleId);
         UpdateInputState();
     }
@@ -229,23 +232,37 @@ public partial class MainWindow : Window, IDisposable
         }
     }
 
-    private async Task<bool> SendCompanionCommandAsync(string type, string? text, string? messageId = null)
+    private async Task<bool> SendCompanionCommandAsync(
+        string type,
+        string? text,
+        string? messageId = null,
+        bool showAiError = false)
     {
         if (_companionProjection is null)
         {
             _viewModel.ReportInboxFailure(new InvalidOperationException("当前判断尚未收到 AI 研究。"));
             return false;
         }
-        await _companionExchange.SendAsync(new
+        try
         {
-            contract = "companion-user-command/v1",
-            command_id = Guid.NewGuid().ToString(),
-            cycle_id = _companionProjection.CycleId,
-            type,
-            text,
-            message_id = messageId,
-        });
-        return true;
+            await _companionExchange.SendAsync(new
+            {
+                contract = "companion-user-command/v1",
+                command_id = Guid.NewGuid().ToString(),
+                cycle_id = _companionProjection.CycleId,
+                type,
+                text,
+                message_id = messageId,
+            });
+            return true;
+        }
+        catch (Exception exception)
+        {
+            _viewModel.ReportInboxFailure(exception);
+            if (showAiError)
+                SetLocalAiNotice(_companionProjection.CycleId, "fault", $"提交失败：{exception.Message}");
+            return false;
+        }
     }
 
     private void RefreshCompanionWorkspace()
@@ -300,7 +317,8 @@ public partial class MainWindow : Window, IDisposable
         if (projection.IsH0Locked) _locallyLockedCycles.Remove(projection.CycleId);
         var knownIds = projection.UserMessages.Select(message => message.MessageId).Where(id => id is not null).ToHashSet(StringComparer.Ordinal);
         LocalStaged().RemoveAll(message => message.MessageId is not null && knownIds.Contains(message.MessageId));
-        RenderAiMessages(projection.AiMessages);
+        ResolveLocalAiNotice(projection.CycleId, projection.AiMessages);
+        RenderAiMessages(WithLocalAiNotice(projection.CycleId, projection.AiMessages));
         RenderUserMessages();
         UpdateInputState();
         RequestCompanionProjectionAsync(projection.CycleId);
@@ -323,6 +341,7 @@ public partial class MainWindow : Window, IDisposable
         {
             var label = message.Kind switch
             {
+                "chat_pending" => "AI",
                 "m0" => "M0 · 客观观察",
                 "m1" => "M1 · 独立判断",
                 "m2" => "M2 · 伴生综合",
@@ -340,6 +359,7 @@ public partial class MainWindow : Window, IDisposable
             };
             var labelBrush = message.Kind switch
             {
+                "chat_pending" => (Brush)FindResource("BlueBrush"),
                 "m0" or "premarket" or "premarket_chat" => (Brush)FindResource("BlueBrush"),
                 "m1" or "m2" or "reflection" => (Brush)FindResource("AccentBrush"),
                 "fault" => new SolidColorBrush(Color.FromRgb(255, 123, 139)),
@@ -351,18 +371,17 @@ public partial class MainWindow : Window, IDisposable
                 Text = FormatTiming(message), Foreground = (Brush)FindResource("SecondaryTextBrush"),
                 FontSize = 11, Margin = new Thickness(0, 3, 0, 0),
             };
-            var body = new TextBlock
-            {
-                Text = MarkdownDocumentBuilder.ToPlainText(message.Text), TextWrapping = TextWrapping.Wrap,
-                FontSize = 15, LineHeight = 24, Margin = new Thickness(0, 10, 0, 0),
-            };
+            var body = CreateMarkdownViewer(message.Text, new Thickness(0, 8, 0, 0));
             var headerRow = new Grid();
             headerRow.ColumnDefinitions.Add(new ColumnDefinition());
             headerRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var copy = CreateCopyButton(message.Text);
-            Grid.SetColumn(copy, 1);
             headerRow.Children.Add(header);
-            headerRow.Children.Add(copy);
+            if (message.Kind != "chat_pending")
+            {
+                var copy = CreateCopyButton(message.Text);
+                Grid.SetColumn(copy, 1);
+                headerRow.Children.Add(copy);
+            }
             var content = new StackPanel { Children = { headerRow, timing, body } };
             var card = new Border
             {
@@ -370,7 +389,16 @@ public partial class MainWindow : Window, IDisposable
                 BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(9), Padding = new Thickness(12),
                 Margin = new Thickness(0, 0, 0, 10), Child = content, Cursor = Cursors.Hand,
             };
-            card.MouseLeftButtonDown += (_, _) =>
+            if (message.Kind == "chat_pending")
+            {
+                card.Cursor = Cursors.Arrow;
+                body.BeginAnimation(OpacityProperty, new DoubleAnimation
+                {
+                    From = 0.48, To = 1, Duration = TimeSpan.FromMilliseconds(760),
+                    AutoReverse = true, RepeatBehavior = RepeatBehavior.Forever,
+                });
+            }
+            else card.MouseLeftButtonDown += (_, _) =>
             {
                 _activeAiMarkdown = message.Text;
                 ReadAloudButton.IsEnabled = true;
@@ -388,9 +416,32 @@ public partial class MainWindow : Window, IDisposable
             });
             _activeAiMarkdown = null;
         }
-        else _activeAiMarkdown = messages[^1].Text;
+        else _activeAiMarkdown = messages.LastOrDefault(message => message.Kind != "chat_pending")?.Text;
         ReadAloudButton.IsEnabled = !string.IsNullOrWhiteSpace(_activeAiMarkdown);
         if (wasAtBottom) Dispatcher.BeginInvoke(() => AiTimelineScrollViewer.ScrollToEnd(), DispatcherPriority.Loaded);
+    }
+
+    private void SetLocalAiNotice(string cycleId, string kind, string text)
+    {
+        _localAiNoticesByCycle[cycleId] = new CompanionAiTimelineEntry(
+            $"local-reply-status-{cycleId}", kind, DateTimeOffset.Now, text, DateTimeOffset.Now);
+        if (_companionProjection?.CycleId == cycleId)
+            RenderAiMessages(WithLocalAiNotice(cycleId, _companionProjection.AiMessages));
+    }
+
+    private IReadOnlyList<CompanionAiTimelineEntry> WithLocalAiNotice(
+        string cycleId,
+        IReadOnlyList<CompanionAiTimelineEntry> messages)
+    {
+        if (!_localAiNoticesByCycle.TryGetValue(cycleId, out var notice)) return messages;
+        return [.. messages, notice];
+    }
+
+    private void ResolveLocalAiNotice(string cycleId, IReadOnlyList<CompanionAiTimelineEntry> messages)
+    {
+        if (!_localAiNoticesByCycle.TryGetValue(cycleId, out var notice) || notice.Kind == "fault") return;
+        if (messages.Any(message => message.At >= notice.At))
+            _localAiNoticesByCycle.Remove(cycleId);
     }
 
     private void RenderUserMessages()
@@ -409,7 +460,7 @@ public partial class MainWindow : Window, IDisposable
                 Text = headerText, FontSize = 11,
                 Foreground = isStaged ? (Brush)FindResource("BlueBrush") : (Brush)FindResource("SecondaryTextBrush"),
             };
-            var body = new TextBlock { Text = entry.Text, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 5, 0, 0) };
+            var body = CreateMarkdownViewer(entry.Text, new Thickness(0, 3, 0, 0));
             var headerRow = new Grid();
             headerRow.ColumnDefinitions.Add(new ColumnDefinition());
             headerRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -455,6 +506,24 @@ public partial class MainWindow : Window, IDisposable
         }
         if (messages.Length == 0)
             MainJudgmentTimelinePanel.Children.Add(new TextBlock { Text = "当前判断还没有你的消息。", Foreground = (Brush)FindResource("SecondaryTextBrush") });
+    }
+
+    private static FlowDocumentScrollViewer CreateMarkdownViewer(string markdown, Thickness margin)
+    {
+        var document = MarkdownDocumentBuilder.Build(markdown);
+        document.ColumnWidth = double.PositiveInfinity;
+        return new FlowDocumentScrollViewer
+        {
+            Document = document,
+            IsToolBarVisible = false,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Background = Brushes.Transparent,
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(0),
+            Margin = margin,
+            IsSelectionEnabled = true,
+        };
     }
 
     private Button CreateCopyButton(string text)

@@ -23,16 +23,31 @@ public sealed class CompanionEventProjectionTests
     {
         var events = new[]
         {
-            """{"contract":"companion-client-event/v1","event_id":"manual-1","cycle_id":"manual-1","type":"analysis.request.created","created_at":"2026-08-29T02:00:00Z","payload":{"cycle":{"task_key":"daily.review.1520","state":"queued","scheduled_for":"2026-08-29T10:00:00.000001+08:00","trigger":"manual_chat","requested_at":"2026-08-29T10:00:00+08:00","task_profile_id":"non_trading_research"}}}""",
-            """{"contract":"companion-client-event/v1","event_id":"manual-2","cycle_id":"manual-2","type":"analysis.request.created","created_at":"2026-08-29T02:01:00Z","payload":{"cycle":{"task_key":"daily.review.1520","state":"queued","scheduled_for":"2026-08-29T10:01:00.000001+08:00","trigger":"manual_chat","requested_at":"2026-08-29T10:01:00+08:00","task_profile_id":"non_trading_research"}}}"""
+            """{"contract":"companion-client-event/v1","event_id":"manual-1","cycle_id":"manual-1","type":"analysis.request.created","created_at":"2026-08-29T02:00:00Z","payload":{"cycle":{"task_key":"manual.non_trading_outlook","state":"queued","scheduled_for":"2026-08-29T10:00:00.000001+08:00","trigger":"manual_chat","requested_at":"2026-08-29T10:00:00+08:00","task_profile_id":"non_trading_outlook","task_profile_json":"{\"display_name\":\"非交易日市场环境总结与下一交易日预判\"}"}}}""",
+            """{"contract":"companion-client-event/v1","event_id":"manual-2","cycle_id":"manual-2","type":"analysis.request.created","created_at":"2026-08-29T02:01:00Z","payload":{"cycle":{"task_key":"manual.non_trading_outlook","state":"queued","scheduled_for":"2026-08-29T10:01:00.000001+08:00","trigger":"manual_chat","requested_at":"2026-08-29T10:01:00+08:00","task_profile_id":"non_trading_outlook","task_profile_json":"{\"display_name\":\"非交易日市场环境总结与下一交易日预判\"}"}}}"""
         };
 
         var projections = CompanionEventProjection.ProjectAll(events);
 
         Assert.Equal(["manual-1", "manual-2"], projections.Select(item => item.CycleId));
         Assert.All(projections, item => Assert.Equal("manual_chat", item.Trigger));
-        Assert.All(projections, item => Assert.Equal("daily.review.1520", item.TaskKey));
+        Assert.All(projections, item => Assert.Equal("manual.non_trading_outlook", item.TaskKey));
+        Assert.All(projections, item => Assert.Equal("非交易日市场环境总结与下一交易日预判", item.TaskProfileDisplayName));
         Assert.Equal(DateTimeOffset.Parse("2026-08-29T10:00:00+08:00", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind), projections[0].RequestedAt);
+    }
+
+    [Fact]
+    public void ProjectsDismissedManualCycleForImmediateRemovalFromTodayList()
+    {
+        var events = new[]
+        {
+            """{"contract":"companion-client-event/v1","event_id":"manual","cycle_id":"manual-1","type":"analysis.request.created","created_at":"2026-08-29T02:00:00Z","payload":{"cycle":{"task_key":"daily.execution.0945","state":"failed","scheduled_for":"2026-08-29T13:00:00.000001+08:00","trigger":"manual_chat","requested_at":"2026-08-29T13:00:00+08:00","task_profile_id":"intraday_execution"}}}""",
+            """{"contract":"companion-client-event/v1","event_id":"dismissed","cycle_id":"manual-1","type":"analysis.dismissed","created_at":"2026-08-29T03:00:00Z","payload":{"cycle":{"task_key":"daily.execution.0945","state":"failed","trigger":"manual_chat","requested_at":"2026-08-29T13:00:00+08:00","task_profile_id":"intraday_execution"}}}"""
+        };
+
+        var projection = Assert.Single(CompanionEventProjection.ProjectAll(events));
+
+        Assert.True(projection.IsDismissed);
     }
 
     [Fact]
@@ -103,6 +118,37 @@ public sealed class CompanionEventProjectionTests
     }
 
     [Fact]
+    public void StreamingReplyShowsPendingNoticeUntilTheFirstVisibleTextArrives()
+    {
+        var started = """{"contract":"companion-client-event/v1","event_id":"started","cycle_id":"c1","type":"chat.stream.started","created_at":"2026-08-25T01:02:00Z","payload":{"cycle":{"task_key":"conversation.daily","state":"open"},"stream":{"stream_id":"s1","state":"streaming","created_at":"2026-08-25T01:02:00Z"}}}""";
+        var delta = """{"contract":"companion-client-event/v1","event_id":"delta","cycle_id":"c1","type":"chat.stream.delta","created_at":"2026-08-25T01:02:01Z","payload":{"cycle":{"task_key":"conversation.daily","state":"open"},"stream_id":"s1","text":"我先核对一下。"}}""";
+
+        var pending = CompanionEventProjection.Project([started]);
+        var replying = CompanionEventProjection.Project([started, delta]);
+
+        Assert.NotNull(pending);
+        Assert.Equal("chat_pending", Assert.Single(pending.AiMessages).Kind);
+        Assert.Equal("AI 正在回复中", pending.AiMessages[0].Text);
+        Assert.NotNull(replying);
+        Assert.Equal("chat", Assert.Single(replying.AiMessages).Kind);
+        Assert.Equal("我先核对一下。", replying.AiMessages[0].Text);
+    }
+
+    [Fact]
+    public void ProjectionReadyRestoresAnEmptyActiveReplyAsPending()
+    {
+        var events = new[]
+        {
+            """{"contract":"companion-client-event/v1","event_id":"projection","cycle_id":"c1","type":"projection.ready","created_at":"2026-08-25T01:02:00Z","payload":{"cycle":{"task_key":"conversation.daily","state":"open"},"stream_messages":[{"stream_id":"s1","state":"streaming","text":"","created_at":"2026-08-25T01:01:59Z"}]}}"""
+        };
+
+        var projection = CompanionEventProjection.Project(events);
+
+        Assert.NotNull(projection);
+        Assert.Equal("chat_pending", Assert.Single(projection.AiMessages).Kind);
+    }
+
+    [Fact]
     public void PreM0MessagesBecomeSubmittedContextWithoutCountingAsH0()
     {
         var events = new[]
@@ -157,6 +203,27 @@ public sealed class CompanionEventProjectionTests
         Assert.Null(projection.ErrorText);
         Assert.Single(projection.AiMessages);
         Assert.Equal("m1", projection.AiMessages[0].Kind);
+    }
+
+    [Fact]
+    public void ConsecutiveFaultsShareOneCardAndRepeatedTextUsesLatestOccurrence()
+    {
+        const string repeated = "M1 遇到技术故障，未能完成。详细诊断已保留在本地审计记录中。";
+        var events = new[]
+        {
+            """{"contract":"companion-client-event/v1","event_id":"fault-1","cycle_id":"cycle-1","type":"m1.failed","created_at":"2026-08-31T07:48:43Z","payload":{"reason":"__REASON__","cycle":{"task_key":"daily.review.1520","state":"m1_retry_wait"}}}""".Replace("__REASON__", repeated, StringComparison.Ordinal),
+            """{"contract":"companion-client-event/v1","event_id":"fault-2","cycle_id":"cycle-1","type":"m1.failed","created_at":"2026-08-31T07:49:19Z","payload":{"reason":"__REASON__","cycle":{"task_key":"daily.review.1520","state":"m1_retry_wait"}}}""".Replace("__REASON__", repeated, StringComparison.Ordinal),
+            """{"contract":"companion-client-event/v1","event_id":"fault-other","cycle_id":"cycle-1","type":"m2.deferred","created_at":"2026-08-31T07:50:00Z","payload":{"reason":"M2 已延后。","cycle":{"task_key":"daily.review.1520","state":"m2_deferred"}}}"""
+        };
+
+        var projection = CompanionEventProjection.ProjectForTask(events, "daily.review.1520");
+
+        Assert.NotNull(projection);
+        var fault = Assert.Single(projection.AiMessages);
+        Assert.Equal("fault", fault.Kind);
+        Assert.Equal(1, fault.Text.Split(repeated, StringSplitOptions.None).Length - 1);
+        Assert.Contains("M2 已延后。", fault.Text, StringComparison.Ordinal);
+        Assert.Equal(DateTimeOffset.Parse("2026-08-31T07:50:00Z", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind), fault.At);
     }
 
     [Fact]

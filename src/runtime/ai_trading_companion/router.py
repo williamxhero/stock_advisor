@@ -9,7 +9,7 @@ from .effort_policy import CognitiveEffortPolicy, EffortPolicyFacts
 
 RESEARCH_STAGES = frozenset({"m0_research", "m1_research", "outcome_research", "chat_research"})
 JUDGMENT_STAGES = frozenset({"m1_judgment", "m2", "reflection", "workflow_feedback"})
-MAJOR_TASKS = frozenset({"daily.execution.1430", "daily.review.1520", "periodic.monthly", "periodic.quarterly", "periodic.annual"})
+MAJOR_TASKS = frozenset({"daily.execution.1430", "daily.review.1520", "manual.non_trading_outlook", "periodic.monthly", "periodic.quarterly", "periodic.annual"})
 
 
 @dataclass(frozen=True)
@@ -135,6 +135,25 @@ class CognitiveRouter:
     def verify(self, stage: str, packet: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
         problems: list[str] = []
         profile = self.profile(stage, packet, 1)
+        if stage == "m0_compose":
+            calendar = packet.get("calendar_context") if isinstance(packet.get("calendar_context"), dict) else {}
+            body = "".join(str(output.get("m0_markdown") or "").split()).lower()
+            if any(marker in body for marker in (
+                "建议买入", "建议卖出", "建议加仓", "建议减仓", "不新增仓", "不加仓", "不减仓", "不清仓",
+                "买入股数", "卖出股数", "持有观察", "今日动作",
+            )):
+                problems.append("m0_contains_direction_or_action")
+            if calendar.get("is_xshg_trading_day") is True and any(marker in body for marker in (
+                "非a股交易日", "非交易日", "状态:skipped", "状态：skipped",
+            )):
+                problems.append("m0_calendar_context_conflict")
+            expected_date = str(calendar.get("date") or "")
+            expected_weekday = str(calendar.get("weekday_name_zh") or "")
+            if expected_date and expected_weekday:
+                expected_labels = {expected_weekday, expected_weekday.replace("星期", "周")}
+                wrong_labels = {f"星期{suffix}" for suffix in "一二三四五六日"} | {f"周{suffix}" for suffix in "一二三四五六日"}
+                if any(f"{expected_date}为{label}" in body for label in wrong_labels - expected_labels):
+                    problems.append("m0_calendar_weekday_conflict")
         if stage == "m1_judgment" and not profile.m1_blind:
             problems.append("m1_packet_contains_human_input")
         snapshot = output.get("snapshot") if isinstance(output.get("snapshot"), dict) else None

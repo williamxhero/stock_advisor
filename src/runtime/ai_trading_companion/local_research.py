@@ -90,6 +90,7 @@ class BrokerResearchPlanner:
         discoveries = _merge_discoveries(
             list(packet.get("research_discoveries") or []),
             _public_market_close_discoveries(packet),
+            _public_intraday_market_discoveries(packet),
         )
         planning_packet = {
             "task_key": packet.get("task_key"),
@@ -331,6 +332,16 @@ def _verify_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> dic
     }
     problems = [f"research_plan_missing_requirement:{key}" for key in sorted(required - planned)]
     problems.extend(f"research_plan_unknown_requirement:{key}" for key in sorted(planned - set(requirements)))
+    available_backends = set(packet.get("available_backends") or [])
+    for row in operations:
+        if not isinstance(row, dict):
+            continue
+        backend = str(row.get("backend") or "")
+        if backend and backend not in available_backends:
+            problems.append(f"research_plan_backend_unavailable:{backend}")
+        for fallback in row.get("fallback_backends") or []:
+            if fallback not in available_backends:
+                problems.append(f"research_plan_backend_unavailable:{fallback}")
     discoveries = {
         str(row.get("requirement_key") or "")
         for row in packet.get("research_discoveries") or []
@@ -374,7 +385,7 @@ def _verify_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> dic
     frozen_market_urls = {
         str(row.get("url") or "")
         for row in packet.get("research_discoveries") or []
-        if isinstance(row, dict) and row.get("source_kind") == "deterministic_public_market"
+        if isinstance(row, dict) and str(row.get("source_kind") or "").startswith("deterministic_public_market")
     }
     if frozen_market_urls and "current_market_state" in required:
         planned_urls = {
@@ -447,6 +458,26 @@ def _public_market_close_discoveries(packet: dict[str, Any]) -> list[dict[str, A
     return rows
 
 
+def _public_intraday_market_discoveries(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    context = _planner_time_context(packet)
+    requirement = next((
+        row for row in context["requirements"]
+        if row.get("requirement_key") == "current_market_state" and not row.get("is_local_market_close")
+    ), None)
+    if not requirement:
+        return []
+    return [{
+        "requirement_key": "current_market_state",
+        "url": f"https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={symbol}",
+        "title": f"Tencent public intraday minute series {symbol}",
+        "excerpt": "Timestamped public intraday index minute series",
+        "fact_as_of": requirement.get("end_utc"),
+        "published_at": None,
+        "primary": False,
+        "source_kind": "deterministic_public_market_intraday",
+    } for symbol in ("sh000001", "sz399001", "sz399006")]
+
+
 def _merge_discoveries(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -495,13 +526,34 @@ def _compile_evidence(packet: dict[str, Any], contract: dict[str, Any], observat
     for requirement in contract.get("requirements") or []:
         key = str(requirement.get("key") or "")
         refs = refs_by_requirement.get(key, [])
-        coverage.append({"requirement_key": key, "status": "covered" if refs else "missing", "evidence_refs": refs})
+        allowed = set(requirement.get("allowed_coverage") or ["covered"])
+        if refs:
+            status = "covered"
+        elif "checked_no_change" in allowed and _has_matching_negative_search(observations, requirement):
+            status = "checked_no_change"
+        else:
+            status = "missing"
+        coverage.append({"requirement_key": key, "status": status, "evidence_refs": refs})
     return {
         "schema_version": 3, "as_of": str(packet.get("as_of") or contract.get("as_of") or ""),
         "spoken_summary": "本地研究证据已按冻结合同采集。", "sources": sources, "coverage": coverage,
         "critical_gaps": [row["requirement_key"] for row in coverage if row["status"] == "missing"],
         "conflicts": [], "high_impact_events": [],
     }
+
+
+def _has_matching_negative_search(observations: list[dict[str, Any]], requirement: dict[str, Any]) -> bool:
+    key = str(requirement.get("key") or "")
+    terms = [str(term).casefold() for term in requirement.get("negative_query_terms") or []]
+    if not terms:
+        return False
+    return any(
+        observation.get("operation") == "web_search"
+        and observation.get("status") == "succeeded"
+        and str((observation.get("arguments") or {}).get("requirement_key") or "") == key
+        and all(term in str((observation.get("arguments") or {}).get("query") or "").casefold() for term in terms)
+        for observation in observations
+    )
 
 
 def _fallback_operation(backend: str) -> str:

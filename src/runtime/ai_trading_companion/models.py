@@ -41,6 +41,7 @@ TASK_POLICIES = {
     "daily.execution.1030": TaskPolicy("daily.execution.1030", "A股 10:30趋势确认", "protocols/07_DAILY_EXECUTION_PROTOCOL.md", time(14, 30), _RESERVE, _INTRADAY, _INTRADAY, timedelta(minutes=15), "daily_intraday"),
     "daily.execution.1430": TaskPolicy("daily.execution.1430", "A股 14:30操作决策", "protocols/07_DAILY_EXECUTION_PROTOCOL.md", time(15, 20), _RESERVE, _INTRADAY, _INTRADAY, timedelta(minutes=15), "daily_intraday"),
     "daily.review.1520": TaskPolicy("daily.review.1520", "A股 15:20收盘复盘", "protocols/07_DAILY_EXECUTION_PROTOCOL.md", time(16, 0), _RESERVE, _INTRADAY, _INTRADAY, timedelta(minutes=15), "daily_open_close"),
+    "manual.non_trading_outlook": TaskPolicy("manual.non_trading_outlook", "A股非交易日市场环境总结与下一交易日预判", "protocols/10_NON_TRADING_OUTLOOK_PROTOCOL.md", None, _RESERVE, timedelta(minutes=10), _INTRADAY, timedelta(minutes=15), "non_trading_outlook"),
     "periodic.monthly": TaskPolicy("periodic.monthly", "A股月度复盘", "protocols/08_PERIODIC_REVIEW_PROTOCOL.md", None, _RESERVE, timedelta(minutes=10), _INTRADAY, timedelta(minutes=15), "periodic_review"),
     "periodic.quarterly": TaskPolicy("periodic.quarterly", "A股季度复盘", "protocols/08_PERIODIC_REVIEW_PROTOCOL.md", None, _RESERVE, timedelta(minutes=10), _INTRADAY, timedelta(minutes=15), "periodic_review"),
     "periodic.annual": TaskPolicy("periodic.annual", "A股年度复盘", "protocols/08_PERIODIC_REVIEW_PROTOCOL.md", None, _RESERVE, timedelta(minutes=10), _INTRADAY, timedelta(minutes=15), "periodic_review"),

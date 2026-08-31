@@ -67,6 +67,33 @@ class LocalResearchTests(unittest.TestCase):
         self.assertIn("research_plan_market_query_uses_utc_clock_as_local", result["problems"])
         self.assertIn("research_plan_missing_frozen_public_market_read", result["problems"])
 
+    def test_planner_supplies_and_requires_public_intraday_quote_read(self) -> None:
+        broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})
+        planner = BrokerResearchPlanner(broker, intellect="smart", effort="medium", deadline=lambda: 123.0)
+        packet = {
+            "as_of": "2026-08-31T05:10:00Z",
+            "evidence_contract": {
+                "version": 3, "as_of": "2026-08-31T05:10:00Z", "requirements": [{
+                    "key": "current_market_state", "blocking": True,
+                    "window": {"mode": "range", "start": "2026-08-31T04:55:00Z", "end": "2026-08-31T05:10:00Z"},
+                }],
+            },
+        }
+        planner(packet, [], 0)
+        request = broker.invoke.call_args.args[0]
+        market_urls = [row["url"] for row in request.packet["research_discoveries"]]
+        market_url = market_urls[0]
+        self.assertEqual(3, len(market_urls))
+        self.assertEqual("https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sh000001", market_url)
+        valid = {"version": 1, "operations": [
+            {**row("web_read", url=market_url), "requirement_key": "current_market_state"},
+        ]}
+        self.assertTrue(request.verifier(valid)["passed"])
+        result = request.verifier({"version": 1, "operations": [
+            {**row("web_search", query="A股 盘中"), "requirement_key": "current_market_state"},
+        ]})
+        self.assertIn("research_plan_missing_frozen_public_market_read", result["problems"])
+
     def test_plan_verifier_requires_every_blocking_requirement(self) -> None:
         broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})
         contract = {**CONTRACT, "requirements": [
@@ -80,6 +107,26 @@ class LocalResearchTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertIn("research_plan_missing_requirement:events", result["problems"])
 
+    def test_plan_verifier_rejects_a_backend_that_is_not_actually_available(self) -> None:
+        broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})
+        planner = BrokerResearchPlanner(broker, intellect="smart", effort="medium", deadline=lambda: 123.0)
+        planner({
+            "as_of": CONTRACT["as_of"], "evidence_contract": CONTRACT,
+            "allowed_research_backends": ["gateway", "market"],
+        }, [], 0)
+        request = broker.invoke.call_args.args[0]
+        market_operation = {
+            "requirement_key": "market", "backend": "market", "operation": "market_snapshot",
+            "arguments": {"query": None, "categories": "市场价量", "url": None, "symbol": None,
+                          "render": None, "session_id": None, "actions": None},
+            "fallback_backends": ["gateway"],
+        }
+
+        result = request.verifier({"version": 1, "operations": [market_operation]})
+
+        self.assertFalse(result["passed"])
+        self.assertIn("research_plan_backend_unavailable:market", result["problems"])
+
     def test_gateway_adapter_exposes_only_read_operations(self) -> None:
         client = mock.Mock(); backend = WebAccessGatewayBackend(client, as_of=CONTRACT["as_of"])
         backend("web_search", row("web_search", query="收盘")["arguments"])
@@ -92,6 +139,46 @@ class LocalResearchTests(unittest.TestCase):
         plan = {"version": 1, "operations": [row("web_search", query="收盘")]}
         result = LocalResearchChain(lambda *_: plan, ReadOnlyResearchExecutor({"gateway": lambda *_: search}), max_repairs=0).run({"as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="x")
         self.assertFalse(result.qualified); self.assertEqual([], result.evidence["sources"])
+
+    def test_successful_negative_event_query_can_record_checked_no_change_without_promoting_search_results(self) -> None:
+        contract = {
+            **CONTRACT,
+            "requirements": [
+                *CONTRACT["requirements"],
+                {
+                    "key": "events", "blocking": True,
+                    "allowed_coverage": ["covered", "checked_no_change"],
+                    "window": {
+                        "mode": "after_start_to_end",
+                        "start": "2026-08-27T06:00:00Z", "end": CONTRACT["as_of"],
+                    },
+                    "negative_query_terms": ["公告", "政策", "风险"],
+                },
+            ],
+        }
+        market_read = {
+            "results": [{
+                "url": "https://example.test/market", "title": "收盘", "excerpt_text": "收盘事实",
+                "fact_as_of": CONTRACT["as_of"], "primary": True,
+            }],
+        }
+        plan = {"version": 1, "operations": [
+            row("web_read", url="https://example.test/market"),
+            {**row("web_search", query="A股 公告 政策 风险"), "requirement_key": "events"},
+        ]}
+
+        def backend(operation: str, _arguments: dict) -> dict:
+            return {"results": []} if operation == "web_search" else market_read
+
+        result = LocalResearchChain(
+            lambda *_: plan, ReadOnlyResearchExecutor({"gateway": backend}), max_repairs=0,
+        ).run({"as_of": CONTRACT["as_of"]}, contract, attempt_id="x")
+
+        self.assertTrue(result.qualified, result.verifier["problems"])
+        events = next(row for row in result.evidence["coverage"] if row["requirement_key"] == "events")
+        self.assertEqual("checked_no_change", events["status"])
+        self.assertEqual([], events["evidence_refs"])
+        self.assertEqual(1, len(result.evidence["sources"]))
 
     def test_verified_read_can_cover_contract(self) -> None:
         read = {"results": [{"url": "https://example.test/2026-08-27", "title": "收盘", "excerpt_text": "收盘事实", "fact_as_of": "2026-08-27T07:00:00Z", "primary": True}]}

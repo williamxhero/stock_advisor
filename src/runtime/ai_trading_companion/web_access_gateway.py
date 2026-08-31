@@ -38,6 +38,26 @@ class WebAccessGatewayClient:
         value = self._call("web_read", {"url": url, "render": render, "output": "markdown"}, self.read_timeout)
         body = _text(value, "markdown")
         title = _text(value, "title")
+        frozen_minute = _frozen_public_intraday_minute_row(url, body, not_after)
+        if frozen_minute is not None:
+            return {"trace_id": _text(value, "trace_id"), "results": [{
+                "url": _text(value, "url") or url,
+                "title": frozen_minute["title"],
+                "excerpt_text": frozen_minute["excerpt_text"],
+                "fact_as_of": frozen_minute["fact_as_of"],
+                "published_at": None,
+                "primary": False,
+            }]}
+        frozen_intraday = _frozen_public_intraday_rows(url, body, not_after)
+        if frozen_intraday is not None:
+            return {"trace_id": _text(value, "trace_id"), "results": [{
+                "url": _text(value, "url") or url,
+                "title": frozen_intraday["title"],
+                "excerpt_text": frozen_intraday["excerpt_text"],
+                "fact_as_of": frozen_intraday["fact_as_of"],
+                "published_at": None,
+                "primary": False,
+            }]}
         frozen_market = _frozen_public_market_row(url, body, not_after)
         if frozen_market is not None:
             return {"trace_id": _text(value, "trace_id"), "results": [{
@@ -209,6 +229,79 @@ def _frozen_public_market_row(url: str, body: str, not_after: str | None) -> dic
     return {
         "title": f"腾讯证券公开历史日线 {symbol} {row[0]}",
         "excerpt_text": json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        "fact_as_of": fact_time.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _frozen_public_intraday_rows(url: str, body: str, not_after: str | None) -> dict[str, str] | None:
+    """Normalize Tencent's public quote wire format into timestamped index rows."""
+    parsed = urlsplit(url)
+    if parsed.netloc.casefold() != "qt.gtimg.cn" or not parsed.path.startswith("/q="):
+        return None
+    cutoff = _aware_utc(not_after)
+    rows: list[tuple[datetime, dict[str, str]]] = []
+    for match in re.finditer(r'v\\?_([a-z]{2}\d+)\s*=\s*"([^"]+)"', body, flags=re.IGNORECASE):
+        values = match.group(2).split("~")
+        if len(values) <= 32 or not re.fullmatch(r"20\d{12}", values[30]):
+            continue
+        try:
+            local_time = datetime.strptime(values[30], "%Y%m%d%H%M%S").replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        except ValueError:
+            continue
+        quote_time = local_time.astimezone(timezone.utc)
+        if cutoff is not None and quote_time > cutoff:
+            continue
+        rows.append((quote_time, {
+            "symbol": match.group(1).lower(), "code": values[2], "current": values[3],
+            "previous_close": values[4], "open": values[5], "change": values[31],
+            "change_percent": values[32], "quote_time": values[30],
+        }))
+    if not rows:
+        return None
+    fact_time = max(row[0] for row in rows)
+    payload = {
+        "source": "Tencent public intraday index quote",
+        "indices": [row for quote_time, row in rows if quote_time == fact_time],
+    }
+    return {
+        "title": f"Tencent public intraday indices {fact_time.astimezone(ZoneInfo('Asia/Shanghai')).isoformat()}",
+        "excerpt_text": json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        "fact_as_of": fact_time.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _frozen_public_intraday_minute_row(url: str, body: str, not_after: str | None) -> dict[str, str] | None:
+    """Select the latest minute row that existed at the immutable research cutoff."""
+    parsed = urlsplit(url)
+    if parsed.netloc.casefold() != "web.ifzq.gtimg.cn" or parsed.path != "/appstock/app/minute/query":
+        return None
+    symbol = (parse_qs(parsed.query).get("code") or [""])[0]
+    date_match = re.search(r'"date"\s*:\s*"(20\d{6})"', body)
+    if not symbol or date_match is None:
+        return None
+    cutoff = _aware_utc(not_after)
+    candidates: list[tuple[datetime, dict[str, str]]] = []
+    for match in re.finditer(r'"([012]\d)([0-5]\d)\s+([^"\s]+)\s+([^"\s]+)\s+([^"\s]+)"', body):
+        compact = date_match.group(1) + match.group(1) + match.group(2)
+        try:
+            local_time = datetime.strptime(compact, "%Y%m%d%H%M").replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        except ValueError:
+            continue
+        quote_time = local_time.astimezone(timezone.utc)
+        if cutoff is not None and quote_time > cutoff:
+            continue
+        candidates.append((quote_time, {
+            "symbol": symbol, "date": date_match.group(1), "time": match.group(1) + match.group(2),
+            "price": match.group(3), "cumulative_volume": match.group(4),
+            "cumulative_turnover": match.group(5),
+        }))
+    if not candidates:
+        return None
+    fact_time, row = max(candidates, key=lambda item: item[0])
+    payload = {"source": "Tencent public intraday minute series", **row}
+    return {
+        "title": f"Tencent public intraday minute {symbol} {row['date']} {row['time']}",
+        "excerpt_text": json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         "fact_as_of": fact_time.isoformat().replace("+00:00", "Z"),
     }
 

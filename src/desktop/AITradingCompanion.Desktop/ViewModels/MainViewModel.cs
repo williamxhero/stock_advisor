@@ -15,6 +15,7 @@ public sealed class MainViewModel : ObservableObject
     private readonly AppSettings _settings;
     private readonly ICompanionGateway _gateway;
     private readonly List<TaskMessage> _allHistory = [];
+    private readonly HashSet<string> _dismissedGatewayCycleIds = new(StringComparer.Ordinal);
     private TaskRowViewModel? _selectedTask;
     private HistoryRecordViewModel? _selectedHistory;
     private int _selectedSectionIndex;
@@ -266,11 +267,17 @@ public sealed class MainViewModel : ObservableObject
                     if (string.IsNullOrWhiteSpace(cycleId) || string.IsNullOrWhiteSpace(scheduled) || string.IsNullOrWhiteSpace(taskKey)) continue;
                     var at = DateTimeOffset.Parse(scheduled, CultureInfo.InvariantCulture);
                     var expected = ExpectedTaskCatalog.AShareTasks.FirstOrDefault(item => item.TaskKey == taskKey);
+                    var displayName = expected?.Name ?? taskKey;
+                    if (node["task_profile_json"]?.GetValue<string>() is { Length: > 0 } profileJson)
+                    {
+                        try { displayName = System.Text.Json.Nodes.JsonNode.Parse(profileJson)?["display_name"]?.GetValue<string>() ?? displayName; }
+                        catch (System.Text.Json.JsonException) { }
+                    }
                     var state = node["state"]?.GetValue<string>() ?? "queued";
                     var status = state is "failed" or "waiting_for_repair" ? TaskMessageStatus.Failed : TaskMessageStatus.Succeeded;
                     await _store.AddAsync(new IncomingTaskMessage($"gateway:{cycleId}", "gateway", cycleId, "AI Trading Companion", taskKey,
-                        expected?.Name ?? taskKey, at, at, at, status, string.Empty, string.Empty,
-                        $"运行时状态：{state}", $"# {expected?.Name ?? taskKey}\n\n运行时状态：{state}", node.ToJsonString(), cycleId)).ConfigureAwait(true);
+                        displayName, at, at, at, status, string.Empty, string.Empty,
+                        $"运行时状态：{state}", $"# {displayName}\n\n运行时状态：{state}", node.ToJsonString(), cycleId)).ConfigureAwait(true);
                 }
                 _gatewayHistoryAvailable = true;
                 return;
@@ -327,7 +334,19 @@ public sealed class MainViewModel : ObservableObject
     public void SynchronizeManualCycles(IEnumerable<CompanionWorkspaceProjection> projections)
     {
         var timeout = TimeSpan.FromMinutes(Math.Max(1, _settings.Display.NodeTimeoutMinutes));
-        foreach (var projection in projections.Where(item => item.Trigger == "manual_chat" && item.RequestedAt is not null && IsCurrentTradingDate(item.RequestedAt!.Value)))
+        var current = projections.Where(item => item.Trigger == "manual_chat" && item.RequestedAt is not null && IsCurrentTradingDate(item.RequestedAt!.Value)).ToArray();
+        var dismissed = current.Where(item => item.IsDismissed).ToArray();
+        foreach (var projection in dismissed)
+        {
+            var existing = Tasks.FirstOrDefault(task => task.CycleId == projection.CycleId);
+            if (existing is not null) Tasks.Remove(existing);
+        }
+        var newlyDismissed = dismissed
+            .Select(item => item.CycleId)
+            .Where(cycleId => _dismissedGatewayCycleIds.Add(cycleId))
+            .ToArray();
+        if (newlyDismissed.Length > 0) _ = RemoveDismissedGatewayCyclesAsync(newlyDismissed);
+        foreach (var projection in current.Where(item => !item.IsDismissed))
         {
             var existing = Tasks.FirstOrDefault(task => task.CycleId == projection.CycleId);
             if (existing is not null)
@@ -339,10 +358,25 @@ public sealed class MainViewModel : ObservableObject
             var expected = new ExpectedTask(
                 projection.TaskKey ?? "manual.analysis",
                 TimeOnly.FromDateTime(requested.DateTime),
-                projection.TaskProfileId ?? "手动研判");
+                projection.TaskProfileDisplayName ?? projection.TaskProfileId ?? "手动研判");
             var row = new TaskRowViewModel(expected, null, timeout, projection.CycleId);
             row.UpdateCompanionStatus(projection.State, projection.ErrorText);
             Tasks.Add(row);
+        }
+    }
+
+    private async Task RemoveDismissedGatewayCyclesAsync(IReadOnlyCollection<string> cycleIds)
+    {
+        try
+        {
+            if (await _store.RemoveGatewayCyclesAsync(cycleIds).ConfigureAwait(true) > 0)
+            {
+                await RefreshAsync().ConfigureAwait(true);
+            }
+        }
+        catch (Exception exception)
+        {
+            StatusText = $"清理已隐藏研判的本地缓存失败：{exception.Message}";
         }
     }
 

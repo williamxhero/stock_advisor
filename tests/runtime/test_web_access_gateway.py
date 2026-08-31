@@ -85,6 +85,41 @@ class WebAccessGatewayTests(unittest.TestCase):
         self.assertNotIn("future-value", item["excerpt_text"])
         self.assertFalse(item["primary"])
 
+    def test_tencent_intraday_quote_exposes_compact_quote_time_and_index_values(self) -> None:
+        url = "https://qt.gtimg.cn/q=sh000001,sz399001,sz399006"
+        markdown = (
+            'v\\_sh000001="1~name~000001~3945.53~3952.18~3926.53' + '~0' * 24
+            + '~20260831131054~-6.65~-0.17"; '
+            'v\\_sz399001="51~name~399001~13823.92~13953.07~13764.41' + '~0' * 24
+            + '~20260831131054~-129.15~-0.93";'
+        )
+        response = {"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
+            "trace_id": "trace", "url": url, "markdown": markdown,
+        })}]}}
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=_Response(response)):
+            item = self.client.read(url, not_after="2026-08-31T05:11:00Z")["results"][0]
+        self.assertEqual("2026-08-31T05:10:54Z", item["fact_as_of"])
+        self.assertIn('"symbol":"sh000001"', item["excerpt_text"])
+        self.assertIn('"current":"3945.53"', item["excerpt_text"])
+        self.assertFalse(item["primary"])
+
+    def test_tencent_intraday_minute_read_selects_latest_row_before_frozen_cutoff(self) -> None:
+        url = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sh000001"
+        markdown = (
+            '{"data":{"sh000001":{"data":{"data":\\['
+            '"1313 3943.00 100 200.00","1314 3945.53 120 240.00","1315 3950.00 130 260.00"'
+            '\\],"date":"20260831"}}}}'
+        )
+        response = {"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
+            "trace_id": "trace", "url": url, "markdown": markdown,
+        })}]}}
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=_Response(response)):
+            item = self.client.read(url, not_after="2026-08-31T05:14:19Z")["results"][0]
+        self.assertEqual("2026-08-31T05:14:00Z", item["fact_as_of"])
+        self.assertIn('"price":"3945.53"', item["excerpt_text"])
+        self.assertNotIn("3950.00", item["excerpt_text"])
+        self.assertFalse(item["primary"])
+
     def test_browser_rejects_any_mutating_action_before_network(self) -> None:
         with mock.patch("ai_trading_companion.web_access_gateway.urlopen") as open_request:
             with self.assertRaisesRegex(WebAccessGatewayError, "read-only"):

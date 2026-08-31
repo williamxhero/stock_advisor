@@ -46,6 +46,43 @@ public sealed class SqliteTaskMessageStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task RemovesOnlyRequestedGatewayCycleCacheRows()
+    {
+        var store = new SqliteTaskMessageStore(new AppPaths(_directory));
+        await store.InitializeAsync();
+        var gatewayOne = TestMessageFactory.CreateIncoming() with
+        {
+            ExternalId = "gateway:cycle-1",
+            Source = "gateway",
+            SourceRunId = "cycle-1",
+            ContentSha256 = "cycle-1"
+        };
+        var gatewayTwo = gatewayOne with
+        {
+            ExternalId = "gateway:cycle-2",
+            SourceRunId = "cycle-2",
+            ContentSha256 = "cycle-2"
+        };
+        var local = gatewayOne with
+        {
+            ExternalId = "local:cycle-1",
+            Source = "stock_advisor",
+            ContentSha256 = "local-cycle-1"
+        };
+        await store.AddAsync(gatewayOne);
+        await store.AddAsync(gatewayTwo);
+        await store.AddAsync(local);
+
+        var removed = await store.RemoveGatewayCyclesAsync(["cycle-1"]);
+        var remaining = await store.GetAllAsync();
+
+        Assert.Equal(1, removed);
+        Assert.Equal(2, remaining.Count);
+        Assert.Contains(remaining, message => message.SourceRunId == "cycle-2");
+        Assert.Contains(remaining, message => message.Source == "stock_advisor" && message.SourceRunId == "cycle-1");
+    }
+
+    [Fact]
     public async Task MigratesLegacyGmailRowsWithoutDeletingHistory()
     {
         var paths = new AppPaths(_directory);

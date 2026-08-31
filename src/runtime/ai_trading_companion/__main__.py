@@ -38,7 +38,7 @@ from .projection import LearningProjectionRenderer
 from .scheduler import SHANGHAI, conversation_auto_submit_at, ensure_registered_policy, run_registry_schedule
 from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
-from .runtime_strategy_policy import RuntimeStrategyPolicy
+from .runtime_strategy_policy import RuntimeStrategyControls, RuntimeStrategyPolicy
 from .web_access_gateway import WebAccessGatewayClient
 from .local_research import (
     BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
@@ -67,6 +67,93 @@ class VerifiedStageResult:
     def __iter__(self):
         yield self.output
         yield self.broker
+
+
+M1_MAX_JUDGMENT_ATTEMPTS = 4
+M1_MIN_RETRY_WINDOW_SECONDS = 30
+
+
+def _m1_should_retry(exc: Exception, *, attempt_number: int, remaining_seconds: int) -> bool:
+    if attempt_number >= M1_MAX_JUDGMENT_ATTEMPTS or remaining_seconds < M1_MIN_RETRY_WINDOW_SECONDS:
+        return False
+    if isinstance(exc, EvidenceInsufficient):
+        return False
+    if isinstance(exc, TimeoutError):
+        return True
+    if not isinstance(exc, BrokerError):
+        return False
+    return exc.category not in {
+        "broker_effort_unsupported",
+        "broker_authentication",
+        "broker_forbidden",
+        "broker_secret_rejected",
+    }
+
+
+def _m1_retry_feedback(exc: Exception) -> dict[str, Any] | None:
+    if not isinstance(exc, BrokerError) or not isinstance(exc.verifier, dict):
+        return None
+    schema = exc.verifier.get("schema") if isinstance(exc.verifier.get("schema"), dict) else {}
+    business = exc.verifier.get("business") if isinstance(exc.verifier.get("business"), dict) else {}
+
+    def problems(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item)[:500] for item in value[:20]]
+
+    return {
+        "category": exc.category,
+        "schema_problems": problems(schema.get("problems")),
+        "business_problems": problems(business.get("problems")),
+    }
+
+
+def resolve_stage_controls(
+    store: CompanionStore,
+    stage: str,
+    *,
+    timeout: int,
+    search: bool,
+    runtime_strategy_shadow_cell: str | None = None,
+) -> RuntimeStrategyControls:
+    """Resolve the controls that must be part of a stage's frozen input."""
+    runtime_strategy = RuntimeStrategyPolicy(store)
+    if runtime_strategy_shadow_cell:
+        return runtime_strategy.shadow_controls(
+            runtime_strategy_shadow_cell, stage, timeout_seconds=timeout, search=search,
+        )
+    return runtime_strategy.controls(stage, timeout_seconds=timeout, search=search)
+
+
+def finalize_stage_packet(packet: dict[str, Any], controls: RuntimeStrategyControls) -> dict[str, Any]:
+    """Bind runtime controls before deriving the sole hash for a stage invocation.
+
+    The returned packet is a new immutable candidate.  Its ``sha256`` covers
+    exactly the object later persisted, checkpointed, and sent to Broker.
+    """
+    final_packet = {
+        key: value for key, value in packet.items()
+        if key not in {"sha256", "runtime_strategy_controls", "allowed_research_backends"}
+    }
+    final_packet["runtime_strategy_controls"] = {
+        "timeout_seconds": controls.timeout_seconds,
+        "max_operations": controls.max_operations,
+        "enabled_backends": list(controls.enabled_backends),
+        "revisions": list(controls.revisions),
+    }
+    final_packet["allowed_research_backends"] = list(controls.enabled_backends)
+    final_packet["sha256"] = canonical_packet_hash(final_packet)
+    return final_packet
+
+
+def _evidence_read_cutoff(packet: dict[str, Any], contract: dict[str, Any]) -> str | None:
+    """Freeze external reads to the evidence contract, never the later worker start."""
+    return str(contract.get("as_of") or packet.get("as_of") or "") or None
+
+
+def _m1_research_as_of(evidence: dict[str, Any], frozen_as_of: str | None) -> str:
+    """M1 judges the exact frozen M0 bundle and must preserve its timestamp."""
+    return str(frozen_as_of or evidence.get("as_of") or iso(datetime.now(timezone.utc)))
 
 
 def exchange_root() -> Path:
@@ -303,26 +390,17 @@ def _call_stage(
     timeout: int,
     retry_model_slot: str | None = None,
     runtime_strategy_shadow_cell: str | None = None,
+    frozen_controls: RuntimeStrategyControls | None = None,
 ) -> VerifiedStageResult:
     settings = load_settings(PATHS.home)
     runtime_strategy = RuntimeStrategyPolicy(store)
-    controls = (
-        runtime_strategy.shadow_controls(runtime_strategy_shadow_cell, stage, timeout_seconds=timeout, search=search)
-        if runtime_strategy_shadow_cell
-        else runtime_strategy.controls(stage, timeout_seconds=timeout, search=search)
+    controls = frozen_controls or resolve_stage_controls(
+        store, stage, timeout=timeout, search=search,
+        runtime_strategy_shadow_cell=runtime_strategy_shadow_cell,
     )
     timeout = controls.timeout_seconds
     search = bool(search and controls.max_operations > 0 and controls.enabled_backends)
-    packet = {
-        **packet,
-        "runtime_strategy_controls": {
-            "timeout_seconds": controls.timeout_seconds,
-            "max_operations": controls.max_operations,
-            "enabled_backends": list(controls.enabled_backends),
-            "revisions": list(controls.revisions),
-        },
-        "allowed_research_backends": list(controls.enabled_backends),
-    }
+    packet = finalize_stage_packet(packet, controls)
     router = CognitiveRouter(effort_policy=CognitiveEffortPolicy.load(store))
     preliminary = router.plan(stage, packet, timeout, search)
     cell = store.router_policy_cell(
@@ -368,7 +446,7 @@ def _call_stage(
                 broker, deadline=lambda: deadline, intellect=decision.intellect, effort=decision.reasoning_effort,
             )
             web = WebAccessGatewayBackend(
-                WebAccessGatewayClient(settings.research), as_of=str(packet.get("as_of") or "") or None,
+                WebAccessGatewayClient(settings.research), as_of=_evidence_read_cutoff(packet, contract),
             )
             market_facts = packet.get("deterministic_market_facts")
             backends = {"gateway": web} if "gateway" in controls.enabled_backends else {}
@@ -400,6 +478,7 @@ def _call_stage(
                 stage=stage, packet=request_packet, packet_sha256=request_hash,
                 intellect=decision.intellect, effort=decision.reasoning_effort, schema=schema,
                 visible_stream=False, absolute_deadline=deadline,
+                output_token_limit=6_000 if stage == "m1_judgment" else 4_000 if stage == "m2" else 2_000,
                 verifier_name=f"cognitive-router/{stage}",
                 verifier=lambda output: router.verify(stage, packet, output),
                 h0_forbidden=stage == "m1_judgment",
@@ -453,6 +532,7 @@ def _call_stage(
             status = "timed_out" if isinstance(exc, TimeoutError) else "failed"
             store.finish_attempt(
                 attempt["attempt_id"], status, error=str(exc),
+                verifier=getattr(exc, "verifier", None),
                 broker_metadata=exc.metadata or {"request_id": exc.request_id, "attempts": exc.attempts} if isinstance(exc, BrokerError) else None,
                 actual_model=exc.metadata.get("actual_model") if isinstance(exc, BrokerError) else None,
                 tool_trace=getattr(exc, "tool_trace", None) or tool_trace,
@@ -678,7 +758,15 @@ def run_research(
         return result
 
     policy = TASK_POLICIES[cycle["task_key"]]
-    public_packet = builder.build(cycle, "m0_research")
+    research_timeout = int(policy.research_timeout.total_seconds())
+    research_controls = resolve_stage_controls(
+        store, "m0_research", timeout=research_timeout, search=True,
+    )
+    public_packet = finalize_stage_packet(builder.build(cycle, "m0_research"), research_controls)
+    compose_timeout = int(policy.m1_timeout.total_seconds())
+    compose_controls = resolve_stage_controls(
+        store, "m0_compose", timeout=compose_timeout, search=False,
+    )
     for number in range(1, 3):
         try:
             checkpoint = store.stage_checkpoint(cycle["cycle_id"], "m0_research", public_packet["sha256"])
@@ -688,7 +776,7 @@ def run_research(
             else:
                 evidence_stage = _call_stage(
                     store, cycle, "m0_research", public_packet, "companion-evidence-result-v3.schema.json",
-                    search=True, timeout=int(policy.research_timeout.total_seconds()),
+                    search=True, timeout=research_timeout, frozen_controls=research_controls,
                     retry_model_slot="fast" if number > 1 else None,
                 )
                 evidence = evidence_stage.output
@@ -699,14 +787,16 @@ def run_research(
                     cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False),
                     evidence.get("as_of") or cycle["as_of"], {"public_only": True, "attempt_id": evidence_attempt_id},
                 )
-            local_packet = builder.build(cycle, "m0_compose", evidence=evidence)
+            local_packet = finalize_stage_packet(
+                builder.build(cycle, "m0_compose", evidence=evidence), compose_controls,
+            )
             compose_checkpoint = store.stage_checkpoint(cycle["cycle_id"], "m0_compose", local_packet["sha256"])
             if compose_checkpoint:
                 m0_output, compose_attempt_id = compose_checkpoint["output"], compose_checkpoint["attempt_id"]
             else:
                 compose_stage = _call_stage(
                     store, cycle, "m0_compose", local_packet, "companion-m0-result-v1.schema.json",
-                    search=False, timeout=int(policy.m1_timeout.total_seconds()),
+                    search=False, timeout=compose_timeout, frozen_controls=compose_controls,
                 )
                 m0_output, compose_attempt_id = compose_stage.output, compose_stage.attempt_id
                 store.save_stage_checkpoint(cycle["cycle_id"], "m0_compose", local_packet["sha256"], compose_attempt_id, m0_output)
@@ -772,10 +862,13 @@ def run_m1(
             "passed": False, "problems": ["frozen_m0_evidence_missing"],
             "missing_requirements": ["current_market_state", "material_events_and_counterevidence"],
         })
-    research_as_of = frozen_as_of or iso(datetime.now(timezone.utc))
-    public_packet = builder.build(
-        cycle, "m1_research", evidence=prior_evidence,
-        as_of=research_as_of,
+    research_as_of = _m1_research_as_of(prior_evidence, frozen_as_of)
+    research_timeout = int(policy.research_timeout.total_seconds())
+    research_controls = resolve_stage_controls(
+        store, "m1_research", timeout=research_timeout, search=True,
+    )
+    public_packet = finalize_stage_packet(
+        builder.build(cycle, "m1_research", evidence=prior_evidence, as_of=research_as_of), research_controls,
     )
     checkpoint = store.stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"])
     if checkpoint:
@@ -792,12 +885,29 @@ def run_m1(
             str(evidence.get("as_of") or research_as_of),
             {"public_only": True, "attempt_id": evidence_attempt_id, "reused_from": "m0_research"},
         )
-    for number in range(1, 3):
+    verification_feedback: dict[str, Any] | None = None
+    for number in range(1, M1_MAX_JUDGMENT_ATTEMPTS + 1):
         try:
             cycle = engine.m1_judgment_started(cycle_id)
-            local_packet = builder.build(
+            judgment_timeout = _deadline_timeout(cycle, int(policy.m1_timeout.total_seconds()))
+            judgment_controls = resolve_stage_controls(
+                store, "m1_judgment", timeout=judgment_timeout, search=False,
+            )
+            judgment_packet = builder.build(
                 cycle, "m1_judgment", evidence=evidence,
                 as_of=str(evidence.get("as_of") or iso(datetime.now(timezone.utc))),
+            )
+            if verification_feedback is not None:
+                judgment_packet["verification_repair"] = {
+                    **verification_feedback,
+                    "attempt_number": number,
+                    "instruction": (
+                        "The previous candidate was not published. Correct every listed schema and business-verifier "
+                        "problem while independently recomputing the judgment from the same frozen evidence."
+                    ),
+                }
+            local_packet = finalize_stage_packet(
+                judgment_packet, judgment_controls,
             )
             judgment_checkpoint = store.stage_checkpoint(cycle_id, "m1_judgment", local_packet["sha256"])
             if judgment_checkpoint:
@@ -805,7 +915,7 @@ def run_m1(
             else:
                 judgment_stage = _call_stage(
                     store, cycle, "m1_judgment", local_packet, "companion-m1-result-v1.schema.json",
-                    search=False, timeout=_deadline_timeout(cycle, int(policy.m1_timeout.total_seconds())),
+                    search=False, timeout=judgment_timeout, frozen_controls=judgment_controls,
                 )
                 judgment, judgment_attempt_id = judgment_stage.output, judgment_stage.attempt_id
                 store.save_stage_checkpoint(cycle_id, "m1_judgment", local_packet["sha256"], judgment_attempt_id, judgment)
@@ -820,10 +930,15 @@ def run_m1(
                 remaining = _deadline_timeout(store.get_cycle(cycle_id), 60)
             except TimeoutError:
                 remaining = 0
-            retryable = not isinstance(exc, EvidenceInsufficient) and number < 2 and remaining >= 30
-            engine.m1_failed(cycle_id, str(exc), retryable=retryable, details=exc.verifier if isinstance(exc, EvidenceInsufficient) else None)
+            retryable = _m1_should_retry(exc, attempt_number=number, remaining_seconds=remaining)
+            details = getattr(exc, "verifier", None)
+            engine.m1_failed(
+                cycle_id, str(exc), retryable=retryable,
+                details=details if isinstance(details, dict) else None,
+            )
             if not retryable:
                 raise
+            verification_feedback = _m1_retry_feedback(exc)
             cycle = store.get_cycle(cycle_id)
             time.sleep(2)
     raise RuntimeError("M1 attempts exhausted")
@@ -840,10 +955,14 @@ def run_m2(engine: CompanionEngine, store: CompanionStore, cycle_id: str, execut
             attempt_id=_fixture_attempt(store, cycle_id, "m2", packet_hash, {"m2_markdown": "Fixture 模式：这里会显示 M0、H0和独立 M1的伴生综合 M2。"}), packet_hash=packet_hash,
         )
     frozen_as_of = str(cycle.get("m1_completed_at") or cycle["as_of"])
-    packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store).build(cycle, "m2", as_of=frozen_as_of)
+    timeout = int(TASK_POLICIES[cycle["task_key"]].m2_timeout.total_seconds())
+    controls = resolve_stage_controls(store, "m2", timeout=timeout, search=False)
+    packet = finalize_stage_packet(
+        RuntimePacketBuilder(PATHS.resources, WORKSPACE, store).build(cycle, "m2", as_of=frozen_as_of), controls,
+    )
     stage_result = _call_stage(
         store, cycle, "m2", packet, "companion-m2-result-v1.schema.json",
-        search=False, timeout=int(TASK_POLICIES[cycle["task_key"]].m2_timeout.total_seconds()),
+        search=False, timeout=timeout, frozen_controls=controls,
     )
     store.save_stage_checkpoint(cycle_id, "m2", packet["sha256"], stage_result.attempt_id, stage_result.output)
     return engine.m2_ready(

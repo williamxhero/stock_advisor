@@ -136,6 +136,23 @@ public sealed class SqliteTaskMessageStore : ITaskMessageStore
     public Task SetArchivedAsync(long id, bool isArchived, CancellationToken cancellationToken = default) =>
         UpdateStateAsync(id, "is_archived", isArchived ? 1 : 0, cancellationToken);
 
+    public async Task<int> RemoveGatewayCyclesAsync(IEnumerable<string> cycleIds, CancellationToken cancellationToken = default)
+    {
+        var ids = cycleIds.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.Ordinal).ToArray();
+        if (ids.Length == 0) return 0;
+
+        await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        var placeholders = new string[ids.Length];
+        for (var index = 0; index < ids.Length; index++)
+        {
+            placeholders[index] = $"$cycle_id_{index}";
+            command.Parameters.AddWithValue(placeholders[index], ids[index]);
+        }
+        command.CommandText = $"DELETE FROM task_messages WHERE source = 'gateway' AND source_run_id IN ({string.Join(", ", placeholders)});";
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task SaveNoteAsync(long id, string note, CancellationToken cancellationToken = default)
     {
         await using var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);

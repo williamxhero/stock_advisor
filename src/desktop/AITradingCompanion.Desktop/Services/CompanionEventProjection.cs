@@ -33,7 +33,9 @@ public sealed record CompanionWorkspaceProjection(
     string? TaskKey = null,
     string? Trigger = null,
     DateTimeOffset? RequestedAt = null,
-    string? TaskProfileId = null)
+    string? TaskProfileId = null,
+    string? TaskProfileDisplayName = null,
+    bool IsDismissed = false)
 {
     public bool IsH0Locked => H0LockedAt is not null;
     public bool HasStagedMessages => UserMessages.Any(message => message.State == "staged");
@@ -93,6 +95,8 @@ public static class CompanionEventProjection
         string? taskKey = null;
         string? trigger = null;
         string? taskProfileId = null;
+        string? taskProfileDisplayName = null;
+        var isDismissed = false;
         var ai = new Dictionary<string, CompanionAiTimelineEntry>(StringComparer.Ordinal);
         var users = new Dictionary<string, CompanionTimelineEntry>(StringComparer.Ordinal);
 
@@ -104,6 +108,7 @@ public static class CompanionEventProjection
             trigger = ReadCycleString(payload, "trigger") ?? trigger;
             requestedAt = ReadDate(ReadCycleString(payload, "requested_at")) ?? requestedAt;
             taskProfileId = ReadCycleString(payload, "task_profile_id") ?? taskProfileId;
+            taskProfileDisplayName = ReadTaskProfileDisplayName(payload) ?? taskProfileDisplayName;
             scheduledFor = ReadDate(ReadCycleString(payload, "scheduled_for")) ?? scheduledFor;
             autoSubmit = ReadDate(ReadCycleString(payload, "h0_auto_submit_at"))
                 ?? ReadDate(ReadString(payload, "h0_auto_submit_at")) ?? autoSubmit;
@@ -113,6 +118,9 @@ public static class CompanionEventProjection
 
             switch (item.Type)
             {
+                case "analysis.dismissed":
+                    isDismissed = true;
+                    break;
                 case "m0.started":
                 case "research.started":
                     m0StartedAt ??= item.At;
@@ -186,11 +194,20 @@ public static class CompanionEventProjection
                     UpsertAi(ai, ReadString(payload, "stream_id") ?? ReadString(payload, "source_artifact_id"), "chat", item.At,
                         ReadString(payload, "text"), item.At, item.At);
                     break;
+                case "chat.stream.started":
+                    var startedStreamId = ReadNestedString(payload, "stream", "stream_id");
+                    if (!string.IsNullOrWhiteSpace(startedStreamId))
+                        UpsertAi(ai, startedStreamId, "chat_pending",
+                            ReadDate(ReadNestedString(payload, "stream", "created_at")) ?? item.At,
+                            "AI 正在回复中", item.At, null);
+                    break;
                 case "chat.stream.delta":
                     var streamId = ReadString(payload, "stream_id");
                     if (!string.IsNullOrWhiteSpace(streamId))
                     {
-                        var existingText = ai.TryGetValue(streamId, out var existing) ? existing.Text : string.Empty;
+                        var existingText = ai.TryGetValue(streamId, out var existing) && existing.Kind != "chat_pending"
+                            ? existing.Text
+                            : string.Empty;
                         UpsertAi(ai, streamId, "chat", item.At, existingText + (ReadString(payload, "text") ?? string.Empty), item.At, null);
                     }
                     break;
@@ -219,9 +236,10 @@ public static class CompanionEventProjection
                     break;
                 case "projection.ready":
                     ReadProjection(payload, ai, users, ref scheduledFor, ref autoSubmit, ref m1Deadline, ref h0LockedAt,
-                        ref taskKey, ref trigger, ref requestedAt, ref taskProfileId);
+                        ref taskKey, ref trigger, ref requestedAt, ref taskProfileId, ref taskProfileDisplayName);
                     break;
                 case "research.failed":
+                case "m0.invalidated":
                 case "cycle.missed":
                 case "m1.failed":
                 case "outcome.failed":
@@ -244,12 +262,61 @@ public static class CompanionEventProjection
             h0LockedAt,
             state,
             errorText,
-            ai.Values.OrderBy(message => message.At).ToArray(),
+            CollapseVisibleFaults(ai.Values),
             users.Values.OrderBy(message => message.At).ToArray(),
             taskKey,
             trigger,
             requestedAt,
-            taskProfileId);
+            taskProfileId,
+            taskProfileDisplayName,
+            isDismissed);
+    }
+
+    private static CompanionAiTimelineEntry[] CollapseVisibleFaults(
+        IEnumerable<CompanionAiTimelineEntry> messages)
+    {
+        var materialized = messages.ToArray();
+        var latestFaultIds = materialized
+            .Where(message => message.Kind == "fault")
+            .GroupBy(message => message.Text.Trim(), StringComparer.Ordinal)
+            .Select(group => group.OrderByDescending(message => message.At).First().ArtifactId)
+            .ToHashSet(StringComparer.Ordinal);
+        var ordered = materialized
+            .Where(message => message.Kind != "fault" || latestFaultIds.Contains(message.ArtifactId))
+            .OrderBy(message => message.At)
+            .ToArray();
+        var collapsed = new List<CompanionAiTimelineEntry>();
+        var faultRun = new List<CompanionAiTimelineEntry>();
+        foreach (var message in ordered)
+        {
+            if (message.Kind == "fault")
+            {
+                faultRun.Add(message);
+                continue;
+            }
+            FlushFaultRun();
+            collapsed.Add(message);
+        }
+        FlushFaultRun();
+        return collapsed.ToArray();
+
+        void FlushFaultRun()
+        {
+            if (faultRun.Count == 0) return;
+            if (faultRun.Count == 1)
+            {
+                collapsed.Add(faultRun[0]);
+                faultRun.Clear();
+                return;
+            }
+            var latest = faultRun[^1];
+            var text = string.Join("\n\n", faultRun.Select(message =>
+                $"{message.At.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture)} · {message.Text.Trim()}"));
+            collapsed.Add(new CompanionAiTimelineEntry(
+                $"fault-group-{latest.ArtifactId}", "fault", latest.At, text,
+                faultRun[0].StartedAt, latest.CompletedAt));
+            faultRun.Clear();
+        }
     }
 
     private static void ReadProjection(
@@ -263,12 +330,14 @@ public static class CompanionEventProjection
         ref string? taskKey,
         ref string? trigger,
         ref DateTimeOffset? requestedAt,
-        ref string? taskProfileId)
+        ref string? taskProfileId,
+        ref string? taskProfileDisplayName)
     {
         taskKey = ReadNestedString(payload, "cycle", "task_key") ?? taskKey;
         trigger = ReadNestedString(payload, "cycle", "trigger") ?? trigger;
         requestedAt = ReadDate(ReadNestedString(payload, "cycle", "requested_at")) ?? requestedAt;
         taskProfileId = ReadNestedString(payload, "cycle", "task_profile_id") ?? taskProfileId;
+        taskProfileDisplayName = ReadTaskProfileDisplayName(payload) ?? taskProfileDisplayName;
         scheduledFor = ReadDate(ReadNestedString(payload, "cycle", "scheduled_for")) ?? scheduledFor;
         autoSubmit = ReadDate(ReadNestedString(payload, "cycle", "h0_auto_submit_at")) ?? autoSubmit;
         m1Deadline = ReadDate(ReadNestedString(payload, "cycle", "m1_publish_deadline")) ?? m1Deadline;
@@ -303,10 +372,16 @@ public static class CompanionEventProjection
             {
                 var id = ReadString(stream, "stream_id");
                 var text = ReadString(stream, "text");
-                if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(text)) continue;
+                if (string.IsNullOrWhiteSpace(id)) continue;
                 var state = ReadString(stream, "state");
-                if (state == "failed") text += "\n\n（未完成）";
                 var at = ReadDate(ReadString(stream, "created_at")) ?? DateTimeOffset.MinValue;
+                if (state == "streaming" && string.IsNullOrWhiteSpace(text))
+                {
+                    UpsertAi(ai, id, "chat_pending", at, "AI 正在回复中", at, null);
+                    continue;
+                }
+                if (string.IsNullOrWhiteSpace(text)) continue;
+                if (state == "failed") text += "\n\n（未完成）";
                 UpsertAi(ai, id, state == "failed" ? "chat_incomplete" : "chat", at, text, at, state == "completed" ? ReadDate(ReadString(stream, "completed_at")) : null);
             }
         }
@@ -392,6 +467,18 @@ public static class CompanionEventProjection
 
     private static string? ReadCycleString(JsonElement payload, string property) =>
         ReadNestedString(payload, "cycle", property) ?? ReadString(payload, property);
+
+    private static string? ReadTaskProfileDisplayName(JsonElement payload)
+    {
+        var raw = ReadCycleString(payload, "task_profile_json");
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        try
+        {
+            using var document = JsonDocument.Parse(raw);
+            return ReadString(document.RootElement, "display_name");
+        }
+        catch (JsonException) { return null; }
+    }
 
     private static DateTimeOffset? ReadDate(string? value) =>
         DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var result) ? result : null;

@@ -302,6 +302,12 @@ class _EvidenceGateV3:
                 problems.append(f"blocking_requirement_missing:{key}"); missing.append(key); continue
             refs = [str(ref) for ref in row.get("evidence_refs") or []]
             bound = [sources[ref] for ref in refs if ref in sources]
+            if row.get("status") == "checked_no_change" and not refs:
+                if not self._matching_negative_observation(
+                    observations, key, requirement.get("negative_query_terms") or [], attempt_id,
+                ):
+                    problems.append(f"checked_no_change_query_not_matched:{key}"); missing.append(key)
+                continue
             if not refs or len(bound) != len(refs):
                 problems.append(f"blocking_requirement_untraceable:{key}"); missing.append(key); continue
             if not self._in_window(bound, requirement.get("window") or {}, problems):
@@ -353,6 +359,24 @@ class _EvidenceGateV3:
         if not terms:
             return True
         return any(all(term.casefold() in str(item.get("tool_arguments", {}).get("query") or "").casefold() for term in terms) for item in sources)
+
+    @staticmethod
+    def _matching_negative_observation(
+        observations: list[dict[str, Any]], requirement_key: str, terms: list[str], attempt_id: str | None,
+    ) -> bool:
+        if not terms:
+            return False
+        return any(
+            item.get("operation") == "web_search"
+            and item.get("status") == "succeeded"
+            and (not attempt_id or item.get("attempt_id") == attempt_id)
+            and str((item.get("arguments") or {}).get("requirement_key") or "") == requirement_key
+            and all(
+                str(term).casefold() in str((item.get("arguments") or {}).get("query") or "").casefold()
+                for term in terms
+            )
+            for item in observations
+        )
 
     @staticmethod
     def _normalized(evidence: dict[str, Any], sources: dict[str, dict[str, Any]]) -> dict[str, Any]:

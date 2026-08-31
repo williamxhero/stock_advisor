@@ -133,6 +133,28 @@ class CompanionEngineTests(unittest.TestCase):
             )
         self.assertIsNone(self.store.latest_artifact(self.cycle["cycle_id"], "m0"))
 
+    def test_invalidates_published_m0_without_overwriting_it(self):
+        ready = self.ready()
+        original = self.store.latest_artifact(self.cycle["cycle_id"], "m0")
+
+        result = self.engine.command({
+            "command_id": "invalidate-m0-calendar-conflict",
+            "type": "invalidate_m0",
+            "cycle_id": self.cycle["cycle_id"],
+            "expected_revision": self.store.get_cycle(self.cycle["cycle_id"])["revision"],
+            "reason": "M0 与本地交易日历冲突。",
+            "qualification_problems": ["m0_calendar_context_conflict"],
+        })
+
+        self.assertEqual("failed", result["state"])
+        self.assertEqual(original["artifact_id"], self.store.latest_artifact(self.cycle["cycle_id"], "m0")["artifact_id"])
+        with self.store.connection() as connection:
+            event = connection.execute(
+                "SELECT payload_json FROM client_event_log WHERE cycle_id=? AND event_type='m0.invalidated'",
+                (self.cycle["cycle_id"],),
+            ).fetchone()
+        self.assertIn("m0_calendar_context_conflict", event[0])
+
     def test_m0_artifact_state_and_outbox_are_one_transaction(self):
         self.engine.research_started(self.cycle["cycle_id"])
         evidence_hash, compose_hash = "atomic-evidence", "atomic-compose"
@@ -319,6 +341,27 @@ class CompanionEngineTests(unittest.TestCase):
         self.assertIn("输出格式配置错误", payload["reason"])
         self.assertNotIn("C:\\Users", payload["reason"])
 
+    def test_m1_local_verifier_failure_has_an_honest_user_category(self):
+        self.ready()
+        self.engine.command({"command_id": "commit-verifier", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0"})
+
+        self.engine.m1_failed(
+            self.cycle["cycle_id"],
+            "Broker output did not pass local verification",
+            retryable=True,
+            details={
+                "passed": False,
+                "schema": {"passed": False, "problems": ["$.snapshot.triggers: required"]},
+                "business": {"passed": True, "problems": []},
+            },
+        )
+
+        event = [item for item in self.store.pending_events() if item["event_type"] == "m1.failed"][-1]
+        payload = json.loads(event["payload_json"])
+        self.assertEqual("output_schema_invalid", payload["diagnostic_code"])
+        self.assertIn("本地输出格式校验", payload["reason"])
+        self.assertNotIn("详细诊断已保留", payload["reason"])
+
     def test_broker_unavailable_has_explicit_user_category(self):
         self.ready()
         self.engine.command({"command_id": "commit-http", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0"})
@@ -420,6 +463,40 @@ class CompanionEngineTests(unittest.TestCase):
             {created["receipt"]["cycle_id"], another["receipt"]["cycle_id"]},
             {item["cycle"]["cycle_id"] for item in today["projections"]},
         )
+
+    def test_dismiss_manual_analyses_hides_every_matching_cycle_without_deleting_audit_history(self):
+        cycle_ids = []
+        for index in range(2):
+            result = self.engine.command({
+                "command_id": f"manual-intraday-{index}",
+                "type": "request_formal_analysis",
+                "request_id": f"manual-intraday-request-{index}",
+                "task_key": "daily.execution.0945",
+                "requested_at": f"2026-08-29T13:0{index}:00+08:00",
+                "source": {"kind": "test"},
+                "task_profile": {"profile_id": "intraday_execution", "version": 1},
+            })
+            cycle_ids.append(result["receipt"]["cycle_id"])
+
+        dismissed = self.engine.command({
+            "command_id": "dismiss-all-intraday",
+            "type": "dismiss_manual_analyses",
+            "task_profile_id": "intraday_execution",
+            "reason": "user_requested_cleanup",
+        })
+
+        self.assertEqual(2, dismissed["dismissed_count"])
+        self.assertEqual(set(cycle_ids), set(dismissed["cycle_ids"]))
+        self.assertEqual([], self.store.latest_cycles_for_date("2026-08-29"))
+        visible_history_ids = {item["cycle_id"] for item in self.store.history_page(limit=20)["items"]}
+        self.assertTrue(set(cycle_ids).isdisjoint(visible_history_ids))
+        with self.store.connection() as connection:
+            self.assertEqual(2, connection.execute(
+                "SELECT COUNT(*) FROM companion_cycle WHERE task_profile_id='intraday_execution'"
+            ).fetchone()[0])
+            self.assertEqual(2, connection.execute(
+                "SELECT COUNT(*) FROM companion_cycle_visibility WHERE dismissed_at IS NOT NULL"
+            ).fetchone()[0])
 
     def test_manual_analysis_request_never_consumes_a_scheduled_occurrence(self):
         manual = self.engine.command({

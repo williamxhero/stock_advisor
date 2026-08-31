@@ -169,6 +169,9 @@ public sealed class UiContractTests
 
         Assert.Contains("CreateCopyButton(message.Text)", source, StringComparison.Ordinal);
         Assert.Contains("CreateCopyButton(entry.Text)", source, StringComparison.Ordinal);
+        Assert.Contains("CreateMarkdownViewer(message.Text", source, StringComparison.Ordinal);
+        Assert.Contains("CreateMarkdownViewer(entry.Text", source, StringComparison.Ordinal);
+        Assert.Contains("MarkdownDocumentBuilder.Build(markdown)", source, StringComparison.Ordinal);
         Assert.Contains("Clipboard.SetText(text)", source, StringComparison.Ordinal);
     }
 

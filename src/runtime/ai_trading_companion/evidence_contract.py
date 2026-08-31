@@ -11,6 +11,12 @@ from .trading_calendar import XshgTradingCalendar
 
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+_INTRADAY_MARKET_MAX_AGE = timedelta(minutes=15)
+_INTRADAY_EVENT_ANCHORS = {
+    "daily.execution.0945": time(9, 0),
+    "daily.execution.1030": time(9, 45),
+    "daily.execution.1430": time(10, 30),
+}
 
 
 class EvidenceContractFactory:
@@ -46,7 +52,7 @@ class EvidenceContractFactory:
     ) -> list[dict[str, Any]]:
         if task_profile is not None and stage == "m0_research":
             return self._manual_requirements(as_of, str(task_profile["evidence_family"]))
-        if task_key == "daily.opportunity.0900" and stage == "m0_research":
+        if task_key == "daily.opportunity.0900" and stage in {"m0_research", "m1_research"}:
             close = self._latest_completed_close(as_of)
             close_text = self._iso(close)
             return [
@@ -62,7 +68,7 @@ class EvidenceContractFactory:
                     "negative_query_terms": ["公告", "政策", "风险"],
                 },
             ]
-        if task_key == "daily.review.1520" and stage == "m0_research":
+        if task_key == "daily.review.1520" and stage in {"m0_research", "m1_research"}:
             close = self._latest_completed_close(as_of)
             close_text = self._iso(close)
             prior_close_text = self._iso(self._latest_completed_close(close - timedelta(seconds=1)))
@@ -79,6 +85,8 @@ class EvidenceContractFactory:
                     "negative_query_terms": ["公告", "政策", "风险"],
                 },
             ]
+        if task_key in _INTRADAY_EVENT_ANCHORS and stage in {"m0_research", "m1_research"}:
+            return self._scheduled_intraday_requirements(task_key, as_of)
         return [
             {
                 "key": "current_market_state", "blocking": True,
@@ -93,31 +101,74 @@ class EvidenceContractFactory:
             },
         ]
 
-    def _manual_requirements(self, as_of: datetime, evidence_family: str) -> list[dict[str, Any]]:
-        if evidence_family == "intraday_snapshot":
-            market_at = as_of
-            events_start = as_of
-        elif evidence_family == "morning_close":
-            local = as_of.astimezone(_SHANGHAI)
-            market_at = datetime.combine(local.date(), time(11, 30), _SHANGHAI).astimezone(ZoneInfo("UTC"))
-            events_start = market_at
-        else:
-            market_at = self._latest_completed_close(as_of)
-            events_start = market_at
-        market_text = self._iso(market_at)
+    def _scheduled_intraday_requirements(self, task_key: str, as_of: datetime) -> list[dict[str, Any]]:
+        local = as_of.astimezone(_SHANGHAI)
+        event_start = datetime.combine(
+            local.date(), _INTRADAY_EVENT_ANCHORS[task_key], _SHANGHAI,
+        ).astimezone(ZoneInfo("UTC"))
+        market_start = as_of - _INTRADAY_MARKET_MAX_AGE
         return [
             {
                 "key": "current_market_state", "blocking": True,
                 "allowed_coverage": ["covered"],
-                "window": {"start": market_text, "end": market_text, "mode": "exact"},
+                "window": {
+                    "start": self._iso(market_start), "end": self._iso(as_of),
+                    "mode": "after_start_to_end",
+                },
+            },
+            {
+                "key": "material_events_and_counterevidence", "blocking": True,
+                "allowed_coverage": ["covered", "checked_no_change"],
+                "window": {
+                    "start": self._iso(event_start), "end": self._iso(as_of),
+                    "mode": "after_start_to_end",
+                },
+                "negative_query_terms": ["公告", "政策", "风险"],
+            },
+        ]
+
+    def _manual_requirements(self, as_of: datetime, evidence_family: str) -> list[dict[str, Any]]:
+        if evidence_family == "intraday_snapshot":
+            market_window = {
+                "start": self._iso(as_of - _INTRADAY_MARKET_MAX_AGE),
+                "end": self._iso(as_of),
+                "mode": "after_start_to_end",
+            }
+            events_start = self._manual_intraday_anchor(as_of)
+        elif evidence_family == "morning_close":
+            local = as_of.astimezone(_SHANGHAI)
+            market_start = datetime.combine(local.date(), time(11, 15), _SHANGHAI).astimezone(ZoneInfo("UTC"))
+            events_start = datetime.combine(local.date(), time(10, 30), _SHANGHAI).astimezone(ZoneInfo("UTC"))
+            market_window = {
+                "start": self._iso(market_start),
+                "end": self._iso(as_of),
+                "mode": "after_start_to_end",
+            }
+        else:
+            market_at = self._latest_completed_close(as_of)
+            events_start = market_at
+            market_text = self._iso(market_at)
+            market_window = {"start": market_text, "end": market_text, "mode": "exact"}
+        return [
+            {
+                "key": "current_market_state", "blocking": True,
+                "allowed_coverage": ["covered"],
+                "window": market_window,
             },
             {
                 "key": "material_events_and_counterevidence", "blocking": True,
                 "allowed_coverage": ["covered", "checked_no_change"],
                 "window": {"start": self._iso(events_start), "end": self._iso(as_of), "mode": "after_start_to_end"},
-                "negative_query_terms": ["鍏憡", "鏀跨瓥", "椋庨櫓"],
+                "negative_query_terms": ["公告", "政策", "风险"],
             },
         ]
+
+    @staticmethod
+    def _manual_intraday_anchor(as_of: datetime) -> datetime:
+        local = as_of.astimezone(_SHANGHAI)
+        anchors = (time(9, 0), time(9, 45), time(10, 30), time(14, 30))
+        selected = max((anchor for anchor in anchors if anchor <= local.time()), default=time(9, 0))
+        return datetime.combine(local.date(), selected, _SHANGHAI).astimezone(ZoneInfo("UTC"))
 
     def _latest_completed_close(self, as_of: datetime) -> datetime:
         local = as_of.astimezone(_SHANGHAI)

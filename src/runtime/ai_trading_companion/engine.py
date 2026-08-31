@@ -277,6 +277,23 @@ class CompanionEngine:
                 }
             else:
                 cycle_id = result["receipt"]["cycle_id"]
+        elif typ == "dismiss_manual_analyses":
+            task_profile_id = str(command.get("task_profile_id") or "").strip()
+            if not task_profile_id:
+                raise ValueError("task_profile_id required")
+            reason = str(command.get("reason") or "user_requested_cleanup").strip()
+            cycles = self.store.dismiss_manual_analyses(task_profile_id, reason)
+            for dismissed_cycle in cycles:
+                self.emit(dismissed_cycle, "analysis.dismissed", {
+                    "cycle": dismissed_cycle,
+                    "task_profile_id": task_profile_id,
+                    "reason": reason,
+                })
+            result = {
+                "task_profile_id": task_profile_id,
+                "dismissed_count": len(cycles),
+                "cycle_ids": [cycle["cycle_id"] for cycle in cycles],
+            }
         else:
             if not cycle_id:
                 raise ValueError("cycle_id required")
@@ -287,6 +304,21 @@ class CompanionEngine:
             if typ == "request_projection":
                 result = self._projection(cycle)
                 self.emit(cycle, "projection.ready", result)
+            elif typ == "invalidate_m0":
+                if cycle["state"] not in {"awaiting_h0", "voice_grace"}:
+                    raise ValueError(f"M0 cannot be invalidated from state: {cycle['state']}")
+                if self.store.latest_artifact(cycle_id, "m0") is None:
+                    raise ValueError("M0 cannot be invalidated before publication")
+                problems = [str(item) for item in command.get("qualification_problems") or [] if str(item).strip()]
+                if not problems:
+                    raise ValueError("qualification_problems required")
+                reason = str(command.get("reason") or "M0 failed deterministic qualification after publication").strip()
+                result = self.store.transition(cycle_id, "failed")
+                self.emit(result, "m0.invalidated", {
+                    "cycle": result,
+                    "reason": reason,
+                    "qualification_problems": problems,
+                })
             elif typ in {"begin_voice_capture", "begin_h0_edit"}:
                 result = self._begin_grace(cycle, typ)
             elif typ == "stage_message":
@@ -562,15 +594,21 @@ class CompanionEngine:
 
     def m1_failed(self, cycle_id: str, reason: str, *, retryable: bool, details: dict[str, Any] | None = None) -> dict[str, Any]:
         message = self._stage_failure_message("M1", str(reason), details)
+        diagnostic_code = self._verifier_diagnostic_code(details) or self._diagnostic_code(str(reason))
         cycle = self.store.transition(cycle_id, "m1_retry_wait" if retryable else "waiting_for_repair")
         self.emit(cycle, "m1.failed", {
             "cycle": cycle, "reason": message,
-            "diagnostic_code": self._diagnostic_code(str(reason)), "retryable": retryable,
+            "diagnostic_code": diagnostic_code, "retryable": retryable,
         })
         return cycle
 
     @classmethod
     def _stage_failure_message(cls, stage: str, reason: str, details: dict[str, Any] | None) -> str:
+        verifier_code = cls._verifier_diagnostic_code(details)
+        if verifier_code == "output_schema_invalid":
+            return f"{stage} 返回内容未通过本地输出格式校验，本次结果未发布；具体缺失或冲突字段已保留在本地审计记录中。"
+        if verifier_code == "output_quality_invalid":
+            return f"{stage} 返回内容未通过本地判断质量校验，本次结果未发布；具体拒绝项已保留在本地审计记录中。"
         if not details:
             return cls._user_fault_message(reason, stage)
         missing = "、".join(str(item) for item in details.get("missing_requirements") or []) or "关键事实覆盖"
@@ -730,6 +768,18 @@ class CompanionEngine:
 
     def emit(self, cycle: dict[str, Any], event_type: str, payload: dict[str, Any]) -> None:
         self.store.queue_event(cycle["cycle_id"], event_type, payload)
+
+    @staticmethod
+    def _verifier_diagnostic_code(details: dict[str, Any] | None) -> str | None:
+        if not isinstance(details, dict):
+            return None
+        schema = details.get("schema") if isinstance(details.get("schema"), dict) else None
+        business = details.get("business") if isinstance(details.get("business"), dict) else None
+        if schema is not None and schema.get("passed") is False:
+            return "output_schema_invalid"
+        if business is not None and business.get("passed") is False:
+            return "output_quality_invalid"
+        return None
 
     @staticmethod
     def _diagnostic_code(reason: str) -> str:

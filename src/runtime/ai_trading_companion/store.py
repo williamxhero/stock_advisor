@@ -123,6 +123,9 @@ class CompanionStore:
             CREATE TABLE IF NOT EXISTS companion_manual_analysis_claim (
               request_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL UNIQUE REFERENCES companion_cycle(cycle_id),
               claimed_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS companion_cycle_visibility (
+              cycle_id TEXT PRIMARY KEY REFERENCES companion_cycle(cycle_id),
+              dismissed_at TEXT NOT NULL, reason TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS companion_message (
               message_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               actor TEXT NOT NULL, state TEXT NOT NULL, phase TEXT NOT NULL,
@@ -476,6 +479,7 @@ class CompanionStore:
             if search:
                 clauses.append("(c.task_key LIKE ? OR EXISTS(SELECT 1 FROM narrative_artifact a WHERE a.cycle_id=c.cycle_id AND a.body_markdown LIKE ?))")
                 values.extend([f"%{search}%", f"%{search}%"])
+            clauses.append("NOT EXISTS(SELECT 1 FROM companion_cycle_visibility v WHERE v.cycle_id=c.cycle_id AND v.dismissed_at IS NOT NULL)")
             rows = c.execute(f"""WITH ranked AS (
               SELECT c.*,COUNT(DISTINCT a.artifact_id) artifact_count,COUNT(DISTINCT m.message_id) message_count,
               ROW_NUMBER() OVER(PARTITION BY c.task_key,c.scheduled_for ORDER BY COUNT(DISTINCT a.artifact_id) DESC,COUNT(DISTINCT m.message_id) DESC,c.updated_at DESC,c.revision DESC) current_rank
@@ -782,12 +786,36 @@ class CompanionStore:
                          GROUP BY cycle_id
                     ) m ON m.cycle_id=c.cycle_id
                         WHERE substr(scheduled_for, 1, 10)=?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM companion_cycle_visibility v
+                               WHERE v.cycle_id=c.cycle_id AND v.dismissed_at IS NOT NULL
+                          )
                     )
                     WHERE current_rank=1
                     ORDER BY scheduled_for, task_key""",
                 (scheduled_date,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def dismiss_manual_analyses(self, task_profile_id: str, reason: str) -> list[dict[str, Any]]:
+        """Hide matching manual cycles from user-facing projections without erasing audit history."""
+        self.initialize()
+        dismissed_at = now()
+        with self.connection() as c:
+            cycles = [dict(row) for row in c.execute(
+                """SELECT * FROM companion_cycle
+                    WHERE trigger='manual_chat' AND task_profile_id=?
+                    ORDER BY created_at""",
+                (task_profile_id,),
+            )]
+            for cycle in cycles:
+                c.execute(
+                    """INSERT INTO companion_cycle_visibility(cycle_id,dismissed_at,reason)
+                       VALUES(?,?,?) ON CONFLICT(cycle_id) DO UPDATE SET
+                       dismissed_at=excluded.dismissed_at,reason=excluded.reason""",
+                    (cycle["cycle_id"], dismissed_at, reason),
+                )
+        return cycles
 
     def get_cycle(self, cycle_id: str, *, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
         if connection is not None:

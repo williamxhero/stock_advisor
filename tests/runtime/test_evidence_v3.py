@@ -6,7 +6,14 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-from ai_trading_companion.__main__ import _call_stage
+from ai_trading_companion.__main__ import (
+    M1_MAX_JUDGMENT_ATTEMPTS,
+    _call_stage,
+    _evidence_read_cutoff,
+    _m1_research_as_of,
+    _m1_retry_feedback,
+    _m1_should_retry,
+)
 from ai_trading_companion.broker_client import BrokerError
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.evidence_gate import EvidenceGate
@@ -15,6 +22,17 @@ from ai_trading_companion.store import CompanionStore
 
 
 class EvidenceV3Tests(TestCase):
+    def test_gateway_reads_are_frozen_to_contract_not_later_stage_start(self):
+        packet = {"as_of": "2026-08-31T05:22:27Z"}
+        contract = {"as_of": "2026-08-31T05:21:50Z"}
+        self.assertEqual("2026-08-31T05:21:50Z", _evidence_read_cutoff(packet, contract))
+
+    def test_m1_reuse_keeps_the_frozen_m0_evidence_time(self):
+        self.assertEqual(
+            "2026-08-31T05:25:57Z",
+            _m1_research_as_of({"as_of": "2026-08-31T05:25:57Z"}, None),
+        )
+
     def setUp(self):
         self.as_of = "2026-08-26T01:00:00Z"
         self.contract = EvidenceContractFactory(_WeekdayCalendar()).build(
@@ -72,6 +90,63 @@ class EvidenceV3Tests(TestCase):
         )
         self.assertEqual("2026-08-26T07:00:00Z", events["window"]["start"])
         self.assertEqual("2026-08-27T07:20:02.555000Z", events["window"]["end"])
+
+    def test_intraday_contract_accepts_recent_market_facts_and_since_prior_checkpoint_events(self):
+        contract_0945 = EvidenceContractFactory(_WeekdayCalendar()).build(
+            task_key="daily.execution.0945", stage="m0_research",
+            as_of="2026-08-31T01:45:05.144Z",
+        )
+        market_0945, events_0945 = contract_0945["requirements"]
+        self.assertEqual({
+            "start": "2026-08-31T01:30:05.144000Z",
+            "end": "2026-08-31T01:45:05.144000Z",
+            "mode": "after_start_to_end",
+        }, market_0945["window"])
+        self.assertEqual("2026-08-31T01:00:00Z", events_0945["window"]["start"])
+        self.assertEqual("2026-08-31T01:45:05.144000Z", events_0945["window"]["end"])
+
+        contract_1030 = EvidenceContractFactory(_WeekdayCalendar()).build(
+            task_key="daily.execution.1030", stage="m0_research",
+            as_of="2026-08-31T02:30:01.533Z",
+        )
+        market_1030, events_1030 = contract_1030["requirements"]
+        self.assertEqual("2026-08-31T02:15:01.533000Z", market_1030["window"]["start"])
+        self.assertEqual("2026-08-31T01:45:00Z", events_1030["window"]["start"])
+
+    def test_intraday_contract_passes_with_minute_precision_market_and_incremental_event(self):
+        as_of = "2026-08-31T01:45:05.144Z"
+        contract = EvidenceContractFactory(_WeekdayCalendar()).build(
+            task_key="daily.execution.0945", stage="m0_research", as_of=as_of,
+        )
+        observations = [{
+            "attempt_id": "intraday-attempt", "status": "succeeded", "non_empty": True,
+            "backend": "gateway", "arguments": {"query": "A股 公告 政策 风险"},
+            "evidence_items": [{
+                "evidence_ref": "ev_market", "excerpt_text": "09:44 A股市场行情",
+                "fact_as_of": "2026-08-31T01:44:00Z", "published_at": None,
+                "acquired_at": as_of, "primary": True,
+            }, {
+                "evidence_ref": "ev_event", "excerpt_text": "09:30 新增政策反证",
+                "fact_as_of": "2026-08-31T01:30:00Z", "published_at": "2026-08-31T01:30:00Z",
+                "acquired_at": as_of, "primary": True,
+            }],
+        }]
+        evidence = {
+            "schema_version": 3, "as_of": as_of,
+            "sources": [
+                {"evidence_ref": "ev_market", "excerpt": "09:44 A股市场行情", "analysis": "当前行情"},
+                {"evidence_ref": "ev_event", "excerpt": "09:30 新增政策反证", "analysis": "新增事件"},
+            ],
+            "coverage": [
+                {"requirement_key": "current_market_state", "status": "covered", "evidence_refs": ["ev_market"]},
+                {"requirement_key": "material_events_and_counterevidence", "status": "covered", "evidence_refs": ["ev_event"]},
+            ],
+            "high_impact_events": [],
+        }
+
+        result = EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="intraday-attempt")
+
+        self.assertTrue(result["passed"], result["problems"])
 
     def test_rejects_foreign_reference_and_naive_runtime_time(self):
         foreign = EvidenceGate().evaluate(self._evidence("ev_other_1"), self.contract, self.observations, self.as_of, attempt_id="attempt-1")
@@ -157,6 +232,66 @@ class EvidenceV3Tests(TestCase):
             attempt = store.attempts(cycle["cycle_id"])[0]
             self.assertEqual("failed", attempt["status"])
             self.assertEqual(trace, json.loads(attempt["tool_trace_json"]))
+
+    def test_failed_stage_persists_broker_verifier_for_auditable_repair(self):
+        verifier = {
+            "passed": False,
+            "name": "cognitive-router/m1_judgment",
+            "schema": {"passed": False, "problems": ["$.snapshot.triggers: required"]},
+            "business": {"passed": True, "problems": []},
+        }
+        with TemporaryDirectory() as temporary:
+            store = CompanionStore(Path(temporary) / "companion.sqlite3")
+            cycle = CompanionEngine(store).start_cycle(
+                "daily.review.1520", "2026-08-31T15:20:00+08:00", self.as_of,
+            )
+            broker = Mock()
+            broker.invoke.side_effect = BrokerError(
+                "Broker output did not pass local verification",
+                category="broker_output_invalid",
+                verifier=verifier,
+                attempts=[{"provider": "test", "status": "completed"}],
+            )
+            settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
+            packet = {"task_key": cycle["task_key"], "stage": "m1_judgment", "as_of": self.as_of}
+
+            with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
+                "ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker,
+            ), self.assertRaisesRegex(BrokerError, "local verification"):
+                _call_stage(
+                    store, cycle, "m1_judgment", packet,
+                    "companion-m1-result-v1.schema.json", search=False, timeout=60,
+                )
+
+            attempt = store.attempts(cycle["cycle_id"])[0]
+            self.assertEqual(verifier, json.loads(attempt["verifier_json"]))
+            self.assertEqual(6000, broker.invoke.call_args.args[0].output_token_limit)
+
+    def test_m1_retry_policy_uses_four_attempts_and_supplies_verifier_feedback(self):
+        verifier = {
+            "passed": False,
+            "schema": {"passed": False, "problems": ["$.snapshot.triggers: required"]},
+            "business": {"passed": False, "problems": ["qualified_snapshot_lacks_execution_boundary"]},
+        }
+        error = BrokerError(
+            "Broker output did not pass local verification",
+            category="broker_output_invalid",
+            verifier=verifier,
+        )
+
+        self.assertEqual(4, M1_MAX_JUDGMENT_ATTEMPTS)
+        self.assertTrue(_m1_should_retry(error, attempt_number=1, remaining_seconds=300))
+        self.assertTrue(_m1_should_retry(error, attempt_number=3, remaining_seconds=60))
+        self.assertFalse(_m1_should_retry(error, attempt_number=4, remaining_seconds=300))
+        self.assertFalse(_m1_should_retry(error, attempt_number=1, remaining_seconds=20))
+        self.assertEqual(
+            {
+                "category": "broker_output_invalid",
+                "schema_problems": ["$.snapshot.triggers: required"],
+                "business_problems": ["qualified_snapshot_lacks_execution_boundary"],
+            },
+            _m1_retry_feedback(error),
+        )
 
     def test_research_planning_uses_broker_and_never_calls_legacy_provider_tool_loop(self):
         with TemporaryDirectory() as temporary:

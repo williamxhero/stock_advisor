@@ -319,6 +319,52 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.assertEqual("analysis", json.loads(cycle["request_source_json"])["message_id"])
         self.assertIn("正式研判任务已创建", outcome.reply_markdown)
 
+    def test_unique_verbatim_analysis_quote_rebinds_miscalculated_offsets(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-08-27")
+        text = "Analyze the AI sector for the current session."
+        self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="rebind-analysis")
+        batch_id, messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        artifact = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text, conversation["as_of"], {"batch_id": batch_id}
+        )
+        action = self._analysis_action("rebind-analysis", text)
+        quote = "AI sector"
+        action["source_span"] = {"message_id": "rebind-analysis", "start": 0, "end": len(quote), "quote": quote}
+
+        outcome = UnifiedCognition(self.store, self.portfolio, self.engine).apply(
+            conversation, artifact, messages, "conversation",
+            {"reply_markdown": "I will verify it.", "needs_fresh_search": False, "public_search_request": None,
+             "propositions": [], "actions": [action]},
+        )
+
+        self.assertEqual("created", outcome.receipts[0]["state"], outcome.receipts[0])
+        cycle = self.store.get_cycle(outcome.receipts[0]["cycle_id"])
+        source_span = json.loads(cycle["request_source_json"])["source_span"]
+        self.assertEqual(text.index(quote), source_span["start"])
+        self.assertEqual(text.index(quote) + len(quote), source_span["end"])
+        self.assertEqual(quote, source_span["quote"])
+
+    def test_repeated_verbatim_quote_with_bad_offsets_remains_rejected(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-08-27")
+        text = "Analyze AI, then analyze AI sector."
+        self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="ambiguous-quote")
+        batch_id, messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        artifact = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text, conversation["as_of"], {"batch_id": batch_id}
+        )
+        action = self._analysis_action("ambiguous-quote", text)
+        action["source_span"] = {"message_id": "ambiguous-quote", "start": 1, "end": 3, "quote": "AI"}
+
+        outcome = UnifiedCognition(self.store, self.portfolio, self.engine).apply(
+            conversation, artifact, messages, "conversation",
+            {"reply_markdown": "I will verify it.", "needs_fresh_search": False, "public_search_request": None,
+             "propositions": [], "actions": [action]},
+        )
+
+        self.assertEqual("rejected", outcome.receipts[0]["state"])
+        with self.store.connection() as connection:
+            self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM companion_cycle WHERE trigger='manual_chat'").fetchone()[0])
+
     def test_brokered_natural_language_analysis_request_uses_the_formal_orchestrator(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-08-27")
         text = "Analyze the AI sector for the current session."

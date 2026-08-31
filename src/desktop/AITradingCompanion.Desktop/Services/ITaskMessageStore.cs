@@ -18,5 +18,7 @@ public interface ITaskMessageStore
 
     Task SetArchivedAsync(long id, bool isArchived, CancellationToken cancellationToken = default);
 
+    Task<int> RemoveGatewayCyclesAsync(IEnumerable<string> cycleIds, CancellationToken cancellationToken = default);
+
     Task SaveNoteAsync(long id, string note, CancellationToken cancellationToken = default);
 }

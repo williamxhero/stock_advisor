@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ai_trading_companion.asr import lexicon
 from ai_trading_companion.engine import CompanionEngine
+from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.governance import RouterGovernance, classify_regime
 from ai_trading_companion.learning import JudgmentLifecycle, WorkflowEvolution
 from ai_trading_companion.packet_builder import RuntimePacketBuilder
@@ -187,6 +188,44 @@ class CompanionLearningTests(unittest.TestCase):
         })
         self.assertFalse(conflict["passed"])
         self.assertIn("judgment_qualification_conflicts_with_snapshot", conflict["problems"])
+
+    def test_packet_and_verifier_reject_a_false_non_trading_day_m0(self):
+        class TradingDayCalendar:
+            @staticmethod
+            def is_trading_day(_value):
+                return True
+
+        cycle = self.cycle("daily.execution.1430", "2026-08-31T14:30:00+08:00", "2026-08-31T06:30:00Z")
+        packet = RuntimePacketBuilder(
+            PROJECT_ROOT / "resources", PROJECT_ROOT / "data", self.store,
+            evidence_contract_factory=EvidenceContractFactory(calendar=TradingDayCalendar()),
+        ).build(cycle, "m0_compose")
+
+        self.assertEqual({
+            "date": "2026-08-31",
+            "weekday_iso": 1,
+            "weekday_name_zh": "星期一",
+            "is_xshg_trading_day": True,
+            "authority": "deterministic_local_xshg_calendar",
+        }, packet["calendar_context"])
+        self.assertEqual("m0_objective_observation_only", packet["protocol"]["stage_scope"])
+        self.assertNotIn("建议总股票仓位", packet["protocol"]["text"])
+        rejected = CognitiveRouter().verify("m0_compose", packet, {
+            "m0_markdown": "`状态: skipped` 2026-08-31为周日，非A股交易日。",
+        })
+        accepted = CognitiveRouter().verify("m0_compose", packet, {
+            "m0_markdown": "截至14:30，沪深主要指数与成交数据已经更新。",
+        })
+        action_leak = CognitiveRouter().verify("m0_compose", packet, {
+            "m0_markdown": "今天的可执行建议为：不新增仓、不加仓、不减仓，建议卖出股数为0。",
+        })
+
+        self.assertFalse(rejected["passed"])
+        self.assertIn("m0_calendar_context_conflict", rejected["problems"])
+        self.assertIn("m0_calendar_weekday_conflict", rejected["problems"])
+        self.assertTrue(accepted["passed"])
+        self.assertFalse(action_leak["passed"])
+        self.assertIn("m0_contains_direction_or_action", action_leak["problems"])
 
     def test_router_store_queues_frozen_shadow_with_daily_budget(self):
         cycle = self.cycle("daily.execution.1430", "2026-08-25T14:30:00+08:00", "2026-08-25T06:30:00Z")

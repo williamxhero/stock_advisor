@@ -162,10 +162,12 @@ class UnifiedCognition:
         by_id = {item["message_id"]: item for item in messages}
         propositions_recorded = 0
         for index, proposition in enumerate(result.get("propositions") or []):
-            message = self._validated_message(by_id, proposition.get("source_span") or {})
-            if message is None:
+            validated = self._validated_source_span(by_id, proposition.get("source_span") or {})
+            if validated is None:
                 continue
+            message, source_span = validated
             parsed = dict(proposition)
+            parsed["source_span"] = source_span
             try:
                 parsed["object"] = json.loads(str(parsed.pop("object_json")))
             except json.JSONDecodeError:
@@ -186,12 +188,14 @@ class UnifiedCognition:
             if existing:
                 receipts.append(json.loads(existing["result_json"]))
                 continue
-            message = self._validated_message(by_id, action.get("source_span") or {})
-            if message is None:
+            validated = self._validated_source_span(by_id, action.get("source_span") or {})
+            if validated is None:
                 receipt = {"action_id": action_id, "action_type": action_type, "state": "rejected", "reason": "原文证据区间无效"}
             else:
+                message, source_span = validated
+                executable_action = {**action, "source_span": source_span}
                 try:
-                    receipt = self._execute(action_id, action_type, action, message, cycle, source_artifact)
+                    receipt = self._execute(action_id, action_type, executable_action, message, cycle, source_artifact)
                 except Exception as exc:
                     receipt = {"action_id": action_id, "action_type": action_type, "state": "failed", "reason": str(exc)}
             self.store.save_action_receipt(action_id, job["job_id"], action_type, payload, receipt["state"], receipt)
@@ -210,7 +214,9 @@ class UnifiedCognition:
         )
 
     @staticmethod
-    def _validated_message(by_id: dict[str, dict[str, Any]], span: dict[str, Any]) -> dict[str, Any] | None:
+    def _validated_source_span(
+        by_id: dict[str, dict[str, Any]], span: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
         message = by_id.get(str(span.get("message_id") or ""))
         if message is None:
             return None
@@ -218,10 +224,26 @@ class UnifiedCognition:
             start, end = int(span["start"]), int(span["end"])
         except (KeyError, TypeError, ValueError):
             return None
-        text = message["body_text"]
-        if start < 0 or end <= start or end > len(text) or text[start:end] != span.get("quote"):
+        text = str(message["body_text"])
+        quote = span.get("quote")
+        if not isinstance(quote, str) or not quote:
             return None
-        return message
+        if start >= 0 and end > start and end <= len(text) and text[start:end] == quote:
+            return message, {"message_id": message["message_id"], "start": start, "end": end, "quote": quote}
+
+        # Structured models occasionally preserve the exact quote but miscount character
+        # offsets (notably around multi-byte characters).  Rebind only an unambiguous,
+        # verbatim quote in the declared immutable message; absent or repeated quotes
+        # remain invalid rather than broadening the evidence boundary.
+        rebound_start = text.find(quote)
+        if rebound_start < 0 or text.find(quote, rebound_start + 1) >= 0:
+            return None
+        return message, {
+            "message_id": message["message_id"],
+            "start": rebound_start,
+            "end": rebound_start + len(quote),
+            "quote": quote,
+        }
 
     def _execute(self, action_id: str, action_type: str, action: dict[str, Any], message: dict[str, Any], cycle: dict[str, Any], source_artifact: dict[str, Any]) -> dict[str, Any]:
         if action_type == "portfolio.apply":

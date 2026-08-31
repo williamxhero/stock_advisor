@@ -23,11 +23,12 @@ class ManualAnalysisProfileResolver:
     time even if profile definitions later evolve.
     """
 
-    VERSION = 1
+    VERSION = 3
 
     _PROFILES = {
         "pre_market_opportunity": {
             "task_key": "daily.opportunity.0900",
+            "display_name": "盘前市场机会研判",
             "evidence_family": "previous_close",
             "stage_strategy": "pre_market_baseline",
             "h0_window_minutes": 15,
@@ -35,6 +36,7 @@ class ManualAnalysisProfileResolver:
         },
         "intraday_execution": {
             "task_key": "daily.execution.0945",
+            "display_name": "盘中市场环境研判",
             "evidence_family": "intraday_snapshot",
             "stage_strategy": "intraday_incremental",
             "h0_window_minutes": 20,
@@ -42,6 +44,7 @@ class ManualAnalysisProfileResolver:
         },
         "lunch_break_analysis": {
             "task_key": "daily.execution.1030",
+            "display_name": "午间市场环境研判",
             "evidence_family": "morning_close",
             "stage_strategy": "lunch_break_reconciliation",
             "h0_window_minutes": 20,
@@ -49,13 +52,15 @@ class ManualAnalysisProfileResolver:
         },
         "post_close_review": {
             "task_key": "daily.review.1520",
+            "display_name": "收盘市场复盘",
             "evidence_family": "completed_close",
             "stage_strategy": "post_close_review",
             "h0_window_minutes": 20,
             "m1_publish_window_minutes": 35,
         },
-        "non_trading_research": {
-            "task_key": "periodic.monthly",
+        "non_trading_outlook": {
+            "task_key": "manual.non_trading_outlook",
+            "display_name": "非交易日市场环境总结与下一交易日预判",
             "evidence_family": "latest_completed_close",
             "stage_strategy": "non_trading_research",
             "h0_window_minutes": 60,
@@ -69,12 +74,15 @@ class ManualAnalysisProfileResolver:
     def resolve(self, requested_at: str, analysis: dict[str, Any]) -> dict[str, Any]:
         self._require_analysis(analysis)
         requested = self._aware(requested_at).astimezone(_SHANGHAI)
-        profile_id = self._profile_id(requested, str(analysis["time_scope"]).strip())
+        requested_time_scope = str(analysis["time_scope"]).strip()
+        time_scope = self._normalize_time_scope(requested_time_scope)
+        profile_id = self._profile_id(requested, time_scope)
         definition = self._PROFILES[profile_id]
         return {
             "profile_id": profile_id,
             "version": self.VERSION,
             "task_key": definition["task_key"],
+            "display_name": definition["display_name"],
             "evidence_family": definition["evidence_family"],
             "stage_strategy": definition["stage_strategy"],
             "delivery_window": {
@@ -84,7 +92,8 @@ class ManualAnalysisProfileResolver:
             "requested_at": requested.isoformat(),
             "analysis": {
                 "subject": str(analysis["subject"]).strip(),
-                "time_scope": str(analysis["time_scope"]).strip(),
+                "time_scope": time_scope,
+                "requested_time_scope": requested_time_scope,
                 "goal": str(analysis["goal"]).strip(),
             },
         }
@@ -107,7 +116,7 @@ class ManualAnalysisProfileResolver:
 
     def _profile_id(self, requested: datetime, time_scope: str) -> str:
         if not self.calendar.is_trading_day(requested.date()):
-            actual = "non_trading_research"
+            actual = "non_trading_outlook"
         else:
             clock = requested.timetz().replace(tzinfo=None)
             if clock < time(9, 30):
@@ -121,17 +130,27 @@ class ManualAnalysisProfileResolver:
             else:
                 actual = "post_close_review"
         accepted_scopes = {
-            "pre_market_opportunity": {"current_session", "pre_market"},
+            "pre_market_opportunity": {"current_session", "pre_market", "next_trading_session"},
             "intraday_execution": {"current_session", "intraday"},
             "lunch_break_analysis": {"current_session", "lunch_break"},
             "post_close_review": {"current_session", "post_close"},
-            "non_trading_research": {"current_session", "non_trading_period", "next_trading_session", "weekend"},
+            "non_trading_outlook": {"current_session", "non_trading_period", "next_trading_session", "weekend"},
         }
         if time_scope not in accepted_scopes[actual]:
             raise AnalysisClarificationRequired(
                 f"analysis.time_scope '{time_scope}' does not match the current market session"
             )
         return actual
+
+    @staticmethod
+    def _normalize_time_scope(time_scope: str) -> str:
+        """Map an unambiguous user-facing weekend-to-session phrase to its canonical scope."""
+        folded = time_scope.casefold()
+        is_weekend_to_next_session = (
+            ("周末" in time_scope and ("周一" in time_scope or "下一交易日" in time_scope))
+            or ("weekend" in folded and ("monday" in folded or "next trading session" in folded))
+        )
+        return "next_trading_session" if is_weekend_to_next_session else time_scope
 
     @staticmethod
     def _require_analysis(analysis: dict[str, Any]) -> None:

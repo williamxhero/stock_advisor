@@ -5,7 +5,8 @@ from unittest import TestCase
 
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.engine import CompanionEngine
-from ai_trading_companion.packet_builder import RuntimePacketBuilder
+from ai_trading_companion.packet_builder import RuntimePacketBuilder as _RuntimePacketBuilder
+from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.store import CompanionStore
 from ai_trading_companion.task_profiles import (
     AnalysisClarificationRequired,
@@ -154,3 +155,6 @@ class ManualAnalysisProfileResolverTests(TestCase):
 class _Calendar:
     def is_trading_day(self, value: date) -> bool:
         return value.weekday() < 5 and value != date(2026, 10, 1)
+def RuntimePacketBuilder(*args, **kwargs):
+    kwargs.setdefault("memory", InMemoryMemoryAdapter())
+    return _RuntimePacketBuilder(*args, **kwargs)

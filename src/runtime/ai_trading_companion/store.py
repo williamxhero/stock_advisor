@@ -1171,28 +1171,6 @@ class CompanionStore:
             ).fetchone()
         return dict(row) if row else None
 
-    def relevant_propositions(
-        self, known_at: str, query_text: str, *, exclude_cycle_id: str | None = None, limit: int = 20,
-    ) -> list[dict[str, Any]]:
-        """Return text-relevant memory plus the small set of necessary stable facts."""
-        candidates = self.current_propositions(known_at, exclude_cycle_id=exclude_cycle_id, limit=100)
-        tokens = {
-            token.lower() for token in re.findall(r"[A-Za-z0-9_]{2,}", query_text)
-        }
-        necessary = {("user.account", "total_assets"), ("user", "risk_tolerance")}
-        ranked: list[tuple[int, dict[str, Any]]] = []
-        for row in candidates:
-            rendered = " ".join((
-                str(row.get("subject") or ""), str(row.get("predicate") or ""), str(row.get("object_json") or ""),
-            )).lower()
-            score = sum(token in rendered for token in tokens)
-            if (row["subject"], row["predicate"]) in necessary:
-                score += 100
-            if score:
-                ranked.append((score, row))
-        ranked.sort(key=lambda item: (-item[0], item[1]["known_at"], item[1]["proposition_id"]), reverse=False)
-        return [row for _, row in ranked[:limit]]
-
     def get_message(self, message_id: str) -> dict[str, Any]:
         with self.connection() as c:
             row = c.execute("SELECT * FROM companion_message WHERE message_id=?", (message_id,)).fetchone()

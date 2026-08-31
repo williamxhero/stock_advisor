@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .learning import WorkflowEvolution
-from .memory import MemoryLibrary, MemoryQuery, MemoryRequest, MemoryRetriever, SqliteMemoryRetriever
+from .memory_port import MemoryPort, MemoryUnavailable
 from .secret_guard import assert_safe
 from .evidence_contract import EvidenceContractFactory
 from .models import TASK_POLICIES
@@ -25,14 +25,15 @@ class RuntimePacketBuilder:
         resources_root: Path,
         workspace_root: Path,
         store: Any,
-        memory: MemoryRetriever | None = None,
+        memory: MemoryPort | None = None,
+        memory_space_id: str = "ai-trading-companion",
         evidence_contract_factory: EvidenceContractFactory | None = None,
     ) -> None:
         self.resources_root = Path(resources_root)
         self.workspace_root = Path(workspace_root)
         self.store = store
-        self.memory = memory or SqliteMemoryRetriever(store)
-        self.memory_library = MemoryLibrary(store) if memory is None else None
+        self.memory = memory
+        self.memory_space_id = memory_space_id
         self.evidence_contract_factory = evidence_contract_factory or EvidenceContractFactory()
 
     def build(
@@ -80,7 +81,6 @@ class RuntimePacketBuilder:
             packet["evidence"] = evidence or {}
             packet["artifacts"] = self._stage_artifacts(cycle, stage)
             packet["memories"] = memory_cards
-            packet["proposition_memory"] = self._proposition_memory(cycle, stage, packet_as_of)
             packet["active_workflow_policy"] = WorkflowEvolution(self.store).active_policy()
             if message_batch is not None:
                 packet["message_batch"] = message_batch
@@ -119,13 +119,17 @@ class RuntimePacketBuilder:
         }
 
     def _memory_cards(self, cycle: dict[str, Any], stage: str, packet_as_of: str, evidence: dict[str, Any] | None) -> list[dict[str, Any]]:
-        query = MemoryQuery(task_key=cycle["task_key"], known_at=packet_as_of, text=self._memory_query_text(evidence), cycle_id=cycle["cycle_id"], stage=stage)
-        if self.memory_library is None:
-            return self.memory.retrieve(query)
-        return self.memory_library.retrieve_bundle(MemoryRequest(
-            task_key=cycle["task_key"], known_at=packet_as_of, stage=stage,
-            query_text=query.text, cycle_id=cycle["cycle_id"],
-        )).cards
+        if self.memory is None:
+            raise MemoryUnavailable("MemoryHub is required; local long-term memory fallback is disabled")
+        access_stage = {"m2": "m2_synthesis", "outcome_research": "reflection"}.get(stage, stage)
+        snapshot = self.memory.begin_snapshot({
+            "memory_space_id": self.memory_space_id, "as_of": packet_as_of,
+            "stage": access_stage, "cycle_id": cycle["cycle_id"],
+        })
+        bundle = self.memory.retrieve_bundle(
+            str(snapshot["snapshot_id"]), self._memory_query_text(evidence), limit=80,
+        )
+        return list(bundle.get("results") or [])
 
     def _public_scope(
         self,
@@ -290,18 +294,6 @@ class RuntimePacketBuilder:
         if stage == "m1_judgment" and cycle.get("private_context_json"):
             inputs.insert(0, {"path": "runtime://private-context-before-h0", "text": cycle["private_context_json"]})
         return inputs
-
-    def _proposition_memory(self, cycle: dict[str, Any], stage: str, known_at: str) -> list[dict[str, Any]]:
-        rows = self.store.current_propositions(
-            known_at,
-            exclude_cycle_id=cycle["cycle_id"] if stage == "m1_judgment" else None,
-            limit=80,
-        )
-        return [{
-            "proposition_id": row["proposition_id"], "kind": row["proposition_kind"],
-            "subject": row["subject"], "predicate": row["predicate"],
-            "object": json.loads(row["object_json"]), "known_at": row["known_at"],
-        } for row in rows]
 
     def _stage_artifacts(self, cycle: dict[str, Any], stage: str) -> list[dict[str, Any]]:
         allowed = {

@@ -757,7 +757,7 @@ def run_research(
     publish_observatory_forecast(store, cycle["cycle_id"], trigger="stage:m0_started")
     if on_progress:
         on_progress()
-    builder = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store)
+    builder = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
     if not execute:
         evidence = {"as_of": cycle["as_of"], "spoken_summary": "Fixture 模式：等待真实公开信息搜索。", "sources": [], "critical_gaps": []}
         store.append_artifact(cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False), cycle["as_of"])
@@ -859,7 +859,7 @@ def run_m1(
         cycle = engine.resume_m1_after_repair(cycle_id)
     if cycle["state"] not in {"researching_m1", "m1_retry_wait"}:
         raise RuntimeError(f"cycle is not waiting for M1: {cycle['state']}")
-    builder = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store)
+    builder = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
     if not execute:
         engine.m1_judgment_started(cycle_id)
         research_hash, judgment_hash = "fixture-m1-research", "fixture-m1-judgment"
@@ -975,7 +975,7 @@ def run_m2(engine: CompanionEngine, store: CompanionStore, cycle_id: str, execut
     timeout = int(TASK_POLICIES[cycle["task_key"]].m2_timeout.total_seconds())
     controls = resolve_stage_controls(store, "m2", timeout=timeout, search=False)
     packet = finalize_stage_packet(
-        RuntimePacketBuilder(PATHS.resources, WORKSPACE, store).build(cycle, "m2", as_of=frozen_as_of), controls,
+        RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(cycle, "m2", as_of=frozen_as_of), controls,
     )
     stage_result = _call_stage(
         store, cycle, "m2", packet, "companion-m2-result-v1.schema.json",
@@ -1049,7 +1049,7 @@ def run_reflection(
     if not execute:
         data = {"reflection_markdown": "Fixture 模式：结果已记录，等待真实复盘。", "memory_tags": ["fixture"], "workflow_proposal": None}
     else:
-        packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store).build(
+        packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
             cycle, "reflection", context={"checkpoint_id": checkpoint_id},
             as_of=iso(datetime.now(timezone.utc)),
         )
@@ -1087,7 +1087,7 @@ def run_outcome(
             "observations": [], "data_gaps": ["fixture mode"],
         }
     else:
-        packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store).build(
+        packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
             cycle,
             "outcome_research",
             context={
@@ -1178,7 +1178,7 @@ def run_chat_research(
         reply = "Fixture 模式：补查完成后，我会把新增信息继续发在这里。"
         data = None
     else:
-        builder = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store)
+        builder = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
         research_packet = builder.build(
             cycle, "chat_research", context=public_scope,
             as_of=iso(datetime.now(timezone.utc)),
@@ -1231,7 +1231,7 @@ def run_pending_workflow_feedback(
         if not execute:
             data = {"reflection_markdown": "Fixture 模式：这条工作流反馈已记录。", "memory_tags": ["workflow_feedback"], "workflow_proposal": None}
         else:
-            packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store).build(
+            packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
                 cycle, "workflow_feedback", context={"source_artifact_id": h0["artifact_id"]},
                 as_of=iso(datetime.now(timezone.utc)),
             )

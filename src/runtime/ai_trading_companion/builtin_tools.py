@@ -12,6 +12,8 @@ _CAPABILITIES = {
     "generic_web_read": "web_read",
     "generic_browser_capture": "browser_capture",
     "generic_web_search": "web_search",
+    "cninfo_search": "cninfo_search",
+    "article_range": "article_range",
 }
 
 
@@ -109,6 +111,30 @@ def main() -> None:
     if not isinstance(inputs, dict):
         fail(64, "inputs must be an object")
     mode = sys.argv[1]
+    if mode in {"cninfo_search", "article_range"}:
+        base = safe_url(inputs.get("base_url") or "http://yosef-server:8815").rstrip("/")
+        if mode == "cninfo_search":
+            query = str(inputs.get("q") or "").strip()
+            if not query:
+                fail(64, "q is required")
+            url, body = fetch(base + "/api/cninfo/search?q=" + quote_plus(query))
+        else:
+            source = str(inputs.get("source") or "all")
+            start_date = str(inputs.get("start_date") or "")
+            end_date = str(inputs.get("end_date") or "")
+            if not start_date or not end_date:
+                fail(64, "start_date and end_date are required")
+            if source not in {"all", "cninfo_disclosure", "eastmoney_stock_report", "eastmoney_broker_report", "eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news"}:
+                fail(64, "unsupported article source")
+            url, body = fetch(base + "/api/articles/range?source=" + quote_plus(source) + "&start_date=" + quote_plus(start_date) + "&end_date=" + quote_plus(end_date))
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            fail(75, "article service response is not JSON")
+        if not isinstance(payload, dict):
+            fail(75, "article service response is not an object")
+        result({"url": url, **payload})
+        return
     if mode == "web_search":
         query = str(inputs.get("query") or "").strip()
         if not query:

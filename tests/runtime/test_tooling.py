@@ -294,7 +294,12 @@ class ToolRunnerTests(unittest.TestCase):
     def test_builtin_generic_http_and_web_capabilities_are_read_only_cli_tools(self) -> None:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
-                body = b'{"market":"open","items":[1,2]}' if self.path == "/json" else b"<html><title>Market</title><body>market breadth 1234</body></html>"
+                if self.path.startswith("/api/cninfo/search"):
+                    body = b'{"announcements":[{"title":"disclosure","published_at":"2026-09-01T01:00:00Z"}]}'
+                elif self.path.startswith("/api/articles/range"):
+                    body = b'{"articles":[{"title":"market report","published_at":"2026-09-01T01:00:00Z"}]}'
+                else:
+                    body = b'{"market":"open","items":[1,2]}' if self.path == "/json" else b"<html><title>Market</title><body>market breadth 1234</body></html>"
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json" if self.path == "/json" else "text/html")
                 self.send_header("Content-Length", str(len(body)))
@@ -316,10 +321,16 @@ class ToolRunnerTests(unittest.TestCase):
                 json_result = runner.resolve(FactRequest(1, "generic_http_json", "2026-09-01T01:30:00Z", 2.0, {"url": f"{base}/json"}))
                 web_result = runner.resolve(FactRequest(1, "generic_web_read", "2026-09-01T01:30:00Z", 2.0, {"url": f"{base}/page"}))
                 capture_result = runner.resolve(FactRequest(1, "generic_browser_capture", "2026-09-01T01:30:00Z", 2.0, {"url": f"{base}/page"}))
+                disclosures = runner.resolve(FactRequest(1, "cninfo_search", "2026-09-01T01:30:00Z", 2.0, {"base_url": base, "q": "600000"}))
+                articles = runner.resolve(FactRequest(1, "article_range", "2026-09-01T01:30:00Z", 2.0, {
+                    "base_url": base, "source": "cninfo_disclosure", "start_date": "2026-08-31", "end_date": "2026-09-01",
+                }))
 
                 self.assertEqual("open", json_result.data["json"]["market"])
                 self.assertIn("market breadth 1234", web_result.data["text"])
                 self.assertEqual("static", capture_result.data["capture_mode"])
+                self.assertEqual("disclosure", disclosures.data["announcements"][0]["title"])
+                self.assertEqual("market report", articles.data["articles"][0]["title"])
                 self.assertTrue(json_result.raw_artifact_ref)
             finally:
                 server.shutdown()

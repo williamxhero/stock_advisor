@@ -128,6 +128,27 @@ class MemoryHub:
                     searchable_text TEXT NOT NULL,
                     FOREIGN KEY(episode_id) REFERENCES episode(episode_id)
                 );
+                CREATE TABLE IF NOT EXISTS derivation_job (
+                    episode_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    error TEXT,
+                    extractor_version TEXT,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(episode_id) REFERENCES episode(episode_id)
+                );
+                CREATE TABLE IF NOT EXISTS derived_memory (
+                    episode_id TEXT PRIMARY KEY,
+                    extractor_version TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    FOREIGN KEY(episode_id) REFERENCES episode(episode_id)
+                );
+                CREATE TABLE IF NOT EXISTS event_link (
+                    left_episode_id TEXT NOT NULL,
+                    right_episode_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    PRIMARY KEY(left_episode_id,right_episode_id)
+                );
                 """
             )
 
@@ -195,7 +216,99 @@ class MemoryHub:
                     "INSERT INTO source_search_index(episode_id,title,searchable_text) VALUES(?,?,?)",
                     (episode_id, hydrated["title"], hydrated["body"]),
                 )
+            connection.execute(
+                "INSERT INTO derivation_job(episode_id,state,error,extractor_version,updated_at) VALUES(?,'pending',NULL,NULL,?)",
+                (episode_id, value["submitted_at"]),
+            )
             return AppendReceipt(episode_id, int(cursor.lastrowid), value["content_hash"])
+
+    def derive_pending(
+        self, extractor: Any, *, extractor_version: str, limit: int = 20
+    ) -> int:
+        with self._connection() as connection:
+            jobs = list(
+                connection.execute(
+                    """SELECT j.episode_id,e.body,s.searchable_text,e.submitted_at
+                       FROM derivation_job j JOIN episode e ON e.episode_id=j.episode_id
+                       LEFT JOIN source_search_index s ON s.episode_id=e.episode_id
+                       WHERE j.state='pending' ORDER BY e.sequence LIMIT ?""",
+                    (max(1, min(limit, 100)),),
+                )
+            )
+        completed = 0
+        for job in jobs:
+            text = str(job["body"] or job["searchable_text"] or "")
+            try:
+                value = extractor(text)
+                self._validate_derivation(text, value)
+                with self._connection() as connection:
+                    connection.execute(
+                        """INSERT OR REPLACE INTO derived_memory(episode_id,extractor_version,value_json)
+                           VALUES(?,?,?)""",
+                        (job["episode_id"], extractor_version, _json(value)),
+                    )
+                    connection.execute(
+                        """UPDATE derivation_job SET state='complete',error=NULL,extractor_version=?,updated_at=?
+                           WHERE episode_id=?""",
+                        (extractor_version, job["submitted_at"], job["episode_id"]),
+                    )
+                completed += 1
+            except Exception as error:
+                with self._connection() as connection:
+                    connection.execute(
+                        """UPDATE derivation_job SET state='failed',error=?,extractor_version=?,updated_at=?
+                           WHERE episode_id=?""",
+                        (str(error)[:1000], extractor_version, job["submitted_at"], job["episode_id"]),
+                    )
+        return completed
+
+    def derived_memory(self, episode_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM derived_memory WHERE episode_id=?", (episode_id,)
+            ).fetchone()
+        if row is None:
+            raise MemoryHubError("derived memory is unavailable")
+        return {**json.loads(row["value_json"]), "extractor_version": row["extractor_version"], "episode_id": episode_id}
+
+    def link_events(self, left_episode_id: str, right_episode_id: str) -> dict[str, str]:
+        left, right = sorted((left_episode_id, right_episode_id))
+        if left == right:
+            return {"status": "confirmed", "reason": "same_episode"}
+        records = self._event_records(left, right)
+        status, reason = self._event_link_status(records[left], records[right])
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO event_link(left_episode_id,right_episode_id,status,reason) VALUES(?,?,?,?)",
+                (left, right, status, reason),
+            )
+        return {"status": status, "reason": reason}
+
+    def independent_source_count(self, episode_ids: list[str]) -> int:
+        parent = {episode_id: episode_id for episode_id in episode_ids}
+
+        def root(value: str) -> str:
+            while parent[value] != value:
+                parent[value] = parent[parent[value]]
+                value = parent[value]
+            return value
+
+        placeholders = ",".join("?" for _ in episode_ids)
+        if not placeholders:
+            return 0
+        with self._connection() as connection:
+            links = list(
+                connection.execute(
+                    f"""SELECT * FROM event_link WHERE status='confirmed'
+                        AND left_episode_id IN ({placeholders}) AND right_episode_id IN ({placeholders})""",
+                    [*episode_ids, *episode_ids],
+                )
+            )
+        for link in links:
+            left_root, right_root = root(link["left_episode_id"]), root(link["right_episode_id"])
+            if left_root != right_root:
+                parent[right_root] = left_root
+        return len({root(value) for value in episode_ids})
 
     def begin_snapshot(
         self, memory_space_id: str, *, as_of: str, stage: str, cycle_id: str | None = None
@@ -237,7 +350,13 @@ class MemoryHub:
             if score:
                 scored.append((score, row))
         scored.sort(key=lambda item: (item[0], item[1]["sequence"]), reverse=True)
-        return [self._card(row) for _, row in scored[: max(1, min(limit, 100))]]
+        selected = [row for _, row in scored[: max(1, min(limit, 100))]]
+        derived = self._derived_summaries(row["episode_id"] for row in selected)
+        cards = [self._card(row) for row in selected]
+        for card in cards:
+            if card["episode_id"] in derived:
+                card["derived_summary"] = derived[card["episode_id"]]
+        return cards
 
     def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
         snapshot = self._snapshot(snapshot_id)
@@ -277,11 +396,21 @@ class MemoryHub:
     def health(self) -> dict[str, Any]:
         with self._connection() as connection:
             count = int(connection.execute("SELECT COUNT(*) FROM episode").fetchone()[0])
+            source_index_count = int(connection.execute("SELECT COUNT(*) FROM source_search_index").fetchone()[0])
+            derivation = {
+                row["state"]: row["count"]
+                for row in connection.execute("SELECT state,COUNT(*) AS count FROM derivation_job GROUP BY state")
+            }
         return {
             "protocol_version": PROTOCOL_VERSION,
             "ledger": {"state": "ready", "episodes": count},
-            "index": {"state": "not_configured"},
-            "derivation": {"state": "not_configured"},
+            "index": {"state": "ready", "source_documents": source_index_count, "ledger_documents": count},
+            "derivation": {
+                "state": "degraded" if derivation.get("failed") else "ready",
+                "pending": derivation.get("pending", 0),
+                "complete": derivation.get("complete", 0),
+                "failed": derivation.get("failed", 0),
+            },
             "sources": {name: adapter.health() for name, adapter in self.source_adapters.items()},
         }
 
@@ -316,6 +445,58 @@ class MemoryHub:
                     f"SELECT * FROM source_search_index WHERE episode_id IN ({placeholders})", values
                 )
             }
+
+    def _derived_summaries(self, episode_ids: Any) -> dict[str, str]:
+        values = list(episode_ids)
+        if not values:
+            return {}
+        placeholders = ",".join("?" for _ in values)
+        with self._connection() as connection:
+            rows = list(connection.execute(
+                f"SELECT episode_id,value_json FROM derived_memory WHERE episode_id IN ({placeholders})", values
+            ))
+        return {
+            row["episode_id"]: str((json.loads(row["value_json"]) or {}).get("summary") or "")
+            for row in rows
+        }
+
+    @staticmethod
+    def _validate_derivation(text: str, value: Any) -> None:
+        if not isinstance(value, dict):
+            raise MemoryHubError("extractor result must be an object")
+        for proposition in value.get("propositions") or []:
+            span = proposition.get("span") if isinstance(proposition, dict) else None
+            if not span or str(span) not in text:
+                raise MemoryHubError("derived proposition must cite an exact source span")
+
+    def _event_records(self, *episode_ids: str) -> dict[str, sqlite3.Row]:
+        placeholders = ",".join("?" for _ in episode_ids)
+        with self._connection() as connection:
+            records = {
+                row["episode_id"]: row
+                for row in connection.execute(
+                    f"SELECT * FROM episode WHERE episode_id IN ({placeholders})", episode_ids
+                )
+            }
+        if len(records) != len(set(episode_ids)):
+            raise MemoryHubError("event link episode does not exist")
+        return records
+
+    @staticmethod
+    def _event_link_status(left: sqlite3.Row, right: sqlite3.Row) -> tuple[str, str]:
+        if left["content_hash"] == right["content_hash"]:
+            return "confirmed", "content_hash"
+        left_metadata, right_metadata = _loads(left["metadata_json"]) or {}, _loads(right["metadata_json"]) or {}
+        if left_metadata.get("original_url") and left_metadata.get("original_url") == right_metadata.get("original_url"):
+            return "confirmed", "original_url"
+        left_reference, right_reference = _loads(left["source_reference_json"]) or {}, _loads(right["source_reference_json"]) or {}
+        if (
+            left_reference.get("event_id")
+            and left_reference.get("source_system") == right_reference.get("source_system")
+            and left_reference.get("event_id") == right_reference.get("event_id")
+        ):
+            return "confirmed", "source_event_id"
+        return "candidate", "semantic_similarity_only"
 
     def _watermark(self, memory_space_id: str) -> int:
         with self._connection() as connection:

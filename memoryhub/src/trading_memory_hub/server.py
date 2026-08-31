@@ -9,6 +9,7 @@ from typing import Any
 
 from .core import EpisodeConflict, MemoryHub, MemoryHubError, SourceIntegrityError
 from .sources import ArticleArchiveSourceAdapter, MarketHubSourceAdapter
+from .derivation import DerivationWorker, OllamaExtractor
 
 
 def make_server(host: str, port: int, database: Path | str, *, source_adapters: dict[str, Any] | None = None) -> ThreadingHTTPServer:
@@ -77,8 +78,23 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8820)
     parser.add_argument("--database", type=Path, required=True)
+    parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
+    parser.add_argument("--ollama-model", default="")
     args = parser.parse_args()
-    make_server(args.host, args.port, args.database).serve_forever()
+    server = make_server(args.host, args.port, args.database)
+    worker = None
+    if args.ollama_model:
+        worker = DerivationWorker(
+            MemoryHub(args.database),
+            OllamaExtractor(base_url=args.ollama_url, model=args.ollama_model),
+        )
+    try:
+        if worker:
+            worker.start()
+        server.serve_forever()
+    finally:
+        if worker:
+            worker.stop()
 
 
 if __name__ == "__main__":

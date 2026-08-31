@@ -154,6 +154,13 @@ class MemoryHub:
                     reason TEXT NOT NULL,
                     PRIMARY KEY(left_episode_id,right_episode_id)
                 );
+                CREATE TABLE IF NOT EXISTS clear_request (
+                    confirmation_token TEXT PRIMARY KEY,
+                    memory_space_id TEXT NOT NULL,
+                    export_sha256 TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    result_json TEXT
+                );
                 """
             )
 
@@ -446,6 +453,92 @@ class MemoryHub:
                 )
             )
         return [self._episode(row) for row in rows]
+
+    def export_space(self, memory_space_id: str) -> dict[str, Any]:
+        if not memory_space_id:
+            raise MemoryHubError("export requires memory_space_id")
+        with self._connection() as connection:
+            episodes = [
+                self._episode(row) for row in connection.execute(
+                    "SELECT * FROM episode WHERE memory_space_id=? ORDER BY sequence",
+                    (memory_space_id,),
+                )
+            ]
+        machine = {
+            "memory_space_id": memory_space_id,
+            "protocol_version": PROTOCOL_VERSION,
+            "episodes": episodes,
+        }
+        canonical = json.dumps(machine, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        human_lines = [f"# MemoryHub export: {memory_space_id}", ""]
+        for item in episodes:
+            human_lines.extend([
+                f"## {item['sequence']}. {item['episode_type']}",
+                f"- occurred_at: {item['occurred_at']}",
+                f"- known_at: {item['known_at']}",
+                f"- source: {item['source_system']} / {item['source_event_id']}",
+                "", str(item.get("body") or "[public source reference]"), "",
+            ])
+        return {
+            **machine,
+            "human_markdown": "\n".join(human_lines).rstrip() + "\n",
+            "export_sha256": _content_hash(canonical),
+        }
+
+    def prepare_clear(self, memory_space_id: str, export_sha256: str) -> dict[str, Any]:
+        current = self.export_space(memory_space_id)
+        if current["export_sha256"] != export_sha256:
+            raise MemoryHubError("clear requires a fresh successful export")
+        token = str(uuid.uuid4())
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO clear_request(confirmation_token,memory_space_id,export_sha256,state) VALUES(?,?,?,'pending')",
+                (token, memory_space_id, export_sha256),
+            )
+        return {
+            "confirmation_token": token, "memory_space_id": memory_space_id,
+            "export_sha256": export_sha256, "state": "confirmation_required",
+        }
+
+    def clear_space(self, memory_space_id: str, confirmation_token: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            request = connection.execute(
+                "SELECT * FROM clear_request WHERE confirmation_token=? AND memory_space_id=?",
+                (confirmation_token, memory_space_id),
+            ).fetchone()
+            if request is None:
+                raise MemoryHubError("clear confirmation is invalid")
+            if request["state"] == "applied":
+                return json.loads(request["result_json"])
+            if request["state"] != "pending":
+                raise MemoryHubError("clear confirmation is no longer valid")
+            current = self.export_space(memory_space_id)
+            if current["export_sha256"] != request["export_sha256"]:
+                raise MemoryHubError("memory changed after export; export again before clearing")
+            episode_ids = [item["episode_id"] for item in current["episodes"]]
+            if episode_ids:
+                marks = ",".join("?" for _ in episode_ids)
+                connection.execute(
+                    f"DELETE FROM event_link WHERE left_episode_id IN ({marks}) OR right_episode_id IN ({marks})",
+                    [*episode_ids, *episode_ids],
+                )
+                for table in ("derived_memory", "derivation_job", "source_search_index"):
+                    connection.execute(f"DELETE FROM {table} WHERE episode_id IN ({marks})", episode_ids)
+            connection.execute("DELETE FROM memory_snapshot WHERE memory_space_id=?", (memory_space_id,))
+            connection.execute("DELETE FROM episode WHERE memory_space_id=?", (memory_space_id,))
+            result = {
+                "memory_space_id": memory_space_id, "state": "cleared",
+                "deleted_episodes": len(episode_ids), "export_sha256": request["export_sha256"],
+            }
+            connection.execute(
+                "UPDATE clear_request SET state='invalidated' WHERE memory_space_id=? AND state='pending'",
+                (memory_space_id,),
+            )
+            connection.execute(
+                "UPDATE clear_request SET state='applied',result_json=? WHERE confirmation_token=?",
+                (json.dumps(result, ensure_ascii=False, sort_keys=True), confirmation_token),
+            )
+        return result
 
     def health(self) -> dict[str, Any]:
         with self._connection() as connection:

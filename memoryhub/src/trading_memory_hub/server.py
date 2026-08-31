@@ -51,6 +51,15 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
                         result = hub.timeline(parts[2], after_sequence=value.get("after_sequence", 0))
                         self._reply(HTTPStatus.OK, {"result": result})
                         return
+                    if len(parts) == 4 and parts[:2] == ["v1", "memory-spaces"] and parts[3] == "export":
+                        self._reply(HTTPStatus.OK, {"result": hub.export_space(parts[2])})
+                        return
+                    if len(parts) == 5 and parts[:2] == ["v1", "memory-spaces"] and parts[3:] == ["clear", "prepare"]:
+                        self._reply(HTTPStatus.OK, {"result": hub.prepare_clear(parts[2], value["export_sha256"])})
+                        return
+                    if len(parts) == 4 and parts[:2] == ["v1", "memory-spaces"] and parts[3] == "clear":
+                        self._reply(HTTPStatus.OK, {"result": hub.clear_space(parts[2], value["confirmation_token"])})
+                        return
                     if len(parts) != 4 or parts[:2] != ["v1", "snapshots"]:
                         self._reply(HTTPStatus.NOT_FOUND, {"error": "not_found"})
                         return

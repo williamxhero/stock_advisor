@@ -55,6 +55,8 @@ public partial class MainWindow : Window, IDisposable
     private string? _voiceContextFile;
     private bool _suppressDraftUpdate;
     private bool _disposed;
+    private string? _pendingMemoryExportCommandId;
+    private readonly HashSet<string> _handledMemoryResults = new(StringComparer.Ordinal);
 
     public MainWindow(MainViewModel viewModel, AppPaths paths)
     {
@@ -274,6 +276,7 @@ public partial class MainWindow : Window, IDisposable
             catch (Exception exception) { _viewModel.ReportInboxFailure(exception); }
         }
         var events = _companionExchange.ReadLatestEvents(1000);
+        HandleMemoryResults(events);
         _taskManagementWindow?.UpdateEvents(events);
         RequestTodayProjectionsAsync();
         _viewModel.SynchronizeManualCycles(CompanionEventProjection.ProjectAll(events));
@@ -322,6 +325,59 @@ public partial class MainWindow : Window, IDisposable
         RenderUserMessages();
         UpdateInputState();
         RequestCompanionProjectionAsync(projection.CycleId);
+    }
+
+    private async void MemoryButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_pendingMemoryExportCommandId is not null) return;
+        var commandId = Guid.NewGuid().ToString();
+        _pendingMemoryExportCommandId = commandId;
+        try
+        {
+            await _companionExchange.SendAsync(new
+            {
+                contract = "memory-user-command/v1", command_id = commandId, type = "memory.export",
+            });
+            MessageBox.Show(this, "正在导出全部私人记忆。导出成功后会再次询问是否清空；此操作不会修改 MarketHub 或 8815 的公共历史。", "AI交易伙伴", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception exception)
+        {
+            _pendingMemoryExportCommandId = null;
+            _viewModel.ReportInboxFailure(exception);
+        }
+    }
+
+    private async void HandleMemoryResults(IReadOnlyList<string> events)
+    {
+        foreach (var raw in events)
+        {
+            using var document = JsonDocument.Parse(raw);
+            var root = document.RootElement;
+            if (!root.TryGetProperty("contract", out var contract) || contract.GetString() != "memory-command-result/v1") continue;
+            var commandId = root.GetProperty("command_id").GetString();
+            if (string.IsNullOrWhiteSpace(commandId) || !_handledMemoryResults.Add(commandId)) continue;
+            var result = root.GetProperty("result");
+            var state = result.TryGetProperty("state", out var stateValue) ? stateValue.GetString() : null;
+            if (state == "exported" && commandId == _pendingMemoryExportCommandId)
+            {
+                _pendingMemoryExportCommandId = null;
+                var humanPath = result.GetProperty("human_export_path").GetString();
+                var token = result.GetProperty("confirmation_token").GetString();
+                var answer = MessageBox.Show(
+                    this,
+                    $"私人记忆已成功导出到：\n{humanPath}\n\n是否彻底清空整个私人记忆空间？这会删除正式消息、摘要、索引和派生关系，且不可撤销；持仓、成交、日程和任务不会被删除。",
+                    "二次确认：清空私人记忆", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+                await _companionExchange.SendAsync(new
+                {
+                    contract = "memory-user-command/v1", command_id = Guid.NewGuid().ToString(), type = "memory.clear",
+                    confirmed = answer == MessageBoxResult.Yes, confirmation_token = token,
+                });
+            }
+            else if (state == "cleared")
+            {
+                MessageBox.Show(this, "私人记忆空间已清空。MarketHub、8815、持仓、成交、日程和任务未受影响。", "AI交易伙伴", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
     }
 
     private void RenderHistoricalMessage()

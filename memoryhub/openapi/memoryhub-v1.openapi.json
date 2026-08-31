@@ -11,6 +11,9 @@
     "/v1/snapshots/{snapshot_id}/search": {"post": {"responses": {"200": {"description": "Policy-filtered memory cards"}}}},
     "/v1/snapshots/{snapshot_id}/expand": {"post": {"responses": {"200": {"description": "Visible immutable episode"}}}},
     "/v1/snapshots/{snapshot_id}/related": {"post": {"responses": {"200": {"description": "Visible correction and outcome links"}}}},
-    "/v1/memory-spaces/{memory_space_id}/timeline": {"post": {"responses": {"200": {"description": "Submitted and published message timeline"}}}}
+    "/v1/memory-spaces/{memory_space_id}/timeline": {"post": {"responses": {"200": {"description": "Submitted and published message timeline"}}}},
+    "/v1/memory-spaces/{memory_space_id}/export": {"post": {"responses": {"200": {"description": "Human and machine rebuildable private-space export"}}}},
+    "/v1/memory-spaces/{memory_space_id}/clear/prepare": {"post": {"responses": {"200": {"description": "Second-confirmation token bound to a fresh export"}}}},
+    "/v1/memory-spaces/{memory_space_id}/clear": {"post": {"responses": {"200": {"description": "Idempotent whole-space clear receipt"}}}}
   }
 }

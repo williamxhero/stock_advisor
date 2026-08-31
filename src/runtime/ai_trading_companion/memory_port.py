@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+import uuid
 
 
 class MemoryUnavailable(RuntimeError):
@@ -18,6 +20,9 @@ class MemoryPort(Protocol):
     def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]: ...
     def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]: ...
     def timeline(self, memory_space_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]: ...
+    def export_space(self, memory_space_id: str) -> dict[str, Any]: ...
+    def prepare_clear(self, memory_space_id: str, export_sha256: str) -> dict[str, Any]: ...
+    def clear_space(self, memory_space_id: str, confirmation_token: str) -> dict[str, Any]: ...
     def health(self) -> dict[str, Any]: ...
 
 
@@ -48,6 +53,21 @@ class HttpMemoryAdapter:
             {"after_sequence": after_sequence},
         )["result"]
 
+    def export_space(self, memory_space_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/v1/memory-spaces/{memory_space_id}/export", {})["result"]
+
+    def prepare_clear(self, memory_space_id: str, export_sha256: str) -> dict[str, Any]:
+        return self._request(
+            "POST", f"/v1/memory-spaces/{memory_space_id}/clear/prepare",
+            {"export_sha256": export_sha256},
+        )["result"]
+
+    def clear_space(self, memory_space_id: str, confirmation_token: str) -> dict[str, Any]:
+        return self._request(
+            "POST", f"/v1/memory-spaces/{memory_space_id}/clear",
+            {"confirmation_token": confirmation_token},
+        )["result"]
+
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/health")
 
@@ -75,6 +95,7 @@ class InMemoryMemoryAdapter:
         self._receipts: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._episodes: list[dict[str, Any]] = []
         self._snapshots: dict[str, dict[str, Any]] = {}
+        self._clear_requests: dict[str, dict[str, Any]] = {}
 
     def append(self, episode: dict[str, Any]) -> dict[str, Any]:
         key = (episode["memory_space_id"], episode["source_system"], episode["source_event_id"])
@@ -125,6 +146,39 @@ class InMemoryMemoryAdapter:
             and item["sequence"] > after_sequence
             and item["episode_type"] in {"user_message", "ai_message"}
         ]
+
+    def export_space(self, memory_space_id: str) -> dict[str, Any]:
+        episodes = [dict(item) for item in self._episodes if item["memory_space_id"] == memory_space_id]
+        machine = {"memory_space_id": memory_space_id, "protocol_version": "memoryhub/v1", "episodes": episodes}
+        canonical = json.dumps(machine, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return {
+            **machine, "human_markdown": "\n".join(str(item.get("body") or "") for item in episodes),
+            "export_sha256": "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        }
+
+    def prepare_clear(self, memory_space_id: str, export_sha256: str) -> dict[str, Any]:
+        if self.export_space(memory_space_id)["export_sha256"] != export_sha256:
+            raise MemoryUnavailable("clear requires a fresh successful export")
+        token = str(uuid.uuid4())
+        value = {"confirmation_token": token, "memory_space_id": memory_space_id, "export_sha256": export_sha256}
+        self._clear_requests[token] = value
+        return {**value, "state": "confirmation_required"}
+
+    def clear_space(self, memory_space_id: str, confirmation_token: str) -> dict[str, Any]:
+        request = self._clear_requests.get(confirmation_token)
+        if not request or request["memory_space_id"] != memory_space_id:
+            raise MemoryUnavailable("clear confirmation is invalid")
+        prior = request.get("result")
+        if prior:
+            return dict(prior)
+        before = len(self._episodes)
+        self._episodes = [item for item in self._episodes if item["memory_space_id"] != memory_space_id]
+        self._receipts = {
+            key: receipt for key, receipt in self._receipts.items() if key[0] != memory_space_id
+        }
+        result = {"memory_space_id": memory_space_id, "state": "cleared", "deleted_episodes": before - len(self._episodes), "export_sha256": request["export_sha256"]}
+        request["result"] = result
+        return dict(result)
 
     def health(self) -> dict[str, Any]:
         return {"protocol_version": "memoryhub/v1", "ledger": {"state": "ready", "episodes": len(self._receipts)}}

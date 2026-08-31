@@ -28,6 +28,7 @@ from .governance import EvolutionGovernance, RouterGovernance, StrategyPolicyExe
 from .gateway import RuntimeGateway, serve as serve_gateway
 from .learning import JudgmentLifecycle, WorkflowEvolution
 from .message_presentation import explicit_format_requested
+from .memory_commands import handle_memory_command
 from .memory_port import HttpMemoryAdapter
 from .migration import LegacyMigrator, LegacySources
 from .models import TASK_POLICIES
@@ -1682,6 +1683,22 @@ def consume(
     results: list[dict[str, Any]] = []
     for path, command in exchange.receive("to-runtime"):
         try:
+            if command.get("contract") == "memory-user-command/v1":
+                command_id = str(command.get("command_id") or "")
+                command_type = str(command.get("type") or "")
+                result = store.receipt(command_id, command)
+                if result is None:
+                    result = handle_memory_command(
+                        engine.memory, engine.memory_space_id, command, PATHS.home / "exports" / "memory",
+                    )
+                    store.save_receipt(command_id, None, command_type, command, result)
+                exchange.send("to-client", f"memory-{command_id}", {
+                    "contract": "memory-command-result/v1", "command_id": command_id,
+                    "type": command_type, "result": result,
+                })
+                exchange.acknowledge("to-runtime", path)
+                results.append(result)
+                continue
             if command.get("contract") == "schedule-user-command/v1":
                 result = _schedule_command(store, command)
                 exchange.acknowledge("to-runtime", path)

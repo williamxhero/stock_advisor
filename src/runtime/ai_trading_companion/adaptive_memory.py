@@ -41,7 +41,7 @@ class AdaptiveMemoryResearch:
         self.monotonic = monotonic
 
     def collect(
-        self, cycle_id: str, messages: list[dict[str, Any]], *, deadline: float,
+        self, cycle_id: str, messages: list[dict[str, Any]], *, deadline: float, stage: str = "chat",
     ) -> MemoryResearchResult:
         if not messages:
             raise MemoryResearchError("memory research requires submitted messages")
@@ -49,7 +49,7 @@ class AdaptiveMemoryResearch:
         snapshot = self.memory.begin_snapshot({
             "memory_space_id": self.memory_space_id,
             "as_of": as_of,
-            "stage": "chat",
+            "stage": stage,
             "cycle_id": cycle_id,
         })
         snapshot_id = str(snapshot.get("snapshot_id") or "")

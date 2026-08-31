@@ -777,7 +777,8 @@ def run_research(
     research_controls = resolve_stage_controls(
         store, "m0_research", timeout=research_timeout, search=True,
     )
-    public_packet = finalize_stage_packet(builder.build(cycle, "m0_research"), research_controls)
+    memory_research = _formal_adaptive_research(engine, store, cycle, "m0_research", cycle["as_of"], research_timeout)
+    public_packet = finalize_stage_packet(builder.build(cycle, "m0_research", context=memory_research), research_controls)
     compose_timeout = int(policy.m1_timeout.total_seconds())
     compose_controls = resolve_stage_controls(
         store, "m0_compose", timeout=compose_timeout, search=False,
@@ -882,8 +883,9 @@ def run_m1(
     research_controls = resolve_stage_controls(
         store, "m1_research", timeout=research_timeout, search=True,
     )
+    memory_research = _formal_adaptive_research(engine, store, cycle, "m1_research", research_as_of, research_timeout)
     public_packet = finalize_stage_packet(
-        builder.build(cycle, "m1_research", evidence=prior_evidence, as_of=research_as_of), research_controls,
+        builder.build(cycle, "m1_research", evidence=prior_evidence, as_of=research_as_of, context=memory_research), research_controls,
     )
     checkpoint = store.stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"])
     if checkpoint:
@@ -1455,6 +1457,26 @@ def _next_memory_research_action(
     if not isinstance(outcome.result, dict):
         raise MemoryResearchError("Broker produced no qualified memory research decision")
     return outcome.result
+
+
+def _formal_adaptive_research(engine: CompanionEngine, store: CompanionStore, cycle: dict[str, Any], stage: str, as_of: str, timeout: int) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    result = AdaptiveMemoryResearch(
+        engine.memory, engine.memory_space_id,
+        lambda state: _next_memory_research_action(store, cycle, state, deadline),
+        discover_external=lambda action, snapshot: _discover_chat_external_evidence(engine, action, snapshot),
+    ).collect(cycle["cycle_id"], [{"message_id": stage, "body_text": f"Formal {stage} evidence gaps", "known_at": as_of}], deadline=deadline, stage=stage)
+    return {"memoryhub_snapshot": result.snapshot, "adaptive_memory": list(result.context), "adaptive_actions": list(result.actions)}
+
+
+def _formal_memory_snapshot(engine: CompanionEngine, cycle: dict[str, Any], stage: str, as_of: str) -> dict[str, Any]:
+    """Freeze the policy-filtered MemoryHub view used by one formal stage."""
+    if engine.memory is None:
+        raise MemoryResearchError("MemoryHub is required for formal research")
+    return engine.memory.begin_snapshot({
+        "memory_space_id": engine.memory_space_id, "as_of": as_of,
+        "stage": stage, "cycle_id": cycle["cycle_id"],
+    })
 
 
 def _discover_chat_external_evidence(

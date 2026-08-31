@@ -13,6 +13,7 @@ from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter, MemoryUnavailable
 from ai_trading_companion.portfolio import PortfolioService
 from ai_trading_companion.store import CompanionStore
+from trading_memory_hub.core import MemoryHub
 
 
 def _episode(space: str, event_id: str, body: str, known_at: str) -> dict[str, object]:
@@ -148,6 +149,18 @@ class AdaptiveMemoryResearchTests(unittest.TestCase):
             rows = _discover_chat_external_evidence(engine, action, {"snapshot_id": "s", "cycle_id": "cycle"})
         self.assertEqual("immutable_source_reference", rows[0]["authority"])
         self.assertIn("memory_snapshot_id", rows[0])
+
+    def test_m1_snapshot_hides_same_cycle_h0_but_keeps_prior_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            hub = MemoryHub(Path(temporary) / "memory.sqlite3")
+            for event, body, episode_type, stage in [("old", "prior lesson", "note", "m0_research"), ("h0", "current human h0", "h0", "h0")]:
+                hub.append({"memory_space_id": "formal", "source_system": "test", "source_event_id": event,
+                    "content_hash": "auto", "episode_type": episode_type, "body": body,
+                    "occurred_at": "2026-08-20T00:00:00Z", "known_at": "2026-08-20T00:00:00Z", "submitted_at": "2026-08-20T00:00:00Z",
+                    "authority": "test", "protocol_version": "memoryhub/v1", "metadata": {"cycle_id": "cycle", "stage": stage, "actor": "human" if event == "h0" else "ai"}})
+            snapshot = hub.begin_snapshot("formal", as_of="2026-08-21T00:00:00Z", stage="m1_research", cycle_id="cycle")
+            visible = hub.search(snapshot.snapshot_id, "", limit=20)
+        self.assertEqual(["prior lesson"], [item["summary"] for item in visible])
 
 
 def _response(result: dict[str, object]) -> BrokerResponse:

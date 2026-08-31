@@ -438,6 +438,18 @@ public partial class MainWindow : Window, IDisposable
                 Grid.SetColumn(copy, 1);
                 headerRow.Children.Add(copy);
             }
+            if (message.Kind == "chat_pending" && _companionProjection is not null)
+            {
+                var stop = new Button { Content = "终止", Tag = _companionProjection.CycleId, Padding = new Thickness(8, 2, 8, 2) };
+                stop.Click += async (_, _) => await SendCompanionCommandAsync("terminate_chat_research", null, showAiError: true);
+                Grid.SetColumn(stop, 1); headerRow.Children.Add(stop);
+            }
+            if (message.Kind == "chat_terminated" && _companionProjection is not null)
+            {
+                var resume = new Button { Content = "继续研究", Tag = _companionProjection.CycleId, Padding = new Thickness(8, 2, 8, 2) };
+                resume.Click += async (_, _) => await SendCompanionCommandAsync("continue_chat_research", null, showAiError: true);
+                Grid.SetColumn(resume, 1); headerRow.Children.Add(resume);
+            }
             var content = new StackPanel { Children = { headerRow, timing, body } };
             var card = new Border
             {

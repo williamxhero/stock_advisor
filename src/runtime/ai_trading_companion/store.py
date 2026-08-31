@@ -173,6 +173,8 @@ class CompanionStore:
               source_sha256 TEXT NOT NULL, result_json TEXT, created_at TEXT NOT NULL,
               claimed_at TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, completed_at TEXT, error TEXT,
               UNIQUE(source_artifact_id, mode));
+            CREATE TABLE IF NOT EXISTS companion_chat_control (
+              cycle_id TEXT PRIMARY KEY REFERENCES companion_cycle(cycle_id), terminated_at TEXT, resumed_at TEXT, research_json TEXT);
             CREATE TABLE IF NOT EXISTS companion_action_receipt (
               action_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES companion_cognition_job(job_id),
               action_type TEXT NOT NULL, state TEXT NOT NULL, payload_sha256 TEXT NOT NULL,
@@ -354,6 +356,9 @@ class CompanionStore:
             for name, declaration in {"claimed_at": "TEXT", "attempt_count": "INTEGER NOT NULL DEFAULT 0"}.items():
                 if name not in cognition_columns:
                     c.execute(f"ALTER TABLE companion_cognition_job ADD COLUMN {name} {declaration}")
+            control_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_chat_control)")}
+            if "research_json" not in control_columns:
+                c.execute("ALTER TABLE companion_chat_control ADD COLUMN research_json TEXT")
             artifact_columns = {row[1] for row in c.execute("PRAGMA table_info(narrative_artifact)")}
             if "occurred_at" not in artifact_columns:
                 c.execute("ALTER TABLE narrative_artifact ADD COLUMN occurred_at TEXT")
@@ -1281,6 +1286,24 @@ class CompanionStore:
                 f"UPDATE companion_message_batch SET state='completed',completed_at=?,response_artifact_id=? WHERE batch_id IN ({placeholders}) AND state='pending'",
                 [now(), artifact_id, *batch_ids],
             )
+
+    def terminate_chat_research(self, cycle_id: str) -> dict[str, Any]:
+        with self.connection() as c:
+            job = c.execute("SELECT result_json FROM companion_cognition_job WHERE cycle_id=? AND result_json IS NOT NULL ORDER BY completed_at DESC LIMIT 1", (cycle_id,)).fetchone()
+            c.execute("INSERT OR IGNORE INTO companion_chat_control(cycle_id,terminated_at,research_json) VALUES(?,?,?)", (cycle_id, now(), job["result_json"] if job else None))
+            row = c.execute("SELECT * FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+        return dict(row)
+
+    def chat_research_terminated(self, cycle_id: str) -> bool:
+        with self.connection() as c:
+            row = c.execute("SELECT terminated_at,resumed_at FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+        return bool(row and row["terminated_at"] and not row["resumed_at"])
+
+    def continue_chat_research(self, cycle_id: str) -> dict[str, Any]:
+        with self.connection() as c:
+            c.execute("UPDATE companion_chat_control SET resumed_at=? WHERE cycle_id=? AND terminated_at IS NOT NULL", (now(), cycle_id))
+            row = c.execute("SELECT * FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+        return dict(row) if row else {"cycle_id": cycle_id, "state": "not_terminated"}
 
     def start_stream_message(self, cycle_id: str, batch_ids: list[str], kind: str) -> dict[str, Any]:
         stream_id = str(uuid.uuid4())

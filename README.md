@@ -18,6 +18,7 @@
 ## 目录
 
 - `src/runtime/ai_trading_companion/`：调度、周期状态机、Exchange、记忆、持仓和 Router。
+- `memoryhub/`：独立部署的交易伙伴 MemoryHub、版本化 interface 与不可变 Episode Ledger。
 - `src/desktop/AITradingCompanion.Desktop/`：WPF 三栏应用。
 - `resources/`：只读合同、日程、协议、知识基线与模板。
 - `tests/runtime/`、`tests/desktop/`：运行时与桌面契约测试。

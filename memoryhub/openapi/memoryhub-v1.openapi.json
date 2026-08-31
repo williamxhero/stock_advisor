@@ -1,0 +1,12 @@
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Trading MemoryHub", "version": "1.0.0"},
+  "paths": {
+    "/health": {"get": {"responses": {"200": {"description": "Capability health"}}}},
+    "/v1/episodes": {"post": {"responses": {
+      "200": {"description": "Immutable append receipt"},
+      "409": {"description": "Same source event with different content"}
+    }}}
+  }
+}
+

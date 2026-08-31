@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-memory-hub"
+version = "0.1.0"
+description = "Independent immutable memory authority for AI trading companions"
+requires-python = ">=3.11"
+
+[project.scripts]
+memoryhub = "trading_memory_hub.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

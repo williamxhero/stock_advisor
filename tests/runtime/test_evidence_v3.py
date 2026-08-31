@@ -33,6 +33,18 @@ class EvidenceV3Tests(TestCase):
             _m1_research_as_of({"as_of": "2026-08-31T05:25:57Z"}, None),
         )
 
+    def test_1430_contract_requires_fresh_intraday_market_and_event_evidence(self):
+        contract = EvidenceContractFactory(_WeekdayCalendar()).build(
+            task_key="daily.execution.1430", stage="m0_research", as_of="2026-08-26T06:30:00Z",
+        )
+        market = next(item for item in contract["requirements"] if item["key"] == "current_market_state")
+        events = next(item for item in contract["requirements"] if item["key"] == "material_events_and_counterevidence")
+
+        self.assertEqual("after_start_to_end", market["window"]["mode"])
+        self.assertEqual("2026-08-26T06:15:00Z", market["window"]["start"])
+        self.assertEqual("2026-08-26T06:30:00Z", market["window"]["end"])
+        self.assertEqual("2026-08-26T02:30:00Z", events["window"]["start"])
+
     def setUp(self):
         self.as_of = "2026-08-26T01:00:00Z"
         self.contract = EvidenceContractFactory(_WeekdayCalendar()).build(

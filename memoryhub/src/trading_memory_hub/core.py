@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from datetime import date, datetime, timezone
 import json
 import hashlib
 from pathlib import Path
@@ -13,6 +14,10 @@ from .secret_guard import assert_safe
 
 
 PROTOCOL_VERSION = "memoryhub/v1"
+ALLOWED_STAGES = {
+    "chat", "chat_research", "m0_research", "m0_compose", "m1_research",
+    "m1_judgment", "m2_synthesis", "reflection", "workflow_feedback",
+}
 
 
 class MemoryHubError(RuntimeError):
@@ -164,8 +169,14 @@ class MemoryHub:
             assert_safe(str(value["body"]))
 
         value = dict(value)
-        if value.get("body") and value["content_hash"] == "auto":
-            value["content_hash"] = _content_hash(str(value["body"]))
+        for name in ("occurred_at", "known_at", "submitted_at"):
+            value[name] = _canonical_time(str(value[name]))
+        if value.get("body"):
+            actual_body_hash = _content_hash(str(value["body"]))
+            if value["content_hash"] == "auto":
+                value["content_hash"] = actual_body_hash
+            elif value["content_hash"] != actual_body_hash:
+                raise SourceIntegrityError("episode body does not match supplied hash")
         with self._connection() as connection:
             existing = connection.execute(
                 """SELECT episode_id, sequence, content_hash, protocol_version
@@ -317,31 +328,33 @@ class MemoryHub:
                     "SELECT episode_id,content_hash,source_reference_json FROM episode WHERE source_reference_json IS NOT NULL"
                 )
             )
+        rebuilt: list[tuple[str, str, str]] = []
+        for row in source_rows:
+            reference = _loads(row["source_reference_json"])
+            hydrated = self._hydrate(reference)
+            if _content_hash(hydrated["body"]) != row["content_hash"]:
+                raise SourceIntegrityError("source changed during index rebuild")
+            rebuilt.append((row["episode_id"], hydrated["title"], hydrated["body"]))
+        with self._connection() as connection:
             connection.execute("DELETE FROM source_search_index")
             connection.execute("DELETE FROM derived_memory")
             connection.execute("DELETE FROM event_link")
             connection.execute(
                 "UPDATE derivation_job SET state='pending',error=NULL,extractor_version=NULL"
             )
-        rebuilt_sources = 0
-        for row in source_rows:
-            reference = _loads(row["source_reference_json"])
-            hydrated = self._hydrate(reference)
-            if _content_hash(hydrated["body"]) != row["content_hash"]:
-                raise SourceIntegrityError("source changed during index rebuild")
-            with self._connection() as connection:
-                connection.execute(
-                    "INSERT INTO source_search_index(episode_id,title,searchable_text) VALUES(?,?,?)",
-                    (row["episode_id"], hydrated["title"], hydrated["body"]),
-                )
-            rebuilt_sources += 1
-        return {"source_documents": rebuilt_sources, "derivation_jobs": self.health()["ledger"]["episodes"]}
+            connection.executemany(
+                "INSERT INTO source_search_index(episode_id,title,searchable_text) VALUES(?,?,?)", rebuilt
+            )
+        return {"source_documents": len(rebuilt), "derivation_jobs": self.health()["ledger"]["episodes"]}
 
     def begin_snapshot(
         self, memory_space_id: str, *, as_of: str, stage: str, cycle_id: str | None = None
     ) -> SnapshotReceipt:
         if not memory_space_id or not as_of or not stage:
             raise MemoryHubError("snapshot requires memory_space_id, as_of and stage")
+        if stage not in ALLOWED_STAGES:
+            raise MemoryHubError(f"unsupported access-policy stage: {stage}")
+        as_of = _canonical_time(as_of)
         snapshot = SnapshotReceipt(
             snapshot_id=str(uuid.uuid4()),
             memory_space_id=memory_space_id,
@@ -423,15 +436,29 @@ class MemoryHub:
     def health(self) -> dict[str, Any]:
         with self._connection() as connection:
             count = int(connection.execute("SELECT COUNT(*) FROM episode").fetchone()[0])
-            source_index_count = int(connection.execute("SELECT COUNT(*) FROM source_search_index").fetchone()[0])
-            derivation = {
-                row["state"]: row["count"]
-                for row in connection.execute("SELECT state,COUNT(*) AS count FROM derivation_job GROUP BY state")
-            }
+            try:
+                source_index_count = int(
+                    connection.execute("SELECT COUNT(*) FROM source_search_index").fetchone()[0]
+                )
+                index_health = {
+                    "state": "ready", "source_documents": source_index_count,
+                    "ledger_documents": count,
+                }
+            except sqlite3.Error as error:
+                index_health = {"state": "unavailable", "detail": str(error)}
+            try:
+                derivation = {
+                    row["state"]: row["count"]
+                    for row in connection.execute(
+                        "SELECT state,COUNT(*) AS count FROM derivation_job GROUP BY state"
+                    )
+                }
+            except sqlite3.Error:
+                derivation = {"failed": 1}
         return {
             "protocol_version": PROTOCOL_VERSION,
             "ledger": {"state": "ready", "episodes": count},
-            "index": {"state": "ready", "source_documents": source_index_count, "ledger_documents": count},
+            "index": index_health,
             "derivation": {
                 "state": "degraded" if derivation.get("failed") else "ready",
                 "pending": derivation.get("pending", 0),
@@ -573,7 +600,7 @@ class MemoryHub:
         return not (
             metadata.get("stage") in {"h0", "premarket"}
             or metadata.get("actor") == "human"
-            or row["episode_type"] in {"h0", "h0_proposition", "h0_action"}
+            or row["episode_type"] in {"user_message", "h0", "h0_proposition", "h0_action"}
         )
 
     @staticmethod
@@ -615,3 +642,17 @@ def _loads(value: str | None) -> Any:
 
 def _content_hash(body: str) -> str:
     return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _canonical_time(value: str) -> str:
+    candidate = value.strip()
+    try:
+        if len(candidate) == 10:
+            parsed = datetime.combine(date.fromisoformat(candidate), datetime.min.time(), tzinfo=timezone.utc)
+        else:
+            parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise MemoryHubError(f"invalid timestamp: {value}") from error
+    if parsed.tzinfo is None:
+        raise MemoryHubError(f"timestamp requires timezone: {value}")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")

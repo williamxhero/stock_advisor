@@ -12,6 +12,8 @@ from .sources import ArticleArchiveSourceAdapter, MarketHubSourceAdapter
 from .derivation import DerivationWorker, OllamaExtractor
 from .backup import BackupManager, BackupWorker
 
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
+
 
 def make_server(host: str, port: int, database: Path | str, *, source_adapters: dict[str, Any] | None = None) -> ThreadingHTTPServer:
     adapters = source_adapters if source_adapters is not None else {
@@ -29,6 +31,12 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
         def do_POST(self) -> None:  # noqa: N802
             try:
                 length = int(self.headers.get("Content-Length", "0"))
+                if length < 0 or length > MAX_REQUEST_BYTES:
+                    self._reply(
+                        HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                        {"error": "request_too_large", "limit_bytes": MAX_REQUEST_BYTES},
+                    )
+                    return
                 value = json.loads(self.rfile.read(length) or b"{}")
                 if self.path == "/v1/episodes":
                     result: Any = hub.append(value).as_dict()
@@ -57,7 +65,7 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
                 self._reply(HTTPStatus.CONFLICT, {"error": "immutable_conflict", "detail": str(error)})
             except SourceIntegrityError as error:
                 self._reply(HTTPStatus.CONFLICT, {"error": "source_integrity", "detail": str(error)})
-            except (MemoryHubError, ValueError, json.JSONDecodeError) as error:
+            except (KeyError, MemoryHubError, TypeError, ValueError, json.JSONDecodeError) as error:
                 self._reply(HTTPStatus.BAD_REQUEST, {"error": "invalid_episode", "detail": str(error)})
 
         def log_message(self, format: str, *args: Any) -> None:

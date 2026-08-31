@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from trading_memory_hub import MemoryHub
+import pytest
+
+from trading_memory_hub import MemoryHub, MemoryHubError
 
 
 def add(hub: MemoryHub, event_id: str, body: str, known_at: str, **metadata: object) -> str:
@@ -11,7 +13,7 @@ def add(hub: MemoryHub, event_id: str, body: str, known_at: str, **metadata: obj
             "memory_space_id": "partner-main",
             "source_system": "stock-advisor",
             "source_event_id": event_id,
-            "content_hash": f"sha256:{event_id}",
+            "content_hash": "auto",
             "episode_type": metadata.pop("episode_type", "evidence"),
             "body": body,
             "occurred_at": known_at,
@@ -52,7 +54,7 @@ def test_m1_cannot_see_current_h0_but_m2_can_and_related_keeps_corrections(tmp_p
             "memory_space_id": "partner-main",
             "source_system": "stock-advisor",
             "source_event_id": "public-correction",
-            "content_hash": "sha256:public-correction",
+            "content_hash": "auto",
             "episode_type": "correction",
             "body": "更正后的公开风险",
             "occurred_at": "2026-08-31T01:20:00Z",
@@ -75,3 +77,26 @@ def test_m1_cannot_see_current_h0_but_m2_can_and_related_keeps_corrections(tmp_p
     assert correction.episode_id in {
         card["episode_id"] for card in hub.related(m1.snapshot_id, public)
     }
+
+
+def test_times_are_compared_as_instants_and_unknown_stage_is_rejected(tmp_path: Path) -> None:
+    hub = MemoryHub(tmp_path / "ledger.sqlite3")
+    episode_id = add(hub, "offset", "同时点记录", "2026-08-31T09:00:00+08:00")
+    snapshot = hub.begin_snapshot("partner-main", as_of="2026-08-31T01:00:00Z", stage="chat")
+
+    assert hub.search(snapshot.snapshot_id, "同时点")[0]["episode_id"] == episode_id
+    with pytest.raises(MemoryHubError):
+        hub.begin_snapshot("partner-main", as_of="2026-08-31T02:00:00Z", stage="m1_bypass")
+
+
+def test_m1_hides_current_cycle_user_message_even_without_caller_actor_hint(tmp_path: Path) -> None:
+    hub = MemoryHub(tmp_path / "ledger.sqlite3")
+    h0 = add(
+        hub, "h0-minimal", "当前 H0", "2026-08-31T01:00:00Z",
+        episode_type="user_message", cycle_id="cycle-1",
+    )
+    snapshot = hub.begin_snapshot(
+        "partner-main", as_of="2026-08-31T02:00:00Z", stage="m1_research", cycle_id="cycle-1"
+    )
+
+    assert h0 not in {card["episode_id"] for card in hub.search(snapshot.snapshot_id, "H0")}

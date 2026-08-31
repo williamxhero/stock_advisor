@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from trading_memory_hub import EpisodeConflict, MemoryHub
+from trading_memory_hub import EpisodeConflict, MemoryHub, SourceIntegrityError
 
 
 def episode(**overrides: object) -> dict[str, object]:
@@ -12,7 +12,7 @@ def episode(**overrides: object) -> dict[str, object]:
         "memory_space_id": "partner-main",
         "source_system": "stock-advisor",
         "source_event_id": "message-1",
-        "content_hash": "sha256:one",
+        "content_hash": "auto",
         "episode_type": "user_message",
         "body": "我更重视长期复利。",
         "occurred_at": "2026-08-31T01:00:00Z",
@@ -34,7 +34,7 @@ def test_append_is_idempotent_and_rejects_immutable_conflicts(tmp_path: Path) ->
     assert replay.episode_id == first.episode_id
     assert replay.sequence == 1
     with pytest.raises(EpisodeConflict):
-        hub.append(episode(content_hash="sha256:changed", body="被改写的内容"))
+        hub.append(episode(content_hash="auto", body="被改写的内容"))
 
 
 def test_correction_appends_a_new_episode_without_rewriting_history(tmp_path: Path) -> None:
@@ -44,7 +44,7 @@ def test_correction_appends_a_new_episode_without_rewriting_history(tmp_path: Pa
     correction = hub.append(
         episode(
             source_event_id="message-2",
-            content_hash="sha256:two",
+            content_hash="auto",
             body="更正：我更重视风险调整后的长期复利。",
             corrects_episode_id=original.episode_id,
         )
@@ -55,3 +55,11 @@ def test_correction_appends_a_new_episode_without_rewriting_history(tmp_path: Pa
     assert hub.health()["ledger"]["state"] == "ready"
     assert hub.health()["ledger"]["episodes"] == 2
 
+
+def test_declared_body_hash_must_match_actual_content(tmp_path: Path) -> None:
+    hub = MemoryHub(tmp_path / "ledger.sqlite3")
+
+    with pytest.raises(SourceIntegrityError):
+        hub.append(episode(content_hash="sha256:not-the-body"))
+
+    assert hub.health()["ledger"]["episodes"] == 0

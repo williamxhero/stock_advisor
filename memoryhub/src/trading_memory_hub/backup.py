@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -9,6 +10,10 @@ import sqlite3
 from threading import Event, Thread
 from typing import Any
 import uuid
+
+
+class BackupIntegrityError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -27,10 +32,14 @@ class BackupManager:
         root.mkdir(parents=True, exist_ok=True)
         backup_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
         database = root / f"memoryhub-{backup_id}.sqlite3"
-        with sqlite3.connect(self.hub.database) as source, sqlite3.connect(database) as target:
+        temporary_database = database.with_suffix(".tmp")
+        with closing(sqlite3.connect(self.hub.database)) as source, closing(
+            sqlite3.connect(temporary_database)
+        ) as target:
             source.backup(target)
-        with sqlite3.connect(database) as verified:
+        with closing(sqlite3.connect(temporary_database)) as verified:
             episodes = int(verified.execute("SELECT COUNT(*) FROM episode").fetchone()[0])
+        temporary_database.replace(database)
         manifest = {
             "backup_id": backup_id,
             "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -39,7 +48,9 @@ class BackupManager:
             "database_sha256": hashlib.sha256(database.read_bytes()).hexdigest(),
         }
         manifest_path = database.with_suffix(".manifest.json")
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        temporary_manifest = manifest_path.with_suffix(".tmp")
+        temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        temporary_manifest.replace(manifest_path)
         return BackupArtifact(database, manifest_path, manifest)
 
     @staticmethod
@@ -52,8 +63,21 @@ class BackupManager:
         source_path, destination_path = Path(backup_database), Path(destination)
         if destination_path.exists():
             raise FileExistsError(f"restore destination already exists: {destination_path}")
+        manifest_path = source_path.with_suffix(".manifest.json")
+        if not manifest_path.exists():
+            raise BackupIntegrityError("backup manifest is missing")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        actual_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        if actual_hash != manifest.get("database_sha256"):
+            raise BackupIntegrityError("backup database hash does not match manifest")
+        with closing(sqlite3.connect(source_path)) as verified:
+            episodes = int(verified.execute("SELECT COUNT(*) FROM episode").fetchone()[0])
+        if episodes != manifest.get("episodes"):
+            raise BackupIntegrityError("backup episode count does not match manifest")
         destination_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(source_path) as source, sqlite3.connect(destination_path) as target:
+        with closing(sqlite3.connect(source_path)) as source, closing(
+            sqlite3.connect(destination_path)
+        ) as target:
             source.backup(target)
         hub = MemoryHub(destination_path, source_adapters=source_adapters)
         if rebuild:

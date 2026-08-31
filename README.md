@@ -7,6 +7,7 @@
 - 开发启动：`scripts/run-dev.ps1`
 - 回归测试：`scripts/test.ps1`
 - 发布目录：`scripts/publish.ps1 -Runtime win-x64`
+- MemoryHub Linux 包：`scripts/publish-memoryhub.ps1`
 - 本机安装和数据迁移：`scripts/install-local.ps1 -EnableStartup`
 - 单独迁移旧数据：`scripts/migrate-legacy.ps1`
 - 校验安装：`scripts/verify-install.ps1`

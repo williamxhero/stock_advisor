@@ -13,6 +13,10 @@ class MemoryUnavailable(RuntimeError):
 
 class MemoryPort(Protocol):
     def append(self, episode: dict[str, Any]) -> dict[str, Any]: ...
+    def begin_snapshot(self, request: dict[str, Any]) -> dict[str, Any]: ...
+    def search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, Any]]: ...
+    def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]: ...
+    def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]: ...
     def health(self) -> dict[str, Any]: ...
 
 
@@ -23,7 +27,19 @@ class HttpMemoryAdapter:
     opener: Callable[..., Any] = urlopen
 
     def append(self, episode: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", "/v1/episodes", episode)
+        return self._request("POST", "/v1/episodes", episode)["result"]
+
+    def begin_snapshot(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", "/v1/snapshots", request)["result"]
+
+    def search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        return self._request("POST", f"/v1/snapshots/{snapshot_id}/search", {"query": query, "limit": limit})["result"]
+
+    def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/v1/snapshots/{snapshot_id}/expand", {"episode_id": episode_id})["result"]
+
+    def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        return self._request("POST", f"/v1/snapshots/{snapshot_id}/related", {"episode_id": episode_id, "limit": limit})["result"]
 
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/health")
@@ -50,6 +66,8 @@ class InMemoryMemoryAdapter:
 
     def __init__(self) -> None:
         self._receipts: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._episodes: list[dict[str, Any]] = []
+        self._snapshots: dict[str, dict[str, Any]] = {}
 
     def append(self, episode: dict[str, Any]) -> dict[str, Any]:
         key = (episode["memory_space_id"], episode["source_system"], episode["source_event_id"])
@@ -65,7 +83,33 @@ class InMemoryMemoryAdapter:
             "protocol_version": "memoryhub/v1",
         }
         self._receipts[key] = receipt
+        self._episodes.append({**episode, **receipt})
         return dict(receipt)
+
+    def begin_snapshot(self, request: dict[str, Any]) -> dict[str, Any]:
+        snapshot_id = f"test-snapshot-{len(self._snapshots) + 1}"
+        value = {**request, "snapshot_id": snapshot_id, "watermark": len(self._episodes), "policy_version": "memory-policy/v1", "protocol_version": "memoryhub/v1"}
+        self._snapshots[snapshot_id] = value
+        return dict(value)
+
+    def search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        snapshot = self._snapshots[snapshot_id]
+        return [
+            {"episode_id": item["episode_id"], "summary": item.get("body", ""), "known_at": item["known_at"]}
+            for item in self._episodes[: snapshot["watermark"]]
+            if item["memory_space_id"] == snapshot["memory_space_id"]
+            and item["known_at"] <= snapshot["as_of"]
+            and query.casefold() in item.get("body", "").casefold()
+        ][:limit]
+
+    def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
+        visible = {item["episode_id"] for item in self.search(snapshot_id, "", limit=100)}
+        if episode_id not in visible:
+            raise MemoryUnavailable("episode is not visible in snapshot")
+        return dict(next(item for item in self._episodes if item["episode_id"] == episode_id))
+
+    def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        return [item for item in self.search(snapshot_id, "", limit=100) if item.get("corrects_episode_id") == episode_id][:limit]
 
     def health(self) -> dict[str, Any]:
         return {"protocol_version": "memoryhub/v1", "ledger": {"state": "ready", "episodes": len(self._receipts)}}

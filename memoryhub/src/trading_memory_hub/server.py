@@ -21,13 +21,32 @@ def make_server(host: str, port: int, database: Path | str) -> ThreadingHTTPServ
                 self._reply(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
         def do_POST(self) -> None:  # noqa: N802
-            if self.path != "/v1/episodes":
-                self._reply(HTTPStatus.NOT_FOUND, {"error": "not_found"})
-                return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 value = json.loads(self.rfile.read(length) or b"{}")
-                self._reply(HTTPStatus.OK, hub.append(value).as_dict())
+                if self.path == "/v1/episodes":
+                    result: Any = hub.append(value).as_dict()
+                elif self.path == "/v1/snapshots":
+                    result = hub.begin_snapshot(
+                        value["memory_space_id"], as_of=value["as_of"],
+                        stage=value["stage"], cycle_id=value.get("cycle_id"),
+                    ).as_dict()
+                else:
+                    parts = self.path.strip("/").split("/")
+                    if len(parts) != 4 or parts[:2] != ["v1", "snapshots"]:
+                        self._reply(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                        return
+                    snapshot_id, operation = parts[2], parts[3]
+                    if operation == "search":
+                        result = hub.search(snapshot_id, value.get("query", ""), limit=value.get("limit", 20))
+                    elif operation == "expand":
+                        result = hub.expand(snapshot_id, value["episode_id"])
+                    elif operation == "related":
+                        result = hub.related(snapshot_id, value["episode_id"], limit=value.get("limit", 20))
+                    else:
+                        self._reply(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                        return
+                self._reply(HTTPStatus.OK, {"result": result})
             except EpisodeConflict as error:
                 self._reply(HTTPStatus.CONFLICT, {"error": "immutable_conflict", "detail": str(error)})
             except (MemoryHubError, ValueError, json.JSONDecodeError) as error:
@@ -36,7 +55,7 @@ def make_server(host: str, port: int, database: Path | str) -> ThreadingHTTPServ
         def log_message(self, format: str, *args: Any) -> None:
             return
 
-        def _reply(self, status: HTTPStatus, value: dict[str, Any]) -> None:
+        def _reply(self, status: HTTPStatus, value: Any) -> None:
             body = json.dumps(value, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -58,4 +77,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

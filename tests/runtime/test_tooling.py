@@ -4,9 +4,12 @@ import json
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from ai_trading_companion.builtin_tools import ensure_builtin_tools
 from ai_trading_companion.tooling import FactRequest, ToolCatalog, ToolRunner
 
 
@@ -287,6 +290,53 @@ class ToolRunnerTests(unittest.TestCase):
 
             self.assertTrue(first.succeeded and second.succeeded and changed_time.succeeded)
             self.assertEqual("xx", (version_root / "calls.txt").read_text(encoding="utf-8"))
+
+    def test_builtin_generic_http_and_web_capabilities_are_read_only_cli_tools(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = b'{"market":"open","items":[1,2]}' if self.path == "/json" else b"<html><title>Market</title><body>market breadth 1234</body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json" if self.path == "/json" else "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                runner = ToolRunner(ToolCatalog(root))
+                json_result = runner.resolve(FactRequest(1, "generic_http_json", "2026-09-01T01:30:00Z", 2.0, {"url": f"{base}/json"}))
+                web_result = runner.resolve(FactRequest(1, "generic_web_read", "2026-09-01T01:30:00Z", 2.0, {"url": f"{base}/page"}))
+                capture_result = runner.resolve(FactRequest(1, "generic_browser_capture", "2026-09-01T01:30:00Z", 2.0, {"url": f"{base}/page"}))
+
+                self.assertEqual("open", json_result.data["json"]["market"])
+                self.assertIn("market breadth 1234", web_result.data["text"])
+                self.assertEqual("static", capture_result.data["capture_mode"])
+                self.assertTrue(json_result.raw_artifact_ref)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_builtin_tools_refuse_login_and_credential_urls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+
+            result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                1, "generic_web_read", "2026-09-01T01:30:00Z", 2.0,
+                {"url": "https://example.test/login"},
+            ))
+
+            self.assertFalse(result.succeeded)
+            self.assertEqual("tool_access_restricted", result.error_code)
 
 
 if __name__ == "__main__":

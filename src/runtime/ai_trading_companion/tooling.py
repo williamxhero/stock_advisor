@@ -305,7 +305,9 @@ class ToolRunner:
                 return EvidenceResolution.failed(request.capability, "tool_archive_capacity_exceeded", tool_version=tool.version)
             if process.returncode != 0:
                 return EvidenceResolution.failed(
-                    request.capability, "tool_process_failed", tool_version=tool.version, exit_code=process.returncode,
+                    request.capability,
+                    "tool_access_restricted" if process.returncode == 64 else "tool_process_failed",
+                    tool_version=tool.version, exit_code=process.returncode,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
                 )
             if len(stdout) > self.max_stdout_bytes:

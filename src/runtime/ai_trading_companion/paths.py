@@ -79,3 +79,5 @@ class RuntimePaths:
             self.tools,
         ):
             directory.mkdir(parents=True, exist_ok=True)
+        from .builtin_tools import ensure_builtin_tools
+        ensure_builtin_tools(self.tools)

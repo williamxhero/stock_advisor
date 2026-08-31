@@ -173,6 +173,8 @@ class CompanionStore:
               source_sha256 TEXT NOT NULL, result_json TEXT, created_at TEXT NOT NULL,
               claimed_at TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, completed_at TEXT, error TEXT,
               UNIQUE(source_artifact_id, mode));
+            CREATE TABLE IF NOT EXISTS companion_chat_control (
+              cycle_id TEXT PRIMARY KEY REFERENCES companion_cycle(cycle_id), terminated_at TEXT, resumed_at TEXT, research_json TEXT);
             CREATE TABLE IF NOT EXISTS companion_action_receipt (
               action_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES companion_cognition_job(job_id),
               action_type TEXT NOT NULL, state TEXT NOT NULL, payload_sha256 TEXT NOT NULL,
@@ -354,6 +356,9 @@ class CompanionStore:
             for name, declaration in {"claimed_at": "TEXT", "attempt_count": "INTEGER NOT NULL DEFAULT 0"}.items():
                 if name not in cognition_columns:
                     c.execute(f"ALTER TABLE companion_cognition_job ADD COLUMN {name} {declaration}")
+            control_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_chat_control)")}
+            if "research_json" not in control_columns:
+                c.execute("ALTER TABLE companion_chat_control ADD COLUMN research_json TEXT")
             artifact_columns = {row[1] for row in c.execute("PRAGMA table_info(narrative_artifact)")}
             if "occurred_at" not in artifact_columns:
                 c.execute("ALTER TABLE narrative_artifact ADD COLUMN occurred_at TEXT")
@@ -1281,6 +1286,63 @@ class CompanionStore:
                 f"UPDATE companion_message_batch SET state='completed',completed_at=?,response_artifact_id=? WHERE batch_id IN ({placeholders}) AND state='pending'",
                 [now(), artifact_id, *batch_ids],
             )
+
+    def terminate_chat_research(self, cycle_id: str) -> dict[str, Any]:
+        with self.connection() as c:
+            row = c.execute("SELECT research_json FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+            job = c.execute("SELECT result_json FROM companion_cognition_job WHERE cycle_id=? AND result_json IS NOT NULL ORDER BY completed_at DESC LIMIT 1", (cycle_id,)).fetchone()
+            research_json = row["research_json"] if row and row["research_json"] else job["result_json"] if job else None
+            c.execute(
+                """INSERT INTO companion_chat_control(cycle_id,terminated_at,research_json) VALUES(?,?,?)
+                   ON CONFLICT(cycle_id) DO UPDATE SET
+                     terminated_at=excluded.terminated_at,
+                     resumed_at=NULL,
+                     research_json=COALESCE(companion_chat_control.research_json, excluded.research_json)""",
+                (cycle_id, now(), research_json),
+            )
+            row = c.execute("SELECT * FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+        return dict(row)
+
+    def save_chat_research_checkpoint(
+        self, cycle_id: str, source_artifact_id: str, batch_ids: list[str], checkpoint: dict[str, Any],
+    ) -> None:
+        payload = {"source_artifact_id": source_artifact_id, "batch_ids": batch_ids, "checkpoint": checkpoint}
+        with self.connection() as c:
+            c.execute(
+                """INSERT INTO companion_chat_control(cycle_id,research_json) VALUES(?,?)
+                   ON CONFLICT(cycle_id) DO UPDATE SET research_json=excluded.research_json""",
+                (cycle_id, json.dumps(payload, ensure_ascii=False, sort_keys=True)),
+            )
+
+    def resumed_chat_research_checkpoint(self, cycle_id: str, source_artifact_id: str) -> dict[str, Any] | None:
+        with self.connection() as c:
+            row = c.execute("SELECT resumed_at,research_json FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+        if not row or not row["resumed_at"] or not row["research_json"]:
+            return None
+        try:
+            value = json.loads(row["research_json"])
+        except json.JSONDecodeError:
+            return None
+        return value if value.get("source_artifact_id") == source_artifact_id else None
+
+    def chat_research_terminated(self, cycle_id: str) -> bool:
+        with self.connection() as c:
+            row = c.execute("SELECT terminated_at,resumed_at FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+        return bool(row and row["terminated_at"] and not row["resumed_at"])
+
+    def continue_chat_research(self, cycle_id: str) -> dict[str, Any]:
+        with self.connection() as c:
+            continued = c.execute(
+                "UPDATE companion_chat_control SET resumed_at=? WHERE cycle_id=? AND terminated_at IS NOT NULL AND resumed_at IS NULL",
+                (now(), cycle_id),
+            ).rowcount == 1
+            row = c.execute("SELECT * FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+        if not row:
+            return {"cycle_id": cycle_id, "state": "not_terminated"}
+        result = dict(row)
+        result["state"] = "resumed" if result.get("resumed_at") else "not_terminated"
+        result["continued_now"] = continued
+        return result
 
     def start_stream_message(self, cycle_id: str, batch_ids: list[str], kind: str) -> dict[str, Any]:
         stream_id = str(uuid.uuid4())

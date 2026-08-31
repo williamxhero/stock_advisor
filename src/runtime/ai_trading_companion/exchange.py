@@ -5,7 +5,7 @@ import json
 import os
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def canonical_json(value: dict[str, Any]) -> bytes:
@@ -45,11 +45,28 @@ class LocalExchange:
         return target
 
     def receive(self, direction: str) -> list[tuple[Path, dict[str, Any]]]:
+        return self.receive_matching(direction, lambda _value: True)
+
+    def receive_matching(
+        self, direction: str, predicate: Callable[[dict[str, Any]], bool],
+    ) -> list[tuple[Path, dict[str, Any]]]:
+        """Claim only messages selected by ``predicate``.
+
+        This lets a foreground chat consume its own stop command while leaving
+        unrelated work in pending for the regular Exchange consumer.
+        """
         self.ensure()
         pending = self.root / direction / "pending"
         processing = self.root / direction / "processing"
         result: list[tuple[Path, dict[str, Any]]] = []
         for path in sorted(pending.glob("*.json")):
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, json.JSONDecodeError):
+                # The regular consumer owns malformed-message quarantine.
+                continue
+            if not isinstance(candidate, dict) or not predicate(candidate):
+                continue
             claimed = processing / path.name
             try:
                 os.replace(path, claimed)

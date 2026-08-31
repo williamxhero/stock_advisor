@@ -383,6 +383,13 @@ class CompanionEngine:
                 result = self._commit_chat(cycle)
             elif typ == "commit_conversation_batch":
                 result = self._commit_conversation(cycle, reason="manual")
+            elif typ == "terminate_chat_research":
+                result = self.store.terminate_chat_research(cycle_id)
+                self.emit(cycle, "chat.research.terminated", {"cycle": cycle, "state": result})
+            elif typ == "continue_chat_research":
+                result = self.store.continue_chat_research(cycle_id)
+                if result.get("continued_now"):
+                    self.emit(cycle, "chat.research.continued", {"cycle": cycle, "state": result})
             else:
                 raise ValueError(f"unsupported command: {typ}")
         self.store.save_receipt(command["command_id"], cycle_id, typ, command, result)
@@ -709,6 +716,8 @@ class CompanionEngine:
     ) -> dict[str, Any]:
         if kind not in {"ai_chat", "premarket_chat"}:
             raise ValueError(f"unsupported chat artifact kind: {kind}")
+        if self.store.chat_research_terminated(cycle_id):
+            raise RuntimeError("chat research was terminated; late result is not published")
         cycle = self.store.get_cycle(cycle_id)
         presented = presented or self.present_for_publication(text, iso(utc_now()), kind, allow_structured_format=allow_structured_format)
         published_at = iso(utc_now())

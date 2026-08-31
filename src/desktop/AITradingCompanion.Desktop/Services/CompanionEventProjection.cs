@@ -218,6 +218,18 @@ public static class CompanionEventProjection
                         UpsertAi(ai, failedStreamId, "chat_incomplete", item.At, failedText + "\n\n（未完成）", item.At, null);
                     UpsertAi(ai, ReadString(payload, "source_artifact_id"), "fault", item.At, ReadString(payload, "reason"), item.At, item.At);
                     break;
+                case "chat.research.terminated":
+                    foreach (var pending in ai.Where(pair => pair.Value.Kind == "chat_pending").Select(pair => pair.Key).ToArray())
+                        ai.Remove(pending);
+                    UpsertAi(ai, $"chat-control-{item.At:O}", "chat_terminated", item.At, "研究已终止，尚未形成完整结论。", item.At, item.At);
+                    break;
+                case "chat.stream.cancelled":
+                    var cancelledStreamId = ReadString(payload, "stream_id");
+                    if (!string.IsNullOrWhiteSpace(cancelledStreamId)) ai.Remove(cancelledStreamId);
+                    break;
+                case "chat.research.continued":
+                    UpsertAi(ai, $"chat-control-{item.At:O}", "chat_pending", item.At, "正在继续核验。", item.At, null);
+                    break;
                 case "premarket.reply.ready":
                     UpsertAi(ai, ReadString(payload, "source_artifact_id"), "premarket", item.At,
                         ReadString(payload, "text"), item.At, item.At);

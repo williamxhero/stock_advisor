@@ -155,7 +155,10 @@ class UnifiedCognition:
             "propositions": [], "actions": actions,
         }
 
-    def apply(self, cycle: dict[str, Any], source_artifact: dict[str, Any], messages: list[dict[str, Any]], mode: str, result: dict[str, Any]) -> CognitionOutcome:
+    def apply(
+        self, cycle: dict[str, Any], source_artifact: dict[str, Any], messages: list[dict[str, Any]], mode: str,
+        result: dict[str, Any], *, memory_research: dict[str, Any] | None = None,
+    ) -> CognitionOutcome:
         source_text = str(source_artifact.get("body_markdown") or "\n\n".join(item["body_text"] for item in messages))
         job = self.store.start_cognition_job(cycle["cycle_id"], source_artifact["artifact_id"], mode, source_text)
         if job["state"] == "completed" and job.get("result_json"):
@@ -234,6 +237,7 @@ class UnifiedCognition:
             "reply_markdown": reply, "receipts": receipts, "propositions_recorded": propositions_recorded,
             "needs_fresh_search": bool(result.get("needs_fresh_search")),
             "public_search_request": result.get("public_search_request"),
+            "memory_research": memory_research,
         }
         self.store.finish_cognition_job(job["job_id"], saved)
         return CognitionOutcome(

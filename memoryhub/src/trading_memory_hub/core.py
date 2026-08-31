@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import json
+import hashlib
 from pathlib import Path
 import sqlite3
 from typing import Any, Iterator
@@ -17,6 +18,10 @@ class MemoryHubError(RuntimeError):
 
 
 class EpisodeConflict(MemoryHubError):
+    pass
+
+
+class SourceIntegrityError(MemoryHubError):
     pass
 
 
@@ -55,8 +60,9 @@ class MemoryHub:
         "protocol_version",
     )
 
-    def __init__(self, database: Path | str) -> None:
+    def __init__(self, database: Path | str, *, source_adapters: dict[str, Any] | None = None) -> None:
         self.database = Path(database)
+        self.source_adapters = dict(source_adapters or {})
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -114,6 +120,12 @@ class MemoryHub:
                     policy_version TEXT NOT NULL,
                     protocol_version TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS source_search_index (
+                    episode_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    searchable_text TEXT NOT NULL,
+                    FOREIGN KEY(episode_id) REFERENCES episode(episode_id)
+                );
                 """
             )
 
@@ -126,6 +138,7 @@ class MemoryHub:
         if not value.get("body") and not value.get("source_reference"):
             raise MemoryHubError("episode requires body or source_reference")
 
+        value = dict(value)
         with self._connection() as connection:
             existing = connection.execute(
                 """SELECT episode_id, sequence, content_hash, protocol_version
@@ -133,12 +146,20 @@ class MemoryHub:
                 (value["memory_space_id"], value["source_system"], value["source_event_id"]),
             ).fetchone()
             if existing:
-                if existing["content_hash"] != value["content_hash"]:
+                if value["content_hash"] != "auto" and existing["content_hash"] != value["content_hash"]:
                     raise EpisodeConflict("source event already exists with different content")
                 return AppendReceipt(
                     existing["episode_id"], existing["sequence"],
                     existing["content_hash"], existing["protocol_version"],
                 )
+
+            hydrated: dict[str, str] | None = None
+            if value.get("source_reference") and not value.get("body"):
+                hydrated = self._hydrate(value["source_reference"])
+                actual_hash = _content_hash(hydrated["body"])
+                if value["content_hash"] not in {"auto", actual_hash}:
+                    raise SourceIntegrityError("source content does not match supplied hash")
+                value["content_hash"] = actual_hash
 
             correction = value.get("corrects_episode_id")
             if correction and not connection.execute(
@@ -163,6 +184,11 @@ class MemoryHub:
                     PROTOCOL_VERSION, _json(value.get("metadata") or {}),
                 ),
             )
+            if hydrated is not None:
+                connection.execute(
+                    "INSERT INTO source_search_index(episode_id,title,searchable_text) VALUES(?,?,?)",
+                    (episode_id, hydrated["title"], hydrated["body"]),
+                )
             return AppendReceipt(episode_id, int(cursor.lastrowid), value["content_hash"])
 
     def begin_snapshot(
@@ -195,11 +221,12 @@ class MemoryHub:
         snapshot = self._snapshot(snapshot_id)
         terms = [term.casefold() for term in query.split() if term]
         rows = self._visible_rows(snapshot)
+        source_text = self._source_search_text(row["episode_id"] for row in rows)
         scored: list[tuple[int, sqlite3.Row]] = []
         for row in rows:
             searchable = " ".join(
                 (row["body"] or "", row["metadata_json"] or "", row["source_reference_json"] or "")
-            ).casefold()
+            ).casefold() + " " + source_text.get(row["episode_id"], "").casefold()
             score = sum(searchable.count(term) for term in terms) if terms else 1
             if score:
                 scored.append((score, row))
@@ -211,7 +238,14 @@ class MemoryHub:
         row = next((item for item in self._visible_rows(snapshot) if item["episode_id"] == episode_id), None)
         if row is None:
             raise MemoryHubError("episode is not visible in snapshot")
-        return self._episode(row)
+        result = self._episode(row)
+        if result["body"] is None and result["source_reference"]:
+            hydrated = self._hydrate(result["source_reference"])
+            if _content_hash(hydrated["body"]) != result["content_hash"]:
+                raise SourceIntegrityError("immutable source returned different content")
+            result["title"] = hydrated["title"]
+            result["body"] = hydrated["body"]
+        return result
 
     def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
         snapshot = self._snapshot(snapshot_id)
@@ -242,8 +276,40 @@ class MemoryHub:
             "ledger": {"state": "ready", "episodes": count},
             "index": {"state": "not_configured"},
             "derivation": {"state": "not_configured"},
-            "sources": {},
+            "sources": {name: adapter.health() for name, adapter in self.source_adapters.items()},
         }
+
+    def _hydrate(self, reference: dict[str, str]) -> dict[str, str]:
+        source_system = reference.get("source_system", "")
+        self._validate_reference(reference)
+        adapter = self.source_adapters.get(source_system)
+        if adapter is None:
+            raise MemoryHubError(f"source adapter unavailable: {source_system}")
+        return adapter.hydrate(reference)
+
+    @staticmethod
+    def _validate_reference(reference: dict[str, str]) -> None:
+        common = ("source_system", "record_type", "date", "code")
+        missing = [name for name in common if not reference.get(name)]
+        if reference.get("source_system") == "8815" and not reference.get("event_id"):
+            missing.append("event_id")
+        if reference.get("source_system") not in {"markethub", "8815"}:
+            missing.append("supported source_system")
+        if missing:
+            raise MemoryHubError("invalid immutable source reference: " + ", ".join(missing))
+
+    def _source_search_text(self, episode_ids: Any) -> dict[str, str]:
+        values = list(episode_ids)
+        if not values:
+            return {}
+        placeholders = ",".join("?" for _ in values)
+        with self._connection() as connection:
+            return {
+                row["episode_id"]: row["title"] + " " + row["searchable_text"]
+                for row in connection.execute(
+                    f"SELECT * FROM source_search_index WHERE episode_id IN ({placeholders})", values
+                )
+            }
 
     def _watermark(self, memory_space_id: str) -> int:
         with self._connection() as connection:
@@ -324,3 +390,7 @@ def _json(value: Any) -> str | None:
 
 def _loads(value: str | None) -> Any:
     return None if value is None else json.loads(value)
+
+
+def _content_hash(body: str) -> str:
+    return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()

@@ -7,11 +7,15 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .core import EpisodeConflict, MemoryHub, MemoryHubError
+from .core import EpisodeConflict, MemoryHub, MemoryHubError, SourceIntegrityError
+from .sources import ArticleArchiveSourceAdapter, MarketHubSourceAdapter
 
 
-def make_server(host: str, port: int, database: Path | str) -> ThreadingHTTPServer:
-    hub = MemoryHub(database)
+def make_server(host: str, port: int, database: Path | str, *, source_adapters: dict[str, Any] | None = None) -> ThreadingHTTPServer:
+    adapters = source_adapters if source_adapters is not None else {
+        "markethub": MarketHubSourceAdapter(), "8815": ArticleArchiveSourceAdapter(),
+    }
+    hub = MemoryHub(database, source_adapters=adapters)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -49,6 +53,8 @@ def make_server(host: str, port: int, database: Path | str) -> ThreadingHTTPServ
                 self._reply(HTTPStatus.OK, {"result": result})
             except EpisodeConflict as error:
                 self._reply(HTTPStatus.CONFLICT, {"error": "immutable_conflict", "detail": str(error)})
+            except SourceIntegrityError as error:
+                self._reply(HTTPStatus.CONFLICT, {"error": "source_integrity", "detail": str(error)})
             except (MemoryHubError, ValueError, json.JSONDecodeError) as error:
                 self._reply(HTTPStatus.BAD_REQUEST, {"error": "invalid_episode", "detail": str(error)})
 

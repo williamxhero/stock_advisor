@@ -125,6 +125,8 @@ class ToolCatalog:
     def resolve(self, capability: str) -> PublishedTool:
         if not _safe_segment(capability):
             raise ToolLookupError("invalid_tool_capability")
+        if (self.root / capability / "disabled.json").exists():
+            raise ToolLookupError("tool_disabled")
         current_path = self.root / capability / "current.json"
         try:
             current = json.loads(current_path.read_text(encoding="utf-8"))

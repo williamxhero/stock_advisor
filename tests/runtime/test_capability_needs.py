@@ -42,3 +42,18 @@ def test_capability_need_rejects_unversioned_or_invalid_external_request(tmp_pat
             pass
         else:
             raise AssertionError("invalid capability need was accepted")
+
+
+def test_runtime_can_pause_and_retry_a_capability_need_idempotently(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    need = store.submit_capability_need({
+        "contract": "ai-trading-capability-need/v1", "capability": "market_tool", "output_contract": {"v": 1},
+        "examples": [], "failure_traces": [], "source_hints": [],
+    })
+
+    paused = store.transition_capability_need(need["need_id"], "pause")
+    repeated = store.transition_capability_need(need["need_id"], "pause")
+    retried = store.transition_capability_need(need["need_id"], "retry")
+
+    assert paused["state"] == repeated["state"] == "paused"
+    assert retried["state"] == "queued"

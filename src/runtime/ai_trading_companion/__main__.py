@@ -44,6 +44,7 @@ from .local_research import (
     ReadOnlyResearchExecutor, ToolCatalogResearchBackend,
 )
 from .tooling import ToolCatalog, ToolRunner
+from .tool_manager import ToolManagerRuntime
 from .store import CompanionStore
 from .trading_calendar import XshgTradingCalendar
 
@@ -315,6 +316,7 @@ def flush(store: CompanionStore, exchange: LocalExchange) -> int:
         exchange.send("to-client", event["event_id"], payload)
         store.mark_schedule_event_delivered(event["event_id"])
         count += 1
+    ToolManagerRuntime(store, PATHS.tools, exchange_root()).publish_projection()
     return count
 
 
@@ -358,6 +360,8 @@ def run_gateway(execute: bool = False) -> None:
             result = _schedule_command(store, payload)
         elif contract == "portfolio-user-command/v1":
             result = _portfolio_command(store, portfolio, payload)
+        elif contract == "ai-trading-tool-manager-command/v1":
+            result = ToolManagerRuntime(store, PATHS.tools, exchange_root()).command(payload)
         else:
             result = engine.command(payload)
         flush(store, exchange)
@@ -1674,6 +1678,11 @@ def consume(
                 continue
             if command.get("contract") == "portfolio-user-command/v1":
                 result = _portfolio_command(store, portfolio, command)
+                exchange.acknowledge("to-runtime", path)
+                results.append(result)
+                continue
+            if command.get("contract") == "ai-trading-tool-manager-command/v1":
+                result = ToolManagerRuntime(store, PATHS.tools, exchange_root()).command(command)
                 exchange.acknowledge("to-runtime", path)
                 results.append(result)
                 continue

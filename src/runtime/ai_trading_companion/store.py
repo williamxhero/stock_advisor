@@ -497,6 +497,7 @@ class CompanionStore:
 
     def submit_capability_need(self, request: dict[str, Any]) -> dict[str, Any]:
         """Runtime-owned write endpoint for a versioned, deduplicated tool need."""
+        self.initialize()
         if not isinstance(request, dict) or request.get("contract") != "ai-trading-capability-need/v1":
             raise ValueError("invalid_capability_need_contract")
         capability = str(request.get("capability") or "")
@@ -547,6 +548,25 @@ class CompanionStore:
                      json.dumps(merged_hints, ensure_ascii=False), submitted_at, existing["need_id"]),
                 )
             stored = c.execute("SELECT * FROM capability_need WHERE dedupe_key=?", (dedupe_key,)).fetchone()
+        return self._capability_need_record(dict(stored))
+
+    def transition_capability_need(self, need_id: str, action: str) -> dict[str, Any]:
+        """Apply one idempotent, runtime-authorized queue transition."""
+        if action not in {"pause", "retry"}:
+            raise ValueError("invalid_capability_need_action")
+        self.initialize()
+        with self.connection() as c:
+            row = c.execute("SELECT * FROM capability_need WHERE need_id=?", (need_id,)).fetchone()
+            if row is None:
+                raise ValueError("capability_need_not_found")
+            current = dict(row)
+            target = "paused" if action == "pause" else "queued"
+            allowed = (action == "pause" and current["state"] in {"queued", "claimed", "paused"}) or (action == "retry" and current["state"] in {"paused", "failed", "queued"})
+            if not allowed:
+                raise ValueError("capability_need_transition_invalid")
+            if current["state"] != target:
+                c.execute("UPDATE capability_need SET state=?,updated_at=?,error=NULL WHERE need_id=?", (target, now(), need_id))
+            stored = c.execute("SELECT * FROM capability_need WHERE need_id=?", (need_id,)).fetchone()
         return self._capability_need_record(dict(stored))
 
     def list_capability_needs(self, *, states: tuple[str, ...] | None = None, limit: int = 100) -> list[dict[str, Any]]:

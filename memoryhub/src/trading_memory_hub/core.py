@@ -9,6 +9,8 @@ import sqlite3
 from typing import Any, Iterator
 import uuid
 
+from .secret_guard import assert_safe
+
 
 PROTOCOL_VERSION = "memoryhub/v1"
 
@@ -137,8 +139,12 @@ class MemoryHub:
             raise MemoryHubError(f"unsupported protocol: {value['protocol_version']}")
         if not value.get("body") and not value.get("source_reference"):
             raise MemoryHubError("episode requires body or source_reference")
+        if value.get("body"):
+            assert_safe(str(value["body"]))
 
         value = dict(value)
+        if value.get("body") and value["content_hash"] == "auto":
+            value["content_hash"] = _content_hash(str(value["body"]))
         with self._connection() as connection:
             existing = connection.execute(
                 """SELECT episode_id, sequence, content_hash, protocol_version

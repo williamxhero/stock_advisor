@@ -19,4 +19,3 @@ ReadWritePaths=/data/services/memoryhub/data /data/services/memoryhub/backups
 
 [Install]
 WantedBy=multi-user.target
-

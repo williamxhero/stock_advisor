@@ -21,4 +21,3 @@ PYTHONPATH=src python3 -m trading_memory_hub.server \
 - `backups/`：在线 SQLite 备份及校验 manifest。
 - MarketHub/8815：只保存稳定引用、hash 与可重建索引，原文按需水合。
 - WAG/普通网页：保存当时实际读取的正文快照。
-

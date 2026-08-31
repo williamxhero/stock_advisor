@@ -38,4 +38,3 @@ def test_secret_guard_blocks_snapshot_before_ledger_write(tmp_path: Path) -> Non
         hub.append(web_episode("password=correct-horse-battery-staple"))
 
     assert hub.health()["ledger"]["episodes"] == 0
-

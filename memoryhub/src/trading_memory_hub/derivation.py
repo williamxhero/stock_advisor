@@ -54,4 +54,3 @@ class DerivationWorker:
         while not self._stop.is_set():
             self.hub.derive_pending(self.extractor, extractor_version=self.extractor.version)
             self._stop.wait(self.interval_seconds)
-

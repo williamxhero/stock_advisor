@@ -111,4 +111,3 @@ def _iso(value: str) -> str:
     if len(normalized) == 10:
         normalized += "T00:00:00"
     return normalized + ("Z" if not normalized.endswith("Z") else "")
-

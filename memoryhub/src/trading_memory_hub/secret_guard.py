@@ -20,4 +20,3 @@ _PATTERNS = (
 def assert_safe(value: str) -> None:
     if any(pattern.search(value) for pattern in _PATTERNS):
         raise SecretRejected("secret guard blocked MemoryHub episode")
-

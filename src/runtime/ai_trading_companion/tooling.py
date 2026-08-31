@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .secret_guard import find_secrets
 
@@ -243,11 +243,13 @@ class ToolRunner:
     """Deep execution facade: callers receive evidence, never process or package details."""
 
     def __init__(self, catalog: ToolCatalog, *, max_stdout_bytes: int = 1_000_000,
-                 archive_max_bytes: int | None = None) -> None:
+                 archive_max_bytes: int | None = None,
+                 need_reporter: Callable[[dict[str, Any]], Any] | None = None) -> None:
         self.catalog = catalog
         self.max_stdout_bytes = max(1, int(max_stdout_bytes))
         self.artifacts = ToolArtifactStore(catalog.root, max_bytes=archive_max_bytes)
         self._cache: dict[str, EvidenceResolution] = {}
+        self.need_reporter = need_reporter
 
     def resolve(self, request: FactRequest, *, _tool: PublishedTool | None = None) -> EvidenceResolution:
         try:
@@ -383,7 +385,9 @@ class ToolRunner:
         try:
             candidates = self._ordered_candidates(self.catalog.resolve_candidates(request.capability))
         except ToolLookupError as exc:
-            return EvidenceResolution.failed(request.capability, exc.code)
+            failed = EvidenceResolution.failed(request.capability, exc.code)
+            self._report_capability_need(request, failed)
+            return failed
         attempts: list[str] = []
         last: EvidenceResolution | None = None
         deadline = datetime.now(timezone.utc).timestamp() + request.deadline_seconds
@@ -400,10 +404,36 @@ class ToolRunner:
                 resolved = replace(result, attempts=tuple(attempts))
                 self._cache[cache_key] = resolved
                 self._append_audit(request, resolved)
+                if request.context.get("capability_need_on_success") is True:
+                    self._report_capability_need(request, resolved)
                 return resolved
         failed = replace(last or EvidenceResolution.failed(request.capability, "tool_no_candidate_satisfied"), attempts=tuple(attempts))
         self._append_audit(request, failed)
+        self._report_capability_need(request, failed)
         return failed
+
+    def _report_capability_need(self, request: FactRequest, result: EvidenceResolution) -> None:
+        if self.need_reporter is None:
+            return
+        urgency = str(request.context.get("capability_need_urgency") or "normal")
+        if urgency not in {"low", "normal", "high", "critical"}:
+            urgency = "normal"
+        source_hints = [value for value in request.inputs.values() if isinstance(value, str) and value.startswith(("http://", "https://"))]
+        payload = {
+            "contract": "ai-trading-capability-need/v1", "capability": request.capability,
+            "output_contract": {"result_contract": _RESULT_CONTRACT, "finality": request.finality,
+                                "input_keys": sorted(request.inputs)},
+            "urgency": urgency, "examples": [{"inputs": request.inputs, "required_at": request.required_at}],
+            "failure_trace": {"succeeded": result.succeeded, "error_code": result.error_code,
+                              "attempts": list(result.attempts), "tool_version": result.tool_version,
+                              "raw_artifact_ref": result.raw_artifact_ref},
+            "source_hints": source_hints,
+        }
+        try:
+            self.need_reporter(payload)
+        except Exception:
+            # Development backlog collection must never extend or fail the caller's research deadline.
+            return
 
     def _append_audit(self, request: FactRequest, result: EvidenceResolution) -> None:
         audit_root = self.catalog.root / ".audit"

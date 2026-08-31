@@ -291,6 +291,23 @@ class ToolRunnerTests(unittest.TestCase):
             self.assertTrue(first.succeeded and second.succeeded and changed_time.succeeded)
             self.assertEqual("xx", (version_root / "calls.txt").read_text(encoding="utf-8"))
 
+    def test_exhausted_tool_resolution_reports_a_nonblocking_capability_need(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reported: list[dict] = []
+            runner = ToolRunner(ToolCatalog(Path(directory) / "tools"), need_reporter=reported.append)
+
+            result = runner.resolve_with_fallback(FactRequest(
+                1, "missing_public_fact", "2026-09-01T07:01:00Z", 2.0,
+                {"symbol": "600000"}, context={"capability_need_urgency": "high"},
+            ))
+
+            self.assertFalse(result.succeeded)
+            self.assertEqual("tool_not_found", result.error_code)
+            self.assertEqual(1, len(reported))
+            self.assertEqual("ai-trading-capability-need/v1", reported[0]["contract"])
+            self.assertEqual("missing_public_fact", reported[0]["capability"])
+            self.assertEqual("high", reported[0]["urgency"])
+
     def test_builtin_generic_http_and_web_capabilities_are_read_only_cli_tools(self) -> None:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802

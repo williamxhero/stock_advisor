@@ -446,7 +446,8 @@ def _call_stage(
                 broker, deadline=lambda: deadline, intellect=decision.intellect, effort=decision.reasoning_effort,
             )
             web = ToolCatalogResearchBackend(
-                ToolRunner(ToolCatalog(PATHS.tools)), as_of=_evidence_read_cutoff(packet, contract),
+                ToolRunner(ToolCatalog(PATHS.tools), need_reporter=store.submit_capability_need),
+                as_of=_evidence_read_cutoff(packet, contract),
                 deadline=lambda: deadline - time.monotonic(),
             )
             market_facts = packet.get("deterministic_market_facts")

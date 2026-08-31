@@ -27,6 +27,7 @@ from .exchange import LocalExchange
 from .governance import EvolutionGovernance, RouterGovernance, StrategyPolicyExecutor, classify_regime
 from .gateway import RuntimeGateway, serve as serve_gateway
 from .learning import JudgmentLifecycle, WorkflowEvolution
+from .message_presentation import explicit_format_requested
 from .migration import LegacyMigrator, LegacySources
 from .models import TASK_POLICIES
 from .observatory import EvaluationObservatory, EvaluationRequest, ExperimentRequest, ForecastRequest
@@ -1069,21 +1070,16 @@ def run_reflection(
             store, cycle, "reflection", packet, "companion-reflection-result-v1.schema.json",
             search=False, timeout=int(TASK_POLICIES[cycle["task_key"]].m1_timeout.total_seconds()),
         )
-    artifact = store.append_artifact(
-        cycle_id, "reflection", "model", data["reflection_markdown"],
-        iso(datetime.now(timezone.utc)),
-        {"checkpoint_id": checkpoint_id, "memory_tags": data.get("memory_tags") or []},
+    artifact = engine.publish_proactive_message(
+        cycle_id, "reflection", data["reflection_markdown"],
+        meaningful=not str(data["reflection_markdown"]).startswith("Fixture "),
+        metadata={"checkpoint_id": checkpoint_id, "memory_tags": data.get("memory_tags") or []},
     )
     proposal = None
-    if data.get("workflow_proposal"):
+    if data.get("workflow_proposal") and artifact:
         proposal = WorkflowEvolution(store).propose(
             cycle_id, data["workflow_proposal"], source_artifact_id=artifact["artifact_id"],
         )
-    engine.emit(cycle, "reflection.ready", {
-        "cycle": cycle, "text": data["reflection_markdown"],
-        "source_artifact_id": artifact["artifact_id"],
-        "workflow_proposal_id": proposal["proposal_id"] if proposal else None,
-    })
     return artifact
 
 
@@ -1124,6 +1120,8 @@ def run_outcome(
         next_check = str(result.get("next_check_at") or iso(datetime.now(timezone.utc) + timedelta(hours=1)))
         store.defer_outcome(checkpoint["checkpoint_id"], next_check, result["summary"])
         return result
+    presented = engine.present_for_publication(str(result["summary"]), str(result.get("as_of") or cycle["as_of"]), "outcome")
+    result = {**result, "summary": presented.markdown, "presentation": presented.metadata()["presentation"]}
     artifact = JudgmentLifecycle(store).record_outcome(checkpoint, result)
     regime_metrics = result.get("market_regime") if isinstance(result.get("market_regime"), dict) else {}
     regime = classify_regime(regime_metrics)
@@ -1163,6 +1161,7 @@ def run_outcome(
             )
     engine.emit(cycle, "outcome.ready", {
         "cycle": cycle, "text": result["summary"], "horizon": checkpoint["horizon"],
+        "presentation": presented.metadata()["presentation"],
         "verification_status": result["verification_status"],
         "source_artifact_id": artifact["artifact_id"],
     })
@@ -1253,22 +1252,17 @@ def run_pending_workflow_feedback(
                 store, cycle, "workflow_feedback", packet, "companion-reflection-result-v1.schema.json",
                 search=False, timeout=int(TASK_POLICIES[cycle["task_key"]].m1_timeout.total_seconds()),
             )
-        artifact = store.append_artifact(
-            cycle["cycle_id"], "ai_chat", "model", data["reflection_markdown"],
-            iso(datetime.now(timezone.utc)),
-            {"workflow_feedback_source": h0["artifact_id"], "memory_tags": data.get("memory_tags") or []},
+        artifact = engine.publish_proactive_message(
+            cycle["cycle_id"], "ai_chat", data["reflection_markdown"],
+            meaningful=not str(data["reflection_markdown"]).startswith("Fixture "),
+            metadata={"workflow_feedback_source": h0["artifact_id"], "memory_tags": data.get("memory_tags") or []},
         )
         proposal = None
-        if data.get("workflow_proposal"):
+        if data.get("workflow_proposal") and artifact:
             proposal = WorkflowEvolution(store).propose(
                 cycle["cycle_id"], data["workflow_proposal"], source_artifact_id=artifact["artifact_id"],
             )
-        engine.emit(cycle, "chat.ready", {
-            "cycle": cycle, "text": data["reflection_markdown"],
-            "source_artifact_id": artifact["artifact_id"],
-            "workflow_proposal_id": proposal["proposal_id"] if proposal else None,
-        })
-        return {"cycle_id": cycle["cycle_id"], "artifact_id": artifact["artifact_id"]}
+        return {"cycle_id": cycle["cycle_id"], "artifact_id": artifact["artifact_id"]} if artifact else {"cycle_id": cycle["cycle_id"], "action": "silent"}
     return None
 
 
@@ -1480,6 +1474,13 @@ def run_unified_cognition(
                 "subject": item["subject"], "predicate": item["predicate"],
                 "object": json.loads(item["object_json"]), "known_at": item["known_at"],
             } for item in store.relevant_propositions(iso(datetime.now(timezone.utc)), query_text, limit=20)]
+            preference = store.active_proposition("user.expression", "expression.material_density")
+            if preference and all(item["proposition_id"] != preference["proposition_id"] for item in memories):
+                memories.append({
+                    "proposition_id": preference["proposition_id"], "kind": preference["proposition_kind"],
+                    "subject": preference["subject"], "predicate": preference["predicate"],
+                    "object": json.loads(preference["object_json"]), "known_at": preference["known_at"],
+                })
             stream = engine.chat_stream_started(cycle_id, batch_ids, reply_kind) if mode != "h0" else None
             reply_stream = ReplyMarkdownStream()
             streamed_reply = ""
@@ -1520,7 +1521,11 @@ def run_unified_cognition(
         if stream:
             safe_prefix = _receipt_safe_stream_prefix(streamed_reply)
             if safe_prefix:
-                engine.chat_stream_delta(cycle_id, stream["stream_id"], safe_prefix)
+                presented_prefix = engine.present_for_publication(
+                    safe_prefix, cycle["as_of"], reply_kind,
+                    allow_structured_format=any(explicit_format_requested(item["body_text"]) for item in messages),
+                )
+                engine.chat_stream_delta(cycle_id, stream["stream_id"], presented_prefix.markdown)
             engine.chat_stream_failed(cycle_id, stream["stream_id"], str(exc))
             if on_progress:
                 on_progress()
@@ -1533,10 +1538,15 @@ def run_unified_cognition(
     if outcome.needs_fresh_search and outcome.public_search_request:
         store.queue_research_job(cycle_id, source["artifact_id"], outcome.public_search_request)
     if outcome.reply_markdown:
+        allow_structured_format = any(explicit_format_requested(item["body_text"]) for item in messages)
+        presented = engine.present_for_publication(
+            outcome.reply_markdown, cycle["as_of"], reply_kind,
+            allow_structured_format=allow_structured_format,
+        )
         stream_id = None
         if stream:
             current = store.stream_message(stream["stream_id"])["text"]
-            remainder = outcome.reply_markdown[len(current):] if outcome.reply_markdown.startswith(current) else outcome.reply_markdown if not current else ""
+            remainder = presented.markdown[len(current):] if presented.markdown.startswith(current) else presented.markdown if not current else ""
             if remainder:
                 engine.chat_stream_delta(cycle_id, stream["stream_id"], remainder)
                 if on_progress:
@@ -1544,9 +1554,10 @@ def run_unified_cognition(
             store.finish_stream_message(stream["stream_id"])
             stream_id = stream["stream_id"]
         engine.chat_ready(
-            cycle_id, outcome.reply_markdown,
+            cycle_id, presented.markdown,
             reply_to_batch_id=batch_ids[-1] if batch_ids else None,
             reply_to_batch_ids=batch_ids, stream_id=stream_id, kind=reply_kind,
+            allow_structured_format=allow_structured_format, presented=presented,
         )
     elif mode == "h0":
         store.mark_batches_responded(batch_ids, source["artifact_id"])

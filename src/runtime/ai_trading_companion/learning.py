@@ -162,19 +162,22 @@ class JudgmentLifecycle:
         cycle_id = checkpoint["cycle_id"]
         as_of = str(result.get("as_of") or now())
         summary = str(result.get("summary") or "本次结果数据不足，暂不结案。")
+        metadata = {
+            "checkpoint_id": checkpoint["checkpoint_id"],
+            "snapshot_id": checkpoint["snapshot_id"],
+            "horizon": checkpoint["horizon"],
+            "verification_status": result.get("verification_status", "unverified"),
+            "memory_tags": ["outcome", str(result.get("verification_status", "unverified"))],
+        }
+        if isinstance(result.get("presentation"), dict):
+            metadata["presentation"] = result["presentation"]
         artifact = self.store.append_artifact(
             cycle_id,
             "outcome",
             "model",
             summary,
             as_of,
-            {
-                "checkpoint_id": checkpoint["checkpoint_id"],
-                "snapshot_id": checkpoint["snapshot_id"],
-                "horizon": checkpoint["horizon"],
-                "verification_status": result.get("verification_status", "unverified"),
-                "memory_tags": ["outcome", str(result.get("verification_status", "unverified"))],
-            },
+            metadata,
             known_at=as_of,
         )
         self.store.complete_outcome(checkpoint["checkpoint_id"], as_of, result, artifact["artifact_id"])

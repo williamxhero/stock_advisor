@@ -413,6 +413,10 @@ class ToolRunner:
             "finality": request.finality, "succeeded": result.succeeded,
             "tool_version": result.tool_version, "error_code": result.error_code,
             "attempts": list(result.attempts), "acquired_at": result.acquired_at,
+            "inputs": request.inputs, "fact_as_of": result.fact_as_of,
+            "source": (result.data or {}).get("source") or (result.data or {}).get("url"),
+            "raw_artifact_ref": result.raw_artifact_ref,
+            "technical_validation": list(result.technical_validation),
         }
         with (audit_root / "resolutions.ndjson").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")

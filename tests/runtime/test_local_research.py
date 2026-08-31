@@ -4,7 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, WebAccessGatewayBackend
+from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogResearchBackend, WebAccessGatewayBackend
+from ai_trading_companion.tooling import EvidenceResolution
 
 CONTRACT = {"version": 3, "as_of": "2026-08-27T07:00:00Z", "requirements": [{"key": "market", "blocking": True, "allowed_coverage": ["covered"], "window": {"mode": "exact", "start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z"}}]}
 
@@ -133,6 +134,30 @@ class LocalResearchTests(unittest.TestCase):
         backend("web_read", row("web_read", url="https://example.test")["arguments"])
         client.search.assert_called_once(); client.read.assert_called_once_with("https://example.test", "auto", CONTRACT["as_of"])
         with self.assertRaises(ValueError): backend("download", {})
+
+    def test_tool_catalog_adapter_maps_research_reads_to_fact_requests_without_context(self) -> None:
+        runner = mock.Mock()
+        runner.resolve_with_fallback.side_effect = [
+            EvidenceResolution(True, "generic_web_search", "1.0.0", CONTRACT["as_of"], CONTRACT["as_of"], {
+                "url": "https://search.test", "results": [{"url": "https://example.test/story", "title": "story"}],
+            }, "artifact:sha256:" + "a" * 64, None, ("tool_result_schema_valid",)),
+            EvidenceResolution(True, "generic_web_read", "1.0.0", CONTRACT["as_of"], CONTRACT["as_of"], {
+                "url": "https://example.test/story", "text": "verified source text",
+            }, "artifact:sha256:" + "b" * 64, None, ("tool_result_schema_valid",)),
+        ]
+        backend = ToolCatalogResearchBackend(runner, as_of=CONTRACT["as_of"], deadline=lambda: 30.0)
+
+        found = backend("web_search", row("web_search", query="close") ["arguments"])
+        read = backend("web_read", row("web_read", url="https://example.test/story")["arguments"])
+
+        self.assertEqual("https://example.test/story", found["results"][0]["url"])
+        self.assertEqual("verified source text", read["results"][0]["excerpt_text"])
+        first_request = runner.resolve_with_fallback.call_args_list[0].args[0]
+        second_request = runner.resolve_with_fallback.call_args_list[1].args[0]
+        self.assertEqual("generic_web_search", first_request.capability)
+        self.assertEqual("generic_web_read", second_request.capability)
+        self.assertEqual({}, first_request.context)
+        self.assertEqual(CONTRACT["as_of"], second_request.required_at)
 
     def test_search_listing_is_discovery_not_evidence(self) -> None:
         search = {"results": [{"url": "https://example.test/2026-08-27", "title": "收盘", "excerpt_text": "2026-08-27", "fact_as_of": "2026-08-27T07:00:00Z"}]}

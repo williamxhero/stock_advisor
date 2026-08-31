@@ -39,11 +39,11 @@ from .scheduler import SHANGHAI, conversation_auto_submit_at, ensure_registered_
 from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
 from .runtime_strategy_policy import RuntimeStrategyControls, RuntimeStrategyPolicy
-from .web_access_gateway import WebAccessGatewayClient
 from .local_research import (
     BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
-    ReadOnlyResearchExecutor, WebAccessGatewayBackend,
+    ReadOnlyResearchExecutor, ToolCatalogResearchBackend,
 )
+from .tooling import ToolCatalog, ToolRunner
 from .store import CompanionStore
 from .trading_calendar import XshgTradingCalendar
 
@@ -445,8 +445,9 @@ def _call_stage(
             planner = BrokerResearchPlanner(
                 broker, deadline=lambda: deadline, intellect=decision.intellect, effort=decision.reasoning_effort,
             )
-            web = WebAccessGatewayBackend(
-                WebAccessGatewayClient(settings.research), as_of=_evidence_read_cutoff(packet, contract),
+            web = ToolCatalogResearchBackend(
+                ToolRunner(ToolCatalog(PATHS.tools)), as_of=_evidence_read_cutoff(packet, contract),
+                deadline=lambda: deadline - time.monotonic(),
             )
             market_facts = packet.get("deterministic_market_facts")
             backends = {"gateway": web} if "gateway" in controls.enabled_backends else {}

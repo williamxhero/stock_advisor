@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from .acquisition import AcquisitionBoundary
 from .evidence_gate import EvidenceGate
 from .broker_client import BrokerRequest, ProviderBrokerClient, canonical_packet_hash
+from .tooling import FactRequest, ToolRunner
 
 
 class ResearchPlanError(ValueError):
@@ -147,6 +148,60 @@ class WebAccessGatewayBackend:
         )
         if operation == "web_browser": return self.tools.browser(arguments.get("session_id"), list(arguments.get("actions") or []))
         raise ValueError(f"unsupported read-only research operation: {operation}")
+
+
+class ToolCatalogResearchBackend:
+    """Compatibility projection from a research plan to promoted local CLI capabilities."""
+
+    def __init__(self, runner: ToolRunner, *, as_of: str, deadline: Callable[[], float]) -> None:
+        self.runner = runner
+        self.as_of = as_of
+        self.deadline = deadline
+
+    def __call__(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        capability, inputs = self._request_for(operation, arguments)
+        resolution = self.runner.resolve_with_fallback(FactRequest(
+            contract_version=1, capability=capability, required_at=self.as_of,
+            deadline_seconds=max(0.1, min(15.0, float(self.deadline()))), inputs=inputs,
+            context={}, freshness_seconds=0.0, finality="observed",
+        ))
+        if not resolution.succeeded or resolution.data is None:
+            raise RuntimeError(f"tool resolution failed: {capability}:{resolution.error_code}")
+        return self._project(operation, resolution)
+
+    @staticmethod
+    def _request_for(operation: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        if operation == "web_search":
+            return "generic_web_search", {"query": str(arguments.get("query") or "")}
+        if operation == "web_read":
+            return "generic_web_read", {"url": str(arguments.get("url") or "")}
+        if operation == "web_browser":
+            actions = arguments.get("actions") if isinstance(arguments.get("actions"), list) else []
+            url = str(arguments.get("url") or "")
+            for action in actions:
+                if isinstance(action, dict) and action.get("type") == "navigate" and action.get("url"):
+                    url = str(action["url"])
+            return "generic_browser_capture", {"url": url}
+        raise ValueError(f"unsupported ToolCatalog research operation: {operation}")
+
+    @staticmethod
+    def _project(operation: str, resolution: Any) -> dict[str, Any]:
+        data = resolution.data
+        artifact = resolution.raw_artifact_ref
+        if operation == "web_search":
+            results = [
+                {"url": str(item.get("url") or ""), "title": str(item.get("title") or ""),
+                 "excerpt_text": str(item.get("title") or ""), "fact_as_of": resolution.fact_as_of,
+                 "raw_artifact_ref": artifact}
+                for item in data.get("results") or [] if isinstance(item, dict) and item.get("url")
+            ]
+            return {"url": data.get("url"), "results": results, "raw_artifact_ref": artifact}
+        url, text = str(data.get("url") or ""), str(data.get("text") or "")
+        return {
+            "url": url, "text": text, "raw_artifact_ref": artifact,
+            "results": [{"url": url, "title": url, "excerpt_text": text, "fact_as_of": resolution.fact_as_of,
+                         "raw_artifact_ref": artifact}],
+        }
 
 
 class DeterministicMarketBackend:

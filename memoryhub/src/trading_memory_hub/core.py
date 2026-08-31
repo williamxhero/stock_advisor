@@ -433,6 +433,20 @@ class MemoryHub:
                 result.append(self._card(row))
         return result[: max(1, min(limit, 100))]
 
+    def timeline(self, memory_space_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]:
+        if not memory_space_id:
+            raise MemoryHubError("timeline requires memory_space_id")
+        with self._connection() as connection:
+            rows = list(
+                connection.execute(
+                    """SELECT * FROM episode
+                       WHERE memory_space_id=? AND sequence>? AND episode_type IN ('user_message','ai_message')
+                       ORDER BY sequence""",
+                    (memory_space_id, max(0, int(after_sequence))),
+                )
+            )
+        return [self._episode(row) for row in rows]
+
     def health(self) -> dict[str, Any]:
         with self._connection() as connection:
             count = int(connection.execute("SELECT COUNT(*) FROM episode").fetchone()[0])

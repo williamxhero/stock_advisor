@@ -28,6 +28,7 @@ from .governance import EvolutionGovernance, RouterGovernance, StrategyPolicyExe
 from .gateway import RuntimeGateway, serve as serve_gateway
 from .learning import JudgmentLifecycle, WorkflowEvolution
 from .message_presentation import explicit_format_requested
+from .memory_port import HttpMemoryAdapter
 from .migration import LegacyMigrator, LegacySources
 from .models import TASK_POLICIES
 from .observatory import EvaluationObservatory, EvaluationRequest, ExperimentRequest, ForecastRequest
@@ -249,7 +250,11 @@ def runtime() -> tuple[CompanionEngine, CompanionStore, LocalExchange, Portfolio
     registry.seed(json.loads((PATHS.resources / "schedules" / "tasks.json").read_text(encoding="utf-8")))
     registry.validate_or_repair()
     store.risk_doctrine()
-    engine = CompanionEngine(store)
+    engine = CompanionEngine(
+        store,
+        memory=HttpMemoryAdapter(os.environ.get("MEMORYHUB_URL", "http://yosef-server:8820")),
+        memory_space_id=os.environ.get("MEMORYHUB_SPACE_ID", "ai-trading-companion"),
+    )
     JudgmentLifecycle(store).backfill()
     exchange = LocalExchange(exchange_root())
     exchange.ensure()
@@ -1553,6 +1558,7 @@ def run_chat(
         raise RuntimeError("no unresponded submitted messages")
     if source is None:
         raise RuntimeError("submitted conversation artifact is missing")
+    engine.record_submitted_messages(cycle_id, messages)
     result = run_unified_cognition(
         engine, store, portfolio, cycle_id, source, messages, batch_ids, execute,
         mode="conversation", reply_kind=reply_kind, on_progress=on_progress,

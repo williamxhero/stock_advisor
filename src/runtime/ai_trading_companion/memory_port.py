@@ -17,6 +17,7 @@ class MemoryPort(Protocol):
     def search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, Any]]: ...
     def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]: ...
     def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]: ...
+    def timeline(self, memory_space_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]: ...
     def health(self) -> dict[str, Any]: ...
 
 
@@ -40,6 +41,12 @@ class HttpMemoryAdapter:
 
     def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
         return self._request("POST", f"/v1/snapshots/{snapshot_id}/related", {"episode_id": episode_id, "limit": limit})["result"]
+
+    def timeline(self, memory_space_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]:
+        return self._request(
+            "POST", f"/v1/memory-spaces/{memory_space_id}/timeline",
+            {"after_sequence": after_sequence},
+        )["result"]
 
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/health")
@@ -110,6 +117,14 @@ class InMemoryMemoryAdapter:
 
     def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
         return [item for item in self.search(snapshot_id, "", limit=100) if item.get("corrects_episode_id") == episode_id][:limit]
+
+    def timeline(self, memory_space_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]:
+        return [
+            dict(item) for item in self._episodes
+            if item["memory_space_id"] == memory_space_id
+            and item["sequence"] > after_sequence
+            and item["episode_type"] in {"user_message", "ai_message"}
+        ]
 
     def health(self) -> dict[str, Any]:
         return {"protocol_version": "memoryhub/v1", "ledger": {"state": "ready", "episodes": len(self._receipts)}}

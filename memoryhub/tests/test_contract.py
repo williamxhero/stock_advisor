@@ -63,3 +63,20 @@ def test_declared_body_hash_must_match_actual_content(tmp_path: Path) -> None:
         hub.append(episode(content_hash="sha256:not-the-body"))
 
     assert hub.health()["ledger"]["episodes"] == 0
+
+
+def test_timeline_only_returns_submitted_and_published_message_events(tmp_path: Path) -> None:
+    hub = MemoryHub(tmp_path / "ledger.sqlite3")
+    hub.append(episode(source_event_id="user-1", episode_type="user_message", body="正式问题"))
+    hub.append(episode(source_event_id="candidate-1", episode_type="ai_candidate", body="未发布候选"))
+    hub.append(
+        episode(
+            source_event_id="ai-1", episode_type="ai_message", body="正式回答",
+            metadata={"message_id": "ai-1", "state": "published", "kind": "ai_chat"},
+        )
+    )
+
+    timeline = hub.timeline("partner-main")
+
+    assert [item["body"] for item in timeline] == ["正式问题", "正式回答"]
+    assert timeline[1]["metadata"]["state"] == "published"

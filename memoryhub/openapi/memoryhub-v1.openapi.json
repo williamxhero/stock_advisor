@@ -10,6 +10,7 @@
     "/v1/snapshots": {"post": {"responses": {"200": {"description": "Frozen ledger watermark"}}}},
     "/v1/snapshots/{snapshot_id}/search": {"post": {"responses": {"200": {"description": "Policy-filtered memory cards"}}}},
     "/v1/snapshots/{snapshot_id}/expand": {"post": {"responses": {"200": {"description": "Visible immutable episode"}}}},
-    "/v1/snapshots/{snapshot_id}/related": {"post": {"responses": {"200": {"description": "Visible correction and outcome links"}}}}
+    "/v1/snapshots/{snapshot_id}/related": {"post": {"responses": {"200": {"description": "Visible correction and outcome links"}}}},
+    "/v1/memory-spaces/{memory_space_id}/timeline": {"post": {"responses": {"200": {"description": "Submitted and published message timeline"}}}}
   }
 }

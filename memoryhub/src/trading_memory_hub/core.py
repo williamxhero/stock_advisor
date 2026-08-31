@@ -711,6 +711,21 @@ class MemoryHub:
             if current["export_sha256"] != request["export_sha256"]:
                 raise MemoryHubError("memory changed after export; export again before clearing")
             episode_ids = [item["episode_id"] for item in current["episodes"]]
+            snapshot_rows = list(connection.execute(
+                "SELECT snapshot_id FROM memory_snapshot WHERE memory_space_id=?", (memory_space_id,)
+            ))
+            snapshot_ids = [str(row["snapshot_id"]) for row in snapshot_rows]
+            if snapshot_ids:
+                snapshot_marks = ",".join("?" for _ in snapshot_ids)
+                audits = [str(row["audit_id"]) for row in connection.execute(
+                    f"SELECT audit_id FROM retrieval_bundle WHERE snapshot_id IN ({snapshot_marks})", snapshot_ids
+                )]
+                connection.execute(
+                    f"DELETE FROM retrieval_bundle WHERE snapshot_id IN ({snapshot_marks})", snapshot_ids
+                )
+                if audits:
+                    audit_marks = ",".join("?" for _ in audits)
+                    connection.execute(f"DELETE FROM retrieval_audit WHERE audit_id IN ({audit_marks})", audits)
             if episode_ids:
                 marks = ",".join("?" for _ in episode_ids)
                 connection.execute(

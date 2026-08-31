@@ -63,3 +63,7 @@ def test_bundle_versions_audit_is_private_and_frozen_replay_is_gated(tmp_path: P
     else:
         raise AssertionError("unqualified candidate was promoted")
     assert hub.replay_bundle(bundle["bundle_id"])["results"] == bundle["results"]
+
+    exported = hub.export_space("partner-main")
+    prepared = hub.prepare_clear("partner-main", exported["export_sha256"])
+    assert hub.clear_space("partner-main", prepared["confirmation_token"])["deleted_episodes"] == 2

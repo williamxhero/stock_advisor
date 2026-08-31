@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import json
 import os
 import shutil
@@ -9,10 +10,12 @@ import signal
 import subprocess
 import tempfile
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .secret_guard import find_secrets
 
 
 _MANIFEST_CONTRACT = "ai-trading-tool-manifest/v1"
@@ -26,6 +29,10 @@ class ToolLookupError(ValueError):
         self.code = code
 
 
+class ArtifactCapacityError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class FactRequest:
     """The caller-owned, versioned facts contract for one read-only capability."""
@@ -35,13 +42,14 @@ class FactRequest:
     required_at: str
     deadline_seconds: float
     inputs: dict[str, Any]
+    context: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
         if self.contract_version != 1:
             raise ValueError("unsupported_fact_request_version")
         if not _safe_segment(self.capability):
             raise ValueError("invalid_tool_capability")
-        if not isinstance(self.inputs, dict):
+        if not isinstance(self.inputs, dict) or not isinstance(self.context, dict):
             raise ValueError("fact_request_inputs_must_be_object")
         _parse_timestamp(self.required_at)
         if self.deadline_seconds <= 0:
@@ -52,6 +60,7 @@ class FactRequest:
             "capability": self.capability,
             "required_at": self.required_at,
             "inputs": self.inputs,
+            "context": self.context,
         }
 
 
@@ -66,13 +75,15 @@ class EvidenceResolution:
     acquired_at: str
     data: dict[str, Any] | None
     raw_artifact_ref: str | None
+    diagnostic_artifact_ref: str | None
     technical_validation: tuple[str, ...]
     error_code: str | None = None
     exit_code: int | None = None
 
     @classmethod
     def failed(cls, capability: str, code: str, *, tool_version: str | None = None,
-               exit_code: int | None = None) -> "EvidenceResolution":
+               exit_code: int | None = None, raw_artifact_ref: str | None = None,
+               diagnostic_artifact_ref: str | None = None) -> "EvidenceResolution":
         return cls(
             succeeded=False,
             capability=capability,
@@ -80,7 +91,8 @@ class EvidenceResolution:
             fact_as_of=None,
             acquired_at=_now(),
             data=None,
-            raw_artifact_ref=None,
+            raw_artifact_ref=raw_artifact_ref,
+            diagnostic_artifact_ref=diagnostic_artifact_ref,
             technical_validation=(),
             error_code=code,
             exit_code=exit_code,
@@ -140,17 +152,24 @@ class ToolCatalog:
 class ToolArtifactStore:
     """Opaque raw-output references. Retention and compression evolve behind this facade."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, max_bytes: int | None = None) -> None:
         self.root = Path(root) / ".artifacts"
+        self.max_bytes = None if max_bytes is None else max(0, int(max_bytes))
+
+    def can_accept_new_call(self) -> bool:
+        return self.max_bytes is None or self._used_bytes() < self.max_bytes
 
     def write(self, raw: bytes) -> str:
         digest = hashlib.sha256(raw).hexdigest()
         self.root.mkdir(parents=True, exist_ok=True)
-        target = self.root / f"{digest}.json"
+        target = self.root / f"{digest}.gz"
         if not target.exists():
+            compressed = gzip.compress(raw)
+            if self.max_bytes is not None and self._used_bytes() + len(compressed) > self.max_bytes:
+                raise ArtifactCapacityError("tool_archive_capacity_exceeded")
             temporary = target.with_suffix(f".{uuid.uuid4().hex}.tmp")
             with temporary.open("xb") as handle:
-                handle.write(raw)
+                handle.write(compressed)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, target)
@@ -161,16 +180,23 @@ class ToolArtifactStore:
         digest = reference.removeprefix(prefix)
         if not reference.startswith(prefix) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise ValueError("invalid_artifact_reference")
-        return (self.root / f"{digest}.json").read_bytes()
+        with gzip.open(self.root / f"{digest}.gz", "rb") as handle:
+            return handle.read()
+
+    def _used_bytes(self) -> int:
+        if not self.root.exists():
+            return 0
+        return sum(path.stat().st_size for path in self.root.glob("*.gz"))
 
 
 class ToolRunner:
     """Deep execution facade: callers receive evidence, never process or package details."""
 
-    def __init__(self, catalog: ToolCatalog, *, max_stdout_bytes: int = 1_000_000) -> None:
+    def __init__(self, catalog: ToolCatalog, *, max_stdout_bytes: int = 1_000_000,
+                 archive_max_bytes: int | None = None) -> None:
         self.catalog = catalog
         self.max_stdout_bytes = max(1, int(max_stdout_bytes))
-        self.artifacts = ToolArtifactStore(catalog.root)
+        self.artifacts = ToolArtifactStore(catalog.root, max_bytes=archive_max_bytes)
 
     def resolve(self, request: FactRequest) -> EvidenceResolution:
         try:
@@ -178,6 +204,10 @@ class ToolRunner:
             tool = self.catalog.resolve(request.capability)
         except (ToolLookupError, ValueError) as exc:
             return EvidenceResolution.failed(request.capability, getattr(exc, "code", str(exc)))
+        if find_secrets(json.dumps(wire_request, ensure_ascii=False, sort_keys=True)):
+            return EvidenceResolution.failed(request.capability, "tool_secret_rejected", tool_version=tool.version)
+        if not self.artifacts.can_accept_new_call():
+            return EvidenceResolution.failed(request.capability, "tool_archive_capacity_exceeded", tool_version=tool.version)
 
         run_root = self.catalog.root / ".runs"
         run_root.mkdir(parents=True, exist_ok=True)
@@ -194,33 +224,74 @@ class ToolRunner:
                 creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
             )
             try:
-                stdout, _stderr = process.communicate(
+                stdout, stderr = process.communicate(
                     json.dumps(wire_request, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
                     timeout=request.deadline_seconds,
                 )
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
                 _terminate_process_tree(process)
-                return EvidenceResolution.failed(request.capability, "tool_timeout", tool_version=tool.version)
+                partial_stdout = exc.output if isinstance(exc.output, bytes) else b""
+                partial_stderr = exc.stderr if isinstance(exc.stderr, bytes) else b""
+                completed_stdout, completed_stderr = process.communicate()
+                stdout = _merge_output(partial_stdout, completed_stdout)
+                stderr = _merge_output(partial_stderr, completed_stderr)
+                if _contains_secret(stdout) or _contains_secret(stderr):
+                    return EvidenceResolution.failed(request.capability, "tool_secret_rejected", tool_version=tool.version)
+                try:
+                    raw_artifact_ref = self.artifacts.write(stdout)
+                    diagnostic_artifact_ref = self.artifacts.write(stderr) if stderr else None
+                except ArtifactCapacityError:
+                    return EvidenceResolution.failed(request.capability, "tool_archive_capacity_exceeded", tool_version=tool.version)
+                return EvidenceResolution.failed(
+                    request.capability, "tool_timeout", tool_version=tool.version,
+                    raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                )
+            if _contains_secret(stdout) or _contains_secret(stderr):
+                return EvidenceResolution.failed(request.capability, "tool_secret_rejected", tool_version=tool.version)
+            try:
+                raw_artifact_ref = self.artifacts.write(stdout)
+                diagnostic_artifact_ref = self.artifacts.write(stderr) if stderr else None
+            except ArtifactCapacityError:
+                return EvidenceResolution.failed(request.capability, "tool_archive_capacity_exceeded", tool_version=tool.version)
             if process.returncode != 0:
                 return EvidenceResolution.failed(
                     request.capability, "tool_process_failed", tool_version=tool.version, exit_code=process.returncode,
+                    raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
                 )
             if len(stdout) > self.max_stdout_bytes:
-                return EvidenceResolution.failed(request.capability, "tool_stdout_too_large", tool_version=tool.version)
+                return EvidenceResolution.failed(
+                    request.capability, "tool_stdout_too_large", tool_version=tool.version,
+                    raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                )
             try:
                 output = json.loads(stdout.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
-                return EvidenceResolution.failed(request.capability, "tool_stdout_invalid_json", tool_version=tool.version)
+                return EvidenceResolution.failed(
+                    request.capability, "tool_stdout_invalid_json", tool_version=tool.version,
+                    raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                )
             if not isinstance(output, dict):
-                return EvidenceResolution.failed(request.capability, "tool_result_invalid", tool_version=tool.version)
+                return EvidenceResolution.failed(
+                    request.capability, "tool_result_invalid", tool_version=tool.version,
+                    raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                )
             if set(output) != {"contract", "fact_as_of", "data"} or output.get("contract") != _RESULT_CONTRACT:
-                return EvidenceResolution.failed(request.capability, "tool_result_invalid", tool_version=tool.version)
+                return EvidenceResolution.failed(
+                    request.capability, "tool_result_invalid", tool_version=tool.version,
+                    raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                )
             if not isinstance(output.get("data"), dict):
-                return EvidenceResolution.failed(request.capability, "tool_result_invalid", tool_version=tool.version)
+                return EvidenceResolution.failed(
+                    request.capability, "tool_result_invalid", tool_version=tool.version,
+                    raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                )
             try:
                 _parse_timestamp(str(output.get("fact_as_of") or ""))
             except ValueError:
-                return EvidenceResolution.failed(request.capability, "tool_fact_as_of_invalid", tool_version=tool.version)
+                return EvidenceResolution.failed(
+                    request.capability, "tool_fact_as_of_invalid", tool_version=tool.version,
+                    raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                )
             return EvidenceResolution(
                 succeeded=True,
                 capability=request.capability,
@@ -228,8 +299,9 @@ class ToolRunner:
                 fact_as_of=str(output["fact_as_of"]),
                 acquired_at=_now(),
                 data=dict(output["data"]),
-                raw_artifact_ref=self.artifacts.write(stdout),
-                technical_validation=("tool_process_succeeded", "tool_result_schema_valid"),
+                raw_artifact_ref=raw_artifact_ref,
+                diagnostic_artifact_ref=diagnostic_artifact_ref,
+                technical_validation=("tool_process_succeeded", "tool_result_schema_valid", "raw_output_archived"),
                 exit_code=process.returncode,
             )
         except OSError:
@@ -274,3 +346,13 @@ def _parse_timestamp(value: str) -> datetime:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _contains_secret(value: bytes) -> bool:
+    return bool(find_secrets(value.decode("utf-8", errors="replace")))
+
+
+def _merge_output(partial: bytes, completed: bytes) -> bytes:
+    if completed.startswith(partial):
+        return completed
+    return partial + completed

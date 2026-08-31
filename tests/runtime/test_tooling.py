@@ -28,13 +28,14 @@ class ToolRunnerTests(unittest.TestCase):
         }), encoding="utf-8")
         return version_root
 
-    def request(self, capability: str = "cn_equity_identity") -> FactRequest:
+    def request(self, capability: str = "cn_equity_identity", *, context: dict | None = None) -> FactRequest:
         return FactRequest(
             contract_version=1,
             capability=capability,
             required_at="2026-09-01T01:30:00Z",
             deadline_seconds=2.0,
             inputs={"symbols": ["600000"]},
+            context=context or {},
         )
 
     def test_resolves_a_published_capability_and_preserves_raw_output(self) -> None:
@@ -126,6 +127,109 @@ class ToolRunnerTests(unittest.TestCase):
             self.assertFalse(result.succeeded)
             self.assertEqual("tool_timeout", result.error_code)
             self.assertEqual([], list((root / ".runs").glob("*")))
+
+    def test_passes_ordinary_context_and_deduplicates_compressed_raw_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            self.publish_tool(root, "cn_equity_identity", """
+                import json, sys
+                request = json.load(sys.stdin)
+                assert request["context"]["portfolio"]["shares"] == 300
+                print(json.dumps({
+                    "contract": "ai-trading-tool-result/v1",
+                    "fact_as_of": "2026-09-01T01:30:00Z",
+                    "data": {"identity": "600000.SSE"},
+                }, sort_keys=True))
+            """)
+            runner = ToolRunner(ToolCatalog(root))
+
+            first = runner.resolve(self.request(context={
+                "portfolio": {"shares": 300, "cost": 12.5}, "message": "review current holding",
+            }))
+            second = runner.resolve(self.request(context={
+                "portfolio": {"shares": 300, "cost": 12.5}, "message": "review current holding",
+            }))
+
+            self.assertTrue(first.succeeded)
+            self.assertEqual(first.raw_artifact_ref, second.raw_artifact_ref)
+            self.assertEqual(1, len(list((root / ".artifacts").glob("*.gz"))))
+            self.assertIn(b'"identity": "600000.SSE"', runner.read_artifact(first.raw_artifact_ref))
+
+    def test_rejects_secrets_before_starting_or_archiving_a_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            version_root = self.publish_tool(root, "cn_equity_identity", """
+                from pathlib import Path
+                Path("started.txt").write_text("started", encoding="utf-8")
+            """)
+
+            result = ToolRunner(ToolCatalog(root)).resolve(self.request(context={
+                "note": "token: 1234567890abcdef",
+            }))
+
+            self.assertFalse(result.succeeded)
+            self.assertEqual("tool_secret_rejected", result.error_code)
+            self.assertFalse((version_root / "started.txt").exists())
+            self.assertFalse((root / ".artifacts").exists())
+            self.assertNotIn("1234567890abcdef", str(result))
+
+    def test_refuses_new_calls_after_archive_capacity_is_reached(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            version_root = self.publish_tool(root, "cn_equity_identity", """
+                from pathlib import Path
+                Path("started.txt").write_text("started", encoding="utf-8")
+            """)
+
+            result = ToolRunner(ToolCatalog(root), archive_max_bytes=0).resolve(self.request())
+
+            self.assertFalse(result.succeeded)
+            self.assertEqual("tool_archive_capacity_exceeded", result.error_code)
+            self.assertFalse((version_root / "started.txt").exists())
+
+    def test_archives_nonsecret_failure_output_for_auditing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            self.publish_tool(root, "cn_equity_identity", """
+                import sys
+                print("source returned no result")
+                print("upstream timeout", file=sys.stderr)
+                sys.exit(3)
+            """)
+
+            result = ToolRunner(ToolCatalog(root)).resolve(self.request())
+
+            self.assertFalse(result.succeeded)
+            self.assertEqual("tool_process_failed", result.error_code)
+            self.assertIsNotNone(result.raw_artifact_ref)
+            self.assertIsNotNone(result.diagnostic_artifact_ref)
+            reader = ToolRunner(ToolCatalog(root))
+            self.assertIn(b"source returned no result", reader.read_artifact(result.raw_artifact_ref))
+
+    def test_archives_partial_timeout_output_without_exposing_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            self.publish_tool(root, "cn_equity_identity", """
+                import sys, time
+                print("source still working", flush=True)
+                print("diagnostic pending", file=sys.stderr, flush=True)
+                time.sleep(5)
+            """)
+
+            result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                contract_version=1,
+                capability="cn_equity_identity",
+                required_at="2026-09-01T01:30:00Z",
+                deadline_seconds=0.05,
+                inputs={},
+            ))
+
+            self.assertFalse(result.succeeded)
+            self.assertEqual("tool_timeout", result.error_code)
+            self.assertIsNotNone(result.raw_artifact_ref)
+            self.assertIsNotNone(result.diagnostic_artifact_ref)
+            reader = ToolRunner(ToolCatalog(root))
+            self.assertIn(b"source still working", reader.read_artifact(result.raw_artifact_ref))
 
 
 if __name__ == "__main__":

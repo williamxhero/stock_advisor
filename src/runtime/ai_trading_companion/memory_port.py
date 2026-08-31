@@ -16,6 +16,7 @@ class MemoryUnavailable(RuntimeError):
 
 class MemoryPort(Protocol):
     def append(self, episode: dict[str, Any]) -> dict[str, Any]: ...
+    def append_batch(self, episodes: list[dict[str, Any]]) -> list[dict[str, Any]]: ...
     def begin_snapshot(self, request: dict[str, Any]) -> dict[str, Any]: ...
     def search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, Any]]: ...
     def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20) -> dict[str, Any]: ...
@@ -36,6 +37,9 @@ class HttpMemoryAdapter:
 
     def append(self, episode: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/v1/episodes", episode)["result"]
+
+    def append_batch(self, episodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return self._request("POST", "/v1/episodes/batch", {"episodes": episodes})["result"]
 
     def begin_snapshot(self, request: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/v1/snapshots", request)["result"]
@@ -118,6 +122,15 @@ class InMemoryMemoryAdapter:
         self._receipts[key] = receipt
         self._episodes.append({**episode, **receipt})
         return dict(receipt)
+
+    def append_batch(self, episodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        results = []
+        for episode in episodes:
+            try:
+                results.append({"receipt": self.append(episode)})
+            except Exception as error:
+                results.append({"error": type(error).__name__, "detail": str(error)})
+        return results
 
     def begin_snapshot(self, request: dict[str, Any]) -> dict[str, Any]:
         snapshot_id = f"test-snapshot-{len(self._snapshots) + 1}"

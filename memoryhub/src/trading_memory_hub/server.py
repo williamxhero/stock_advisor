@@ -41,6 +41,8 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
                 value = json.loads(self.rfile.read(length) or b"{}")
                 if self.path == "/v1/episodes":
                     result: Any = hub.append(value).as_dict()
+                elif self.path == "/v1/episodes/batch":
+                    result = hub.append_batch(value["episodes"])
                 elif self.path == "/v1/snapshots":
                     result = hub.begin_snapshot(
                         value["memory_space_id"], as_of=value["as_of"],

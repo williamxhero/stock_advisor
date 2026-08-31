@@ -7,6 +7,7 @@
       "200": {"description": "Immutable append receipt"},
       "409": {"description": "Same source event with different content"}
     }}},
+    "/v1/episodes/batch": {"post": {"responses": {"200": {"description": "Per-record receipts and conflicts for idempotent migration"}}}},
     "/v1/snapshots": {"post": {"responses": {"200": {"description": "Frozen ledger watermark"}}}},
     "/v1/snapshots/{snapshot_id}/search": {"post": {"responses": {"200": {"description": "Policy-filtered memory cards"}}}},
     "/v1/snapshots/{snapshot_id}/retrieve": {"post": {"responses": {"200": {"description": "Versioned, replayable MemoryBundle with separate audit reference"}}}},

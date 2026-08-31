@@ -23,14 +23,13 @@ class MemoryHubMigrator:
         self.migrated_at = migrated_at
 
     def run(self) -> dict[str, Any]:
-        imported = replayed = 0
         counts: dict[str, int] = {}
         conflicts: list[dict[str, str]] = []
         hash_mismatches: list[str] = []
-        receipt_by_source: dict[str, str] = {}
         with sqlite3.connect(f"file:{self.source_database.as_posix()}?mode=ro", uri=True) as connection:
             connection.row_factory = sqlite3.Row
             records = self._records(connection)
+        episodes: list[dict[str, Any]] = []
         for kind, values in records:
             counts[kind] = counts.get(kind, 0) + 1
             body = str(values.pop("body"))
@@ -40,19 +39,34 @@ class MemoryHubMigrator:
                 # Legacy stores did not consistently use the MemoryHub prefix;
                 # record mismatch without corrupting the authoritative import.
                 hash_mismatches.append(str(values["source_event_id"]))
-            corrects_source = values.pop("corrects_source", None)
-            if corrects_source:
-                values["corrects_episode_id"] = receipt_by_source.get(str(corrects_source))
-            episode = {**values, "body": body, "content_hash": actual}
-            try:
-                before = int(self.memory.health().get("ledger", {}).get("episodes", 0))
-                receipt = self.memory.append(episode)
-                after = int(self.memory.health().get("ledger", {}).get("episodes", before))
-                imported += int(after > before)
-                replayed += int(after == before)
-                receipt_by_source[str(values["source_event_id"])] = str(receipt["episode_id"])
-            except Exception as error:
-                conflicts.append({"source_event_id": str(values["source_event_id"]), "error": str(error)})
+            episodes.append({**values, "body": body, "content_hash": actual})
+        before = int(self.memory.health().get("ledger", {}).get("episodes", 0))
+        receipt_by_source: dict[str, str] = {}
+        pending = list(episodes)
+        while pending:
+            ready = [item for item in pending if not item.get("corrects_source") or item["corrects_source"] in receipt_by_source]
+            if not ready:
+                conflicts.extend({"source_event_id": str(item["source_event_id"]), "error": "unresolved correction predecessor"} for item in pending)
+                break
+            payload = []
+            for item in ready:
+                value = dict(item); corrects = value.pop("corrects_source", None)
+                if corrects:
+                    value["corrects_episode_id"] = receipt_by_source[str(corrects)]
+                payload.append(value)
+            results = self.memory.append_batch(payload)
+            for value, result in zip(payload, results):
+                receipt = result.get("receipt") if isinstance(result, dict) else None
+                if receipt:
+                    receipt_by_source[str(value["source_event_id"])] = str(receipt["episode_id"])
+                else:
+                    conflicts.append({"source_event_id": str(value["source_event_id"]), "error": str(result.get("detail") or result.get("error") or "unknown append failure")})
+            ready_ids = {id(item) for item in ready}
+            pending = [item for item in pending if id(item) not in ready_ids]
+        after = int(self.memory.health().get("ledger", {}).get("episodes", before))
+        succeeded = len(receipt_by_source)
+        imported = max(0, after - before)
+        replayed = max(0, succeeded - imported)
         return {
             "source_database": str(self.source_database), "source_database_mode": "read_only",
             "counts": counts, "imported": imported, "replayed": replayed, "conflicts": conflicts,

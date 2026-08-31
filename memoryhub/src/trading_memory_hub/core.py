@@ -268,6 +268,17 @@ class MemoryHub:
             )
             return AppendReceipt(episode_id, int(cursor.lastrowid), value["content_hash"])
 
+    def append_batch(self, values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not isinstance(values, list) or len(values) > 1000:
+            raise MemoryHubError("append batch must contain at most 1000 episodes")
+        results: list[dict[str, Any]] = []
+        for value in values:
+            try:
+                results.append({"receipt": self.append(value).as_dict()})
+            except Exception as error:
+                results.append({"error": type(error).__name__, "detail": str(error)})
+        return results
+
     def derive_pending(
         self, extractor: Any, *, extractor_version: str, limit: int = 20
     ) -> int:

@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterator
 import uuid
+import time
 
 from .secret_guard import assert_safe
 
@@ -161,6 +162,33 @@ class MemoryHub:
                     state TEXT NOT NULL,
                     result_json TEXT
                 );
+                CREATE TABLE IF NOT EXISTS retrieval_bundle (
+                    bundle_id TEXT PRIMARY KEY,
+                    snapshot_id TEXT NOT NULL,
+                    audit_id TEXT NOT NULL UNIQUE,
+                    value_json TEXT NOT NULL,
+                    FOREIGN KEY(snapshot_id) REFERENCES memory_snapshot(snapshot_id)
+                );
+                CREATE TABLE IF NOT EXISTS retrieval_audit (
+                    audit_id TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS frozen_query_set (
+                    query_set_id TEXT PRIMARY KEY,
+                    memory_space_id TEXT NOT NULL,
+                    value_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS qualification_report (
+                    report_id TEXT PRIMARY KEY,
+                    qualified INTEGER NOT NULL,
+                    value_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS retrieval_configuration (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    active_retriever TEXT NOT NULL
+                );
+                INSERT OR IGNORE INTO retrieval_configuration(singleton,active_retriever)
+                    VALUES(1,'sqlite-lexical/v1');
                 """
             )
 
@@ -404,6 +432,158 @@ class MemoryHub:
             if card["episode_id"] in derived:
                 card["derived_summary"] = derived[card["episode_id"]]
         return cards
+
+    def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20) -> dict[str, Any]:
+        """Return replayable retrieval output and persist operational audit separately from memory."""
+        started = time.monotonic()
+        snapshot = self._snapshot(snapshot_id)
+        visible = self._visible_rows(snapshot)
+        results = self.search(snapshot_id, query, limit=limit)
+        result_ids = [str(item["episode_id"]) for item in results]
+        with self._connection() as connection:
+            future = [
+                str(row["episode_id"]) for row in connection.execute(
+                    """SELECT episode_id FROM episode
+                       WHERE memory_space_id=? AND sequence<=? AND known_at>? ORDER BY sequence""",
+                    (snapshot.memory_space_id, snapshot.watermark, snapshot.as_of),
+                )
+            ]
+            active = str(connection.execute(
+                "SELECT active_retriever FROM retrieval_configuration WHERE singleton=1"
+            ).fetchone()[0])
+        versions = {
+            "policy": snapshot.policy_version, "retriever": active,
+            "index": "source-search/v1", "extractor": "derived-memory/v1",
+            "protocol": snapshot.protocol_version,
+        }
+        audit_id, bundle_id = str(uuid.uuid4()), str(uuid.uuid4())
+        audit = {
+            "audit_id": audit_id, "snapshot_id": snapshot_id, "query": query,
+            "candidate_episode_ids": [str(row["episode_id"]) for row in visible],
+            "final_episode_ids": result_ids,
+            "excluded": {"future_knowledge": future},
+            "expanded_original_episode_ids": [],
+            "latency_ms": round((time.monotonic() - started) * 1000, 3), "fault": None,
+            "versions": versions,
+        }
+        bundle = {
+            "bundle_id": bundle_id, "audit_id": audit_id,
+            "snapshot": snapshot.as_dict(), "versions": versions, "query": query,
+            "results": results,
+        }
+        with self._connection() as connection:
+            connection.execute("INSERT INTO retrieval_audit(audit_id,value_json) VALUES(?,?)", (audit_id, _json(audit)))
+            connection.execute(
+                "INSERT INTO retrieval_bundle(bundle_id,snapshot_id,audit_id,value_json) VALUES(?,?,?,?)",
+                (bundle_id, snapshot_id, audit_id, _json(bundle)),
+            )
+        return bundle
+
+    def retrieval_audit(self, audit_id: str) -> dict[str, Any]:
+        return self._governance_value("retrieval_audit", "audit_id", audit_id)
+
+    def replay_bundle(self, bundle_id: str) -> dict[str, Any]:
+        return self._governance_value("retrieval_bundle", "bundle_id", bundle_id)
+
+    def create_frozen_query_set(self, memory_space_id: str, queries: list[dict[str, Any]]) -> dict[str, Any]:
+        if not queries:
+            raise MemoryHubError("frozen query set requires queries")
+        snapshots = [self._snapshot(str(item.get("snapshot_id") or "")) for item in queries]
+        if any(item.memory_space_id != memory_space_id for item in snapshots):
+            raise MemoryHubError("query snapshot belongs to another memory space")
+        query_set_id = str(uuid.uuid4())
+        value = {
+            "query_set_id": query_set_id, "memory_space_id": memory_space_id,
+            "queries": queries,
+            "frozen_contexts": [
+                {"snapshot_id": item.snapshot_id, "watermark": item.watermark,
+                 "as_of": item.as_of, "policy_version": item.policy_version}
+                for item in snapshots
+            ],
+        }
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO frozen_query_set(query_set_id,memory_space_id,value_json) VALUES(?,?,?)",
+                (query_set_id, memory_space_id, _json(value)),
+            )
+        return value
+
+    def evaluate_candidate(self, query_set_id: str, candidate: dict[str, Any]) -> dict[str, Any]:
+        frozen = self._governance_value("frozen_query_set", "query_set_id", query_set_id)
+        if candidate.get("adapter") not in {"graphiti", "mem0"}:
+            raise MemoryHubError("candidate adapter must be graphiti or mem0")
+        runs = candidate.get("runs")
+        if not isinstance(runs, list) or len(runs) != len(frozen["queries"]):
+            raise MemoryHubError("candidate must provide one run per frozen query")
+        misses: list[str] = []
+        false: list[str] = []
+        counter_misses: list[str] = []
+        future: list[str] = []
+        latencies: list[float] = []
+        faults: list[str] = []
+        for query, context, run in zip(frozen["queries"], frozen["frozen_contexts"], runs):
+            returned = {str(value) for value in run.get("episode_ids", [])}
+            expected = {str(value) for value in query.get("expected_episode_ids", [])}
+            counter = {str(value) for value in query.get("major_counterevidence_ids", [])}
+            misses.extend(sorted(expected - returned))
+            false.extend(sorted(returned - expected - counter))
+            counter_misses.extend(sorted(counter - returned))
+            with self._connection() as connection:
+                if returned:
+                    marks = ",".join("?" for _ in returned)
+                    rows = connection.execute(
+                        f"SELECT episode_id,sequence,known_at FROM episode WHERE episode_id IN ({marks})", tuple(returned)
+                    )
+                    future.extend(str(row["episode_id"]) for row in rows if row["sequence"] > context["watermark"] or row["known_at"] > context["as_of"])
+            latencies.append(float(run.get("latency_ms") or 0))
+            if run.get("fault"):
+                faults.append(str(run["fault"]))
+        metrics = {
+            "recall_misses": sorted(set(misses)), "false_associations": sorted(set(false)),
+            "major_counterevidence_misses": sorted(set(counter_misses)),
+            "future_leakage": sorted(set(future)),
+            "latency_ms": latencies, "faults": faults,
+        }
+        qualified = not any((misses, false, counter_misses, future, faults))
+        report_id = str(uuid.uuid4())
+        report = {
+            "report_id": report_id, "query_set_id": query_set_id,
+            "adapter": candidate["adapter"], "retriever_version": candidate.get("retriever_version"),
+            "metrics": metrics, "qualified": qualified,
+            "evidence_rule": "derived clusters, summaries and model propositions are not independent evidence",
+        }
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO qualification_report(report_id,qualified,value_json) VALUES(?,?,?)",
+                (report_id, int(qualified), _json(report)),
+            )
+        return report
+
+    def promote_candidate(self, report_id: str) -> dict[str, Any]:
+        report = self._governance_value("qualification_report", "report_id", report_id)
+        if not report["qualified"]:
+            raise ValueError("candidate is not qualified")
+        version = str(report.get("retriever_version") or "")
+        if not version:
+            raise MemoryHubError("qualified candidate has no retriever version")
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE retrieval_configuration SET active_retriever=? WHERE singleton=1", (version,)
+            )
+        return {"active_retriever": version, "report_id": report_id}
+
+    def _governance_value(self, table: str, key: str, value: str) -> dict[str, Any]:
+        allowed = {
+            ("retrieval_audit", "audit_id"), ("retrieval_bundle", "bundle_id"),
+            ("frozen_query_set", "query_set_id"), ("qualification_report", "report_id"),
+        }
+        if (table, key) not in allowed:
+            raise MemoryHubError("unsupported governance record")
+        with self._connection() as connection:
+            row = connection.execute(f"SELECT value_json FROM {table} WHERE {key}=?", (value,)).fetchone()
+        if row is None:
+            raise MemoryHubError("governance record does not exist")
+        return json.loads(row["value_json"])
 
     def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
         snapshot = self._snapshot(snapshot_id)

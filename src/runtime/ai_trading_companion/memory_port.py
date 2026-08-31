@@ -18,6 +18,7 @@ class MemoryPort(Protocol):
     def append(self, episode: dict[str, Any]) -> dict[str, Any]: ...
     def begin_snapshot(self, request: dict[str, Any]) -> dict[str, Any]: ...
     def search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, Any]]: ...
+    def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20) -> dict[str, Any]: ...
     def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]: ...
     def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]: ...
     def timeline(self, memory_space_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]: ...
@@ -41,6 +42,9 @@ class HttpMemoryAdapter:
 
     def search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
         return self._request("POST", f"/v1/snapshots/{snapshot_id}/search", {"query": query, "limit": limit})["result"]
+
+    def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20) -> dict[str, Any]:
+        return self._request("POST", f"/v1/snapshots/{snapshot_id}/retrieve", {"query": query, "limit": limit})["result"]
 
     def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/snapshots/{snapshot_id}/expand", {"episode_id": episode_id})["result"]
@@ -130,6 +134,15 @@ class InMemoryMemoryAdapter:
             and item["known_at"] <= snapshot["as_of"]
             and query.casefold() in item.get("body", "").casefold()
         ][:limit]
+
+    def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20) -> dict[str, Any]:
+        snapshot = dict(self._snapshots[snapshot_id])
+        return {
+            "bundle_id": f"test-bundle-{len(self._snapshots)}", "audit_id": f"test-audit-{len(self._snapshots)}",
+            "snapshot": snapshot,
+            "versions": {"policy": snapshot["policy_version"], "retriever": "test/v1", "index": "test/v1", "extractor": "test/v1", "protocol": snapshot["protocol_version"]},
+            "query": query, "results": self.search(snapshot_id, query, limit=limit),
+        }
 
     def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
         visible = {item["episode_id"] for item in self.search(snapshot_id, "", limit=100)}

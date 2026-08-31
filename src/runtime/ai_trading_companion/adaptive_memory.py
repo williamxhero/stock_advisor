@@ -17,6 +17,7 @@ class MemoryResearchResult:
     snapshot: dict[str, Any]
     context: tuple[dict[str, Any], ...]
     actions: tuple[dict[str, Any], ...]
+    bundles: tuple[dict[str, Any], ...] = ()
 
 
 class AdaptiveMemoryResearch:
@@ -59,6 +60,7 @@ class AdaptiveMemoryResearch:
             raise MemoryResearchError("MemoryHub returned a snapshot without an id")
         context: list[dict[str, Any]] = list(restored["context"]) if restored else []
         actions: list[dict[str, Any]] = list(restored["actions"]) if restored else []
+        bundles: list[dict[str, Any]] = list(restored.get("bundles", [])) if restored else []
         known_episode_ids: set[str] = set(restored["known_episode_ids"]) if restored else set()
         executed: set[tuple[str, str]] = set(restored["executed"]) if restored else set()
         last_observation: dict[str, Any] | None = restored["last_observation"] if restored else None
@@ -68,6 +70,7 @@ class AdaptiveMemoryResearch:
                 on_checkpoint({
                     "cycle_id": cycle_id, "stage": stage, "snapshot": snapshot,
                     "context": context, "actions": actions,
+                    "bundles": bundles,
                     "known_episode_ids": sorted(known_episode_ids),
                     "executed": [list(item) for item in sorted(executed)],
                     "last_observation": last_observation,
@@ -75,7 +78,7 @@ class AdaptiveMemoryResearch:
 
         checkpoint()
         if actions and actions[-1].get("operation") == "complete":
-            return MemoryResearchResult(snapshot, tuple(context), tuple(actions))
+            return MemoryResearchResult(snapshot, tuple(context), tuple(actions), tuple(bundles))
         while True:
             if self.monotonic() >= deadline:
                 raise MemoryResearchError("memory research reached its response deadline")
@@ -92,7 +95,7 @@ class AdaptiveMemoryResearch:
             if operation == "complete":
                 actions.append(action)
                 checkpoint()
-                return MemoryResearchResult(snapshot, tuple(context), tuple(actions))
+                return MemoryResearchResult(snapshot, tuple(context), tuple(actions), tuple(bundles))
             if operation in {"web_search", "web_read", "markethub_quote", "archive_article"}:
                 if self.discover_external is None:
                     raise MemoryResearchError("external discovery is unavailable for this chat")
@@ -117,7 +120,9 @@ class AdaptiveMemoryResearch:
                 continue
             executed.add(duplicate_key)
             if operation == "search":
-                result: Any = self.memory.search(snapshot_id, target, limit=20)
+                bundle = self.memory.retrieve_bundle(snapshot_id, target, limit=20)
+                bundles.append(bundle)
+                result: Any = bundle.get("results", [])
             elif operation == "expand":
                 result = self.memory.expand(snapshot_id, target)
             else:
@@ -130,7 +135,8 @@ class AdaptiveMemoryResearch:
                     known_episode_ids.add(episode_id)
                 if item not in context:
                     context.append(item)
-            actions.append({**action, "state": "completed", "result_count": len(normalized)})
+            bundle_metadata = ({"bundle_id": bundle.get("bundle_id"), "versions": bundle.get("versions")} if operation == "search" else {})
+            actions.append({**action, **bundle_metadata, "state": "completed", "result_count": len(normalized)})
             last_observation = {"operation": operation, "state": "completed", "items": normalized}
             checkpoint()
 
@@ -147,6 +153,7 @@ class AdaptiveMemoryResearch:
             "snapshot": snapshot,
             "context": [value for value in context if isinstance(value, dict)],
             "actions": [value for value in actions if isinstance(value, dict)],
+            "bundles": [value for value in resume.get("bundles", []) if isinstance(value, dict)] if isinstance(resume.get("bundles", []), list) else [],
             "known_episode_ids": [str(value) for value in known if isinstance(value, str)],
             "executed": {(str(value[0]), str(value[1])) for value in executed if isinstance(value, list) and len(value) == 2},
             "last_observation": resume.get("last_observation") if isinstance(resume.get("last_observation"), dict) else None,

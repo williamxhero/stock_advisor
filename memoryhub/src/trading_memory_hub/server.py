@@ -48,6 +48,24 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
                     ).as_dict()
                 else:
                     parts = self.path.strip("/").split("/")
+                    if self.path == "/v1/retrieval/query-sets":
+                        result = hub.create_frozen_query_set(value["memory_space_id"], value["queries"])
+                        self._reply(HTTPStatus.OK, {"result": result})
+                        return
+                    if self.path == "/v1/retrieval/evaluations":
+                        result = hub.evaluate_candidate(value["query_set_id"], value["candidate"])
+                        self._reply(HTTPStatus.OK, {"result": result})
+                        return
+                    if self.path == "/v1/retrieval/promotions":
+                        result = hub.promote_candidate(value["report_id"])
+                        self._reply(HTTPStatus.OK, {"result": result})
+                        return
+                    if len(parts) == 4 and parts[:2] == ["v1", "retrieval"] and parts[2] == "audits":
+                        self._reply(HTTPStatus.OK, {"result": hub.retrieval_audit(parts[3])})
+                        return
+                    if len(parts) == 4 and parts[:2] == ["v1", "retrieval"] and parts[2] == "bundles":
+                        self._reply(HTTPStatus.OK, {"result": hub.replay_bundle(parts[3])})
+                        return
                     if len(parts) >= 3 and parts[:2] == ["v1", "memory-spaces"]:
                         parts[2] = unquote(parts[2])
                     if len(parts) == 4 and parts[:2] == ["v1", "memory-spaces"] and parts[3] == "timeline":
@@ -69,6 +87,8 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
                     snapshot_id, operation = parts[2], parts[3]
                     if operation == "search":
                         result = hub.search(snapshot_id, value.get("query", ""), limit=value.get("limit", 20))
+                    elif operation == "retrieve":
+                        result = hub.retrieve_bundle(snapshot_id, value.get("query", ""), limit=value.get("limit", 20))
                     elif operation == "expand":
                         result = hub.expand(snapshot_id, value["episode_id"])
                     elif operation == "related":

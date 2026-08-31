@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,11 +62,16 @@ class ToolManagerRuntime:
             result = {"need": self.store.transition_capability_need(str(command.get("need_id") or ""), action)}
         elif action == "disable":
             capability = str(command.get("capability") or "")
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", capability):
+                raise ValueError("invalid_tool_manager_capability")
             marker = self.tools_root / capability / "disabled.json"; marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(json.dumps({"contract": "ai-trading-tool-disabled/v1", "reason": "user_disabled", "at": _now()}), encoding="utf-8")
             result = {"capability": capability, "state": "disabled"}
         elif action == "rollback":
-            result = {"tool": ToolLifecycleManager(self.tools_root).rollback(str(command.get("capability") or ""))}
+            capability = str(command.get("capability") or "")
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", capability):
+                raise ValueError("invalid_tool_manager_capability")
+            result = {"tool": ToolLifecycleManager(self.tools_root).rollback(capability)}
         else:
             raise ValueError("unsupported_tool_manager_command")
         self.store.save_receipt(command_id, None, action, command, result)

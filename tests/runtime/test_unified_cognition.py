@@ -39,9 +39,10 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.store = CompanionStore(self.root / "runtime.sqlite3")
         calendar = _WeekdayCalendar()
+        self.memory = InMemoryMemoryAdapter()
         self.engine = CompanionEngine(
             self.store, task_profiles=ManualAnalysisProfileResolver(calendar),
-            evidence_contract_factory=EvidenceContractFactory(calendar),
+            evidence_contract_factory=EvidenceContractFactory(calendar), memory=self.memory,
         )
         self.portfolio = PortfolioService(self.root, self.store)
 
@@ -271,7 +272,7 @@ class UnifiedCognitionTests(unittest.TestCase):
         action = self._asset_action("m", message["body_text"])
         action["source_span"]["quote"] = "不在原文"
 
-        outcome = UnifiedCognition(self.store, self.portfolio).apply(
+        outcome = UnifiedCognition(self.store, self.portfolio, self.engine).apply(
             conversation, artifact, messages, "conversation",
             {"reply_markdown": "收到", "needs_fresh_search": False, "public_search_request": None, "propositions": [], "actions": [action]},
         )
@@ -292,7 +293,7 @@ class UnifiedCognitionTests(unittest.TestCase):
             "object_json": "240000", "confidence": 1.0, "supersedes_id": None,
             "source_span": {"message_id": "m", "start": 0, "end": len(text), "quote": text},
         }
-        outcome = UnifiedCognition(self.store, self.portfolio).apply(
+        outcome = UnifiedCognition(self.store, self.portfolio, self.engine).apply(
             conversation, artifact, messages, "conversation",
             {"reply_markdown": "收到", "needs_fresh_search": False, "public_search_request": None,
              "propositions": [proposition], "actions": [self._asset_action("m", text)]},
@@ -300,7 +301,7 @@ class UnifiedCognitionTests(unittest.TestCase):
 
         self.assertEqual("applied", outcome.receipts[0]["state"])
         self.assertEqual(240000, self.portfolio.snapshot()["total_assets"])
-        self.assertEqual(1, len(self.store.current_propositions(datetime.now(timezone.utc).isoformat())))
+        self.assertEqual(1, len([row for row in self.memory._episodes if row["episode_type"] == "personal_fact"]))
         with self.store.connection() as connection:
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM portfolio_interpretation_job").fetchone()[0])
 
@@ -482,12 +483,12 @@ class UnifiedCognitionTests(unittest.TestCase):
         first = {"kind": "user_fact", "subject": "user", "predicate": "style", "object_json": '"短线"',
                  "confidence": 1.0, "supersedes_id": None,
                  "source_span": {"message_id": "first", "start": 0, "end": len(first_text), "quote": first_text}}
-        UnifiedCognition(self.store, self.portfolio).apply(
+        UnifiedCognition(self.store, self.portfolio, self.engine).apply(
             conversation, first_artifact, first_messages, "conversation",
             {"reply_markdown": "记住了", "needs_fresh_search": False, "public_search_request": None,
              "propositions": [first], "actions": []},
         )
-        prior = self.store.current_propositions(datetime.now(timezone.utc).isoformat())[0]
+        prior = self.memory._episodes[-1]["metadata"]
         second_text = "更正：我偏好长线"
         self.store.stage_message(conversation["cycle_id"], second_text, "conversation", message_id="second")
         second_batch, second_messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
@@ -498,15 +499,15 @@ class UnifiedCognitionTests(unittest.TestCase):
                      "confidence": 1.0, "supersedes_id": prior["proposition_id"],
                      "source_span": {"message_id": "second", "start": 0, "end": len(second_text), "quote": second_text}}
 
-        UnifiedCognition(self.store, self.portfolio).apply(
+        UnifiedCognition(self.store, self.portfolio, self.engine).apply(
             conversation, second_artifact, second_messages, "conversation",
             {"reply_markdown": "已更正", "needs_fresh_search": False, "public_search_request": None,
              "propositions": [corrected], "actions": []},
         )
 
-        current = self.store.current_propositions(datetime.now(timezone.utc).isoformat())
-        self.assertEqual(1, len(current))
-        self.assertEqual("长线", json.loads(current[0]["object_json"]))
+        episodes = [row for row in self.memory._episodes if row["episode_type"] == "personal_fact"]
+        self.assertEqual(2, len(episodes))
+        self.assertIn("style", episodes[-1]["body"])
 
     @staticmethod
     def _asset_action(message_id: str, text: str) -> dict:

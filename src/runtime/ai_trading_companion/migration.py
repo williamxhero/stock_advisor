@@ -112,8 +112,7 @@ class LegacyMigrator:
                 "portfolio_change_proposal", "portfolio_interpretation_job", "portfolio_render_intent",
                 "portfolio_meta", "portfolio_outbox", "knowledge_change_proposal", "llm_attempt",
                 "companion_research_job", "evidence_ledger_entry", "judgment_snapshot", "outcome_checkpoint",
-                "memory_index_entry", "memory_retrieval_audit", "memory_index_intent", "memory_backup",
-                "memory_recovery_quarantine", "workflow_policy", "timing_policy", "ai_risk_doctrine",
+                "memory_backup", "workflow_policy", "timing_policy", "ai_risk_doctrine",
                 "market_regime_snapshot", "router_policy_cell", "cognitive_route_decision", "router_shadow_job",
                 "router_evaluation", "evolution_hypothesis", "legacy_import_record",
             ]

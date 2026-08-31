@@ -179,14 +179,6 @@ class CompanionStore:
               action_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES companion_cognition_job(job_id),
               action_type TEXT NOT NULL, state TEXT NOT NULL, payload_sha256 TEXT NOT NULL,
               result_json TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS memory_proposition (
-              proposition_id TEXT PRIMARY KEY, subject TEXT NOT NULL, predicate TEXT NOT NULL,
-              object_json TEXT NOT NULL, proposition_kind TEXT NOT NULL, status TEXT NOT NULL,
-              confidence REAL, source_message_id TEXT NOT NULL REFERENCES companion_message(message_id),
-              source_start INTEGER NOT NULL, source_end INTEGER NOT NULL, source_quote TEXT NOT NULL,
-              known_at TEXT NOT NULL, supersedes_id TEXT, tombstoned_at TEXT, created_at TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS ix_memory_proposition_current
-              ON memory_proposition(subject,predicate,status,known_at);
             CREATE TABLE IF NOT EXISTS conversation_auto_submit_claim (
               task_key TEXT NOT NULL, scheduled_for TEXT NOT NULL, conversation_cycle_id TEXT NOT NULL,
               batch_id TEXT, claimed_at TEXT NOT NULL,
@@ -215,25 +207,10 @@ class CompanionStore:
               created_at TEXT NOT NULL, due_at TEXT, status TEXT NOT NULL DEFAULT 'pending',
               result_artifact_id TEXT, error TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
               UNIQUE(snapshot_id,horizon));
-            CREATE TABLE IF NOT EXISTS memory_index_entry (
-              artifact_id TEXT PRIMARY KEY, known_at TEXT NOT NULL,
-              tags_json TEXT NOT NULL, indexed_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS memory_retrieval_audit (
-              retrieval_id TEXT PRIMARY KEY, task_key TEXT NOT NULL, query_text TEXT NOT NULL,
-              known_at TEXT NOT NULL, selected_artifact_ids_json TEXT NOT NULL,
-              created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS memory_index_intent (
-              intent_id TEXT PRIMARY KEY, origin_type TEXT NOT NULL, origin_id TEXT NOT NULL,
-              content_sha256 TEXT NOT NULL, known_at TEXT NOT NULL, state TEXT NOT NULL,
-              created_at TEXT NOT NULL, completed_at TEXT, error TEXT,
-              UNIQUE(origin_type, origin_id, content_sha256));
             CREATE TABLE IF NOT EXISTS memory_backup (
               backup_id TEXT PRIMARY KEY, path TEXT NOT NULL, sha256 TEXT NOT NULL,
               database_kind TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL,
               verified_at TEXT, error TEXT);
-            CREATE TABLE IF NOT EXISTS memory_recovery_quarantine (
-              quarantine_id TEXT PRIMARY KEY, source_path TEXT NOT NULL, record_type TEXT NOT NULL,
-              record_id TEXT, reason TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workflow_policy (
               policy_key TEXT PRIMARY KEY, policy_json TEXT NOT NULL, revision INTEGER NOT NULL,
               previous_policy_json TEXT, updated_at TEXT NOT NULL);
@@ -452,16 +429,6 @@ class CompanionStore:
             }.items():
                 if name not in cycle_columns:
                     c.execute(f"ALTER TABLE companion_cycle ADD COLUMN {name} {declaration}")
-            # v8 migration/backfill: existing immutable facts predate intents.
-            # Deterministic IDs make this safe on every startup and avoid losing
-            # the user's historical formal reasoning after the physical split.
-            c.execute("""INSERT OR IGNORE INTO memory_index_intent(intent_id,origin_type,origin_id,content_sha256,known_at,state,created_at)
-                         SELECT 'artifact:' || artifact_id || ':' || body_sha256,'artifact',artifact_id,body_sha256,COALESCE(known_at,sealed_at),'pending',?
-                         FROM narrative_artifact
-                         WHERE kind IN ('pre_m0','h0','m0','m1','m2','outcome','reflection','chat_human','ai_chat','premarket_chat')""", (now(),))
-            c.execute("""INSERT OR IGNORE INTO memory_index_intent(intent_id,origin_type,origin_id,content_sha256,known_at,state,created_at)
-                         SELECT 'evidence:' || evidence_id || ':' || COALESCE(content_sha256,''),'evidence',evidence_id,COALESCE(content_sha256,''),known_at,'pending',?
-                         FROM evidence_ledger_entry""", (now(),))
             # v9 migration/backfill: historical cycles were created before
             # templates had identities.  Default template keys deliberately
             # retain the former task keys, which makes this deterministic and
@@ -941,17 +908,6 @@ class CompanionStore:
                  json.dumps(metadata,ensure_ascii=False,sort_keys=True),occurred_at or sealed,known_at or sealed),
             )
             c.execute("INSERT INTO narrative_fts(artifact_id,cycle_id,kind,body_markdown) VALUES(?,?,?,?)", (artifact_id,cycle_id,kind,body))
-            if kind in {"pre_m0", "h0", "m1", "m2", "outcome", "reflection", "m0", "chat_human", "ai_chat", "premarket_chat"}:
-                c.execute(
-                    "INSERT OR REPLACE INTO memory_index_entry(artifact_id,known_at,tags_json,indexed_at) VALUES(?,?,?,?)",
-                    (artifact_id, known_at or sealed, json.dumps(metadata.get("memory_tags", []), ensure_ascii=False), sealed),
-                )
-                c.execute(
-                    """INSERT OR IGNORE INTO memory_index_intent(
-                         intent_id,origin_type,origin_id,content_sha256,known_at,state,created_at)
-                       VALUES(?,?,?,?,?,'pending',?)""",
-                    (str(uuid.uuid4()), "artifact", artifact_id, digest(body), known_at or sealed, sealed),
-                )
             result["revision"] = revision
         result: dict[str, Any] = {}
         if connection is not None:
@@ -1120,56 +1076,6 @@ class CompanionStore:
             )
             row = c.execute("SELECT * FROM companion_action_receipt WHERE action_id=?", (action_id,)).fetchone()
         return dict(row)
-
-    def record_proposition(self, proposition_id: str, proposition: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
-        span = proposition["source_span"]
-        supersedes_id = proposition.get("supersedes_id")
-        at = now()
-        with self.connection() as c:
-            if supersedes_id:
-                superseded = c.execute(
-                    "SELECT subject,predicate,status FROM memory_proposition WHERE proposition_id=?",
-                    (supersedes_id,),
-                ).fetchone()
-                if not superseded or superseded["status"] != "active" or superseded["subject"] != proposition["subject"] or superseded["predicate"] != proposition["predicate"]:
-                    raise ValueError("superseded proposition must be the active version of the same subject and predicate")
-                c.execute("UPDATE memory_proposition SET status='superseded' WHERE proposition_id=?", (supersedes_id,))
-            c.execute(
-                """INSERT OR IGNORE INTO memory_proposition(
-                     proposition_id,subject,predicate,object_json,proposition_kind,status,confidence,
-                     source_message_id,source_start,source_end,source_quote,known_at,supersedes_id,created_at)
-                   VALUES(?,?,?,?,?,'active',?,?,?,?,?,?,?,?)""",
-                (proposition_id, proposition["subject"], proposition["predicate"],
-                 json.dumps(proposition.get("object"), ensure_ascii=False, sort_keys=True), proposition["kind"],
-                 proposition.get("confidence"), message["message_id"], int(span["start"]), int(span["end"]),
-                 span["quote"], message["known_at"], supersedes_id, at),
-            )
-            row = c.execute("SELECT * FROM memory_proposition WHERE proposition_id=?", (proposition_id,)).fetchone()
-        return dict(row)
-
-    def current_propositions(self, known_at: str, *, exclude_cycle_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        exclusion = "AND m.cycle_id!=?" if exclude_cycle_id else ""
-        values: list[Any] = [known_at]
-        if exclude_cycle_id:
-            values.append(exclude_cycle_id)
-        values.append(limit)
-        with self.connection() as c:
-            return [dict(row) for row in c.execute(
-                f"""SELECT p.* FROM memory_proposition p
-                   JOIN companion_message m ON m.message_id=p.source_message_id
-                   WHERE p.status='active' AND p.tombstoned_at IS NULL AND p.known_at<=? {exclusion}
-                   ORDER BY p.known_at DESC,p.created_at DESC LIMIT ?""",
-                values,
-            )]
-
-    def active_proposition(self, subject: str, predicate: str) -> dict[str, Any] | None:
-        with self.connection() as c:
-            row = c.execute(
-                """SELECT * FROM memory_proposition WHERE subject=? AND predicate=?
-                   AND status='active' AND tombstoned_at IS NULL ORDER BY known_at DESC,created_at DESC LIMIT 1""",
-                (subject, predicate),
-            ).fetchone()
-        return dict(row) if row else None
 
     def get_message(self, message_id: str) -> dict[str, Any]:
         with self.connection() as c:
@@ -1735,12 +1641,6 @@ class CompanionStore:
                 ).rowcount
                 if changed:
                     inserted.append(evidence_id)
-                    c.execute(
-                        """INSERT OR IGNORE INTO memory_index_intent(
-                             intent_id,origin_type,origin_id,content_sha256,known_at,state,created_at)
-                           VALUES(?,?,?,?,?,'pending',?)""",
-                        (str(uuid.uuid4()), "evidence", evidence_id, fingerprint, known_at, now()),
-                    )
                 c.execute(
                     """INSERT OR IGNORE INTO evidence_cycle_use(cycle_id,evidence_id,stage,used_at)
                        VALUES(?,?,?,?)""",
@@ -1764,12 +1664,6 @@ class CompanionStore:
                 ).rowcount
                 if changed:
                     inserted.append(evidence_id)
-                    c.execute(
-                        """INSERT OR IGNORE INTO memory_index_intent(
-                             intent_id,origin_type,origin_id,content_sha256,known_at,state,created_at)
-                           VALUES(?,?,?,?,?,'pending',?)""",
-                        (str(uuid.uuid4()), "evidence", evidence_id, fingerprint, known_at, now()),
-                    )
                 c.execute(
                     """INSERT OR IGNORE INTO evidence_cycle_use(cycle_id,evidence_id,stage,used_at)
                        VALUES(?,?,?,?)""",

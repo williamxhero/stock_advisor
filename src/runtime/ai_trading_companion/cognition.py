@@ -183,7 +183,7 @@ class UnifiedCognition:
                 continue
             proposition_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{job['job_id']}:proposition:{index}:{digest(json.dumps(parsed, ensure_ascii=False, sort_keys=True))}"))
             try:
-                self.store.record_proposition(proposition_id, parsed, message)
+                self._record_proposition(proposition_id, parsed, message, cycle["cycle_id"])
                 propositions_recorded += 1
             except ValueError:
                 continue
@@ -192,7 +192,7 @@ class UnifiedCognition:
             candidate for message in messages
             for candidate in (
                 explicit_expression_preference(
-                    message, self.store.active_proposition("user.expression", "expression.material_density"),
+                    message, None,
                 ),
                 user_method_claim(message),
             )
@@ -205,7 +205,7 @@ class UnifiedCognition:
                 f"{job['job_id']}:deterministic-learning:{index}:{digest(json.dumps(proposition, ensure_ascii=False, sort_keys=True))}",
             ))
             try:
-                self.store.record_proposition(proposition_id, proposition, message)
+                self._record_proposition(proposition_id, proposition, message, cycle["cycle_id"])
                 propositions_recorded += 1
             except ValueError:
                 continue
@@ -244,6 +244,25 @@ class UnifiedCognition:
             job["job_id"], reply, tuple(receipts), propositions_recorded,
             saved["needs_fresh_search"], saved["public_search_request"],
         )
+
+    def _record_proposition(self, proposition_id: str, proposition: dict[str, Any], message: dict[str, Any], cycle_id: str) -> None:
+        if self.engine is None or self.engine.memory is None:
+            raise RuntimeError("MemoryHub is required to record long-term personal facts")
+        known_at = str(message.get("known_at") or message.get("submitted_at") or message["staged_at"])
+        body = json.dumps({
+            "subject": proposition["subject"], "predicate": proposition["predicate"],
+            "object": proposition.get("object"), "kind": proposition["kind"],
+            "source_quote": proposition["source_span"]["quote"],
+        }, ensure_ascii=False, sort_keys=True)
+        self.engine.memory.append({
+            "memory_space_id": self.engine.memory_space_id, "source_system": "stock-advisor",
+            "source_event_id": proposition_id, "content_hash": "auto",
+            "episode_type": "personal_fact" if proposition["kind"] in {"user_fact", "expression_preference"} else "proposition",
+            "body": body, "occurred_at": str(message.get("occurred_at") or known_at),
+            "known_at": known_at, "submitted_at": known_at,
+            "authority": "user_private_fact", "protocol_version": "memoryhub/v1",
+            "metadata": {"proposition_id": proposition_id, "cycle_id": cycle_id, "source_message_id": message["message_id"], "supersedes_id": proposition.get("supersedes_id")},
+        })
 
     @staticmethod
     def _validated_source_span(

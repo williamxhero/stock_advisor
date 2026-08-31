@@ -16,6 +16,10 @@ from ai_trading_companion.exchange import LocalExchange
 from ai_trading_companion.memory_port import HttpMemoryAdapter
 from ai_trading_companion.portfolio import PortfolioService
 from ai_trading_companion.store import CompanionStore
+from ai_trading_companion.memory_evidence import MemoryEvidenceRegistrar
+from ai_trading_companion.web_access_gateway import WebAccessGatewayClient
+from ai_trading_companion.config import load_settings
+from ai_trading_companion.paths import RuntimePaths
 
 
 @unittest.skipUnless(
@@ -23,6 +27,42 @@ from ai_trading_companion.store import CompanionStore
     "set AI_TRADING_COMPANION_RUN_MEMORYHUB_INTEGRATION=1 for the deployed-service acceptance",
 )
 class RealMemoryHubChatIntegrationTests(unittest.TestCase):
+    def test_cross_source_receipts_are_visible_only_after_a_new_snapshot(self) -> None:
+        memory = HttpMemoryAdapter(os.environ.get("MEMORYHUB_URL", "http://yosef-server:8820"))
+        space = f"stock-advisor-issue-61-{uuid.uuid4()}"
+        now = "2026-09-01T12:00:00Z"
+        try:
+            market = memory.append({
+                "memory_space_id": space, "source_system": "markethub", "source_event_id": "market-600000-2026-08-28",
+                "content_hash": "auto", "episode_type": "external_evidence",
+                "source_reference": {"source_system": "markethub", "record_type": "stock_quote_1d", "date": "2026-08-28", "code": "600000"},
+                "occurred_at": "2026-08-28T00:00:00Z", "known_at": now, "submitted_at": now,
+                "authority": "immutable_source_reference", "protocol_version": "memoryhub/v1",
+            })
+            archive = memory.append({
+                "memory_space_id": space, "source_system": "8815", "source_event_id": "cninfo-1225539198",
+                "content_hash": "auto", "episode_type": "external_evidence",
+                "source_reference": {"source_system": "8815", "record_type": "cninfo_disclosure", "date": "2026-09-01", "code": "600337", "event_id": "1225539198"},
+                "occurred_at": "2026-09-01T00:00:00Z", "known_at": now, "submitted_at": now,
+                "authority": "immutable_source_reference", "protocol_version": "memoryhub/v1",
+            })
+            snapshot = memory.begin_snapshot({"memory_space_id": space, "as_of": now, "stage": "chat", "cycle_id": "issue-61"})
+            self.assertTrue(memory.expand(snapshot["snapshot_id"], market["episode_id"])["body"])
+            self.assertTrue(memory.expand(snapshot["snapshot_id"], archive["episode_id"])["body"])
+            gateway = WebAccessGatewayClient(load_settings(RuntimePaths.discover().home).research)
+            row = next(item for item in gateway.search("A股 市场风险", "news")["results"] if item.get("url") and item.get("excerpt_text"))
+            web = MemoryEvidenceRegistrar(memory, clock=lambda: now).register_web_snapshot(
+                memory_space_id=space, source_event_id="wag-fixed-issue-61", url=row["url"], title=row.get("title", ""),
+                body=row["excerpt_text"], occurred_at=row.get("published_at") or row.get("fact_as_of") or now,
+            )
+            self.assertTrue(web.episode_id)
+            self.assertEqual(web.episode_id, web.context["memory_episode_id"])
+        finally:
+            exported = memory.export_space(space)
+            prepared = memory.prepare_clear(space, exported["export_sha256"])
+            memory.clear_space(space, prepared["confirmation_token"])
+            self.assertEqual([], memory.timeline(space))
+
     def test_real_memoryhub_chat_projects_only_the_final_reply_to_exchange(self) -> None:
         memory = HttpMemoryAdapter(os.environ.get("MEMORYHUB_URL", "http://yosef-server:8820"))
         space = f"stock-advisor-issue-60-{uuid.uuid4()}"

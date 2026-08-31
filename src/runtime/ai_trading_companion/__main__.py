@@ -32,6 +32,7 @@ from .message_presentation import explicit_format_requested
 from .memory_commands import handle_memory_command
 from .memory_port import HttpMemoryAdapter, MemoryUnavailable
 from .memory_health import MemoryCapabilityPolicy
+from .memory_evidence import MemoryEvidenceRegistrar
 from .migration import LegacyMigrator, LegacySources
 from .models import TASK_POLICIES
 from .observatory import EvaluationObservatory, EvaluationRequest, ExperimentRequest, ForecastRequest
@@ -1456,6 +1457,54 @@ def _next_memory_research_action(
     return outcome.result
 
 
+def _discover_chat_external_evidence(
+    engine: CompanionEngine, action: dict[str, Any], snapshot: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Acquire WAG material only through a MemoryHub receipt before context use."""
+    client = WebAccessGatewayClient(load_settings(PATHS.home).research)
+    operation = action["operation"]
+    if operation == "web_search":
+        response = client.search(str(action["query"]), "news")
+    elif operation == "web_read":
+        response = client.read(str(action["url"]), not_after=None)
+    else:
+        reference = dict(action["source_reference"] or {})
+        now = iso(datetime.now(timezone.utc))
+        receipt = engine.memory.append({
+            "memory_space_id": engine.memory_space_id,
+            "source_system": "markethub" if operation == "markethub_quote" else "8815",
+            "source_event_id": "chat:" + str(snapshot["snapshot_id"]) + ":" + hashlib.sha256(json.dumps(reference, sort_keys=True).encode("utf-8")).hexdigest(),
+            "content_hash": "auto", "episode_type": "external_evidence", "source_reference": reference,
+            "occurred_at": str(reference.get("date") or now), "known_at": now, "submitted_at": now,
+            "authority": "immutable_source_reference", "protocol_version": "memoryhub/v1",
+        })
+        receipt_snapshot = engine.memory.begin_snapshot({
+            "memory_space_id": engine.memory_space_id, "as_of": now, "stage": "chat", "cycle_id": snapshot.get("cycle_id"),
+        })
+        expanded = engine.memory.expand(str(receipt_snapshot["snapshot_id"]), str(receipt["episode_id"]))
+        return [{**expanded, "memory_snapshot_id": receipt_snapshot["snapshot_id"], "memory_receipt": receipt}]
+    registered: list[dict[str, Any]] = []
+    registrar = MemoryEvidenceRegistrar(engine.memory, clock=lambda: iso(datetime.now(timezone.utc)))
+    for index, row in enumerate(response.get("results") or []):
+        if not isinstance(row, dict):
+            continue
+        body = str(row.get("excerpt_text") or "")
+        url = str(row.get("url") or "")
+        if not body or not url:
+            continue
+        known = registrar.register_web_snapshot(
+            memory_space_id=engine.memory_space_id,
+            source_event_id=f"chat:{snapshot['snapshot_id']}:{operation}:{index}:{hashlib.sha256(url.encode('utf-8')).hexdigest()}",
+            url=url, title=str(row.get("title") or url), body=body,
+            occurred_at=str(row.get("published_at") or row.get("fact_as_of") or iso(datetime.now(timezone.utc))),
+        )
+        registered.append({
+            **known.context, "episode_id": known.episode_id, "authority": "mutable_source_snapshot",
+            "occurred_at": row.get("published_at") or row.get("fact_as_of"), "source_reference": {"url": url},
+        })
+    return registered
+
+
 def run_unified_cognition(
     engine: CompanionEngine,
     store: CompanionStore,
@@ -1616,6 +1665,7 @@ def run_chat(
             engine.memory,
             engine.memory_space_id,
             lambda state: _next_memory_research_action(store, cycle, state, deadline),
+            discover_external=lambda action, snapshot: _discover_chat_external_evidence(engine, action, snapshot),
         ).collect(cycle_id, messages, deadline=deadline)
         memory_context = list(memory_result.context)
         memory_research = {

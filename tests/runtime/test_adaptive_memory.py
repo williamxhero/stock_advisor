@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from ai_trading_companion.__main__ import run_chat
+from ai_trading_companion.__main__ import _discover_chat_external_evidence, run_chat
 from ai_trading_companion.adaptive_memory import AdaptiveMemoryResearch
 from ai_trading_companion.broker_client import BrokerResponse
 from ai_trading_companion.engine import CompanionEngine
@@ -116,6 +116,38 @@ class AdaptiveMemoryResearchTests(unittest.TestCase):
                 saved = json.loads(connection.execute("SELECT result_json FROM companion_cognition_job").fetchone()[0])
             self.assertEqual("test-snapshot-1", saved["memory_research"]["snapshot"]["snapshot_id"])
             self.assertIn("test-episode-1", saved["memory_research"]["episode_ids"])
+
+    def test_external_discovery_enters_chat_only_after_memoryhub_receipt(self) -> None:
+        memory = _RecordingMemory()
+        seen: list[dict[str, object]] = []
+
+        def external(action: dict[str, object], _snapshot: dict[str, object]) -> list[dict[str, object]]:
+            seen.append(action)
+            receipt = memory.append(_episode("test-space", "web-1", "widely discussed risk", "2026-08-20T00:00:00Z"))
+            return [{"episode_id": receipt["episode_id"], "text": "widely discussed risk", "memory_receipt": receipt}]
+
+        decisions = iter([
+            {"operation": "web_search", "query": "market risk rumor", "episode_id": None, "url": None},
+            {"operation": "complete", "query": None, "episode_id": None, "url": None},
+        ])
+        result = AdaptiveMemoryResearch(memory, "test-space", lambda _state: next(decisions), discover_external=external).collect(
+            "cycle", [{"message_id": "m", "body_text": "risk", "known_at": "2026-08-20T00:00:00Z"}], deadline=float("inf"),
+        )
+
+        self.assertEqual("market risk rumor", seen[0]["query"])
+        self.assertEqual("test-episode-1", result.context[0]["episode_id"])
+
+    def test_stable_source_reference_is_receipted_then_expanded_from_a_new_snapshot(self) -> None:
+        memory = _RecordingMemory()
+        engine = type("Engine", (), {"memory": memory, "memory_space_id": "test-space"})()
+        action = {"operation": "markethub_quote", "source_reference": {
+            "source_system": "markethub", "record_type": "stock_quote_1d", "date": "2026-08-20", "code": "600000",
+        }}
+        with patch("ai_trading_companion.__main__.WebAccessGatewayClient"):
+            # The in-memory adapter accepts the protocol shape; production hydration is covered by MemoryHub itself.
+            rows = _discover_chat_external_evidence(engine, action, {"snapshot_id": "s", "cycle_id": "cycle"})
+        self.assertEqual("immutable_source_reference", rows[0]["authority"])
+        self.assertIn("memory_snapshot_id", rows[0])
 
 
 def _response(result: dict[str, object]) -> BrokerResponse:

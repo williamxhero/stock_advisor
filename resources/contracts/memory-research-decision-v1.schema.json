@@ -2,10 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["operation", "query", "episode_id"],
+  "required": ["operation", "query", "episode_id", "url", "source_reference"],
   "properties": {
-    "operation": {"enum": ["search", "expand", "related", "complete"]},
+    "operation": {"enum": ["search", "expand", "related", "web_search", "web_read", "markethub_quote", "archive_article", "complete"]},
     "query": {"type": ["string", "null"]},
-    "episode_id": {"type": ["string", "null"]}
+    "episode_id": {"type": ["string", "null"]},
+    "url": {"type": ["string", "null"]},
+    "source_reference": {"type": ["object", "null"]}
   }
 }

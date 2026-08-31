@@ -31,11 +31,13 @@ class AdaptiveMemoryResearch:
     def __init__(
         self, memory: MemoryPort, memory_space_id: str,
         decide: Callable[[dict[str, Any]], dict[str, Any]], *,
+        discover_external: Callable[[dict[str, Any], dict[str, Any]], list[dict[str, Any]]] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.memory = memory
         self.memory_space_id = memory_space_id
         self.decide = decide
+        self.discover_external = discover_external
         self.monotonic = monotonic
 
     def collect(
@@ -77,6 +79,16 @@ class AdaptiveMemoryResearch:
             if operation == "complete":
                 actions.append(action)
                 return MemoryResearchResult(snapshot, tuple(context), tuple(actions))
+
+            if operation in {"web_search", "web_read", "markethub_quote", "archive_article"}:
+                if self.discover_external is None:
+                    raise MemoryResearchError("external discovery is unavailable for this chat")
+                rows = self.discover_external(action, snapshot)
+                normalized = [self._context_item(operation, item) for item in rows if isinstance(item, dict)]
+                context.extend(item for item in normalized if item not in context)
+                actions.append({**action, "state": "completed", "result_count": len(normalized)})
+                last_observation = {"operation": operation, "state": "completed", "items": normalized}
+                continue
 
             target = str(action["query"] if operation == "search" else action["episode_id"])
             duplicate_key = (operation, target)
@@ -120,7 +132,7 @@ class AdaptiveMemoryResearch:
         if not isinstance(value, dict):
             raise MemoryResearchError("memory research decision is not an object")
         operation = str(value.get("operation") or "")
-        if operation not in {"search", "expand", "related", "complete"}:
+        if operation not in {"search", "expand", "related", "web_search", "web_read", "markethub_quote", "archive_article", "complete"}:
             raise MemoryResearchError("memory research selected an unsupported operation")
         query = value.get("query")
         episode_id = value.get("episode_id")
@@ -130,10 +142,22 @@ class AdaptiveMemoryResearch:
             raise MemoryResearchError("memory search query is empty")
         if operation in {"expand", "related"} and (not isinstance(episode_id, str) or not episode_id.strip()):
             raise MemoryResearchError(f"memory {operation} requires an episode_id")
+        url = value.get("url")
+        if operation == "web_search" and (not isinstance(query, str) or not query.strip()):
+            raise MemoryResearchError("web search requires a query")
+        if operation == "web_read" and (not isinstance(url, str) or not url.startswith(("http://", "https://"))):
+            raise MemoryResearchError("web read requires an http(s) url")
+        source_reference = value.get("source_reference")
+        if operation == "markethub_quote" and (not isinstance(source_reference, dict) or source_reference.get("source_system") != "markethub"):
+            raise MemoryResearchError("MarketHub discovery requires a markethub source_reference")
+        if operation == "archive_article" and (not isinstance(source_reference, dict) or source_reference.get("source_system") != "8815"):
+            raise MemoryResearchError("8815 discovery requires an 8815 source_reference")
         return {
             "operation": operation,
             "query": query.strip() if isinstance(query, str) else None,
             "episode_id": episode_id.strip() if isinstance(episode_id, str) else None,
+            "url": url.strip() if isinstance(url, str) else None,
+            "source_reference": source_reference if isinstance(source_reference, dict) else None,
         }
 
     @staticmethod

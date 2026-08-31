@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Callable
+from datetime import datetime
 
 from .memory_port import MemoryPort
 
@@ -106,8 +107,9 @@ class MemoryHubMigrator:
                     f"evidence:{item['evidence_id']}", str(item["body_text"]), "evidence",
                     item.get("occurred_at") or at, at, provenance,
                     {"original_id": item["evidence_id"], "cycle_id": item.get("cycle_id"), "stage": item.get("stage"), **metadata},
-                    source_hash=item.get("content_sha256"),
+                    source_hash=None,
                 )))
+                output[-1][1]["metadata"]["legacy_content_sha256"] = item.get("content_sha256")
         if "memory_proposition" in tables:
             for row in connection.execute("SELECT * FROM memory_proposition ORDER BY known_at,created_at,proposition_id"):
                 item = dict(row); at, provenance = known(item.get("known_at"))
@@ -139,12 +141,24 @@ class MemoryHubMigrator:
         return output
 
     def _episode(self, source_event_id: str, body: str, episode_type: str, occurred_at: str, known_at: str, provenance: str, metadata: dict[str, Any], *, source_hash: Any = None) -> dict[str, Any]:
+        original_occurred_at = str(occurred_at)
+        try:
+            parsed = datetime.fromisoformat(original_occurred_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("timezone required")
+            normalized_occurred_at = original_occurred_at
+            occurred_provenance = "source"
+        except ValueError:
+            normalized_occurred_at = self.migrated_at
+            occurred_provenance = "migration_time"
         return {
             "memory_space_id": self.memory_space_id, "source_system": "stock-advisor-migration",
             "source_event_id": source_event_id, "episode_type": episode_type,
-            "occurred_at": str(occurred_at), "known_at": known_at, "submitted_at": self.migrated_at,
+            "occurred_at": normalized_occurred_at, "known_at": known_at, "submitted_at": self.migrated_at,
             "authority": "migrated_legacy_record", "protocol_version": "memoryhub/v1",
-            "metadata": {**metadata, "known_at_provenance": provenance}, "source_hash": source_hash, "body": body,
+            "metadata": {**metadata, "known_at_provenance": provenance, "occurred_at_provenance": occurred_provenance,
+                         **({"legacy_occurred_at": original_occurred_at} if occurred_provenance == "migration_time" else {})},
+            "source_hash": source_hash, "body": body,
         }
 
 

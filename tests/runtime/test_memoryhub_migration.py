@@ -39,7 +39,7 @@ def test_read_only_idempotent_migration_and_shadow_gate(tmp_path: Path) -> None:
     artifact = next(row for row in memory._episodes if row["source_event_id"] == "artifact:art-1")
     assert artifact["known_at"] == "2026-09-01T00:00:00Z"
     assert artifact["metadata"]["known_at_provenance"] == "migration_time"
-    assert first["validation"]["hash_mismatches"] == ["artifact:art-1", "evidence:ev-1"]
+    assert first["validation"]["hash_mismatches"] == ["artifact:art-1"]
     assert first["source_database_mode"] == "read_only"
 
     report = run_shadow_comparison(

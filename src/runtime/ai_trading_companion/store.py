@@ -1289,10 +1289,41 @@ class CompanionStore:
 
     def terminate_chat_research(self, cycle_id: str) -> dict[str, Any]:
         with self.connection() as c:
+            row = c.execute("SELECT research_json FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
             job = c.execute("SELECT result_json FROM companion_cognition_job WHERE cycle_id=? AND result_json IS NOT NULL ORDER BY completed_at DESC LIMIT 1", (cycle_id,)).fetchone()
-            c.execute("INSERT OR IGNORE INTO companion_chat_control(cycle_id,terminated_at,research_json) VALUES(?,?,?)", (cycle_id, now(), job["result_json"] if job else None))
+            research_json = row["research_json"] if row and row["research_json"] else job["result_json"] if job else None
+            c.execute(
+                """INSERT INTO companion_chat_control(cycle_id,terminated_at,research_json) VALUES(?,?,?)
+                   ON CONFLICT(cycle_id) DO UPDATE SET
+                     terminated_at=excluded.terminated_at,
+                     resumed_at=NULL,
+                     research_json=COALESCE(companion_chat_control.research_json, excluded.research_json)""",
+                (cycle_id, now(), research_json),
+            )
             row = c.execute("SELECT * FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
         return dict(row)
+
+    def save_chat_research_checkpoint(
+        self, cycle_id: str, source_artifact_id: str, batch_ids: list[str], checkpoint: dict[str, Any],
+    ) -> None:
+        payload = {"source_artifact_id": source_artifact_id, "batch_ids": batch_ids, "checkpoint": checkpoint}
+        with self.connection() as c:
+            c.execute(
+                """INSERT INTO companion_chat_control(cycle_id,research_json) VALUES(?,?)
+                   ON CONFLICT(cycle_id) DO UPDATE SET research_json=excluded.research_json""",
+                (cycle_id, json.dumps(payload, ensure_ascii=False, sort_keys=True)),
+            )
+
+    def resumed_chat_research_checkpoint(self, cycle_id: str, source_artifact_id: str) -> dict[str, Any] | None:
+        with self.connection() as c:
+            row = c.execute("SELECT resumed_at,research_json FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+        if not row or not row["resumed_at"] or not row["research_json"]:
+            return None
+        try:
+            value = json.loads(row["research_json"])
+        except json.JSONDecodeError:
+            return None
+        return value if value.get("source_artifact_id") == source_artifact_id else None
 
     def chat_research_terminated(self, cycle_id: str) -> bool:
         with self.connection() as c:
@@ -1301,9 +1332,17 @@ class CompanionStore:
 
     def continue_chat_research(self, cycle_id: str) -> dict[str, Any]:
         with self.connection() as c:
-            c.execute("UPDATE companion_chat_control SET resumed_at=? WHERE cycle_id=? AND terminated_at IS NOT NULL", (now(), cycle_id))
+            continued = c.execute(
+                "UPDATE companion_chat_control SET resumed_at=? WHERE cycle_id=? AND terminated_at IS NOT NULL AND resumed_at IS NULL",
+                (now(), cycle_id),
+            ).rowcount == 1
             row = c.execute("SELECT * FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
-        return dict(row) if row else {"cycle_id": cycle_id, "state": "not_terminated"}
+        if not row:
+            return {"cycle_id": cycle_id, "state": "not_terminated"}
+        result = dict(row)
+        result["state"] = "resumed" if result.get("resumed_at") else "not_terminated"
+        result["continued_now"] = continued
+        return result
 
     def start_stream_message(self, cycle_id: str, batch_ids: list[str], kind: str) -> dict[str, Any]:
         stream_id = str(uuid.uuid4())

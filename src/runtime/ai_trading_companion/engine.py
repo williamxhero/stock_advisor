@@ -388,7 +388,8 @@ class CompanionEngine:
                 self.emit(cycle, "chat.research.terminated", {"cycle": cycle, "state": result})
             elif typ == "continue_chat_research":
                 result = self.store.continue_chat_research(cycle_id)
-                self.emit(cycle, "chat.research.continued", {"cycle": cycle, "state": result})
+                if result.get("continued_now"):
+                    self.emit(cycle, "chat.research.continued", {"cycle": cycle, "state": result})
             else:
                 raise ValueError(f"unsupported command: {typ}")
         self.store.save_receipt(command["command_id"], cycle_id, typ, command, result)

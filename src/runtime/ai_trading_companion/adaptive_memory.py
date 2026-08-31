@@ -42,44 +42,57 @@ class AdaptiveMemoryResearch:
 
     def collect(
         self, cycle_id: str, messages: list[dict[str, Any]], *, deadline: float, stage: str = "chat",
+        resume: dict[str, Any] | None = None,
+        on_checkpoint: Callable[[dict[str, Any]], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> MemoryResearchResult:
         if not messages:
             raise MemoryResearchError("memory research requires submitted messages")
+        restored = self._restore(resume, cycle_id, stage)
         as_of = max(str(message["known_at"]) for message in messages)
-        snapshot = self.memory.begin_snapshot({
-            "memory_space_id": self.memory_space_id,
-            "as_of": as_of,
-            "stage": stage,
-            "cycle_id": cycle_id,
+        snapshot = restored["snapshot"] if restored else self.memory.begin_snapshot({
+            "memory_space_id": self.memory_space_id, "as_of": as_of,
+            "stage": stage, "cycle_id": cycle_id,
         })
         snapshot_id = str(snapshot.get("snapshot_id") or "")
         if not snapshot_id:
             raise MemoryResearchError("MemoryHub returned a snapshot without an id")
+        context: list[dict[str, Any]] = list(restored["context"]) if restored else []
+        actions: list[dict[str, Any]] = list(restored["actions"]) if restored else []
+        known_episode_ids: set[str] = set(restored["known_episode_ids"]) if restored else set()
+        executed: set[tuple[str, str]] = set(restored["executed"]) if restored else set()
+        last_observation: dict[str, Any] | None = restored["last_observation"] if restored else None
 
-        context: list[dict[str, Any]] = []
-        actions: list[dict[str, Any]] = []
-        known_episode_ids: set[str] = set()
-        executed: set[tuple[str, str]] = set()
-        last_observation: dict[str, Any] | None = None
+        def checkpoint() -> None:
+            if on_checkpoint:
+                on_checkpoint({
+                    "cycle_id": cycle_id, "stage": stage, "snapshot": snapshot,
+                    "context": context, "actions": actions,
+                    "known_episode_ids": sorted(known_episode_ids),
+                    "executed": [list(item) for item in sorted(executed)],
+                    "last_observation": last_observation,
+                })
+
+        checkpoint()
+        if actions and actions[-1].get("operation") == "complete":
+            return MemoryResearchResult(snapshot, tuple(context), tuple(actions))
         while True:
             if self.monotonic() >= deadline:
                 raise MemoryResearchError("memory research reached its response deadline")
+            if cancelled and cancelled():
+                checkpoint()
+                raise MemoryResearchError("memory research was terminated by the user")
             decision = self.decide({
                 "snapshot": snapshot,
-                "messages": [
-                    {"message_id": item["message_id"], "text": item["body_text"], "known_at": item["known_at"]}
-                    for item in messages
-                ],
-                "prior_actions": actions,
-                "known_episode_ids": sorted(known_episode_ids),
-                "last_observation": last_observation,
+                "messages": [{"message_id": item["message_id"], "text": item["body_text"], "known_at": item["known_at"]} for item in messages],
+                "prior_actions": actions, "known_episode_ids": sorted(known_episode_ids), "last_observation": last_observation,
             })
             action = self._validated_decision(decision)
             operation = action["operation"]
             if operation == "complete":
                 actions.append(action)
+                checkpoint()
                 return MemoryResearchResult(snapshot, tuple(context), tuple(actions))
-
             if operation in {"web_search", "web_read", "markethub_quote", "archive_article"}:
                 if self.discover_external is None:
                     raise MemoryResearchError("external discovery is unavailable for this chat")
@@ -88,27 +101,20 @@ class AdaptiveMemoryResearch:
                 context.extend(item for item in normalized if item not in context)
                 actions.append({**action, "state": "completed", "result_count": len(normalized)})
                 last_observation = {"operation": operation, "state": "completed", "items": normalized}
+                checkpoint()
                 continue
-
             target = str(action["query"] if operation == "search" else action["episode_id"])
             duplicate_key = (operation, target)
             if duplicate_key in executed:
-                last_observation = {
-                    "operation": operation,
-                    "state": "rejected_duplicate",
-                    "detail": "This exact MemoryHub operation already ran in this frozen snapshot; choose another operation or complete.",
-                }
+                last_observation = {"operation": operation, "state": "rejected_duplicate", "detail": "This exact MemoryHub operation already ran in this frozen snapshot; choose another operation or complete."}
                 actions.append({**action, "state": "rejected_duplicate"})
+                checkpoint()
                 continue
             if operation in {"expand", "related"} and target not in known_episode_ids:
-                last_observation = {
-                    "operation": operation,
-                    "state": "rejected_unknown_episode",
-                    "detail": "episode_id must be returned by an earlier search, expand, or related result in this snapshot.",
-                }
+                last_observation = {"operation": operation, "state": "rejected_unknown_episode", "detail": "episode_id must be returned by an earlier search, expand, or related result in this snapshot."}
                 actions.append({**action, "state": "rejected_unknown_episode"})
+                checkpoint()
                 continue
-
             executed.add(duplicate_key)
             if operation == "search":
                 result: Any = self.memory.search(snapshot_id, target, limit=20)
@@ -126,6 +132,25 @@ class AdaptiveMemoryResearch:
                     context.append(item)
             actions.append({**action, "state": "completed", "result_count": len(normalized)})
             last_observation = {"operation": operation, "state": "completed", "items": normalized}
+            checkpoint()
+
+    @staticmethod
+    def _restore(resume: dict[str, Any] | None, cycle_id: str, stage: str) -> dict[str, Any] | None:
+        if not isinstance(resume, dict) or resume.get("cycle_id") != cycle_id or resume.get("stage") != stage:
+            return None
+        snapshot = resume.get("snapshot")
+        context, actions = resume.get("context"), resume.get("actions")
+        known, executed = resume.get("known_episode_ids"), resume.get("executed")
+        if not isinstance(snapshot, dict) or not snapshot.get("snapshot_id") or not all(isinstance(value, list) for value in (context, actions, known, executed)):
+            return None
+        return {
+            "snapshot": snapshot,
+            "context": [value for value in context if isinstance(value, dict)],
+            "actions": [value for value in actions if isinstance(value, dict)],
+            "known_episode_ids": [str(value) for value in known if isinstance(value, str)],
+            "executed": {(str(value[0]), str(value[1])) for value in executed if isinstance(value, list) and len(value) == 2},
+            "last_observation": resume.get("last_observation") if isinstance(resume.get("last_observation"), dict) else None,
+        }
 
     @staticmethod
     def _validated_decision(value: dict[str, Any]) -> dict[str, Any]:

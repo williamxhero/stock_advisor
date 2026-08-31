@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from ai_trading_companion.__main__ import flush, run_chat
+from ai_trading_companion.__main__ import consume, flush, run_chat
 from ai_trading_companion.broker_client import BrokerResponse
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.exchange import LocalExchange
@@ -129,6 +129,92 @@ class RealMemoryHubChatIntegrationTests(unittest.TestCase):
             cleared = memory.clear_space(space, prepared["confirmation_token"])
             self.assertEqual("cleared", cleared["state"])
             self.assertEqual([], memory.timeline(space))
+
+    def test_real_runtime_exchange_control_reuses_snapshot_and_hides_h0(self) -> None:
+        """#64: deployed service plus Runtime/Exchange terminate→continue acceptance."""
+        memory = HttpMemoryAdapter(os.environ.get("MEMORYHUB_URL", "http://yosef-server:8820"))
+        space = f"stock-advisor-issue-64-{uuid.uuid4()}"
+        other_space = f"stock-advisor-issue-64-isolated-{uuid.uuid4()}"
+        timestamp = "2026-09-01T12:00:00Z"
+        try:
+            prior = memory.append({
+                "memory_space_id": space, "source_system": "stock-advisor-acceptance", "source_event_id": "prior",
+                "content_hash": "auto", "episode_type": "note", "body": "prior qualified market evidence",
+                "occurred_at": timestamp, "known_at": timestamp, "submitted_at": timestamp,
+                "authority": "acceptance_fixture", "protocol_version": "memoryhub/v1",
+                "metadata": {"cycle_id": "formal-cycle", "stage": "m0_research", "actor": "ai"},
+            })
+            h0 = memory.append({
+                "memory_space_id": space, "source_system": "stock-advisor-acceptance", "source_event_id": "h0",
+                "content_hash": "auto", "episode_type": "user_message", "body": "current cycle H0 must stay isolated",
+                "occurred_at": timestamp, "known_at": timestamp, "submitted_at": timestamp,
+                "authority": "acceptance_fixture", "protocol_version": "memoryhub/v1",
+                "metadata": {"cycle_id": "formal-cycle", "stage": "h0", "actor": "human"},
+            })
+            m0 = memory.begin_snapshot({"memory_space_id": space, "as_of": timestamp, "stage": "m0_research", "cycle_id": "formal-cycle"})
+            m1 = memory.begin_snapshot({"memory_space_id": space, "as_of": timestamp, "stage": "m1_research", "cycle_id": "formal-cycle"})
+            self.assertIn(prior["episode_id"], {item["episode_id"] for item in memory.search(m0["snapshot_id"], "qualified")})
+            self.assertNotIn(h0["episode_id"], {item["episode_id"] for item in memory.search(m1["snapshot_id"], "H0")})
+            isolated = memory.begin_snapshot({"memory_space_id": other_space, "as_of": timestamp, "stage": "chat", "cycle_id": "other"})
+            self.assertEqual([], memory.search(isolated["snapshot_id"], "qualified"))
+            with self.assertRaisesRegex(Exception, "MemoryHub rejected"):
+                memory.expand(m1["snapshot_id"], "does-not-exist")
+
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                store = CompanionStore(root / "runtime.sqlite3")
+                engine = CompanionEngine(store, memory=memory, memory_space_id=space)
+                exchange = LocalExchange(root / "exchange")
+                portfolio = PortfolioService(root, store)
+                conversation = store.ensure_daily_conversation("2026-09-01")
+                message = store.stage_message(conversation["cycle_id"], "Recall qualified market evidence.", "conversation", message_id="chat")
+                batch_id, _ = store.commit_staged_messages(conversation["cycle_id"], "conversation")
+                source = store.append_artifact(conversation["cycle_id"], "chat_human", "human", message["body_text"], conversation["as_of"], {"batch_id": batch_id})
+                first_broker = Mock()
+                first_broker.invoke.return_value = _response({"operation": "search", "query": "qualified", "episode_id": None})
+                stopped = False
+
+                def stop_from_exchange() -> bool:
+                    nonlocal stopped
+                    if first_broker.invoke.call_count and not stopped:
+                        stopped = True
+                        exchange.send("to-runtime", "stop", {
+                            "contract": "companion-user-command/v1", "command_id": "stop",
+                            "cycle_id": conversation["cycle_id"], "type": "terminate_chat_research",
+                        })
+                        consume(engine, store, exchange, portfolio, True)
+                    return store.chat_research_terminated(conversation["cycle_id"])
+
+                with patch("ai_trading_companion.__main__.ProviderBrokerClient", return_value=first_broker):
+                    stopped_result = run_chat(engine, store, portfolio, conversation["cycle_id"], batch_id, True, cancelled=stop_from_exchange)
+                self.assertEqual("terminated", stopped_result["state"])
+                self.assertEqual(1, first_broker.invoke.call_count)
+                checkpoint = store.resumed_chat_research_checkpoint(conversation["cycle_id"], source["artifact_id"])
+                self.assertIsNone(checkpoint)
+
+                resumed_broker = Mock()
+                resumed_broker.invoke.side_effect = [
+                    _response({"operation": "complete", "query": None, "episode_id": None}),
+                    _response({"reply_markdown": "Qualified evidence is reused after the pause.", "needs_fresh_search": False, "public_search_request": None, "propositions": [], "actions": []}),
+                ]
+                exchange.send("to-runtime", "continue", {
+                    "contract": "companion-user-command/v1", "command_id": "continue",
+                    "cycle_id": conversation["cycle_id"], "type": "continue_chat_research",
+                })
+                with patch("ai_trading_companion.__main__.ProviderBrokerClient", return_value=resumed_broker):
+                    resumed = consume(engine, store, exchange, portfolio, True)
+                self.assertEqual("resumed", resumed[0]["state"])
+                self.assertEqual(["chat_research", "chat"], [call.args[0].stage for call in resumed_broker.invoke.call_args_list])
+                events = [value for _path, value in exchange.receive("to-client")]
+                self.assertTrue(any(event["type"] == "chat.research.terminated" for event in events))
+                self.assertTrue(any(event["type"] == "chat.research.continued" for event in events))
+                self.assertTrue(any(event["type"] == "chat.ready" for event in events))
+        finally:
+            for candidate in (space, other_space):
+                exported = memory.export_space(candidate)
+                prepared = memory.prepare_clear(candidate, exported["export_sha256"])
+                memory.clear_space(candidate, prepared["confirmation_token"])
+                self.assertEqual([], memory.timeline(candidate))
 
 
 def _response(result: dict[str, object]) -> BrokerResponse:

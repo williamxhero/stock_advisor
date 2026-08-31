@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .backup import BackupManager
 from .cognition import ReplyMarkdownStream, UnifiedCognition
@@ -1543,6 +1543,7 @@ def run_unified_cognition(
     memory_context: list[dict[str, Any]] | None = None,
     memory_research: dict[str, Any] | None = None,
     absolute_deadline: float | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Understand once, then execute allowlisted capabilities from receipts."""
     if not messages:
@@ -1556,6 +1557,8 @@ def run_unified_cognition(
             return {"cycle_id": cycle_id, "job_id": job["job_id"], "state": job["state"], "receipts": []}
     stream = None
     try:
+        if cancelled and cancelled():
+            raise MemoryResearchError("memory research was terminated by the user")
         if not execute:
             data = cognition.fixture_result(messages, mode)
         elif job["state"] == "completed" and job.get("result_json"):
@@ -1571,6 +1574,8 @@ def run_unified_cognition(
 
             def on_delta(delta: str) -> None:
                 nonlocal streamed_reply
+                if cancelled and cancelled():
+                    raise MemoryResearchError("memory research was terminated by the user")
                 visible = reply_stream.feed(delta)
                 streamed_reply += visible
 
@@ -1598,18 +1603,23 @@ def run_unified_cognition(
             if not isinstance(outcome.result, dict):
                 raise BrokerError("Broker produced no qualified cognition result", category="broker_output_invalid")
             data = outcome.result
+        if cancelled and cancelled():
+            raise MemoryResearchError("memory research was terminated by the user")
         outcome = cognition.apply(cycle, source, messages, mode, data, memory_research=memory_research)
     except Exception as exc:
         store.finish_cognition_job(job["job_id"], error=str(exc))
         if stream:
-            safe_prefix = _receipt_safe_stream_prefix(streamed_reply)
-            if safe_prefix:
-                presented_prefix = engine.present_for_publication(
-                    safe_prefix, cycle["as_of"], reply_kind,
-                    allow_structured_format=any(explicit_format_requested(item["body_text"]) for item in messages),
-                )
-                engine.chat_stream_delta(cycle_id, stream["stream_id"], presented_prefix.markdown)
-            engine.chat_stream_failed(cycle_id, stream["stream_id"], str(exc))
+            if engine.store.chat_research_terminated(cycle_id):
+                engine.emit(cycle, "chat.stream.cancelled", {"cycle": cycle, "stream_id": stream["stream_id"]})
+            else:
+                safe_prefix = _receipt_safe_stream_prefix(streamed_reply)
+                if safe_prefix:
+                    presented_prefix = engine.present_for_publication(
+                        safe_prefix, cycle["as_of"], reply_kind,
+                        allow_structured_format=any(explicit_format_requested(item["body_text"]) for item in messages),
+                    )
+                    engine.chat_stream_delta(cycle_id, stream["stream_id"], presented_prefix.markdown)
+                engine.chat_stream_failed(cycle_id, stream["stream_id"], str(exc))
             if on_progress:
                 on_progress()
         raise
@@ -1621,6 +1631,8 @@ def run_unified_cognition(
     if outcome.needs_fresh_search and outcome.public_search_request:
         store.queue_research_job(cycle_id, source["artifact_id"], outcome.public_search_request)
     if outcome.reply_markdown:
+        if cancelled and cancelled():
+            raise MemoryResearchError("memory research was terminated by the user")
         allow_structured_format = any(explicit_format_requested(item["body_text"]) for item in messages)
         presented = engine.present_for_publication(
             outcome.reply_markdown, cycle["as_of"], reply_kind,
@@ -1661,6 +1673,7 @@ def run_chat(
     source_kind: str = "chat_human",
     reply_kind: str = "ai_chat",
     on_progress: Any = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     cycle = store.get_cycle(cycle_id)
     phase = "pre_m0" if source_kind == "pre_m0_submission" else "conversation" if cycle.get("kind") == "daily_conversation" else "chat"
@@ -1683,24 +1696,42 @@ def run_chat(
             cycle["task_key"], TASK_POLICIES["daily.execution.0945"],
         ).m1_timeout.total_seconds())
         deadline = time.monotonic() + timeout_seconds
-        memory_result = AdaptiveMemoryResearch(
-            engine.memory,
-            engine.memory_space_id,
-            lambda state: _next_memory_research_action(store, cycle, state, deadline),
-            discover_external=lambda action, snapshot: _discover_chat_external_evidence(engine, action, snapshot),
-        ).collect(cycle_id, messages, deadline=deadline)
+        resumed = store.resumed_chat_research_checkpoint(cycle_id, source["artifact_id"])
+        try:
+            memory_result = AdaptiveMemoryResearch(
+                engine.memory,
+                engine.memory_space_id,
+                lambda state: _next_memory_research_action(store, cycle, state, deadline),
+                discover_external=lambda action, snapshot: _discover_chat_external_evidence(engine, action, snapshot),
+            ).collect(
+                cycle_id, messages, deadline=deadline,
+                resume=resumed.get("checkpoint") if resumed else None,
+                on_checkpoint=lambda checkpoint: store.save_chat_research_checkpoint(
+                    cycle_id, source["artifact_id"], batch_ids, checkpoint,
+                ),
+                cancelled=cancelled,
+            )
+        except MemoryResearchError:
+            if store.chat_research_terminated(cycle_id):
+                return {"cycle_id": cycle_id, "state": "terminated"}
+            raise
         memory_context = list(memory_result.context)
         memory_research = {
             "snapshot": memory_result.snapshot,
             "actions": list(memory_result.actions),
             "episode_ids": [str(item["episode_id"]) for item in memory_result.context if item.get("episode_id")],
         }
-    result = run_unified_cognition(
-        engine, store, portfolio, cycle_id, source, messages, batch_ids, execute,
-        mode="conversation", reply_kind=reply_kind, on_progress=on_progress,
-        memory_context=memory_context, memory_research=memory_research,
-        absolute_deadline=deadline,
-    )
+    try:
+        result = run_unified_cognition(
+            engine, store, portfolio, cycle_id, source, messages, batch_ids, execute,
+            mode="conversation", reply_kind=reply_kind, on_progress=on_progress,
+            memory_context=memory_context, memory_research=memory_research,
+            absolute_deadline=deadline, cancelled=cancelled,
+        )
+    except MemoryResearchError:
+        if store.chat_research_terminated(cycle_id):
+            return {"cycle_id": cycle_id, "state": "terminated"}
+        raise
     if on_progress:
         on_progress()
     return result
@@ -1818,6 +1849,23 @@ def consume(
     execute: bool = False,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+
+    def interrupt_chat_research(cycle_id: str) -> bool:
+        """Process only this chat's stop command while its worker is active."""
+        interrupted = False
+        for control_path, control in exchange.receive_matching(
+            "to-runtime",
+            lambda value: value.get("contract") == "companion-user-command/v1"
+            and value.get("type") == "terminate_chat_research"
+            and value.get("cycle_id") == cycle_id,
+        ):
+            engine.command(control)
+            exchange.acknowledge("to-runtime", control_path)
+            interrupted = True
+        if interrupted:
+            flush(store, exchange)
+        return store.chat_research_terminated(cycle_id)
+
     for path, command in exchange.receive("to-runtime"):
         try:
             if command.get("contract") == "memory-user-command/v1":
@@ -1875,7 +1923,20 @@ def consume(
             elif cycle_id and typ == "commit_pre_m0":
                 run_pending_premarket_reply(engine, store, portfolio, cycle_id, execute)
             elif cycle_id and typ in {"commit_chat_batch", "commit_conversation_batch"}:
-                result = run_chat(engine, store, portfolio, cycle_id, str(result.get("committed_batch_id") or ""), execute, on_progress=lambda: flush(store, exchange))
+                result = run_chat(
+                    engine, store, portfolio, cycle_id, str(result.get("committed_batch_id") or ""), execute,
+                    on_progress=lambda: flush(store, exchange),
+                    cancelled=lambda: interrupt_chat_research(str(cycle_id)),
+                )
+            elif cycle_id and typ == "continue_chat_research" and result.get("continued_now"):
+                result = {
+                    **result,
+                    "continuation": run_chat(
+                        engine, store, portfolio, cycle_id, "", execute,
+                        on_progress=lambda: flush(store, exchange),
+                        cancelled=lambda: interrupt_chat_research(str(cycle_id)),
+                    ),
+                }
             results.append(result)
         except Exception as exc:
             exchange.reject("to-runtime", path, str(exc))

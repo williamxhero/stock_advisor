@@ -37,6 +37,19 @@ if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish failed; no usable release artifact was generated."
 }
 
+$toolManagerOutput = Join-Path $output "ToolManager"
+$toolManagerArguments = @(
+    'publish', "$projectRoot\src\desktop\AITradingCompanion.ToolManager\AITradingCompanion.ToolManager.csproj",
+    '--configuration', 'Release', '--runtime', $Runtime, '--self-contained', 'true', '--output', $toolManagerOutput,
+    '-p:PublishSingleFile=true', '-p:IncludeNativeLibrariesForSelfExtract=true', '-p:UseSharedCompilation=false',
+    "-p:SourceRevisionId=$revision", '-m:1', '--disable-build-servers'
+)
+if ($NoRestore) { $toolManagerArguments += '--no-restore' }
+dotnet @toolManagerArguments
+if ($LASTEXITCODE -ne 0) {
+    throw "Tool Manager publish failed; no usable release artifact was generated."
+}
+
 foreach ($item in @(
     @{ Source = 'resources'; Destination = 'resources' },
     @{ Source = 'src\runtime\ai_trading_companion'; Destination = 'runtime\ai_trading_companion' },

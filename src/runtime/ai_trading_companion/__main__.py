@@ -18,6 +18,7 @@ from typing import Any
 
 from .backup import BackupManager
 from .cognition import ReplyMarkdownStream, UnifiedCognition
+from .adaptive_memory import AdaptiveMemoryResearch, MemoryResearchError
 from .broker_client import BrokerError, BrokerRequest, BrokerResponse, ProviderBrokerClient, canonical_packet_hash
 from .config import load_settings, remove_legacy_provider_settings, save_research_settings
 from .engine import CompanionEngine, iso
@@ -29,7 +30,8 @@ from .gateway import RuntimeGateway, serve as serve_gateway
 from .learning import JudgmentLifecycle, WorkflowEvolution
 from .message_presentation import explicit_format_requested
 from .memory_commands import handle_memory_command
-from .memory_port import HttpMemoryAdapter
+from .memory_port import HttpMemoryAdapter, MemoryUnavailable
+from .memory_health import MemoryCapabilityPolicy
 from .migration import LegacyMigrator, LegacySources
 from .models import TASK_POLICIES
 from .observatory import EvaluationObservatory, EvaluationRequest, ExperimentRequest, ForecastRequest
@@ -251,9 +253,13 @@ def runtime() -> tuple[CompanionEngine, CompanionStore, LocalExchange, Portfolio
     registry.seed(json.loads((PATHS.resources / "schedules" / "tasks.json").read_text(encoding="utf-8")))
     registry.validate_or_repair()
     store.risk_doctrine()
+    memory = HttpMemoryAdapter(os.environ.get("MEMORYHUB_URL", "http://yosef-server:8820"))
+    capability = MemoryCapabilityPolicy.evaluate(memory.health())
+    if not capability.memory_tasks_available:
+        raise MemoryUnavailable("MemoryHub ledger or retrieval index is unavailable; ordinary chat cannot use a local-memory fallback")
     engine = CompanionEngine(
         store,
-        memory=HttpMemoryAdapter(os.environ.get("MEMORYHUB_URL", "http://yosef-server:8820")),
+        memory=memory,
         memory_space_id=os.environ.get("MEMORYHUB_SPACE_ID", "ai-trading-companion"),
     )
     engine.recover_interrupted_streams()
@@ -1410,6 +1416,46 @@ def _receipt_safe_stream_prefix(text: str) -> str:
     return text[:min(indexes)].rstrip() if indexes else text
 
 
+def _next_memory_research_action(
+    store: CompanionStore, cycle: dict[str, Any], state: dict[str, Any], deadline: float,
+) -> dict[str, Any]:
+    """Ask the same conversation cognition to choose one MemoryHub operation.
+
+    The runtime does not infer what to retrieve or when enough has been read:
+    it merely gives the model the frozen snapshot and executes its declared,
+    policy-filtered operation.
+    """
+    packet = {
+        "purpose": (
+            "Choose the next private-memory operation needed before replying to this "
+            "conversation. You may search by a different entity, time, prior mistake, "
+            "correction, counterexample, or related episode when the last result is insufficient. "
+            "Choose complete only when the visible memory is enough for an honest reply. "
+            "Do not answer the user, create actions, or expose this research process."
+        ),
+        "research_state": state,
+        "task_key": cycle["task_key"],
+    }
+    timeout_seconds = max(1, int(deadline - time.monotonic()))
+    decision = CognitiveRouter(
+        effort_policy=CognitiveEffortPolicy.load(store),
+    ).route("chat_research", packet, timeout_seconds, True)
+    outcome = broker_client().invoke(BrokerRequest(
+        stage="chat_research",
+        packet=packet,
+        packet_sha256=canonical_packet_hash(packet),
+        intellect=decision.intellect,
+        effort=decision.reasoning_effort,
+        schema=json.loads((SCHEMAS / "memory-research-decision-v1.schema.json").read_text(encoding="utf-8")),
+        absolute_deadline=deadline,
+        verifier_name="memory-research-decision/v1",
+        verifier=lambda _output: {"passed": True, "problems": []},
+    ))
+    if not isinstance(outcome.result, dict):
+        raise MemoryResearchError("Broker produced no qualified memory research decision")
+    return outcome.result
+
+
 def run_unified_cognition(
     engine: CompanionEngine,
     store: CompanionStore,
@@ -1423,6 +1469,9 @@ def run_unified_cognition(
     mode: str,
     reply_kind: str = "ai_chat",
     on_progress: Any = None,
+    memory_context: list[dict[str, Any]] | None = None,
+    memory_research: dict[str, Any] | None = None,
+    absolute_deadline: float | None = None,
 ) -> dict[str, Any]:
     """Understand once, then execute allowlisted capabilities from receipts."""
     if not messages:
@@ -1441,19 +1490,10 @@ def run_unified_cognition(
         elif job["state"] == "completed" and job.get("result_json"):
             data = {"reply_markdown": None, "needs_fresh_search": False, "public_search_request": None, "propositions": [], "actions": []}
         else:
-            query_text = "\n".join(item["body_text"] for item in messages)
-            memories = [{
-                "proposition_id": item["proposition_id"], "kind": item["proposition_kind"],
-                "subject": item["subject"], "predicate": item["predicate"],
-                "object": json.loads(item["object_json"]), "known_at": item["known_at"],
-            } for item in store.relevant_propositions(iso(datetime.now(timezone.utc)), query_text, limit=20)]
-            preference = store.active_proposition("user.expression", "expression.material_density")
-            if preference and all(item["proposition_id"] != preference["proposition_id"] for item in memories):
-                memories.append({
-                    "proposition_id": preference["proposition_id"], "kind": preference["proposition_kind"],
-                    "subject": preference["subject"], "predicate": preference["predicate"],
-                    "object": json.loads(preference["object_json"]), "known_at": preference["known_at"],
-                })
+            # The ordinary chat entrypoint provides only a real, frozen
+            # MemoryHub context.  Direct unit callers intentionally see no
+            # implicit SQLite-memory substitute.
+            memories = list(memory_context or [])
             stream = engine.chat_stream_started(cycle_id, batch_ids, reply_kind) if mode != "h0" else None
             reply_stream = ReplyMarkdownStream()
             streamed_reply = ""
@@ -1470,6 +1510,7 @@ def run_unified_cognition(
             timeout_seconds = int(TASK_POLICIES.get(
                 cycle["task_key"], TASK_POLICIES["daily.execution.0945"],
             ).m1_timeout.total_seconds())
+            deadline = absolute_deadline if absolute_deadline is not None else time.monotonic() + timeout_seconds
             chat_decision = CognitiveRouter(
                 effort_policy=CognitiveEffortPolicy.load(store),
             ).route("chat", {**request_packet, "task_key": cycle["task_key"]}, timeout_seconds, False)
@@ -1479,14 +1520,14 @@ def run_unified_cognition(
                 schema=json.loads((SCHEMAS / "companion-cognition-result-v1.schema.json").read_text(encoding="utf-8")),
                 visible_stream=stream is not None,
                 on_delta=on_delta if stream else None,
-                absolute_deadline=time.monotonic() + timeout_seconds,
+                absolute_deadline=deadline,
                 verifier_name="unified-cognition/v1",
                 verifier=lambda _output: {"passed": True, "problems": []},
             ))
             if not isinstance(outcome.result, dict):
                 raise BrokerError("Broker produced no qualified cognition result", category="broker_output_invalid")
             data = outcome.result
-        outcome = cognition.apply(cycle, source, messages, mode, data)
+        outcome = cognition.apply(cycle, source, messages, mode, data, memory_research=memory_research)
     except Exception as exc:
         store.finish_cognition_job(job["job_id"], error=str(exc))
         if stream:
@@ -1561,9 +1602,32 @@ def run_chat(
     if source is None:
         raise RuntimeError("submitted conversation artifact is missing")
     engine.record_submitted_messages(cycle_id, messages)
+    memory_context: list[dict[str, Any]] | None = None
+    memory_research: dict[str, Any] | None = None
+    deadline: float | None = None
+    if source_kind == "chat_human":
+        if engine.memory is None:
+            raise MemoryResearchError("MemoryHub is required for ordinary chat")
+        timeout_seconds = int(TASK_POLICIES.get(
+            cycle["task_key"], TASK_POLICIES["daily.execution.0945"],
+        ).m1_timeout.total_seconds())
+        deadline = time.monotonic() + timeout_seconds
+        memory_result = AdaptiveMemoryResearch(
+            engine.memory,
+            engine.memory_space_id,
+            lambda state: _next_memory_research_action(store, cycle, state, deadline),
+        ).collect(cycle_id, messages, deadline=deadline)
+        memory_context = list(memory_result.context)
+        memory_research = {
+            "snapshot": memory_result.snapshot,
+            "actions": list(memory_result.actions),
+            "episode_ids": [str(item["episode_id"]) for item in memory_result.context if item.get("episode_id")],
+        }
     result = run_unified_cognition(
         engine, store, portfolio, cycle_id, source, messages, batch_ids, execute,
         mode="conversation", reply_kind=reply_kind, on_progress=on_progress,
+        memory_context=memory_context, memory_research=memory_research,
+        absolute_deadline=deadline,
     )
     if on_progress:
         on_progress()

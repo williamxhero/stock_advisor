@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["operation", "query", "episode_id"],
+  "properties": {
+    "operation": {"enum": ["search", "expand", "related", "complete"]},
+    "query": {"type": ["string", "null"]},
+    "episode_id": {"type": ["string", "null"]}
+  }
+}

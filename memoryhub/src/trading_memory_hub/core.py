@@ -458,12 +458,15 @@ class MemoryHub:
         if not memory_space_id:
             raise MemoryHubError("export requires memory_space_id")
         with self._connection() as connection:
-            episodes = [
-                self._episode(row) for row in connection.execute(
-                    "SELECT * FROM episode WHERE memory_space_id=? ORDER BY sequence",
-                    (memory_space_id,),
-                )
-            ]
+            return self._space_export(connection, memory_space_id)
+
+    def _space_export(self, connection: sqlite3.Connection, memory_space_id: str) -> dict[str, Any]:
+        episodes = [
+            self._episode(row) for row in connection.execute(
+                "SELECT * FROM episode WHERE memory_space_id=? ORDER BY sequence",
+                (memory_space_id,),
+            )
+        ]
         machine = {
             "memory_space_id": memory_space_id,
             "protocol_version": PROTOCOL_VERSION,
@@ -502,6 +505,7 @@ class MemoryHub:
 
     def clear_space(self, memory_space_id: str, confirmation_token: str) -> dict[str, Any]:
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             request = connection.execute(
                 "SELECT * FROM clear_request WHERE confirmation_token=? AND memory_space_id=?",
                 (confirmation_token, memory_space_id),
@@ -512,7 +516,7 @@ class MemoryHub:
                 return json.loads(request["result_json"])
             if request["state"] != "pending":
                 raise MemoryHubError("clear confirmation is no longer valid")
-            current = self.export_space(memory_space_id)
+            current = self._space_export(connection, memory_space_id)
             if current["export_sha256"] != request["export_sha256"]:
                 raise MemoryHubError("memory changed after export; export again before clearing")
             episode_ids = [item["episode_id"] for item in current["episodes"]]

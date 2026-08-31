@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from .core import EpisodeConflict, MemoryHub, MemoryHubError, SourceIntegrityError
 from .sources import ArticleArchiveSourceAdapter, MarketHubSourceAdapter
@@ -47,6 +48,8 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
                     ).as_dict()
                 else:
                     parts = self.path.strip("/").split("/")
+                    if len(parts) >= 3 and parts[:2] == ["v1", "memory-spaces"]:
+                        parts[2] = unquote(parts[2])
                     if len(parts) == 4 and parts[:2] == ["v1", "memory-spaces"] and parts[3] == "timeline":
                         result = hub.timeline(parts[2], after_sequence=value.get("after_sequence", 0))
                         self._reply(HTTPStatus.OK, {"result": result})

@@ -5,6 +5,7 @@ import hashlib
 import json
 from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 import uuid
 
@@ -49,22 +50,22 @@ class HttpMemoryAdapter:
 
     def timeline(self, memory_space_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]:
         return self._request(
-            "POST", f"/v1/memory-spaces/{memory_space_id}/timeline",
+            "POST", f"/v1/memory-spaces/{quote(memory_space_id, safe='')}/timeline",
             {"after_sequence": after_sequence},
         )["result"]
 
     def export_space(self, memory_space_id: str) -> dict[str, Any]:
-        return self._request("POST", f"/v1/memory-spaces/{memory_space_id}/export", {})["result"]
+        return self._request("POST", f"/v1/memory-spaces/{quote(memory_space_id, safe='')}/export", {})["result"]
 
     def prepare_clear(self, memory_space_id: str, export_sha256: str) -> dict[str, Any]:
         return self._request(
-            "POST", f"/v1/memory-spaces/{memory_space_id}/clear/prepare",
+            "POST", f"/v1/memory-spaces/{quote(memory_space_id, safe='')}/clear/prepare",
             {"export_sha256": export_sha256},
         )["result"]
 
     def clear_space(self, memory_space_id: str, confirmation_token: str) -> dict[str, Any]:
         return self._request(
-            "POST", f"/v1/memory-spaces/{memory_space_id}/clear",
+            "POST", f"/v1/memory-spaces/{quote(memory_space_id, safe='')}/clear",
             {"confirmation_token": confirmation_token},
         )["result"]
 

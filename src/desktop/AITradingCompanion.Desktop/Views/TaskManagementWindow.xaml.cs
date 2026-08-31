@@ -23,7 +23,9 @@ public partial class TaskManagementWindow : Window
 
     public void UpdateEvents(IReadOnlyList<string> events)
     {
-        foreach (var raw in events)
+        // Exchange events arrive newest-first. Replay them chronologically so an
+        // older schedule.list result cannot overwrite the current projection.
+        foreach (var raw in events.Reverse())
         {
             try
             {
@@ -49,7 +51,11 @@ public partial class TaskManagementWindow : Window
 
     private void LoadSchedules(JsonElement schedules)
     {
-        _items.Clear(); foreach (var item in schedules.EnumerateArray()) _items.Add(ScheduleItem.From(item));
+        _items.Clear();
+        _items.AddRange(schedules.EnumerateArray()
+            .Select(ScheduleItem.From)
+            .OrderBy(item => item.NextAt ?? DateTimeOffset.MaxValue)
+            .ThenBy(item => item.Id, StringComparer.Ordinal));
         TaskList.ItemsSource = null; TaskList.ItemsSource = _items;
         if (_selected is not null) TaskList.SelectedItem = _items.FirstOrDefault(item => item.Id == _selected.Id);
     }
@@ -134,7 +140,7 @@ public partial class TaskManagementWindow : Window
     private void RestoreWindowBounds() { if (WindowStateService.Load(_paths.TaskWindowStatePath) is not { } saved) return; Width = saved.Width; Height = saved.Height; if (saved.Left is not null) Left = saved.Left.Value; if (saved.Top is not null) Top = saved.Top.Value; }
     private void SaveWindowBounds() { var bounds = WindowState == WindowState.Normal ? new Rect(Left, Top, ActualWidth, ActualHeight) : RestoreBounds; WindowStateService.Save(_paths.TaskWindowStatePath, bounds.Width, bounds.Height, bounds.Left, bounds.Top); }
 
-    private sealed record ScheduleItem(string Id, int Version, string Status, string Name, string Workflow, string Trigger, string Time, string TriggerDate, string Note, string EffectiveFrom, string EffectiveUntil, string Session, string Next)
+    private sealed record ScheduleItem(string Id, int Version, string Status, string Name, string Workflow, string Trigger, string Time, string TriggerDate, string Note, string EffectiveFrom, string EffectiveUntil, string Session, string Next, DateTimeOffset? NextAt)
     {
         public string Title => Name;
         public string Detail => Trigger switch
@@ -147,19 +153,19 @@ public partial class TaskManagementWindow : Window
         };
         public static ScheduleItem From(JsonElement item)
         {
-            var config = item.GetProperty("config"); var trigger = config.GetProperty("trigger"); var next = FormatNext(item);
-            return new(item.GetProperty("schedule_id").GetString()!, item.GetProperty("version").GetInt32(), item.GetProperty("status").GetString()!, config.GetProperty("name").GetString()!, config.GetProperty("workflow_key").GetString()!, trigger.GetProperty("type").GetString()!, trigger.TryGetProperty("time", out var time) ? time.GetString() ?? "" : "", trigger.TryGetProperty("date", out var date) ? date.GetString() ?? "" : "", config.TryGetProperty("note", out var note) ? note.GetString() ?? "" : "", config.TryGetProperty("effective_from", out var start) && !string.IsNullOrWhiteSpace(start.GetString()) ? start.GetString()! : "立即生效", config.TryGetProperty("effective_until", out var end) && !string.IsNullOrWhiteSpace(end.GetString()) ? end.GetString()! : "长期有效", item.TryGetProperty("session", out var session) ? session.GetString() ?? "" : "", next);
+            var config = item.GetProperty("config"); var trigger = config.GetProperty("trigger"); var (next, nextAt) = FormatNext(item);
+            return new(item.GetProperty("schedule_id").GetString()!, item.GetProperty("version").GetInt32(), item.GetProperty("status").GetString()!, config.GetProperty("name").GetString()!, config.GetProperty("workflow_key").GetString()!, trigger.GetProperty("type").GetString()!, trigger.TryGetProperty("time", out var time) ? time.GetString() ?? "" : "", trigger.TryGetProperty("date", out var date) ? date.GetString() ?? "" : "", config.TryGetProperty("note", out var note) ? note.GetString() ?? "" : "", config.TryGetProperty("effective_from", out var start) && !string.IsNullOrWhiteSpace(start.GetString()) ? start.GetString()! : "立即生效", config.TryGetProperty("effective_until", out var end) && !string.IsNullOrWhiteSpace(end.GetString()) ? end.GetString()! : "长期有效", item.TryGetProperty("session", out var session) ? session.GetString() ?? "" : "", next, nextAt);
         }
 
-        private static string FormatNext(JsonElement item)
+        private static (string Text, DateTimeOffset? At) FormatNext(JsonElement item)
         {
             if (!item.TryGetProperty("next_targets", out var targets) || targets.GetArrayLength() == 0)
-                return "下次触发：暂无";
+                return ("下次触发：暂无", null);
 
             var raw = targets[0].GetString();
             if (DateTimeOffset.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var next))
-                return $"下次触发：{next.ToOffset(TimeSpan.FromHours(8)):M'月'd'日' HH:mm}";
-            return $"下次触发：{raw ?? "暂无"}";
+                return ($"下次触发：{next.ToOffset(TimeSpan.FromHours(8)):M'月'd'日' HH:mm}", next);
+            return ($"下次触发：{raw ?? "暂无"}", null);
         }
     }
 }

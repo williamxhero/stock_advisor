@@ -209,6 +209,8 @@ public sealed class UiContractTests
         Assert.Contains("FormatNext", File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "Views", "TaskManagementWindow.xaml.cs")), StringComparison.Ordinal);
         var taskWindowCode = File.ReadAllText(Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop", "Views", "TaskManagementWindow.xaml.cs"));
         Assert.Contains("下次触发：", taskWindowCode, StringComparison.Ordinal);
+        Assert.Contains("events.Reverse()", taskWindowCode, StringComparison.Ordinal);
+        Assert.Contains("OrderBy(item => item.NextAt ?? DateTimeOffset.MaxValue)", taskWindowCode, StringComparison.Ordinal);
         Assert.DoesNotContain(": Trigger;", taskWindowCode, StringComparison.Ordinal);
         Assert.Contains("\"calendar_periodic\" => \"日历周期\"", taskWindowCode, StringComparison.Ordinal);
         Assert.Contains("\"market_relative\" => \"开收盘相对时间\"", taskWindowCode, StringComparison.Ordinal);

@@ -14,6 +14,8 @@ _CAPABILITIES = {
     "generic_web_search": "web_search",
     "cninfo_search": "cninfo_search",
     "article_range": "article_range",
+    "cn_equity_identity": "cn_equity_identity",
+    "cn_equity_quote_batch": "cn_equity_quote_batch",
 }
 
 
@@ -48,6 +50,10 @@ import re
 import sys
 from urllib.parse import quote_plus, urlparse
 from urllib.request import Request, urlopen
+
+
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 
 
 def fail(code: int, message: str) -> None:
@@ -92,12 +98,66 @@ def strip_html(value: str) -> str:
     return " ".join(html.unescape(value).split())[:200_000]
 
 
-def result(data: dict[str, object]) -> None:
+def result(data: dict[str, object], *, fact_as_of: str | None = None) -> None:
     print(json.dumps({
         "contract": "ai-trading-tool-result/v1",
-        "fact_as_of": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "fact_as_of": fact_as_of or dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "data": data,
     }, ensure_ascii=False, separators=(",", ":")))
+
+
+def identity(symbol: object) -> dict[str, str]:
+    code = str(symbol or "").strip()
+    if not re.fullmatch(r"\d{6}", code):
+        fail(64, "A-share symbols must be six digits")
+    if code.startswith(("6", "9")):
+        exchange, vendor_prefix = "SSE", "sh"
+    elif code.startswith(("0", "2", "3")):
+        exchange, vendor_prefix = "SZSE", "sz"
+    elif code.startswith(("4", "8")):
+        exchange, vendor_prefix = "BSE", "bj"
+    else:
+        fail(64, "unsupported A-share symbol")
+    return {"symbol": code, "exchange": exchange, "market": "CN-A", "vendor_symbol": vendor_prefix + code}
+
+
+def china_timestamp(compact: str) -> tuple[str, str]:
+    if not re.fullmatch(r"20\d{12}", compact):
+        fail(75, "quote timestamp is invalid")
+    moment = dt.datetime.strptime(compact, "%Y%m%d%H%M%S").replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
+    return moment.isoformat(), moment.date().isoformat()
+
+
+def quote_payload(body: str, symbols: list[dict[str, str]], finality: str) -> tuple[dict[str, object], str]:
+    records = {match.group(1): match.group(2).split("~") for match in re.finditer(r'v_([a-z]{2}\d{6})="([^"]*)"', body)}
+    quotes: list[dict[str, object]] = []
+    latest: dt.datetime | None = None
+    for item in symbols:
+        fields = records.get(item["vendor_symbol"])
+        if not fields or len(fields) < 5 or fields[2] != item["symbol"]:
+            fail(75, "quote response has missing or mismatched symbol")
+        timestamp = next((field for field in fields if re.fullmatch(r"20\d{12}", field)), "")
+        quote_at, trading_date = china_timestamp(timestamp)
+        moment = dt.datetime.fromisoformat(quote_at)
+        latest = max(latest, moment) if latest else moment
+        try:
+            price = float(fields[3])
+            previous_close = float(fields[4])
+        except ValueError:
+            fail(75, "quote price is invalid")
+        if price <= 0 or previous_close < 0 or not fields[1].strip():
+            fail(75, "quote identity or price is invalid")
+        close_ready = moment.time() >= dt.time(15, 0)
+        if finality in {"close", "official_close"} and not close_ready:
+            fail(75, "quote does not meet close finality")
+        quotes.append({
+            "symbol": item["symbol"], "name": fields[1].strip(), "exchange": item["exchange"], "market": item["market"],
+            "price": price, "previous_close": previous_close, "quote_at": quote_at, "trading_date": trading_date,
+            "status": "closed" if close_ready else "trading", "source": "tencent_quote",
+        })
+    if latest is None:
+        fail(64, "at least one symbol is required")
+    return {"quotes": quotes, "finality": finality, "source": "tencent_quote"}, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def main() -> None:
@@ -111,6 +171,26 @@ def main() -> None:
     if not isinstance(inputs, dict):
         fail(64, "inputs must be an object")
     mode = sys.argv[1]
+    if mode == "cn_equity_identity":
+        symbols = inputs.get("symbols")
+        if not isinstance(symbols, list) or not symbols:
+            fail(64, "symbols must be a non-empty array")
+        result({"identities": [identity(symbol) for symbol in symbols], "source": "a_share_code_rules"})
+        return
+    if mode == "cn_equity_quote_batch":
+        symbols = inputs.get("symbols")
+        if not isinstance(symbols, list) or not symbols:
+            fail(64, "symbols must be a non-empty array")
+        finality = str(request.get("finality") or "observed")
+        if finality not in {"intraday", "realtime", "close", "official_close"}:
+            fail(64, "unsupported quote finality")
+        normalized = [identity(symbol) for symbol in symbols]
+        quote_url = safe_url(inputs.get("quote_url") or "https://qt.gtimg.cn/q=")
+        separator = "" if quote_url.endswith(("=", ",")) else "&q="
+        _url, body = fetch(quote_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
+        payload, fact_as_of = quote_payload(body, normalized, finality)
+        result(payload, fact_as_of=fact_as_of)
+        return
     if mode in {"cninfo_search", "article_range"}:
         base = safe_url(inputs.get("base_url") or "http://yosef-server:8815").rstrip("/")
         if mode == "cninfo_search":

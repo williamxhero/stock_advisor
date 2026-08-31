@@ -349,6 +349,89 @@ class ToolRunnerTests(unittest.TestCase):
             self.assertFalse(result.succeeded)
             self.assertEqual("tool_access_restricted", result.error_code)
 
+    def test_builtin_quote_tools_validate_a_share_identity_and_close_semantics(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = (
+                    'v_sh600000="1~浦发银行~600000~10.50~10.00~~~~~~~~~~~~20260901150100";\n'
+                    'v_sz000001="51~平安银行~000001~11.20~11.00~~~~~~~~~~~~20260901150100";\n'
+                    'v_bj830001="47~北交所样本~830001~21.00~20.00~~~~~~~~~~~~20260901150100";\n'
+                ).encode("gb18030")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=gb18030")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                runner = ToolRunner(ToolCatalog(root))
+                identities = runner.resolve(FactRequest(
+                    1, "cn_equity_identity", "2026-09-01T07:01:00Z", 2.0,
+                    {"symbols": ["600000", "000001", "830001"]},
+                ))
+                quotes = runner.resolve_with_fallback(FactRequest(
+                    1, "cn_equity_quote_batch", "2026-09-01T07:01:00Z", 2.0,
+                    {"symbols": ["600000", "000001", "830001"], "quote_url": f"http://127.0.0.1:{server.server_port}/quotes?q="},
+                    finality="official_close",
+                ))
+
+                self.assertTrue(identities.succeeded, identities.error_code)
+                self.assertEqual(["SSE", "SZSE", "BSE"], [item["exchange"] for item in identities.data["identities"]])
+                self.assertTrue(quotes.succeeded, quotes.error_code)
+                self.assertEqual("official_close", quotes.data["finality"])
+                self.assertEqual(["600000", "000001", "830001"], [item["symbol"] for item in quotes.data["quotes"]])
+                self.assertEqual("2026-09-01", quotes.data["quotes"][0]["trading_date"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_quote_result_with_a_stale_date_or_nonclose_time_is_rejected_and_degraded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            self.publish_tool(root, "cn_equity_quote_batch", """
+                import json
+                import sys
+                request = json.load(sys.stdin)
+                intraday = request["inputs"].get("case") == "intraday"
+                date = "2026-09-01" if intraday else "2026-08-31"
+                quote_time = f"{date}T14:30:00+08:00" if intraday else f"{date}T15:01:00+08:00"
+                print(json.dumps({
+                    "contract": "ai-trading-tool-result/v1",
+                    "fact_as_of": "2026-09-01T06:30:00Z" if intraday else "2026-08-31T07:01:00Z",
+                    "data": {"finality": "official_close", "quotes": [{
+                        "symbol": "600000", "name": "浦发银行", "exchange": "SSE", "market": "CN-A",
+                        "price": 10.5, "quote_at": quote_time, "trading_date": date,
+                        "status": "trading" if intraday else "closed", "source": "test",
+                    }]},
+                }))
+            """)
+            runner = ToolRunner(ToolCatalog(root))
+            result = runner.resolve_with_fallback(FactRequest(
+                1, "cn_equity_quote_batch", "2026-09-01T07:01:00Z", 2.0,
+                {"symbols": ["600000"]}, finality="official_close",
+            ))
+
+            self.assertFalse(result.succeeded)
+            self.assertEqual("tool_quote_trading_date_mismatch", result.error_code)
+            health = json.loads((root / ".health" / "cn_equity_quote_batch-default-1.0.0.json").read_text(encoding="utf-8"))
+            self.assertTrue(health["degraded"])
+
+            intraday = runner.resolve(FactRequest(
+                1, "cn_equity_quote_batch", "2026-09-01T07:01:00Z", 2.0,
+                {"symbols": ["600000"], "case": "intraday"}, finality="official_close",
+            ))
+            self.assertFalse(intraday.succeeded)
+            self.assertEqual("tool_quote_finality_invalid", intraday.error_code)
+
 
 if __name__ == "__main__":
     unittest.main()

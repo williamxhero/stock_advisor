@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,7 @@ from .secret_guard import find_secrets
 _MANIFEST_CONTRACT = "ai-trading-tool-manifest/v1"
 _CURRENT_CONTRACT = "ai-trading-tool-current/v1"
 _RESULT_CONTRACT = "ai-trading-tool-result/v1"
+_SHANGHAI = timezone(timedelta(hours=8))
 
 
 class ToolLookupError(ValueError):
@@ -344,6 +345,12 @@ class ToolRunner:
                     request.capability, "tool_fact_as_of_invalid", tool_version=tool.version,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
                 )
+            validation_error = _validate_capability_result(request, output)
+            if validation_error:
+                return EvidenceResolution.failed(
+                    request.capability, validation_error, tool_version=tool.version,
+                    raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                )
             return EvidenceResolution(
                 succeeded=True,
                 capability=request.capability,
@@ -418,7 +425,7 @@ class ToolRunner:
         health["attempts"] = int(health.get("attempts") or 0) + 1
         if result.succeeded:
             health["successes"] = int(health.get("successes") or 0) + 1
-        elif result.error_code in {"tool_stdout_invalid_json", "tool_result_invalid", "tool_fact_as_of_invalid"}:
+        elif result.error_code in {"tool_stdout_invalid_json", "tool_result_invalid", "tool_fact_as_of_invalid"} or (result.error_code or "").startswith("tool_quote_"):
             health["degraded"] = True
             health["degrade_reason"] = result.error_code
         else:
@@ -440,6 +447,50 @@ class ToolRunner:
     def _health_path(self, tool: PublishedTool) -> Path:
         safe_name = f"{tool.capability}-{tool.adapter}-{tool.version}".replace("/", "_")
         return self.catalog.root / ".health" / f"{safe_name}.json"
+
+
+def _validate_capability_result(request: FactRequest, output: dict[str, Any]) -> str | None:
+    """Reject quote data whose identity, session date, or finality cannot meet the request."""
+    if request.capability != "cn_equity_quote_batch":
+        return None
+    data = output["data"]
+    quotes = data.get("quotes")
+    expected = request.inputs.get("symbols")
+    if not isinstance(quotes, list) or not isinstance(expected, list) or not quotes:
+        return "tool_quote_result_invalid"
+    expected_symbols = [str(symbol).strip() for symbol in expected]
+    if len(set(expected_symbols)) != len(expected_symbols):
+        return "tool_quote_request_invalid"
+    expected_date = _parse_timestamp(request.required_at).astimezone(_SHANGHAI).date().isoformat()
+    seen: list[str] = []
+    for quote in quotes:
+        if not isinstance(quote, dict):
+            return "tool_quote_result_invalid"
+        symbol = quote.get("symbol")
+        if not isinstance(symbol, str) or symbol not in expected_symbols:
+            return "tool_quote_symbol_mismatch"
+        if symbol in seen:
+            return "tool_quote_symbol_mismatch"
+        seen.append(symbol)
+        if quote.get("trading_date") != expected_date:
+            return "tool_quote_trading_date_mismatch"
+        if quote.get("market") != "CN-A" or quote.get("exchange") not in {"SSE", "SZSE", "BSE"}:
+            return "tool_quote_identity_invalid"
+        if not isinstance(quote.get("name"), str) or not quote["name"].strip() or not isinstance(quote.get("source"), str):
+            return "tool_quote_identity_invalid"
+        try:
+            quote_time = _parse_timestamp(str(quote.get("quote_at") or "")).astimezone(_SHANGHAI)
+            price = float(quote.get("price"))
+        except (TypeError, ValueError):
+            return "tool_quote_result_invalid"
+        if quote_time.date().isoformat() != expected_date or price <= 0:
+            return "tool_quote_trading_date_mismatch" if quote_time.date().isoformat() != expected_date else "tool_quote_result_invalid"
+        if request.finality in {"close", "official_close"}:
+            if quote_time.time().hour < 15 or quote.get("status") != "closed":
+                return "tool_quote_finality_invalid"
+    if set(seen) != set(expected_symbols) or data.get("finality") != request.finality:
+        return "tool_quote_finality_invalid" if data.get("finality") != request.finality else "tool_quote_symbol_mismatch"
+    return None
 
 
 def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:

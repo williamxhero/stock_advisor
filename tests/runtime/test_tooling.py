@@ -231,6 +231,63 @@ class ToolRunnerTests(unittest.TestCase):
             reader = ToolRunner(ToolCatalog(root))
             self.assertIn(b"source still working", reader.read_artifact(result.raw_artifact_ref))
 
+    def test_fallback_resolver_retries_a_transient_failure_then_uses_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            self.publish_tool(root, "cn_equity_identity", "import sys; sys.exit(75)")
+            backup = root / "cn_equity_identity" / "adapters" / "backup" / "versions" / "1.0.0"
+            backup.mkdir(parents=True)
+            (backup / "tool.py").write_text(textwrap.dedent("""
+                import json
+                print(json.dumps({
+                    "contract": "ai-trading-tool-result/v1",
+                    "fact_as_of": "2026-09-01T01:30:00Z",
+                    "data": {"symbol": "600000", "source": "backup"},
+                }))
+            """), encoding="utf-8")
+            (backup / "manifest.json").write_text(json.dumps({
+                "contract": "ai-trading-tool-manifest/v1", "capability": "cn_equity_identity",
+                "version": "1.0.0", "state": "promoted", "command": [sys.executable, "tool.py"],
+            }), encoding="utf-8")
+            (root / "cn_equity_identity" / "routing.json").write_text(json.dumps({
+                "contract": "ai-trading-tool-routing/v1",
+                "candidates": [{"adapter": "default", "version": "1.0.0"}, {"adapter": "backup", "version": "1.0.0"}],
+            }), encoding="utf-8")
+
+            runner = ToolRunner(ToolCatalog(root))
+            result = runner.resolve_with_fallback(self.request())
+
+            self.assertTrue(result.succeeded, result.error_code)
+            self.assertEqual("backup", result.data["source"])
+            self.assertEqual(["default:tool_process_failed", "backup:succeeded"], list(result.attempts))
+            self.assertTrue((root / ".audit" / "resolutions.ndjson").exists())
+
+    def test_fallback_cache_requires_the_same_fact_time_and_finality(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            version_root = self.publish_tool(root, "cn_equity_identity", """
+                import json
+                from pathlib import Path
+                calls = Path("calls.txt")
+                calls.write_text(calls.read_text() + "x" if calls.exists() else "x", encoding="utf-8")
+                print(json.dumps({
+                    "contract": "ai-trading-tool-result/v1",
+                    "fact_as_of": "2026-09-01T01:30:00Z",
+                    "data": {"symbol": "600000"},
+                }))
+            """)
+            runner = ToolRunner(ToolCatalog(root))
+            request = FactRequest(1, "cn_equity_identity", "2026-09-01T01:30:00Z", 2.0, {}, freshness_seconds=60.0, finality="official_close")
+
+            first = runner.resolve_with_fallback(request)
+            second = runner.resolve_with_fallback(request)
+            changed_time = runner.resolve_with_fallback(FactRequest(
+                1, "cn_equity_identity", "2026-09-01T01:31:00Z", 2.0, {}, freshness_seconds=60.0, finality="official_close",
+            ))
+
+            self.assertTrue(first.succeeded and second.succeeded and changed_time.succeeded)
+            self.assertEqual("xx", (version_root / "calls.txt").read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

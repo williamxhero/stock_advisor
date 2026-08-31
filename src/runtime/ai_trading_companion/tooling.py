@@ -10,7 +10,7 @@ import signal
 import subprocess
 import tempfile
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -43,6 +43,8 @@ class FactRequest:
     deadline_seconds: float
     inputs: dict[str, Any]
     context: dict[str, Any] = field(default_factory=dict)
+    freshness_seconds: float = 0.0
+    finality: str = "observed"
 
     def to_wire(self) -> dict[str, Any]:
         if self.contract_version != 1:
@@ -54,6 +56,8 @@ class FactRequest:
         _parse_timestamp(self.required_at)
         if self.deadline_seconds <= 0:
             raise ValueError("fact_request_deadline_must_be_positive")
+        if self.freshness_seconds < 0 or not self.finality:
+            raise ValueError("invalid_fact_request_freshness")
         return {
             "contract": "ai-trading-fact-request/v1",
             "version": self.contract_version,
@@ -61,6 +65,8 @@ class FactRequest:
             "required_at": self.required_at,
             "inputs": self.inputs,
             "context": self.context,
+            "freshness_seconds": self.freshness_seconds,
+            "finality": self.finality,
         }
 
 
@@ -79,6 +85,7 @@ class EvidenceResolution:
     technical_validation: tuple[str, ...]
     error_code: str | None = None
     exit_code: int | None = None
+    attempts: tuple[str, ...] = ()
 
     @classmethod
     def failed(cls, capability: str, code: str, *, tool_version: str | None = None,
@@ -105,6 +112,7 @@ class PublishedTool:
     version: str
     command: tuple[str, ...]
     version_root: Path
+    adapter: str = "default"
 
 
 class ToolCatalog:
@@ -147,6 +155,47 @@ class ToolCatalog:
         if not isinstance(command, list) or not command or any(not isinstance(part, str) or not part for part in command):
             raise ToolLookupError("tool_manifest_invalid")
         return PublishedTool(capability, version, tuple(command), version_root)
+
+    def resolve_candidates(self, capability: str) -> list[PublishedTool]:
+        routing_path = self.root / capability / "routing.json"
+        if not routing_path.exists():
+            return [self.resolve(capability)]
+        try:
+            routing = json.loads(routing_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ToolLookupError("tool_routing_invalid") from exc
+        candidates = routing.get("candidates") if isinstance(routing, dict) else None
+        if routing.get("contract") != "ai-trading-tool-routing/v1" or not isinstance(candidates, list) or not candidates:
+            raise ToolLookupError("tool_routing_invalid")
+        resolved: list[PublishedTool] = []
+        for candidate in candidates:
+            adapter = str(candidate.get("adapter") or "") if isinstance(candidate, dict) else ""
+            version = str(candidate.get("version") or "") if isinstance(candidate, dict) else ""
+            if not _safe_segment(adapter) or not _safe_segment(version):
+                continue
+            if adapter == "default":
+                tool = self.resolve(capability)
+                if tool.version == version:
+                    resolved.append(replace(tool, adapter=adapter))
+                continue
+            version_root = self.root / capability / "adapters" / adapter / "versions" / version
+            try:
+                manifest = json.loads((version_root / "manifest.json").read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
+            command = manifest.get("command") if isinstance(manifest, dict) else None
+            if (
+                manifest.get("contract") == _MANIFEST_CONTRACT
+                and manifest.get("capability") == capability
+                and manifest.get("version") == version
+                and manifest.get("state") == "promoted"
+                and isinstance(command, list) and command
+                and all(isinstance(part, str) and part for part in command)
+            ):
+                resolved.append(PublishedTool(capability, version, tuple(command), version_root, adapter))
+        if not resolved:
+            raise ToolLookupError("tool_not_published")
+        return resolved
 
 
 class ToolArtifactStore:
@@ -197,11 +246,12 @@ class ToolRunner:
         self.catalog = catalog
         self.max_stdout_bytes = max(1, int(max_stdout_bytes))
         self.artifacts = ToolArtifactStore(catalog.root, max_bytes=archive_max_bytes)
+        self._cache: dict[str, EvidenceResolution] = {}
 
-    def resolve(self, request: FactRequest) -> EvidenceResolution:
+    def resolve(self, request: FactRequest, *, _tool: PublishedTool | None = None) -> EvidenceResolution:
         try:
             wire_request = request.to_wire()
-            tool = self.catalog.resolve(request.capability)
+            tool = _tool or self.catalog.resolve(request.capability)
         except (ToolLookupError, ValueError) as exc:
             return EvidenceResolution.failed(request.capability, getattr(exc, "code", str(exc)))
         if find_secrets(json.dumps(wire_request, ensure_ascii=False, sort_keys=True)):
@@ -313,6 +363,81 @@ class ToolRunner:
 
     def read_artifact(self, reference: str) -> bytes:
         return self.artifacts.read(reference)
+
+    def resolve_with_fallback(self, request: FactRequest) -> EvidenceResolution:
+        cache_key = json.dumps(request.to_wire(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        cached = self._cache.get(cache_key)
+        if cached is not None and request.freshness_seconds > 0:
+            age = datetime.now(timezone.utc) - _parse_timestamp(cached.acquired_at)
+            if age.total_seconds() <= request.freshness_seconds:
+                return replace(cached, attempts=("cache:succeeded",))
+        try:
+            candidates = self._ordered_candidates(self.catalog.resolve_candidates(request.capability))
+        except ToolLookupError as exc:
+            return EvidenceResolution.failed(request.capability, exc.code)
+        attempts: list[str] = []
+        last: EvidenceResolution | None = None
+        deadline = datetime.now(timezone.utc).timestamp() + request.deadline_seconds
+        for tool in candidates:
+            remaining = deadline - datetime.now(timezone.utc).timestamp()
+            if remaining <= 0:
+                break
+            attempt_request = replace(request, deadline_seconds=remaining)
+            result = self.resolve(attempt_request, _tool=tool)
+            attempts.append(f"{tool.adapter}:{'succeeded' if result.succeeded else result.error_code}")
+            last = result
+            self._record_health(tool, result)
+            if result.succeeded:
+                resolved = replace(result, attempts=tuple(attempts))
+                self._cache[cache_key] = resolved
+                self._append_audit(request, resolved)
+                return resolved
+        failed = replace(last or EvidenceResolution.failed(request.capability, "tool_no_candidate_satisfied"), attempts=tuple(attempts))
+        self._append_audit(request, failed)
+        return failed
+
+    def _append_audit(self, request: FactRequest, result: EvidenceResolution) -> None:
+        audit_root = self.catalog.root / ".audit"
+        audit_root.mkdir(parents=True, exist_ok=True)
+        record = {
+            "capability": request.capability, "required_at": request.required_at,
+            "finality": request.finality, "succeeded": result.succeeded,
+            "tool_version": result.tool_version, "error_code": result.error_code,
+            "attempts": list(result.attempts), "acquired_at": result.acquired_at,
+        }
+        with (audit_root / "resolutions.ndjson").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def _ordered_candidates(self, candidates: list[PublishedTool]) -> list[PublishedTool]:
+        return sorted(candidates, key=lambda tool: bool(self._health(tool).get("degraded")))
+
+    def _record_health(self, tool: PublishedTool, result: EvidenceResolution) -> None:
+        health = self._health(tool)
+        health["attempts"] = int(health.get("attempts") or 0) + 1
+        if result.succeeded:
+            health["successes"] = int(health.get("successes") or 0) + 1
+        elif result.error_code in {"tool_stdout_invalid_json", "tool_result_invalid", "tool_fact_as_of_invalid"}:
+            health["degraded"] = True
+            health["degrade_reason"] = result.error_code
+        else:
+            health["transient_failures"] = int(health.get("transient_failures") or 0) + 1
+        path = self._health_path(tool)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+        temporary.write_text(json.dumps(health, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, path)
+
+    def _health(self, tool: PublishedTool) -> dict[str, Any]:
+        path = self._health_path(tool)
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _health_path(self, tool: PublishedTool) -> Path:
+        safe_name = f"{tool.capability}-{tool.adapter}-{tool.version}".replace("/", "_")
+        return self.catalog.root / ".health" / f"{safe_name}.json"
 
 
 def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:

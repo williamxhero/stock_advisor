@@ -1157,6 +1157,15 @@ class CompanionStore:
                 values,
             )]
 
+    def active_proposition(self, subject: str, predicate: str) -> dict[str, Any] | None:
+        with self.connection() as c:
+            row = c.execute(
+                """SELECT * FROM memory_proposition WHERE subject=? AND predicate=?
+                   AND status='active' AND tombstoned_at IS NULL ORDER BY known_at DESC,created_at DESC LIMIT 1""",
+                (subject, predicate),
+            ).fetchone()
+        return dict(row) if row else None
+
     def relevant_propositions(
         self, known_at: str, query_text: str, *, exclude_cycle_id: str | None = None, limit: int = 20,
     ) -> list[dict[str, Any]]:

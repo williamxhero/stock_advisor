@@ -9,6 +9,7 @@ from .learning import WorkflowEvolution
 from .portfolio import explicit_fixture_extraction, is_portfolio_statement
 from .store import digest
 from .task_profiles import AnalysisClarificationRequired
+from .user_learning import explicit_expression_preference, user_method_claim
 
 
 @dataclass(frozen=True)
@@ -107,7 +108,12 @@ class UnifiedCognition:
                 "同一原文会被独立交给策略分支，但本分支的结果不得进入当前 M1。"
             )
         else:
-            instructions += "自然回复像同一个熟悉用户的炒股搭档；需要核验当前公开事实时可提出公开搜索请求。"
+            instructions += (
+                "自然回复像同一个熟悉用户的炒股搭档；需要核验当前公开事实时可提出公开搜索请求。"
+                "自己的话只用自然短段，不用标题、列表、表格、字段名或内部任务名。"
+                "只有可归属的短外部材料才可以放进 Markdown 引用块，并带可点击来源链接；"
+                "长材料先给自然摘要和链接，不要倾倒原文。"
+            )
         packet = {
             "cycle_id": cycle["cycle_id"],
             "mode": mode,
@@ -175,6 +181,28 @@ class UnifiedCognition:
             proposition_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{job['job_id']}:proposition:{index}:{digest(json.dumps(parsed, ensure_ascii=False, sort_keys=True))}"))
             try:
                 self.store.record_proposition(proposition_id, parsed, message)
+                propositions_recorded += 1
+            except ValueError:
+                continue
+
+        learned = [
+            candidate for message in messages
+            for candidate in (
+                explicit_expression_preference(
+                    message, self.store.active_proposition("user.expression", "expression.material_density"),
+                ),
+                user_method_claim(message),
+            )
+            if candidate is not None
+        ]
+        for index, proposition in enumerate(learned, start=len(result.get("propositions") or [])):
+            message = by_id[proposition["source_span"]["message_id"]]
+            proposition_id = str(uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{job['job_id']}:deterministic-learning:{index}:{digest(json.dumps(proposition, ensure_ascii=False, sort_keys=True))}",
+            ))
+            try:
+                self.store.record_proposition(proposition_id, proposition, message)
                 propositions_recorded += 1
             except ValueError:
                 continue

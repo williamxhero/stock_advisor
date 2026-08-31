@@ -45,6 +45,19 @@ class EvidenceV3Tests(TestCase):
         self.assertEqual("2026-08-26T06:30:00Z", market["window"]["end"])
         self.assertEqual("2026-08-26T02:30:00Z", events["window"]["start"])
 
+    def test_premarket_and_early_sessions_keep_separate_fact_windows(self):
+        factory = EvidenceContractFactory(_WeekdayCalendar())
+        premarket = factory.build(task_key="daily.opportunity.0900", stage="m0_research", as_of="2026-08-26T00:30:00Z")
+        at_0945 = factory.build(task_key="daily.execution.0945", stage="m0_research", as_of="2026-08-26T01:45:00Z")
+        at_1030 = factory.build(task_key="daily.execution.1030", stage="m0_research", as_of="2026-08-26T02:30:00Z")
+
+        premarket_market = next(item for item in premarket["requirements"] if item["key"] == "current_market_state")
+        early_market = next(item for item in at_0945["requirements"] if item["key"] == "current_market_state")
+        middle_market = next(item for item in at_1030["requirements"] if item["key"] == "current_market_state")
+        self.assertEqual("2026-08-25T07:00:00Z", premarket_market["window"]["end"])
+        self.assertEqual("2026-08-26T01:30:00Z", early_market["window"]["start"])
+        self.assertEqual("2026-08-26T02:15:00Z", middle_market["window"]["start"])
+
     def setUp(self):
         self.as_of = "2026-08-26T01:00:00Z"
         self.contract = EvidenceContractFactory(_WeekdayCalendar()).build(

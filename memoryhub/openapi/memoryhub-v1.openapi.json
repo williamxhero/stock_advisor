@@ -9,11 +9,17 @@
     }}},
     "/v1/snapshots": {"post": {"responses": {"200": {"description": "Frozen ledger watermark"}}}},
     "/v1/snapshots/{snapshot_id}/search": {"post": {"responses": {"200": {"description": "Policy-filtered memory cards"}}}},
+    "/v1/snapshots/{snapshot_id}/retrieve": {"post": {"responses": {"200": {"description": "Versioned, replayable MemoryBundle with separate audit reference"}}}},
     "/v1/snapshots/{snapshot_id}/expand": {"post": {"responses": {"200": {"description": "Visible immutable episode"}}}},
     "/v1/snapshots/{snapshot_id}/related": {"post": {"responses": {"200": {"description": "Visible correction and outcome links"}}}},
     "/v1/memory-spaces/{memory_space_id}/timeline": {"post": {"responses": {"200": {"description": "Submitted and published message timeline"}}}},
     "/v1/memory-spaces/{memory_space_id}/export": {"post": {"responses": {"200": {"description": "Human and machine rebuildable private-space export"}}}},
     "/v1/memory-spaces/{memory_space_id}/clear/prepare": {"post": {"responses": {"200": {"description": "Second-confirmation token bound to a fresh export"}}}},
-    "/v1/memory-spaces/{memory_space_id}/clear": {"post": {"responses": {"200": {"description": "Idempotent whole-space clear receipt"}}}}
+    "/v1/memory-spaces/{memory_space_id}/clear": {"post": {"responses": {"200": {"description": "Idempotent whole-space clear receipt"}}}},
+    "/v1/retrieval/audits/{audit_id}": {"post": {"responses": {"200": {"description": "Operational retrieval audit; never timeline memory"}}}},
+    "/v1/retrieval/bundles/{bundle_id}": {"post": {"responses": {"200": {"description": "Immutable MemoryBundle replay"}}}},
+    "/v1/retrieval/query-sets": {"post": {"responses": {"200": {"description": "Frozen qualification query set"}}}},
+    "/v1/retrieval/evaluations": {"post": {"responses": {"200": {"description": "Multi-dimensional candidate report"}}}},
+    "/v1/retrieval/promotions": {"post": {"responses": {"200": {"description": "Explicit promotion of a qualified candidate"}}}}
   }
 }

@@ -10,6 +10,7 @@ from typing import Any
 from .core import EpisodeConflict, MemoryHub, MemoryHubError, SourceIntegrityError
 from .sources import ArticleArchiveSourceAdapter, MarketHubSourceAdapter
 from .derivation import DerivationWorker, OllamaExtractor
+from .backup import BackupManager, BackupWorker
 
 
 def make_server(host: str, port: int, database: Path | str, *, source_adapters: dict[str, Any] | None = None) -> ThreadingHTTPServer:
@@ -80,21 +81,33 @@ def main() -> None:
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     parser.add_argument("--ollama-model", default="")
+    parser.add_argument("--backup-dir", type=Path)
+    parser.add_argument("--backup-interval-seconds", type=float, default=86400.0)
     args = parser.parse_args()
     server = make_server(args.host, args.port, args.database)
     worker = None
+    backup_worker = None
     if args.ollama_model:
         worker = DerivationWorker(
             MemoryHub(args.database),
             OllamaExtractor(base_url=args.ollama_url, model=args.ollama_model),
         )
+    if args.backup_dir:
+        backup_worker = BackupWorker(
+            BackupManager(MemoryHub(args.database)), args.backup_dir,
+            interval_seconds=args.backup_interval_seconds,
+        )
     try:
         if worker:
             worker.start()
+        if backup_worker:
+            backup_worker.start()
         server.serve_forever()
     finally:
         if worker:
             worker.stop()
+        if backup_worker:
+            backup_worker.stop()
 
 
 if __name__ == "__main__":

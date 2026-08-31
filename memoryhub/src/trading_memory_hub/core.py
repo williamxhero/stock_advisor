@@ -310,6 +310,33 @@ class MemoryHub:
                 parent[right_root] = left_root
         return len({root(value) for value in episode_ids})
 
+    def rebuild_indexes(self) -> dict[str, int]:
+        with self._connection() as connection:
+            source_rows = list(
+                connection.execute(
+                    "SELECT episode_id,content_hash,source_reference_json FROM episode WHERE source_reference_json IS NOT NULL"
+                )
+            )
+            connection.execute("DELETE FROM source_search_index")
+            connection.execute("DELETE FROM derived_memory")
+            connection.execute("DELETE FROM event_link")
+            connection.execute(
+                "UPDATE derivation_job SET state='pending',error=NULL,extractor_version=NULL"
+            )
+        rebuilt_sources = 0
+        for row in source_rows:
+            reference = _loads(row["source_reference_json"])
+            hydrated = self._hydrate(reference)
+            if _content_hash(hydrated["body"]) != row["content_hash"]:
+                raise SourceIntegrityError("source changed during index rebuild")
+            with self._connection() as connection:
+                connection.execute(
+                    "INSERT INTO source_search_index(episode_id,title,searchable_text) VALUES(?,?,?)",
+                    (row["episode_id"], hydrated["title"], hydrated["body"]),
+                )
+            rebuilt_sources += 1
+        return {"source_documents": rebuilt_sources, "derivation_jobs": self.health()["ledger"]["episodes"]}
+
     def begin_snapshot(
         self, memory_space_id: str, *, as_of: str, stage: str, cycle_id: str | None = None
     ) -> SnapshotReceipt:
@@ -411,8 +438,15 @@ class MemoryHub:
                 "complete": derivation.get("complete", 0),
                 "failed": derivation.get("failed", 0),
             },
-            "sources": {name: adapter.health() for name, adapter in self.source_adapters.items()},
+            "sources": {name: self._source_health(adapter) for name, adapter in self.source_adapters.items()},
         }
+
+    @staticmethod
+    def _source_health(adapter: Any) -> dict[str, Any]:
+        try:
+            return adapter.health()
+        except Exception as error:
+            return {"state": "unavailable", "detail": str(error)}
 
     def _hydrate(self, reference: dict[str, str]) -> dict[str, str]:
         source_system = reference.get("source_system", "")

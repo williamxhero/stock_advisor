@@ -13,3 +13,6 @@ memoryhub = "trading_memory_hub.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"trading_memory_hub.admin" = ["*.html", "*.css", "*.js"]

@@ -4,9 +4,10 @@ import argparse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .core import EpisodeConflict, MemoryHub, MemoryHubError, SourceIntegrityError
 from .sources import ArticleArchiveSourceAdapter, MarketHubSourceAdapter
@@ -24,8 +25,26 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
-            if self.path == "/health":
+            request = urlsplit(self.path)
+            if request.path == "/health":
                 self._reply(HTTPStatus.OK, hub.health())
+            elif request.path in {"/admin", "/admin/"}:
+                self._asset("index.html", "text/html; charset=utf-8")
+            elif request.path.startswith("/admin/assets/"):
+                name = request.path.removeprefix("/admin/assets/")
+                content_type = "text/css; charset=utf-8" if name.endswith(".css") else "text/javascript; charset=utf-8"
+                self._asset(name, content_type)
+            elif request.path == "/v1/admin/memory-spaces":
+                self._reply(HTTPStatus.OK, {"result": hub.admin_memory_spaces()})
+            elif request.path == "/v1/admin/episodes":
+                query = parse_qs(request.query)
+                cursor = _first(query, "cursor")
+                result = hub.admin_episodes(
+                    _first(query, "memory_space_id") or "",
+                    cursor=int(cursor) if cursor else None,
+                    limit=int(_first(query, "limit") or "50"),
+                )
+                self._reply(HTTPStatus.OK, {"result": result})
             else:
                 self._reply(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -117,7 +136,24 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
             self.end_headers()
             self.wfile.write(body)
 
+        def _asset(self, name: str, content_type: str) -> None:
+            if name not in {"index.html", "admin.css", "admin.js"}:
+                self._reply(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                return
+            body = files("trading_memory_hub.admin").joinpath(name).read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+
     return ThreadingHTTPServer((host, port), Handler)
+
+
+def _first(query: dict[str, list[str]], name: str) -> str | None:
+    values = query.get(name) or []
+    return values[0] if values else None
 
 
 def main() -> None:

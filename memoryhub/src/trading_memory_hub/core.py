@@ -645,6 +645,41 @@ class MemoryHub:
             )
         return [self._episode(row) for row in rows]
 
+    def admin_memory_spaces(self) -> list[dict[str, Any]]:
+        """Return read-only operator summaries without exposing storage layout."""
+        with self._connection() as connection:
+            rows = list(connection.execute(
+                """SELECT memory_space_id,COUNT(*) AS episode_count,
+                          MAX(sequence) AS latest_sequence,MAX(submitted_at) AS latest_submitted_at
+                   FROM episode GROUP BY memory_space_id ORDER BY latest_sequence DESC"""
+            ))
+        return [dict(row) for row in rows]
+
+    def admin_episodes(
+        self, memory_space_id: str, *, cursor: int | None = None, limit: int = 50
+    ) -> dict[str, Any]:
+        if not memory_space_id:
+            raise MemoryHubError("admin episode listing requires memory_space_id")
+        page_size = max(1, min(int(limit), 200))
+        clauses = ["memory_space_id=?"]
+        values: list[Any] = [memory_space_id]
+        if cursor is not None:
+            clauses.append("sequence<?")
+            values.append(max(1, int(cursor)))
+        values.append(page_size + 1)
+        with self._connection() as connection:
+            rows = list(connection.execute(
+                f"SELECT * FROM episode WHERE {' AND '.join(clauses)} ORDER BY sequence DESC LIMIT ?",
+                values,
+            ))
+        has_more = len(rows) > page_size
+        items = [self._episode(row) for row in rows[:page_size]]
+        return {
+            "items": items,
+            "next_cursor": str(items[-1]["sequence"]) if has_more else None,
+            "protocol_version": PROTOCOL_VERSION,
+        }
+
     def export_space(self, memory_space_id: str) -> dict[str, Any]:
         if not memory_space_id:
             raise MemoryHubError("export requires memory_space_id")
@@ -944,6 +979,7 @@ class MemoryHub:
             "source_system": row["source_system"],
             "source_event_id": row["source_event_id"],
             "submitted_at": row["submitted_at"],
+            "original_span": _loads(row["original_span_json"]),
             "metadata": _loads(row["metadata_json"]) or {},
             "protocol_version": row["protocol_version"],
         }

@@ -80,11 +80,12 @@ class BrokerResearchPlanner:
     """Ask Broker only for declarative JSON; acquisition stays local."""
 
     def __init__(self, broker: ProviderBrokerClient, *, intellect: str, effort: str,
-                 deadline: Callable[[], float] | None = None) -> None:
+                 deadline: Callable[[], float] | None = None, market_tool_available: bool = False) -> None:
         self.broker = broker
         self.deadline = deadline or (lambda: math.inf)
         self.intellect = intellect
         self.effort = effort
+        self.market_tool_available = market_tool_available
         self.outcomes: list[Any] = []
 
     def __call__(self, packet: dict[str, Any], gaps: list[str], round_number: int) -> dict[str, Any]:
@@ -106,12 +107,12 @@ class BrokerResearchPlanner:
             "available_backends": [
                 backend for backend in ("gateway", "market")
                 if backend in set(packet.get("allowed_research_backends") or ("gateway", "market"))
-                and (backend != "market" or packet.get("deterministic_market_facts"))
+                and (backend != "market" or packet.get("deterministic_market_facts") or self.market_tool_available)
             ],
             "instruction": (
                 "Return only a version 1 research plan. Use gateway web_search only for discovery and "
                 "gateway web_read for source verification. Use market operations only when market appears in "
-                "available_backends; they can read frozen caller-supplied market facts and never query external market systems. "
+                "available_backends; they read frozen caller-supplied facts when available, otherwise use promoted local public-market tools. "
                 "All timestamps in the evidence contract are UTC. For Chinese-market search terms, convert them to the "
                 "Asia/Shanghai local timestamps supplied in market_time_context. An exact 15:00 local market-state "
                 "requirement means the closing state: search for 收盘/闭市 evidence, never 早盘 or 开盘. "
@@ -204,6 +205,55 @@ class ToolCatalogResearchBackend:
         }
 
 
+class ToolCatalogMarketBackend:
+    """Resolve public market facts through promoted tools and expose evidence-shaped results."""
+
+    def __init__(self, runner: ToolRunner, *, contract: dict[str, Any], deadline: Callable[[], float]) -> None:
+        self.runner = runner
+        self.contract = contract
+        self.deadline = deadline
+        self.requirements = {
+            str(row.get("key") or ""): row
+            for row in contract.get("requirements") or [] if isinstance(row, dict)
+        }
+
+    def __call__(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        requirement_key = str(arguments.pop("_requirement_key", "") or "")
+        requirement = self.requirements.get(requirement_key) or {}
+        capability = {"market_snapshot": "cn_market_snapshot", "market_breadth": "cn_market_breadth"}.get(operation)
+        if capability is None:
+            raise ValueError(f"unsupported live market operation: {operation}")
+        window = requirement.get("window") if isinstance(requirement.get("window"), dict) else {}
+        required_at = str(window.get("end") or self.contract.get("as_of") or "")
+        mode = str(window.get("mode") or "")
+        finality = "official_close" if mode == "exact" and required_at[11:16] == "07:00" else "intraday"
+        resolution = self.runner.resolve_with_fallback(FactRequest(
+            contract_version=1, capability=capability, required_at=required_at,
+            deadline_seconds=max(0.1, min(25.0, float(self.deadline()))), inputs={}, context={},
+            freshness_seconds=900.0 if finality == "intraday" else 0.0, finality=finality,
+        ))
+        if not resolution.succeeded or resolution.data is None:
+            raise RuntimeError(f"tool resolution failed: {capability}:{resolution.error_code}")
+        source_rows = [row for row in resolution.data.get("source_evidence") or []
+                       if isinstance(row, dict) and str(row.get("url") or "").startswith(("http://", "https://"))]
+        if not source_rows:
+            source_rows = [{"url": url, "fact_as_of": resolution.fact_as_of, "data": resolution.data}
+                           for url in resolution.data.get("source_urls") or []
+                           if str(url).startswith(("http://", "https://"))]
+        if not source_rows:
+            raise RuntimeError(f"tool resolution has no public source URLs: {capability}")
+        results = []
+        for row in source_rows:
+            excerpt = json.dumps(row.get("data") if isinstance(row.get("data"), dict) else {}, ensure_ascii=False, sort_keys=True)[:8000]
+            results.append({"url": str(row["url"]), "title": str(resolution.data.get("source") or capability),
+                            "excerpt_text": excerpt, "fact_as_of": str(row.get("fact_as_of") or resolution.fact_as_of),
+                            "raw_artifact_ref": resolution.raw_artifact_ref})
+        return {
+            "url": results[0]["url"], "text": results[0]["excerpt_text"],
+            "raw_artifact_ref": resolution.raw_artifact_ref, "results": results,
+        }
+
+
 class DeterministicMarketBackend:
     """Serve market facts frozen by the caller; never performs network I/O."""
 
@@ -266,7 +316,7 @@ class ReadOnlyResearchExecutor:
                 continue
             operation = row["operation"] if row["operation"] in _OPERATIONS[backend] else _fallback_operation(backend)
             try:
-                result = adapter(operation, dict(row["arguments"]))
+                result = adapter(operation, {**row["arguments"], "_requirement_key": row["requirement_key"]})
                 if not isinstance(result, dict):
                     raise TypeError("backend result is not an object")
                 return backend, {**result, "backend": backend}

@@ -18,6 +18,7 @@ _CAPABILITIES = {
     "cn_equity_quote_batch": "cn_equity_quote_batch",
     "cn_market_index_batch": "cn_market_index_batch",
     "cn_market_snapshot": "cn_market_snapshot",
+    "cn_market_breadth": "cn_market_breadth",
 }
 _ADAPTERS = {
     "cn_equity_quote_batch": {"tencent": "cn_equity_quote_tencent", "sina": "cn_equity_quote_sina"},
@@ -68,6 +69,7 @@ def ensure_builtin_tools(root: Path) -> None:
 _CLI = r'''from __future__ import annotations
 
 import datetime as dt
+from concurrent.futures import ThreadPoolExecutor
 import html
 import json
 import os
@@ -146,16 +148,24 @@ def capture_dynamic(url: str) -> str | None:
         return None
     with tempfile.TemporaryDirectory(prefix="ai-trading-browser-") as profile:
         try:
-            completed = subprocess.run([
+            process = subprocess.Popen([
                 executable, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
                 "--disable-sync", "--disable-extensions", "--user-data-dir=" + profile,
                 "--virtual-time-budget=1200", "--dump-dom", url,
-            ], capture_output=True, timeout=12, check=False)
-        except (OSError, subprocess.TimeoutExpired):
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, _stderr = process.communicate(timeout=12)
+        except OSError:
             return None
-    if completed.returncode != 0 or not completed.stdout:
+        except subprocess.TimeoutExpired:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            else:
+                process.kill()
+            process.communicate()
+            return None
+    if process.returncode != 0 or not stdout:
         return None
-    return completed.stdout.decode("utf-8", errors="replace")
+    return stdout.decode("utf-8", errors="replace")
 
 
 def result(data: dict[str, object], *, fact_as_of: str | None = None) -> None:
@@ -316,6 +326,105 @@ def market_snapshot_payload(body: str, finality: str) -> tuple[dict[str, object]
     return data, moment.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def breadth_page_url(endpoint: str, page: int) -> str:
+    separator = "&" if "?" in endpoint else "?"
+    return endpoint + separator + (
+        "pn=" + str(page) + "&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+        "&fltt=2&invt=2&fid=f3&fs=m%3A0%2Bt%3A6%2Cm%3A0%2Bt%3A80"
+        "&fields=f12%2Cf14%2Cf2%2Cf3%2Cf124"
+    )
+
+
+def market_breadth_payload(endpoint: str, finality: str) -> tuple[dict[str, object], str]:
+    first_url, first_body = fetch(breadth_page_url(endpoint, 1))
+    try:
+        first = json.loads(first_body)
+        first_data = first["data"]
+        total = int(first_data["total"])
+        rows = list(first_data["diff"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        fail(75, "market breadth response is invalid")
+    if total <= 0 or not all(isinstance(row, dict) for row in rows):
+        fail(75, "market breadth response is empty")
+    pages = min(64, (total + 99) // 100)
+    if pages > 1:
+        def read_page(page: int) -> list[object]:
+            _page_url, page_body = fetch(breadth_page_url(endpoint, page))
+            try:
+                value = json.loads(page_body)["data"]["diff"]
+            except (KeyError, TypeError, json.JSONDecodeError):
+                fail(75, "market breadth page is invalid")
+            return value if isinstance(value, list) else []
+        with ThreadPoolExecutor(max_workers=min(8, pages - 1)) as pool:
+            for page_rows in pool.map(read_page, range(2, pages + 1)):
+                rows.extend(row for row in page_rows if isinstance(row, dict))
+    if len(rows) < total:
+        fail(75, "market breadth response is incomplete")
+    moments: list[dt.datetime] = []
+    up = down = flat = limit_up = limit_down = unpriced = 0
+    for row in rows[:total]:
+        try:
+            moment = dt.datetime.fromtimestamp(int(row["f124"]), tz=dt.timezone.utc)
+        except (KeyError, TypeError, ValueError, OSError):
+            fail(75, "market breadth quote is invalid")
+        moments.append(moment)
+        try:
+            change = float(row["f3"])
+        except (KeyError, TypeError, ValueError):
+            unpriced += 1
+            continue
+        if change > 0:
+            up += 1
+        elif change < 0:
+            down += 1
+        else:
+            flat += 1
+        limit_up += int(change >= 9.9)
+        limit_down += int(change <= -9.9)
+    observed = max(moments)
+    local = observed.astimezone(dt.timezone(dt.timedelta(hours=8)))
+    if finality in {"close", "official_close"} and local.time() < dt.time(15, 0):
+        fail(75, "market breadth does not meet close finality")
+    data = {
+        "is_trading_day": True, "trading_date": local.date().isoformat(), "source": "eastmoney_breadth",
+        "source_urls": [first_url],
+        "breadth": {
+            "up": up, "down": down, "flat": flat, "limit_up": limit_up, "limit_down": limit_down,
+            "universe_count": total, "unpriced": unpriced,
+            "limit_count_basis": "percent_change_threshold_candidates",
+        },
+        "finality": finality,
+    }
+    fact_as_of = observed.isoformat().replace("+00:00", "Z")
+    data["source_evidence"] = [{"url": first_url, "fact_as_of": fact_as_of, "data": {
+        "trading_date": data["trading_date"], "breadth": data["breadth"], "finality": finality,
+    }}]
+    return data, fact_as_of
+
+
+def default_market_snapshot(inputs: dict[str, object], finality: str) -> tuple[dict[str, object], str]:
+    normalized = [index_identity(symbol) for symbol in ("000001", "399001", "399006")]
+    index_url = safe_url(inputs.get("index_url") or "https://qt.gtimg.cn/q=")
+    separator = "" if index_url.endswith(("=", ",")) else "&q="
+    index_source_url, index_body = fetch(index_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
+    index_data, index_fact_as_of = index_payload(index_body, normalized, finality)
+    breadth_endpoint = safe_url(inputs.get("breadth_url") or "https://push2delay.eastmoney.com/api/qt/clist/get")
+    breadth_data, breadth_fact_as_of = market_breadth_payload(breadth_endpoint, finality)
+    index_moment = dt.datetime.fromisoformat(index_fact_as_of.replace("Z", "+00:00"))
+    breadth_moment = dt.datetime.fromisoformat(breadth_fact_as_of.replace("Z", "+00:00"))
+    fact_as_of = min(index_moment, breadth_moment).astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "is_trading_day": True, "trading_date": breadth_data["trading_date"],
+        "source": "tencent_quote+eastmoney_breadth", "indices": index_data["indices"],
+        "source_urls": [index_source_url, *breadth_data["source_urls"]],
+        "source_evidence": [
+            {"url": index_source_url, "fact_as_of": index_fact_as_of, "data": {"indices": index_data["indices"], "finality": finality}},
+            *breadth_data["source_evidence"],
+        ],
+        "breadth": breadth_data["breadth"], "industries": [], "themes": [], "finality": finality,
+    }, fact_as_of
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         fail(64, "tool mode is required")
@@ -375,12 +484,24 @@ def main() -> None:
         payload, fact_as_of = index_payload(body, normalized, finality)
         result(payload, fact_as_of=fact_as_of)
         return
+    if mode == "cn_market_breadth":
+        finality = str(request.get("finality") or "observed")
+        if finality not in {"intraday", "realtime", "close", "official_close"}:
+            fail(64, "unsupported market finality")
+        payload, fact_as_of = market_breadth_payload(
+            safe_url(inputs.get("breadth_url") or "https://push2delay.eastmoney.com/api/qt/clist/get"), finality,
+        )
+        result(payload, fact_as_of=fact_as_of)
+        return
     if mode == "cn_market_snapshot":
         finality = str(request.get("finality") or "observed")
         if finality not in {"intraday", "realtime", "close", "official_close"}:
             fail(64, "unsupported market finality")
-        _url, body = fetch(safe_url(inputs.get("url")))
-        payload, fact_as_of = market_snapshot_payload(body, finality)
+        if inputs.get("url"):
+            _url, body = fetch(safe_url(inputs.get("url")))
+            payload, fact_as_of = market_snapshot_payload(body, finality)
+        else:
+            payload, fact_as_of = default_market_snapshot(inputs, finality)
         result(payload, fact_as_of=fact_as_of)
         return
     if mode in {"cninfo_search", "article_range"}:

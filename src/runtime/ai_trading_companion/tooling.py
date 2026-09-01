@@ -491,6 +491,8 @@ def _validate_capability_result(request: FactRequest, output: dict[str, Any]) ->
         return _validate_market_indices(request, output["data"])
     if request.capability == "cn_market_snapshot":
         return _validate_market_snapshot(request, output["data"], str(output["fact_as_of"]))
+    if request.capability == "cn_market_breadth":
+        return _validate_market_breadth(request, output["data"], str(output["fact_as_of"]))
     if request.capability != "cn_equity_quote_batch":
         return None
     data = output["data"]
@@ -601,6 +603,33 @@ def _validate_market_snapshot(request: FactRequest, data: dict[str, Any], fact_a
                 float(entry.get("strength"))
             except (TypeError, ValueError):
                 return "tool_market_result_invalid"
+    return None
+
+
+def _validate_market_breadth(request: FactRequest, data: dict[str, Any], fact_as_of: str) -> str | None:
+    expected_date = _parse_timestamp(request.required_at).astimezone(_SHANGHAI).date().isoformat()
+    if data.get("is_trading_day") is False:
+        return "tool_market_non_trading_day"
+    if data.get("trading_date") != expected_date or data.get("finality") != request.finality:
+        return "tool_market_trading_date_mismatch"
+    try:
+        observed = _parse_timestamp(fact_as_of).astimezone(_SHANGHAI)
+    except ValueError:
+        return "tool_market_result_invalid"
+    if observed.date().isoformat() != expected_date:
+        return "tool_market_trading_date_mismatch"
+    if request.finality in {"close", "official_close"} and observed.time().hour < 15:
+        return "tool_market_finality_invalid"
+    if not isinstance(data.get("source"), str) or not data["source"].strip():
+        return "tool_market_identity_invalid"
+    breadth = data.get("breadth")
+    if not isinstance(breadth, dict):
+        return "tool_market_result_invalid"
+    try:
+        if any(float(breadth[field]) < 0 for field in ("up", "down", "flat", "limit_up", "limit_down")):
+            return "tool_market_result_invalid"
+    except (KeyError, TypeError, ValueError):
+        return "tool_market_result_invalid"
     return None
 
 

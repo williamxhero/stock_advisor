@@ -41,7 +41,7 @@ from .router import CognitiveRouter
 from .runtime_strategy_policy import RuntimeStrategyControls, RuntimeStrategyPolicy
 from .local_research import (
     BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
-    ReadOnlyResearchExecutor, ToolCatalogResearchBackend,
+    ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend,
 )
 from .tooling import ToolCatalog, ToolRunner
 from .tool_manager import ToolManagerRuntime
@@ -448,16 +448,22 @@ def _call_stage(
                 }
             planner = BrokerResearchPlanner(
                 broker, deadline=lambda: deadline, intellect=decision.intellect, effort=decision.reasoning_effort,
+                market_tool_available="market" in controls.enabled_backends,
             )
+            tool_runner = ToolRunner(ToolCatalog(PATHS.tools), need_reporter=store.submit_capability_need)
             web = ToolCatalogResearchBackend(
-                ToolRunner(ToolCatalog(PATHS.tools), need_reporter=store.submit_capability_need),
+                tool_runner,
                 as_of=_evidence_read_cutoff(packet, contract),
                 deadline=lambda: deadline - time.monotonic(),
             )
             market_facts = packet.get("deterministic_market_facts")
             backends = {"gateway": web} if "gateway" in controls.enabled_backends else {}
-            if "market" in controls.enabled_backends and isinstance(market_facts, dict) and market_facts:
-                backends["market"] = DeterministicMarketBackend(market_facts)
+            if "market" in controls.enabled_backends:
+                backends["market"] = (
+                    DeterministicMarketBackend(market_facts)
+                    if isinstance(market_facts, dict) and market_facts
+                    else ToolCatalogMarketBackend(tool_runner, contract=contract, deadline=lambda: deadline - time.monotonic())
+                )
             executor = ReadOnlyResearchExecutor(backends, max_operations=controls.max_operations)
             research = LocalResearchChain(planner, executor, max_repairs=2).run(
                 packet, contract, attempt_id=attempt["attempt_id"],

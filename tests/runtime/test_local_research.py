@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogResearchBackend, WebAccessGatewayBackend
+from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, WebAccessGatewayBackend
 from ai_trading_companion.tooling import EvidenceResolution, FactRequest, ToolCatalog, ToolRunner
 
 CONTRACT = {"version": 3, "as_of": "2026-08-27T07:00:00Z", "requirements": [{"key": "market", "blocking": True, "allowed_coverage": ["covered"], "window": {"mode": "exact", "start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z"}}]}
@@ -162,6 +162,48 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual("generic_web_read", second_request.capability)
         self.assertEqual({}, first_request.context)
         self.assertEqual(CONTRACT["as_of"], second_request.required_at)
+
+    def test_market_tool_adapter_freezes_a_live_intraday_snapshot_as_qualified_evidence(self) -> None:
+        contract = {
+            "version": 3, "as_of": "2026-09-01T06:30:00Z", "requirements": [{
+                "key": "market", "blocking": True, "allowed_coverage": ["covered"],
+                "window": {"mode": "after_start_to_end", "start": "2026-09-01T06:15:00Z", "end": "2026-09-01T06:30:00Z"},
+            }],
+        }
+        runner = mock.Mock()
+        runner.resolve_with_fallback.return_value = EvidenceResolution(
+            True, "cn_market_snapshot", "1.1.0", "2026-09-01T06:29:00Z", "2026-09-01T06:30:01Z", {
+                "source": "tencent_quote+eastmoney_breadth",
+                "source_urls": ["https://qt.gtimg.cn/q=sh000001", "https://push2delay.eastmoney.com/api/qt/clist/get"],
+                "source_evidence": [
+                    {"url": "https://qt.gtimg.cn/q=sh000001", "fact_as_of": "2026-09-01T06:29:00Z", "data": {"indices": [{"symbol": "000001", "price": 3500}]}},
+                    {"url": "https://push2delay.eastmoney.com/api/qt/clist/get", "fact_as_of": "2026-09-01T06:29:00Z", "data": {"breadth": {"up": 2000, "down": 1000, "flat": 50}}},
+                ],
+                "indices": [{"symbol": "000001", "price": 3500}],
+                "breadth": {"up": 2000, "down": 1000, "flat": 50},
+                "finality": "intraday",
+            }, "artifact:sha256:" + "c" * 64, None, ("tool_result_schema_valid",), attempts=("default:succeeded",),
+        )
+        backend = ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0)
+        plan = {"version": 1, "operations": [{
+            "requirement_key": "market", "backend": "market", "operation": "market_snapshot",
+            "arguments": {"query": None, "categories": None, "url": None, "symbol": None, "render": None, "session_id": None, "actions": None},
+            "fallback_backends": [],
+        }]}
+
+        result = LocalResearchChain(lambda *_: plan, ReadOnlyResearchExecutor({"market": backend}), max_repairs=0).run(
+            {"as_of": contract["as_of"]}, contract, attempt_id="live-market",
+        )
+
+        self.assertTrue(result.qualified, result.verifier["problems"])
+        request = runner.resolve_with_fallback.call_args.args[0]
+        self.assertEqual("cn_market_snapshot", request.capability)
+        self.assertEqual("intraday", request.finality)
+        self.assertEqual("2026-09-01T06:30:00Z", request.required_at)
+        self.assertEqual(2, len(result.evidence["sources"]))
+        self.assertIn("indices", result.evidence["sources"][0]["excerpt"])
+        self.assertNotIn("breadth", result.evidence["sources"][0]["excerpt"])
+        self.assertIn("breadth", result.evidence["sources"][1]["excerpt"])
 
     def test_post_close_research_uses_tool_fallback_then_freezes_qualified_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

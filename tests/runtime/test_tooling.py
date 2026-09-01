@@ -347,7 +347,7 @@ class ToolRunnerTests(unittest.TestCase):
 
                 self.assertEqual("open", json_result.data["json"]["market"])
                 self.assertIn("market breadth 1234", web_result.data["text"])
-                self.assertEqual("static", capture_result.data["capture_mode"])
+                self.assertEqual("dynamic", capture_result.data["capture_mode"])
                 self.assertEqual("disclosure", disclosures.data["announcements"][0]["title"])
                 self.assertEqual("market report", articles.data["articles"][0]["title"])
                 self.assertTrue(json_result.raw_artifact_ref)
@@ -610,6 +610,62 @@ class ToolRunnerTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_default_market_snapshot_and_breadth_collect_public_facts_without_a_caller_snapshot_url(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/index"):
+                    body = (
+                        'v_sh000001="1~上证指数~000001~3500.0~3490.0~~~~~~~~~~~~20260901143000";\n'
+                        'v_sz399001="51~深证成指~399001~12000.0~11900.0~~~~~~~~~~~~20260901143000";\n'
+                        'v_sz399006="51~创业板指~399006~2600.0~2590.0~~~~~~~~~~~~20260901143000";\n'
+                    ).encode("gb18030")
+                    content_type = "text/plain; charset=gb18030"
+                else:
+                    body = json.dumps({"data": {"total": 3, "diff": [
+                        {"f12": "600000", "f14": "浦发银行", "f2": 10.5, "f3": 1.2, "f124": 1788244200},
+                        {"f12": "000001", "f14": "平安银行", "f2": 11.2, "f3": -2.0, "f124": 1788244200},
+                        {"f12": "300001", "f14": "特锐德", "f2": 20.0, "f3": 0.0, "f124": 1788244200},
+                    ]}}).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                inputs = {
+                    "index_url": f"http://127.0.0.1:{server.server_port}/index?q=",
+                    "breadth_url": f"http://127.0.0.1:{server.server_port}/breadth",
+                }
+                runner = ToolRunner(ToolCatalog(root))
+                snapshot = runner.resolve_with_fallback(FactRequest(
+                    1, "cn_market_snapshot", "2026-09-01T06:30:00Z", 6.0, inputs, finality="intraday",
+                ))
+                breadth = runner.resolve_with_fallback(FactRequest(
+                    1, "cn_market_breadth", "2026-09-01T06:30:00Z", 6.0,
+                    {"breadth_url": inputs["breadth_url"]}, finality="intraday",
+                ))
+
+                self.assertTrue(snapshot.succeeded, snapshot.error_code)
+                self.assertEqual("tencent_quote+eastmoney_breadth", snapshot.data["source"])
+                self.assertEqual(1, snapshot.data["breadth"]["up"])
+                self.assertEqual(3, snapshot.data["breadth"]["universe_count"])
+                self.assertEqual(["000001", "399001", "399006"], [item["symbol"] for item in snapshot.data["indices"]])
+                self.assertTrue(breadth.succeeded, breadth.error_code)
+                self.assertEqual(1, breadth.data["breadth"]["down"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_market_snapshot_rejects_nontrading_or_stale_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "tools"
@@ -628,6 +684,24 @@ class ToolRunnerTests(unittest.TestCase):
 
             self.assertFalse(result.succeeded)
             self.assertEqual("tool_market_non_trading_day", result.error_code)
+
+    def test_market_breadth_rejects_a_snapshot_without_a_matching_trade_date(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            self.publish_tool(root, "cn_market_breadth", """
+                import json
+                print(json.dumps({
+                    "contract": "ai-trading-tool-result/v1", "fact_as_of": "2026-08-31T07:01:00Z",
+                    "data": {"is_trading_day": True, "trading_date": "2026-08-31", "source": "test",
+                    "finality": "intraday", "breadth": {"up": 1, "down": 1, "flat": 0, "limit_up": 0, "limit_down": 0}},
+                }))
+            """)
+            result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                1, "cn_market_breadth", "2026-09-01T07:01:00Z", 2.0, {}, finality="intraday",
+            ))
+
+            self.assertFalse(result.succeeded)
+            self.assertEqual("tool_market_trading_date_mismatch", result.error_code)
 
 
 if __name__ == "__main__":

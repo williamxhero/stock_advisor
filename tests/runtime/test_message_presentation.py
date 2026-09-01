@@ -43,6 +43,27 @@ Protocol: OpportunityDiscovery-v1.3
                 kind="ai_chat",
             )
 
+    def test_dates_are_spoken_relative_to_the_conversation(self):
+        today = present_message(
+            "数据截至2026-09-01 09:00。",
+            as_of="2026-09-01T01:00:00Z",
+            kind="ai_chat",
+        )
+        tomorrow = present_message(
+            "我会在2026-09-02再看。",
+            as_of="2026-09-01T01:00:00Z",
+            kind="ai_chat",
+        )
+        monday = present_message(
+            "我会在2026-09-07再看。",
+            as_of="2026-09-04T01:00:00Z",
+            kind="ai_chat",
+        )
+
+        self.assertEqual("数据截至今天早上九点。", today.markdown)
+        self.assertEqual("我会在明天再看。", tomorrow.markdown)
+        self.assertEqual("我会在周一再看。", monday.markdown)
+
     def test_presentation_exposes_a_versioned_message_contract(self):
         presented = present_message(
             "我倾向于先等承接确认。",

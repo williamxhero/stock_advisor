@@ -11,7 +11,7 @@ _HEADING = re.compile(r"^\s{0,3}#{1,6}\s*(.+?)\s*#*\s*$")
 _LIST = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(.+)$")
 _TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
 _FIELD = re.compile(r"^\s*([a-z\u4e00-\u9fff][a-z0-9_\u4e00-\u9fff]{0,40})\s*[:：]\s*(.+?)\s*$", re.I)
-_ISO_DAY = re.compile(r"(?<!\d)(20\d{2})[-‐‑‒–—−](\d{2})[-‐‑‒–—−](\d{2})(?:[T\s][0-2]\d:[0-5]\d(?::[0-5]\d)?(?:\.\d+)?(?:Z|[+-][0-2]\d:?\d\d)?)?(?!\d)")
+_ISO_DAY = re.compile(r"(?<!\d)(20\d{2})[-‐‑‒–—−](\d{2})[-‐‑‒–—−](\d{2})(?:[T\s]([0-2]\d):([0-5]\d)(?::[0-5]\d)?(?:\.\d+)?(?:Z|[+-][0-2]\d:?\d\d)?)?(?!\d)")
 _URL = re.compile(r"https?://[^\s)>]+")
 
 _INTERNAL_FIELDS = {
@@ -276,9 +276,29 @@ def _human_day(match: re.Match[str], as_of: str) -> str:
         reference = datetime.fromisoformat(as_of.replace("Z", "+00:00")).date()
     except ValueError:
         return match.group(0)
-    if day == reference:
-        return "今天"
-    return f"{day.month}月{day.day}日"
+    delta = (day - reference).days
+    if delta == 0:
+        spoken = "今天"
+    elif delta == 1:
+        spoken = "明天"
+    elif 1 < delta <= 3:
+        spoken = "周" + "一二三四五六日"[day.weekday()]
+    else:
+        spoken = f"{day.month}月{day.day}日"
+    if match.group(4) is not None:
+        spoken += _spoken_clock(int(match.group(4)), int(match.group(5)))
+    return spoken
+
+
+def _spoken_clock(hour: int, minute: int) -> str:
+    period = "早上" if 5 <= hour < 12 else "下午" if 12 <= hour < 18 else "晚上" if hour >= 18 else "凌晨"
+    display_hour = hour if 1 <= hour <= 11 else 12 if hour in {0, 12} else hour - 12
+    numerals = "零一二三四五六七八九十"
+    spoken_hour = numerals[display_hour] if display_hour <= 10 else "十一" if display_hour == 11 else "十二"
+    if minute == 0:
+        return f"{period}{spoken_hour}点"
+    spoken_minute = str(minute) if minute < 10 else ("十" if minute == 10 else f"{numerals[minute // 10]}十{numerals[minute % 10] if minute % 10 else ''}")
+    return f"{period}{spoken_hour}点{spoken_minute}分"
 
 
 def _bound_material(markdown: str) -> str:

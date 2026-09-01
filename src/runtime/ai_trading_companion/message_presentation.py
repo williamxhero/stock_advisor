@@ -3,8 +3,10 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
+import uuid
+from zoneinfo import ZoneInfo
 
 
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s*(.+?)\s*#*\s*$")
@@ -13,6 +15,7 @@ _TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
 _FIELD = re.compile(r"^\s*([a-z\u4e00-\u9fff][a-z0-9_\u4e00-\u9fff]{0,40})\s*[:：]\s*(.+?)\s*$", re.I)
 _ISO_DAY = re.compile(r"(?<!\d)(20\d{2})[-‐‑‒–—−](\d{2})[-‐‑‒–—−](\d{2})(?:[T\s]([0-2]\d):([0-5]\d)(?::[0-5]\d)?(?:\.\d+)?(?:Z|[+-][0-2]\d:?\d\d)?)?(?!\d)")
 _URL = re.compile(r"https?://[^\s)>]+")
+_MATERIAL_REF = re.compile(r"\[\[material:([A-Za-z0-9._:-]+)\]\]")
 
 _INTERNAL_FIELDS = {
     "task_key", "stage", "protocol", "reference_at", "model", "token",
@@ -56,12 +59,16 @@ class PresentedMessage:
     markdown: str
     parts: tuple[dict[str, Any], ...]
     kind: str = "ai_chat"
+    message_id: str = ""
+    sealed_at: str = ""
     contract_version: int = 2
     qualification_problems: tuple[str, ...] = ()
 
     def message(self) -> dict[str, Any]:
         return {
             "contract": "companion-published-message/v2",
+            "message_id": self.message_id,
+            "sealed_at": self.sealed_at,
             "kind": self.kind,
             "parts": list(self.parts),
             "text_projection": self.markdown,
@@ -88,6 +95,10 @@ def present_message(
     as_of: str,
     kind: str,
     allow_structured_format: bool = False,
+    material_registry: dict[str, dict[str, str]] | None = None,
+    expression_profile: dict[str, Any] | None = None,
+    message_id: str | None = None,
+    sealed_at: str | None = None,
 ) -> PresentedMessage:
     """Prepare a message for a chat bubble without changing its judgment.
 
@@ -98,7 +109,20 @@ def present_message(
     source = str(text or "").replace("\r\n", "\n").strip()
     if not source:
         source = "我这次没有形成可发布的内容。"
-    speech, materials = _split_parts(source)
+    material_ids = _MATERIAL_REF.findall(source)
+    source = _MATERIAL_REF.sub("", source).strip()
+    speech, unregistered_materials = _split_parts(source)
+    if unregistered_materials:
+        raise MessageQualificationError(["unregistered_material"])
+    materials: list[dict[str, str]] = []
+    registry = material_registry or {}
+    for material_id in material_ids:
+        material = registry.get(material_id)
+        if not isinstance(material, dict):
+            raise MessageQualificationError(["unknown_material_id"])
+        if not all(str(material.get(field) or "").strip() for field in ("title", "url", "markdown")):
+            raise MessageQualificationError(["unattributed_material"])
+        materials.append({**material, "material_id": material_id})
     parts: list[dict[str, Any]] = []
     rendered: list[str] = []
     if speech:
@@ -107,12 +131,13 @@ def present_message(
             rendered.append(natural)
             parts.append({"kind": "speech", "text": natural})
     for material in materials:
-        url = _first_url(material)
-        title = _source_title(material)
-        excerpt = _bound_material(material, title, url)
+        url = str(material["url"])
+        title = str(material["title"])
+        excerpt = _bound_material(str(material["markdown"]), title, url, expression_profile or {})
         rendered.append(excerpt)
         parts.append({
             "kind": "material", "markdown": excerpt,
+            "material_id": str(material["material_id"]),
             "source_title": title, "source_url": url,
         })
     if not rendered:
@@ -122,13 +147,31 @@ def present_message(
     problems = _qualification_problems(parts, allow_structured_format)
     if problems:
         raise MessageQualificationError(problems)
-    return PresentedMessage("\n\n".join(rendered), tuple(parts), kind=kind)
+    sealed_at = sealed_at or datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return PresentedMessage(
+        "\n\n".join(rendered), tuple(parts), kind=kind,
+        message_id=message_id or str(uuid.uuid4()), sealed_at=sealed_at,
+    )
 
 
 def explicit_format_requested(text: str) -> bool:
     """A request for three risks is content; an explicit list/table is layout."""
     compact = re.sub(r"\s+", "", text or "")
     return bool(re.search(r"(?:用|按|给我)(?:markdown)?(?:列表|表格|项目符号|编号)", compact, re.I))
+
+
+def repair_message_draft(text: str, problems: tuple[str, ...]) -> str:
+    """Repair invisible scaffolding only; never invent judgment content."""
+    repaired = str(text or "").replace("\u200b", "").replace("\ufeff", "")
+    if "unknown_machine_field" in problems or "machine_field" in problems:
+        kept = []
+        for line in repaired.splitlines():
+            field = _FIELD.match(line)
+            if field and ("_" in field.group(1) or _normalized(field.group(1)).lower() not in _INTERNAL_FIELDS | {"time_scope"}):
+                continue
+            kept.append(line)
+        repaired = "\n".join(kept)
+    return repaired
 
 
 def _split_parts(text: str) -> tuple[str, list[str]]:
@@ -277,7 +320,10 @@ def _normalized(text: str) -> str:
 def _human_day(match: re.Match[str], as_of: str) -> str:
     try:
         day = datetime(int(match.group(1)), int(match.group(2)), int(match.group(3))).date()
-        reference = datetime.fromisoformat(as_of.replace("Z", "+00:00")).date()
+        reference_at = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+        if reference_at.tzinfo is None:
+            reference_at = reference_at.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        reference = reference_at.astimezone(ZoneInfo("Asia/Shanghai")).date()
     except ValueError:
         return match.group(0)
     delta = (day - reference).days
@@ -285,6 +331,10 @@ def _human_day(match: re.Match[str], as_of: str) -> str:
         spoken = "今天"
     elif delta == 1:
         spoken = "明天"
+    elif delta == -1:
+        spoken = "昨天"
+    elif delta == -2:
+        spoken = "前天"
     elif 1 < delta <= 3:
         spoken = "周" + "一二三四五六日"[day.weekday()]
     else:
@@ -305,9 +355,13 @@ def _spoken_clock(hour: int, minute: int) -> str:
     return f"{period}{spoken_hour}点{spoken_minute}分"
 
 
-def _bound_material(markdown: str, title: str, url: str | None) -> str:
-    max_characters = 1_200
+def _bound_material(markdown: str, title: str, url: str | None, expression_profile: dict[str, Any]) -> str:
+    material_preference = expression_profile.get("material_density")
+    density = str(material_preference.get("value") if isinstance(material_preference, dict) else expression_profile.get("value") or "")
+    max_characters = 2_400 if density == "more_source_excerpt" else 600 if density == "summary_and_link" else 1_200
     if len(markdown) <= max_characters:
+        if url and url not in markdown:
+            return f"{markdown}\n\n[查看{title}]({url})"
         return markdown
     if url:
         return f"[查看{title}]({url})"

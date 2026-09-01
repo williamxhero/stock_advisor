@@ -45,6 +45,7 @@ from .scheduler import SHANGHAI, conversation_auto_submit_at, ensure_registered_
 from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
 from .runtime_strategy_policy import RuntimeStrategyControls, RuntimeStrategyPolicy
+from .stage_expression import express_stage_semantics, legacy_stage_semantics
 from .local_research import (
     BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
     ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend,
@@ -860,13 +861,14 @@ def run_research(
                 m0_output, compose_attempt_id = compose_checkpoint["output"], compose_checkpoint["attempt_id"]
             else:
                 compose_stage = _call_stage(
-                    store, cycle, "m0_compose", local_packet, "companion-m0-result-v1.schema.json",
+                    store, cycle, "m0_compose", local_packet, "companion-m0-result-v2.schema.json",
                     search=False, timeout=compose_timeout, frozen_controls=compose_controls,
                 )
                 m0_output, compose_attempt_id = compose_stage.output, compose_stage.attempt_id
                 store.save_stage_checkpoint(cycle["cycle_id"], "m0_compose", local_packet["sha256"], compose_attempt_id, m0_output)
+            m0_semantic = m0_output.get("semantic") if isinstance(m0_output.get("semantic"), dict) else legacy_stage_semantics("m0", m0_output["m0_markdown"])
             ready = engine.research_ready(
-                cycle["cycle_id"], m0_output["m0_markdown"],
+                cycle["cycle_id"], express_stage_semantics("m0", m0_semantic),
                 evidence_attempt_id=evidence_attempt_id, compose_attempt_id=compose_attempt_id,
                 evidence_packet_hash=public_packet["sha256"], packet_hash=local_packet["sha256"],
                 evidence_as_of=evidence.get("as_of"),
@@ -980,16 +982,17 @@ def run_m1(
                 judgment, judgment_attempt_id = judgment_checkpoint["output"], judgment_checkpoint["attempt_id"]
             else:
                 judgment_stage = _call_stage(
-                    store, cycle, "m1_judgment", local_packet, "companion-m1-result-v1.schema.json",
+                    store, cycle, "m1_judgment", local_packet, "companion-m1-result-v2.schema.json",
                     search=False, timeout=judgment_timeout, frozen_controls=judgment_controls,
                 )
                 judgment, judgment_attempt_id = judgment_stage.output, judgment_stage.attempt_id
                 store.save_stage_checkpoint(cycle_id, "m1_judgment", local_packet["sha256"], judgment_attempt_id, judgment)
+            m1_semantic = judgment.get("semantic") if isinstance(judgment.get("semantic"), dict) else legacy_stage_semantics("m1", judgment["m1_markdown"], judgment.get("snapshot"))
             return engine.m1_ready(
-                cycle_id, judgment["m1_markdown"], as_of=evidence.get("as_of"),
+                cycle_id, express_stage_semantics("m1", m1_semantic), as_of=evidence.get("as_of"),
                 research_attempt_id=evidence_attempt_id, judgment_attempt_id=judgment_attempt_id,
                 research_packet_hash=public_packet["sha256"], judgment_packet_hash=local_packet["sha256"],
-                snapshot=judgment.get("snapshot"), qualified=bool(judgment.get("judgment_qualified")),
+                snapshot=judgment.get("snapshot"), qualified=bool(m1_semantic.get("qualified", judgment.get("judgment_qualified"))),
             )
         except Exception as exc:
             try:
@@ -1027,12 +1030,13 @@ def run_m2(engine: CompanionEngine, store: CompanionStore, cycle_id: str, execut
         RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(cycle, "m2", as_of=frozen_as_of), controls,
     )
     stage_result = _call_stage(
-        store, cycle, "m2", packet, "companion-m2-result-v1.schema.json",
+        store, cycle, "m2", packet, "companion-m2-result-v2.schema.json",
         search=False, timeout=timeout, frozen_controls=controls,
     )
     store.save_stage_checkpoint(cycle_id, "m2", packet["sha256"], stage_result.attempt_id, stage_result.output)
+    m2_semantic = stage_result.output.get("semantic") if isinstance(stage_result.output.get("semantic"), dict) else legacy_stage_semantics("m2", stage_result.output["m2_markdown"], stage_result.output.get("snapshot"))
     return engine.m2_ready(
-        cycle_id, stage_result.output["m2_markdown"], snapshot=stage_result.output.get("snapshot"), as_of=frozen_as_of,
+        cycle_id, express_stage_semantics("m2", m2_semantic), snapshot=stage_result.output.get("snapshot"), as_of=frozen_as_of,
         attempt_id=stage_result.attempt_id, packet_hash=packet["sha256"],
     )
 
@@ -1582,6 +1586,46 @@ def _discover_chat_external_evidence(
     return registered
 
 
+def _frozen_expression_profile(engine: CompanionEngine, cycle: dict[str, Any], as_of: str | None = None) -> dict[str, Any]:
+    if engine.memory is None:
+        return {}
+    snapshot = engine.memory.begin_snapshot({
+        "memory_space_id": engine.memory_space_id, "as_of": as_of or cycle["as_of"],
+        "stage": "expression", "cycle_id": cycle["cycle_id"],
+    })
+    hits = engine.memory.search(snapshot["snapshot_id"], "user.expression", limit=50)
+    profile: dict[str, Any] = {}
+    for hit in hits:
+        row = engine.memory.expand(snapshot["snapshot_id"], hit["episode_id"])
+        try:
+            body = json.loads(str(row.get("body") or "{}"))
+        except json.JSONDecodeError:
+            continue
+        predicate = str(body.get("predicate") or "")
+        if body.get("subject") == "user.expression" and predicate.startswith("expression."):
+            value = body.get("object")
+            if isinstance(value, dict):
+                profile[predicate.removeprefix("expression.")] = value
+    return profile
+
+
+def _frozen_material_registry(context: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    """Expose only attributable materials already present in frozen input."""
+    registry: dict[str, dict[str, str]] = {}
+    for row in context:
+        if not isinstance(row, dict):
+            continue
+        nested = row.get("context") if isinstance(row.get("context"), dict) else {}
+        reference = row.get("source_reference") if isinstance(row.get("source_reference"), dict) else {}
+        material_id = str(row.get("material_id") or row.get("episode_id") or "").strip()
+        title = str(row.get("title") or nested.get("title") or reference.get("title") or "").strip()
+        url = str(row.get("url") or nested.get("url") or reference.get("url") or "").strip()
+        body = str(row.get("markdown") or row.get("body") or nested.get("body") or nested.get("excerpt_text") or "").strip()
+        if material_id and title and url and body:
+            registry[material_id] = {"title": title, "url": url, "markdown": body}
+    return registry
+
+
 def run_unified_cognition(
     engine: CompanionEngine,
     store: CompanionStore,
@@ -1611,6 +1655,9 @@ def run_unified_cognition(
         if not job["claimed"]:
             return {"cycle_id": cycle_id, "job_id": job["job_id"], "state": job["state"], "receipts": []}
     stream = None
+    expression_profile = _frozen_expression_profile(
+        engine, cycle, max(str(message.get("known_at") or cycle["as_of"]) for message in messages),
+    )
     try:
         if cancelled and cancelled():
             raise MemoryResearchError("memory research was terminated by the user")
@@ -1623,6 +1670,13 @@ def run_unified_cognition(
             # MemoryHub context.  Direct unit callers intentionally see no
             # implicit SQLite-memory substitute.
             memories = list(memory_context or [])
+            material_registry = _frozen_material_registry(memories)
+            memories.extend(
+                {"kind": "publication_material", "material_id": key, "title": value["title"], "url": value["url"]}
+                for key, value in material_registry.items()
+            )
+            if expression_profile:
+                memories.append({"kind": "expression_preference", "object": expression_profile})
             stream = engine.chat_stream_started(cycle_id, batch_ids, reply_kind) if mode != "h0" else None
             reply_stream = ReplyMarkdownStream()
             streamed_reply = ""
@@ -1691,9 +1745,15 @@ def run_unified_cognition(
         if cancelled and cancelled():
             raise MemoryResearchError("memory research was terminated by the user")
         allow_structured_format = any(explicit_format_requested(item["body_text"]) for item in messages)
+        material_registry = _frozen_material_registry(list(memory_context or []))
+        stream_identity = store.stream_message(stream["stream_id"]) if stream else None
         presented = engine.present_for_publication(
             outcome.reply_markdown, cycle["as_of"], reply_kind,
             allow_structured_format=allow_structured_format,
+            expression_profile=expression_profile,
+            material_registry=material_registry,
+            message_id=str(stream_identity["stream_id"]) if stream_identity else None,
+            sealed_at=str(stream_identity["created_at"]) if stream_identity else None,
         )
         stream_id = None
         if stream:

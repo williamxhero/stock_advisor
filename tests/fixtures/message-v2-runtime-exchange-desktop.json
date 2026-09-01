@@ -1,0 +1,24 @@
+{
+  "contract": "companion-client-event/v1",
+  "event_id": "release-replay-1",
+  "cycle_id": "release-cycle",
+  "type": "projection.ready",
+  "created_at": "2026-09-01T01:00:01Z",
+  "payload": {
+    "cycle": {"task_key": "conversation.daily", "state": "open"},
+    "ai_messages": [{
+      "artifact_id": "artifact-release-1",
+      "kind": "ai_chat",
+      "at": "2026-09-01T01:00:00Z",
+      "text": "raw internal fallback",
+      "message": {
+        "contract": "companion-published-message/v2",
+        "message_id": "message-release-1",
+        "sealed_at": "2026-09-01T01:00:00Z",
+        "kind": "ai_chat",
+        "parts": [{"kind": "speech", "text": "我先看核心承接，不急着追。"}],
+        "text_projection": "我先看核心承接，不急着追。"
+      }
+    }]
+  }
+}

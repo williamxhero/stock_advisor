@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any
 
@@ -112,7 +113,9 @@ class UnifiedCognition:
                 "自然回复像同一个熟悉用户的炒股搭档；需要核验当前公开事实时可提出公开搜索请求。"
                 "自己的话只用自然短段，不用标题、列表、表格、字段名或内部任务名。"
                 "只有可归属的短外部材料才可以放进 Markdown 引用块，并带可点击来源链接；"
-                "长材料先给自然摘要和链接，不要倾倒原文。"
+                "长材料先给自然摘要和链接，不要倾倒原文。若确需转贴输入中的材料，只能输出"
+                "[[material:材料ID]]；材料ID必须来自 current_personal_memory 中的 publication_material，"
+                "不得自己编造材料、ID、标题或链接。"
             )
         packet = {
             "cycle_id": cycle["cycle_id"],
@@ -192,7 +195,7 @@ class UnifiedCognition:
             candidate for message in messages
             for candidate in (
                 explicit_expression_preference(
-                    message, None,
+                    message, self._current_expression_preference(),
                 ),
                 user_method_claim(message),
             )
@@ -244,6 +247,29 @@ class UnifiedCognition:
             job["job_id"], reply, tuple(receipts), propositions_recorded,
             saved["needs_fresh_search"], saved["public_search_request"],
         )
+
+    def _current_expression_preference(self) -> dict[str, Any]:
+        if self.engine is None or self.engine.memory is None:
+            return {}
+        snapshot = self.engine.memory.begin_snapshot({
+            "memory_space_id": self.engine.memory_space_id,
+            "as_of": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "stage": "expression_preference_write", "cycle_id": "preference-write",
+        })
+        hits = self.engine.memory.search(snapshot["snapshot_id"], "user.expression", limit=50)
+        rows = [self.engine.memory.expand(snapshot["snapshot_id"], hit["episode_id"]) for hit in hits]
+        current: dict[str, Any] = {}
+        for row in reversed(rows):
+            if row.get("episode_type") != "personal_fact":
+                continue
+            try:
+                body = json.loads(str(row.get("body") or "{}"))
+            except json.JSONDecodeError:
+                continue
+            predicate = str(body.get("predicate") or "")
+            if body.get("subject") == "user.expression" and predicate.startswith("expression."):
+                current[predicate] = {"proposition_id": (row.get("metadata") or {}).get("proposition_id"), **body}
+        return current
 
     def _record_proposition(self, proposition_id: str, proposition: dict[str, Any], message: dict[str, Any], cycle_id: str) -> None:
         if self.engine is None or self.engine.memory is None:

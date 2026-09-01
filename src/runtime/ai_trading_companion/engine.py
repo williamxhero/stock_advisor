@@ -8,15 +8,9 @@ from zoneinfo import ZoneInfo
 
 from .learning import JudgmentLifecycle
 from .evidence_contract import EvidenceContractFactory
-from .message_presentation import PresentedMessage, present_message
-
-
-PUBLISHED_MESSAGE_EVENT_TYPES = frozenset({
-    "m0.ready", "m1.ready", "m2.ready", "chat.ready", "premarket.reply.ready",
-    "outcome.ready", "reflection.ready", "judgment.revised", "chat.stream.delta",
-    "chat.stream.failed", "research.failed", "m0.invalidated", "cycle.missed",
-    "m1.failed", "m2.deferred", "outcome.failed", "chat_research.failed",
-})
+from .message_presentation import MessageQualificationError, PresentedMessage, present_message, repair_message_draft
+from .publication_registry import published_event_types
+from .stage_expression import express_stage_semantics
 from .models import TASK_POLICIES
 from .secret_guard import assert_safe
 from .task_profiles import ManualAnalysisProfileResolver
@@ -252,7 +246,9 @@ class CompanionEngine:
             raise ValueError(f"cycle is not researching M0: {cycle['state']}")
         self.store.verified_attempt(evidence_attempt_id, cycle_id, "m0_research", evidence_packet_hash)
         compose_attempt = self.store.verified_attempt(compose_attempt_id, cycle_id, "m0_compose", packet_hash)
-        if json.loads(compose_attempt.get("output_json") or "null") != {"m0_markdown": m0}:
+        compose_output = json.loads(compose_attempt.get("output_json") or "null")
+        verified_m0 = express_stage_semantics("m0", compose_output["semantic"]) if isinstance(compose_output, dict) and isinstance(compose_output.get("semantic"), dict) else compose_output.get("m0_markdown") if isinstance(compose_output, dict) else None
+        if verified_m0 != m0:
             raise ValueError("M0 body does not match the verified compose attempt")
         ready_at = utc_now()
         profile_json = cycle.get("task_profile_json")
@@ -270,6 +266,7 @@ class CompanionEngine:
                 cycle["scheduled_for"], ready_at, reserve=timedelta(seconds=reserve_seconds),
             )
         presented = self.present_for_publication(m0, evidence_as_of or cycle["as_of"], "m0")
+        self._append_published_memory(cycle, presented)
         with self.store.connection() as connection:
             artifact = self.store.append_artifact(
                 cycle_id, "m0", "model", presented.markdown, evidence_as_of or cycle["as_of"],
@@ -282,7 +279,7 @@ class CompanionEngine:
                 m1_publish_deadline=iso(publish), packet_hash=packet_hash,
                 m1_reserve_seconds=reserve_seconds, timing_policy_version=timing_version,
             )
-            self.store.queue_event(cycle_id, "m0.ready", {
+            self._queue_event(cycle_id, "m0.ready", {
                 "cycle": cycle,
                 "m0": presented.markdown,
                 "presentation": presented.metadata()["presentation"],
@@ -605,7 +602,8 @@ class CompanionEngine:
         self.store.verified_attempt(research_attempt_id, cycle_id, "m1_research", research_packet_hash)
         judgment_attempt = self.store.verified_attempt(judgment_attempt_id, cycle_id, "m1_judgment", judgment_packet_hash)
         verified_output = json.loads(judgment_attempt.get("output_json") or "null")
-        if not isinstance(verified_output, dict) or verified_output.get("m1_markdown") != m1:
+        verified_m1 = express_stage_semantics("m1", verified_output["semantic"]) if isinstance(verified_output, dict) and isinstance(verified_output.get("semantic"), dict) else verified_output.get("m1_markdown") if isinstance(verified_output, dict) else None
+        if verified_m1 != m1:
             raise ValueError("M1 body does not match the verified judgment attempt")
         verified_snapshot = verified_output.get("snapshot") if isinstance(verified_output.get("snapshot"), dict) else snapshot
         verified_qualified = bool(verified_output.get("judgment_qualified", qualified))
@@ -621,6 +619,7 @@ class CompanionEngine:
         completed = iso(utc_now())
         next_state = "synthesizing_m2" if bool(cycle.get("has_h0")) and verified_qualified else "complete"
         presented = self.present_for_publication(m1, as_of or cycle["as_of"], "m1")
+        self._append_published_memory(cycle, presented)
         with self.store.connection() as connection:
             artifact = self.store.append_artifact(
                 cycle_id, "m1", "model", presented.markdown, as_of or iso(utc_now()),
@@ -635,16 +634,26 @@ class CompanionEngine:
                 cycle_id, next_state, connection=connection, m1_completed_at=completed,
                 m2_started_at=completed if next_state == "synthesizing_m2" else None,
             )
-            self.store.queue_event(
+            self._queue_event(
                 cycle_id, "m1.ready", {"cycle": cycle, "m1": presented.markdown, "presentation": presented.metadata()["presentation"], "message": presented.message(), "source_artifact_id": artifact["artifact_id"]},
                 connection=connection,
             )
             if next_state == "synthesizing_m2":
                 self.store.queue_event(cycle_id, "m2.started", {"cycle": cycle}, connection=connection)
         if recovered:
+            recovery = self.present_for_publication(
+                "刚才因为运行配置问题有些延迟，现在已经修复并重新完成；最后的判断来自修复后的完整流程。",
+                cycle["as_of"], "recovery",
+            )
+            self._append_published_memory(cycle, recovery)
+            recovery_artifact = self.store.append_artifact(
+                cycle_id, "recovery", "system", recovery.markdown, cycle["as_of"],
+                self._presentation_metadata({}, recovery),
+            )
             self.emit(cycle, "m1.recovered", {
                 "cycle": cycle,
-                "message": "刚才 M1 因运行配置问题有所延迟，系统已修复并重新完成；最终判断使用的是修复后的完整流程。",
+                "message": recovery.message(),
+                "source_artifact_id": recovery_artifact["artifact_id"],
             })
         return cycle
 
@@ -675,7 +684,8 @@ class CompanionEngine:
         cycle = self.store.get_cycle(cycle_id)
         verified_attempt = self.store.verified_attempt(attempt_id, cycle_id, "m2", packet_hash)
         verified_output = json.loads(verified_attempt.get("output_json") or "null")
-        if not isinstance(verified_output, dict) or verified_output.get("m2_markdown") != m2:
+        verified_m2 = express_stage_semantics("m2", verified_output["semantic"]) if isinstance(verified_output, dict) and isinstance(verified_output.get("semantic"), dict) else verified_output.get("m2_markdown") if isinstance(verified_output, dict) else None
+        if verified_m2 != m2:
             raise ValueError("M2 body does not match the verified synthesis attempt")
         if not cycle.get("has_h0"):
             raise ValueError("M2 requires H0")
@@ -687,6 +697,7 @@ class CompanionEngine:
         if cycle["state"] not in {"synthesizing_m2", "m2_deferred"}:
             raise ValueError(f"M2 cannot be published from: {cycle['state']}")
         presented = self.present_for_publication(m2, as_of or cycle["as_of"], "m2")
+        self._append_published_memory(cycle, presented)
         with self.store.connection() as connection:
             artifact = self.store.append_artifact(
                 cycle_id, "m2", "model", presented.markdown, as_of or iso(utc_now()),
@@ -698,7 +709,7 @@ class CompanionEngine:
                 connection=connection,
             )
             cycle = self.store.transition(cycle_id, "complete", connection=connection, m2_completed_at=iso(utc_now()))
-            self.store.queue_event(
+            self._queue_event(
                 cycle_id, "m2.ready", {"cycle": cycle, "m2": presented.markdown, "presentation": presented.metadata()["presentation"], "message": presented.message(), "source_artifact_id": artifact["artifact_id"]},
                 connection=connection,
             )
@@ -783,6 +794,7 @@ class CompanionEngine:
         message = text if meaningful else "我已经核对过了，暂时没有需要你据此调整的新信息。"
         event_type = {"outcome": "outcome.ready", "reflection": "reflection.ready"}.get(kind, "chat.ready")
         presented = self.present_for_publication(message, iso(utc_now()), kind)
+        self._append_published_memory(cycle, presented)
         artifact = self.store.append_artifact(
             cycle_id, kind, "model", presented.markdown, iso(utc_now()),
             self._presentation_metadata(metadata or {}, presented),
@@ -803,7 +815,11 @@ class CompanionEngine:
 
     def chat_stream_delta(self, cycle_id: str, stream_id: str, text: str) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
-        presented = self.present_for_publication(text, cycle["as_of"], "ai_chat")
+        current = self.store.stream_message(stream_id)
+        presented = self.present_for_publication(
+            text, cycle["as_of"], "ai_chat",
+            message_id=stream_id, sealed_at=str(current["created_at"]),
+        )
         stream = self.store.append_stream_chunk(stream_id, presented.markdown)
         self.emit(cycle, "chat.stream.delta", {
             "cycle": cycle, "stream_id": stream_id, "text": presented.markdown,
@@ -829,6 +845,7 @@ class CompanionEngine:
             })
         stream = self.store.finish_stream_message(stream_id, error=reason)
         presented = self.present_for_publication(self._user_fault_message(reason, "聊天回复"), iso(utc_now()), "system_fault")
+        self._append_published_memory(cycle, presented)
         artifact = self.store.append_artifact(cycle_id, "system_fault", "system", presented.markdown, iso(utc_now()), self._presentation_metadata({"stream_id": stream_id, "reason_category": self._diagnostic_code(reason)}, presented))
         self.emit(cycle, "chat.stream.failed", {"cycle": cycle, "stream": stream, "reason": presented.markdown, "presentation": presented.metadata()["presentation"], "message": presented.message(), "source_artifact_id": artifact["artifact_id"]})
         return stream
@@ -840,6 +857,7 @@ class CompanionEngine:
             raise ValueError("judgment revision must reference an artifact in the same cycle")
         text = self._with_revision_continuity(prior["body_markdown"], text)
         presented = self.present_for_publication(text, iso(utc_now()), "judgment_revision")
+        self._append_published_memory(cycle, presented)
         artifact = self.store.append_artifact(
             cycle_id, "judgment_revision", "model", presented.markdown, iso(utc_now()),
             self._presentation_metadata({"revises_artifact_id": revises_artifact_id}, presented),
@@ -856,7 +874,7 @@ class CompanionEngine:
         artifacts = self.store.artifacts(cycle["cycle_id"])
         ai_kinds = {
             "m0", "m1", "m2", "ai_chat", "premarket_chat", "judgment_revision", "system_fault",
-            "outcome", "reflection", "legacy_message",
+            "outcome", "reflection", "recovery", "legacy_message",
         }
         ai_messages = []
         for artifact in artifacts:
@@ -934,19 +952,55 @@ class CompanionEngine:
         }
 
     def emit(self, cycle: dict[str, Any], event_type: str, payload: dict[str, Any]) -> None:
-        if event_type in PUBLISHED_MESSAGE_EVENT_TYPES:
+        self._queue_event(cycle["cycle_id"], event_type, payload)
+
+    def _queue_event(
+        self, cycle_id: str, event_type: str, payload: dict[str, Any], *, connection: Any = None,
+    ) -> None:
+        if event_type in published_event_types():
             message = payload.get("message")
             if not isinstance(message, dict) or message.get("contract") != "companion-published-message/v2":
                 raise ValueError(f"published event requires companion-published-message/v2: {event_type}")
-        self.store.queue_event(cycle["cycle_id"], event_type, payload)
+        self.store.queue_event(cycle_id, event_type, payload, connection=connection)
+
+    def _append_published_memory(self, cycle: dict[str, Any], presented: PresentedMessage) -> None:
+        if self.memory is None:
+            return
+        self.memory.append({
+            "memory_space_id": self.memory_space_id, "source_system": "stock-advisor",
+            "source_event_id": presented.message_id, "content_hash": "auto",
+            "episode_type": "ai_message", "body": presented.markdown,
+            "occurred_at": presented.sealed_at, "known_at": presented.sealed_at,
+            "submitted_at": presented.sealed_at, "authority": "published_ai_message",
+            "protocol_version": "memoryhub/v1",
+            "metadata": {
+                "message_id": presented.message_id, "cycle_id": cycle["cycle_id"],
+                "kind": presented.kind, "state": "published", "actor": "ai",
+                "published_message": presented.message(),
+            },
+        })
 
     @staticmethod
     def present_for_publication(
         text: str, as_of: str, kind: str, *, allow_structured_format: bool = False,
+        material_registry: dict[str, dict[str, str]] | None = None,
+        expression_profile: dict[str, Any] | None = None,
+        message_id: str | None = None, sealed_at: str | None = None,
     ) -> PresentedMessage:
-        return present_message(
-            text, as_of=as_of, kind=kind, allow_structured_format=allow_structured_format,
-        )
+        draft = text
+        for repair_count in range(3):
+            try:
+                return present_message(
+                    draft, as_of=as_of, kind=kind, allow_structured_format=allow_structured_format,
+                    material_registry=material_registry,
+                    expression_profile=expression_profile,
+                    message_id=message_id, sealed_at=sealed_at,
+                )
+            except MessageQualificationError as error:
+                if repair_count == 2:
+                    raise
+                draft = repair_message_draft(draft, error.problems)
+        raise AssertionError("bounded message repair exhausted")
 
     @staticmethod
     def _presentation_metadata(metadata: dict[str, Any], presented: PresentedMessage) -> dict[str, Any]:
@@ -956,6 +1010,7 @@ class CompanionEngine:
         self, cycle: dict[str, Any], event_type: str, message: str, reason: str, extra: dict[str, Any] | None = None,
     ) -> None:
         presented = self.present_for_publication(message, iso(utc_now()), "system_fault")
+        self._append_published_memory(cycle, presented)
         artifact = self.store.append_artifact(
             cycle["cycle_id"], "system_fault", "system", presented.markdown, iso(utc_now()),
             self._presentation_metadata({"reason_category": self._diagnostic_code(reason), **(extra or {})}, presented),

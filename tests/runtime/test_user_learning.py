@@ -40,6 +40,7 @@ class UserLearningTests(unittest.TestCase):
         rows = [row for row in self.memory._episodes if "expression.material_density" in row["body"]]
         self.assertEqual(2, len(rows))
         self.assertIn("more_source_excerpt", rows[-1]["body"])
+        self.assertEqual(rows[0]["metadata"]["proposition_id"], rows[-1]["metadata"]["supersedes_id"])
 
     def test_method_is_recorded_as_an_unverified_user_view(self) -> None:
         self.apply("我觉得这是诱多，因为高开后核心承接不住。")
@@ -47,6 +48,20 @@ class UserLearningTests(unittest.TestCase):
         row = next(row for row in self.memory._episodes if "user.market_method" in row["body"])
         self.assertEqual("proposition", row["episode_type"])
         self.assertIn("unverified", row["body"])
+
+    def test_length_and_tone_preferences_are_append_only_too(self) -> None:
+        self.apply("以后简短点。")
+        self.apply("以后详细点。")
+        self.apply("以后直接点。")
+        self.apply("以后叫我老周。")
+
+        length = [row for row in self.memory._episodes if "expression.length" in row["body"]]
+        tone = [row for row in self.memory._episodes if "expression.tone" in row["body"]]
+        address = [row for row in self.memory._episodes if "expression.address" in row["body"]]
+        self.assertEqual(2, len(length))
+        self.assertEqual(length[0]["metadata"]["proposition_id"], length[1]["metadata"]["supersedes_id"])
+        self.assertEqual(1, len(tone))
+        self.assertEqual(1, len(address))
 
 
 if __name__ == "__main__":

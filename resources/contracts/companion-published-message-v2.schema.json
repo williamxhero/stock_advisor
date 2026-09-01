@@ -2,9 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["contract", "kind", "parts", "text_projection"],
+  "required": ["contract", "message_id", "sealed_at", "kind", "parts", "text_projection"],
   "properties": {
     "contract": {"const": "companion-published-message/v2"},
+    "message_id": {"type": "string", "minLength": 1},
+    "sealed_at": {"type": "string", "format": "date-time"},
     "kind": {"type": "string", "minLength": 1},
     "parts": {
       "type": "array",
@@ -23,10 +25,11 @@
           {
             "type": "object",
             "additionalProperties": false,
-            "required": ["kind", "markdown", "source_title", "source_url"],
+            "required": ["kind", "markdown", "material_id", "source_title", "source_url"],
             "properties": {
               "kind": {"const": "material"},
               "markdown": {"type": "string", "minLength": 1},
+              "material_id": {"type": "string", "minLength": 1},
               "source_title": {"type": "string", "minLength": 1},
               "source_url": {"type": "string", "format": "uri"}
             }

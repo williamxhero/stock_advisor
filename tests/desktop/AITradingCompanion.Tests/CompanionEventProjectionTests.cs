@@ -6,6 +6,20 @@ namespace AITradingCompanion.Tests;
 public sealed class CompanionEventProjectionTests
 {
     [Fact]
+    public void RuntimeExchangeDesktopReleaseFixtureUsesTheSealedV2Text()
+    {
+        var json = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "fixtures", "message-v2-runtime-exchange-desktop.json"));
+
+        var projection = CompanionEventProjection.Project([json]);
+
+        Assert.NotNull(projection);
+        var message = Assert.Single(projection.AiMessages);
+        Assert.Equal("message-release-1", message.ArtifactId);
+        Assert.Equal("我先看核心承接，不急着追。", message.Text);
+        Assert.DoesNotContain("raw internal fallback", message.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ProjectionRejectsAnUnknownNewAiMessageKind()
     {
         var payload = """{"contract":"companion-client-event/v1","event_id":"projection","cycle_id":"c1","type":"projection.ready","created_at":"2026-08-25T01:00:00Z","payload":{"cycle":{"task_key":"conversation.daily"},"ai_messages":[{"artifact_id":"a1","kind":"future_internal_stage","at":"2026-08-25T01:00:00Z","text":"must stay hidden"}]}}""";
@@ -21,13 +35,14 @@ public sealed class CompanionEventProjectionTests
     {
         var events = new[]
         {
-            """{"contract":"companion-client-event/v1","event_id":"projection","cycle_id":"c1","type":"projection.ready","created_at":"2026-09-01T01:02:00Z","payload":{"cycle":{"task_key":"conversation.daily","state":"open"},"ai_messages":[{"artifact_id":"a1","kind":"ai_chat","at":"2026-09-01T01:00:00Z","text":"raw internal report","message":{"contract":"companion-published-message/v2","kind":"ai_chat","parts":[{"kind":"speech","text":"我倾向于先等承接确认。"},{"kind":"material","markdown":"> 公告原文","source_title":"公告","source_url":"https://example.com/notice"}],"text_projection":"我倾向于先等承接确认。"}}]}}"""
+            """{"contract":"companion-client-event/v1","event_id":"projection","cycle_id":"c1","type":"projection.ready","created_at":"2026-09-01T01:02:00Z","payload":{"cycle":{"task_key":"conversation.daily","state":"open"},"ai_messages":[{"artifact_id":"message-1","kind":"ai_chat","at":"2026-09-01T01:00:00Z","text":"raw internal report","message":{"contract":"companion-published-message/v2","message_id":"message-1","sealed_at":"2026-09-01T01:00:00Z","kind":"ai_chat","parts":[{"kind":"speech","text":"我倾向于先等承接确认。"},{"kind":"material","markdown":"> 公告原文","material_id":"notice-1","source_title":"公告","source_url":"https://example.com/notice"}],"text_projection":"我倾向于先等承接确认。"}}]}}"""
         };
 
         var projection = CompanionEventProjection.Project(events)!;
 
         Assert.Equal("我倾向于先等承接确认。", Assert.Single(projection.AiMessages).Text);
         Assert.Equal(["speech", "material"], projection.AiMessages[0].Parts!.Select(part => part.Kind));
+        Assert.Equal("notice-1", projection.AiMessages[0].Parts![1].MaterialId);
         Assert.Equal("公告", projection.AiMessages[0].Parts![1].SourceTitle);
     }
 
@@ -131,7 +146,7 @@ public sealed class CompanionEventProjectionTests
         Assert.Equal("AI 正在研究中", researching.AiMessages[0].Text);
 
         var retried = CompanionEventProjection.ProjectForCycle([m0Started, retrying], "cycle-1")!;
-        Assert.Equal("上游暂时不可用，正在自动重试。", Assert.Single(retried.AiMessages).Text);
+        Assert.Equal("我正在重新核对，稍等一下。", Assert.Single(retried.AiMessages).Text);
 
         var judging = CompanionEventProjection.ProjectForCycle([m0Started, retrying, m0Ready, m1Started], "cycle-1")!;
         Assert.Equal(["m0", "action_pending"], judging.AiMessages.Select(message => message.Kind));

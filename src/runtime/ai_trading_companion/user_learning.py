@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 
@@ -9,17 +10,30 @@ def explicit_expression_preference(message: dict[str, Any], previous: dict[str, 
     if "这次" in text or "本次" in text:
         return None
     value = None
+    predicate = None
     if "以后少贴原文" in text or "以后少发原文" in text:
-        value = "summary_and_link"
+        predicate, value = "expression.material_density", "summary_and_link"
     elif "以后多贴原文" in text:
-        value = "more_source_excerpt"
+        predicate, value = "expression.material_density", "more_source_excerpt"
+    elif any(token in text for token in ("以后简短点", "以后少说点", "以后别太长")):
+        predicate, value = "expression.length", "concise"
+    elif any(token in text for token in ("以后详细点", "以后多说一点", "以后说详细些")):
+        predicate, value = "expression.length", "detailed"
+    elif any(token in text for token in ("以后直接点", "以后直说")):
+        predicate, value = "expression.tone", "direct"
+    elif any(token in text for token in ("以后语气柔和点", "以后委婉点")):
+        predicate, value = "expression.tone", "gentle"
+    else:
+        address = re.search(r"以后叫我([^，。！？!?\s]{1,12})", text)
+        if address:
+            predicate, value = "expression.address", address.group(1)
     if value is None:
         return None
-    predicate = "expression.material_density"
+    prior = previous.get(predicate) if isinstance(previous, dict) and predicate in previous else previous
     return {
         "kind": "user_fact", "subject": "user.expression", "predicate": predicate,
         "object": {"value": value, "scope": "long_term", "explicit": True}, "confidence": 1.0,
-        "supersedes_id": previous["proposition_id"] if previous else None,
+        "supersedes_id": prior["proposition_id"] if isinstance(prior, dict) and prior.get("proposition_id") else None,
         "source_span": {"message_id": message["message_id"], "start": 0, "end": len(text), "quote": text},
     }
 

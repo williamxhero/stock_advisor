@@ -8,9 +8,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ai_trading_companion.engine import CompanionEngine, iso, parse
-from ai_trading_companion.__main__ import run_pending_premarket_reply
+from ai_trading_companion.message_presentation import MessageQualificationError
+from ai_trading_companion.stage_expression import express_stage_semantics
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
+from ai_trading_companion.__main__ import run_pending_premarket_reply
 from ai_trading_companion.packet_builder import RuntimePacketBuilder as _RuntimePacketBuilder
+from ai_trading_companion.publication_registry import published_event_types
 from ai_trading_companion.scheduler import conversation_auto_submit_at, load_schedules, run_daily_schedule, run_periodic_schedule
 from ai_trading_companion.store import CompanionStore
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
@@ -42,18 +45,34 @@ def packet_builder(store: CompanionStore) -> RuntimePacketBuilder:
 
 class CompanionEngineTests(unittest.TestCase):
     def test_user_visible_event_cannot_bypass_the_v2_publication_contract(self):
-        with self.assertRaisesRegex(ValueError, "requires companion-published-message/v2"):
-            self.engine.emit(self.cycle, "chat.ready", {"cycle": self.cycle, "text": "raw bypass"})
-        self.assertFalse(any(item["event_type"] == "chat.ready" for item in self.store.pending_events()))
+        for event_type in published_event_types():
+            with self.subTest(event_type=event_type):
+                with self.assertRaisesRegex(ValueError, "requires companion-published-message/v2"):
+                    self.engine.emit(self.cycle, event_type, {"cycle": self.cycle, "text": "raw bypass"})
+        queued = {item["event_type"] for item in self.store.pending_events()}
+        self.assertTrue(published_event_types().isdisjoint(queued))
 
-    def test_unqualified_chat_candidate_is_not_sealed_as_an_artifact(self):
-        with self.assertRaisesRegex(ValueError, "message qualification failed"):
-            self.engine.chat_ready(
-                self.cycle["cycle_id"],
-                "internal_flag: active\n我倾向于先等承接确认。",
-            )
+    def test_unqualified_chat_candidate_is_repaired_before_it_is_sealed(self):
+        self.engine.chat_ready(
+            self.cycle["cycle_id"],
+            "internal_flag: active\n我倾向于先等承接确认。",
+        )
 
-        self.assertIsNone(self.store.latest_artifact(self.cycle["cycle_id"], "ai_chat"))
+        artifact = self.store.latest_artifact(self.cycle["cycle_id"], "ai_chat")
+        self.assertNotIn("internal_flag", artifact["body_markdown"])
+
+    def test_chat_draft_closes_after_two_failed_repairs_without_sealing(self):
+        cycle = self.engine.ensure_daily_conversation()
+        self.store.stage_message(cycle["cycle_id"], "请继续看承接。", "conversation")
+        batch_id, _ = self.store.commit_staged_messages(cycle["cycle_id"], "conversation")
+        error = MessageQualificationError(["internal_token"])
+        with patch("ai_trading_companion.engine.present_message", side_effect=error) as qualify:
+            with self.assertRaises(MessageQualificationError):
+                self.engine.chat_ready(cycle["cycle_id"], "bad draft", reply_to_batch_ids=[batch_id])
+
+        self.assertEqual(3, qualify.call_count)
+        self.assertIsNone(self.store.latest_artifact(cycle["cycle_id"], "ai_chat"))
+        self.assertEqual([batch_id], [batch["batch_id"] for batch in self.store.pending_message_batches(cycle["cycle_id"], "conversation")])
 
     def test_machine_shaped_chat_is_qualified_before_it_reaches_the_projection(self):
         self.engine.chat_ready(
@@ -80,12 +99,16 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertIn("现有信息还不够，我先不下判断。", visible)
 
     def test_published_message_v2_survives_the_runtime_projection(self):
+        memory = InMemoryMemoryAdapter()
+        self.engine.memory = memory
         self.ready()
 
         projection = self.engine._projection(self.store.get_cycle(self.cycle["cycle_id"]))
         message = next(item for item in projection["ai_messages"] if item["kind"] == "m0")
 
         self.assertEqual("companion-published-message/v2", message["message"]["contract"])
+        self.assertRegex(message["message"]["message_id"], r"^[0-9a-f-]{36}$")
+        self.assertTrue(message["message"]["sealed_at"].endswith("Z"))
         self.assertEqual("今天先看客观信息。", message["message"]["text_projection"])
         self.assertEqual(
             [{"kind": "speech", "text": "今天先看客观信息。"}],
@@ -95,6 +118,36 @@ Protocol: OpportunityDiscovery-v1.3
         event = next(item for item in self.store.pending_events() if item["event_type"] == "m0.ready")
         payload = json.loads(event["payload_json"])
         self.assertEqual("companion-published-message/v2", payload["message"]["contract"])
+        memory_message = next(row for row in memory._episodes if row["episode_type"] == "ai_message")
+        self.assertEqual(message["message"]["message_id"], memory_message["metadata"]["message_id"])
+        self.assertEqual(message["message"], memory_message["metadata"]["published_message"])
+
+    def test_new_m0_result_publishes_from_structured_semantics_not_markdown(self):
+        self.engine.research_started(self.cycle["cycle_id"])
+        semantic = {
+            "summary": "现在先看客观承接。", "observations": ["核心仍然偏弱"],
+            "risks": ["量能没有改善"], "unknowns": ["开盘后的扩散强度"],
+        }
+        evidence_hash, compose_hash = "semantic-evidence", "semantic-compose"
+        self.engine.research_ready(
+            self.cycle["cycle_id"], express_stage_semantics("m0", semantic),
+            evidence_attempt_id=self.qualified("m0_research", evidence_hash, output={}),
+            compose_attempt_id=self.qualified("m0_compose", compose_hash, output={"semantic": semantic}),
+            evidence_packet_hash=evidence_hash, packet_hash=compose_hash,
+        )
+        artifact = self.store.latest_artifact(self.cycle["cycle_id"], "m0")
+        self.assertIn("核心仍然偏弱", artifact["body_markdown"])
+        self.assertNotIn("m0_markdown", artifact["metadata_json"])
+
+    def test_structured_judgment_expression_keeps_direction_and_qualification(self):
+        text = express_stage_semantics("m1", {
+            "summary": "承接还没有形成共振。", "direction": "继续观望", "qualified": False,
+            "triggers": ["核心同步转强"], "invalidations": ["量能继续萎缩"],
+            "risks": ["尾部冲高回落"], "unknowns": ["开盘后的扩散强度"],
+        })
+
+        self.assertIn("继续观望", text)
+        self.assertIn("不会把它当成可以直接执行的判断", text)
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()

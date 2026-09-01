@@ -7,7 +7,8 @@ public sealed record CompanionMessagePart(
     string Kind,
     string Text,
     string? SourceTitle = null,
-    string? SourceUrl = null);
+    string? SourceUrl = null,
+    string? MaterialId = null);
 
 public sealed record CompanionAiTimelineEntry(
     string ArtifactId,
@@ -142,12 +143,12 @@ public static class CompanionEventProjection
                         : ai.ContainsKey("action-pending-m1") ? "action-pending-m1" : null;
                     if (pendingResearchId is not null)
                         UpsertAi(ai, pendingResearchId, "action_pending", item.At,
-                            ReadString(payload, "reason") ?? "AI 正在重新尝试研究", item.At, null);
+                            "我正在重新核对，稍等一下。", item.At, null);
                     break;
                 case "m0.ready":
                     ai.Remove("action-pending-m0");
-                    UpsertAi(ai, ReadString(payload, "source_artifact_id"), "m0", item.At,
-                        ReadPublishedText(payload, "m0"), m0StartedAt, item.At, ReadPublishedParts(payload));
+                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "m0", ReadPublishedAt(payload, item.At),
+                        ReadPublishedText(payload, "m0"), m0StartedAt, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "brief.ready": // v1 compatibility
                     UpsertAi(ai, null, "m0", item.At, ReadString(payload, "brief"), m0StartedAt, item.At);
@@ -186,15 +187,15 @@ public static class CompanionEventProjection
                     foreach (var fault in ai.Where(pair => pair.Value.Kind == "fault").Select(pair => pair.Key).ToArray())
                         ai.Remove(fault);
                     errorText = null;
-                    UpsertAi(ai, ReadString(payload, "source_artifact_id"), "m1", item.At,
-                        ReadPublishedText(payload, "m1"), m1StartedAt, item.At, ReadPublishedParts(payload));
+                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "m1", ReadPublishedAt(payload, item.At),
+                        ReadPublishedText(payload, "m1"), m1StartedAt, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "m1.recovered":
                     foreach (var fault in ai.Where(pair => pair.Value.Kind == "fault").Select(pair => pair.Key).ToArray())
                         ai.Remove(fault);
                     errorText = null;
-                    UpsertAi(ai, $"recovery-{item.At:O}", "recovery", item.At,
-                        ReadString(payload, "message"), item.At, item.At);
+                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id") ?? $"recovery-{item.At:O}"), "recovery", ReadPublishedAt(payload, item.At),
+                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "joint.ready": // v1 compatibility; this mixed H0 and the old model output.
                     UpsertAi(ai, null, "legacy_synthesis", item.At,
@@ -213,13 +214,13 @@ public static class CompanionEventProjection
                     foreach (var fault in ai.Where(pair => pair.Value.Kind == "fault").Select(pair => pair.Key).ToArray())
                         ai.Remove(fault);
                     errorText = null;
-                    UpsertAi(ai, ReadString(payload, "source_artifact_id"), "m2", item.At,
-                        ReadPublishedText(payload, "m2"), m2StartedAt, item.At, ReadPublishedParts(payload));
+                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "m2", ReadPublishedAt(payload, item.At),
+                        ReadPublishedText(payload, "m2"), m2StartedAt, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "chat.ready":
                     isCompanionThinking = false;
-                    UpsertAi(ai, ReadString(payload, "stream_id") ?? ReadString(payload, "source_artifact_id"), "chat", item.At,
-                        ReadPublishedText(payload), item.At, item.At, ReadPublishedParts(payload));
+                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "stream_id") ?? ReadString(payload, "source_artifact_id")), "chat", ReadPublishedAt(payload, item.At),
+                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "chat.stream.started":
                     isCompanionThinking = true;
@@ -232,7 +233,7 @@ public static class CompanionEventProjection
                         var existingText = ai.TryGetValue(streamId, out var existing) && existing.Kind != "chat_pending"
                             ? existing.Text
                             : string.Empty;
-                        UpsertAi(ai, streamId, "chat", item.At, existingText + (ReadPublishedText(payload) ?? string.Empty), item.At, null);
+                        UpsertAi(ai, ReadPublishedId(payload, streamId), "chat", ReadPublishedAt(payload, item.At), existingText + (ReadPublishedText(payload) ?? string.Empty), item.At, null);
                     }
                     break;
                 case "chat.stream.failed":
@@ -241,7 +242,8 @@ public static class CompanionEventProjection
                     var failedText = ReadNestedString(payload, "stream", "text");
                     if (!string.IsNullOrWhiteSpace(failedStreamId) && !string.IsNullOrWhiteSpace(failedText))
                         UpsertAi(ai, failedStreamId, "chat_incomplete", item.At, failedText + "\n\n（未完成）", item.At, null);
-                    UpsertAi(ai, ReadString(payload, "source_artifact_id"), "fault", item.At, ReadString(payload, "reason"), item.At, item.At);
+                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "fault", ReadPublishedAt(payload, item.At),
+                        ReadPublishedText(payload) ?? ReadString(payload, "reason"), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "chat.research.terminated":
                     foreach (var pending in ai.Where(pair => pair.Value.Kind == "chat_pending").Select(pair => pair.Key).ToArray())
@@ -256,20 +258,20 @@ public static class CompanionEventProjection
                     UpsertAi(ai, $"chat-control-{item.At:O}", "chat_pending", item.At, "正在继续核验。", item.At, null);
                     break;
                 case "premarket.reply.ready":
-                    UpsertAi(ai, ReadString(payload, "source_artifact_id"), "premarket", item.At,
-                        ReadPublishedText(payload), item.At, item.At, ReadPublishedParts(payload));
+                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "premarket", ReadPublishedAt(payload, item.At),
+                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "outcome.ready":
-                    UpsertAi(ai, ReadString(payload, "source_artifact_id"), "outcome", item.At,
-                        ReadPublishedText(payload), item.At, item.At, ReadPublishedParts(payload));
+                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "outcome", ReadPublishedAt(payload, item.At),
+                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "reflection.ready":
-                    UpsertAi(ai, ReadString(payload, "source_artifact_id"), "reflection", item.At,
-                        ReadPublishedText(payload), item.At, item.At, ReadPublishedParts(payload));
+                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "reflection", ReadPublishedAt(payload, item.At),
+                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "judgment.revised":
-                    UpsertAi(ai, ReadString(payload, "source_artifact_id"), "judgment_revision", item.At,
-                        ReadPublishedText(payload), item.At, item.At, ReadPublishedParts(payload));
+                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "judgment_revision", ReadPublishedAt(payload, item.At),
+                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "projection.ready":
                     ReadProjection(payload, ai, users, ref scheduledFor, ref autoSubmit, ref m1Deadline, ref h0LockedAt,
@@ -285,14 +287,14 @@ public static class CompanionEventProjection
                     RemoveActionPending(ai);
                     errorText = ReadNestedString(payload, "message", "text_projection")
                         ?? ReadString(payload, "reason") ?? "这次研究没有完成。";
-                    UpsertAi(ai, ReadString(payload, "source_artifact_id") ?? $"fault-{item.At:O}", "fault", item.At,
-                        errorText, item.At, item.At, ReadPublishedParts(payload));
+                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id") ?? $"fault-{item.At:O}"), "fault", ReadPublishedAt(payload, item.At),
+                        errorText, item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "m2.deferred":
                     errorText = ReadNestedString(payload, "message", "text_projection")
                         ?? ReadString(payload, "reason") ?? "这次综合判断要晚一点。";
-                    UpsertAi(ai, ReadString(payload, "source_artifact_id") ?? $"fault-{item.At:O}", "fault", item.At,
-                        errorText, item.At, item.At, ReadPublishedParts(payload));
+                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id") ?? $"fault-{item.At:O}"), "fault", ReadPublishedAt(payload, item.At),
+                        errorText, item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
             }
         }
@@ -404,14 +406,15 @@ public static class CompanionEventProjection
                 var kind = ReadString(message, "kind") switch
                 {
                     "premarket_chat" => "premarket",
-                    { } value when IsPublishedKind(value) => value,
+                    { } value when CompanionMessagePublicationRegistry.CanReadKind(value) => value,
                     _ => null,
                 };
                 if (kind is null) continue;
-                var at = ReadDate(ReadString(message, "at")) ?? DateTimeOffset.MinValue;
+                var at = ReadDate(ReadNestedString(message, "message", "sealed_at"))
+                    ?? ReadDate(ReadString(message, "at")) ?? DateTimeOffset.MinValue;
                 var started = kind == "m1" ? projectedM1StartedAt : kind == "m2" ? projectedM2StartedAt : at;
                 var completed = kind == "m1" ? projectedM1CompletedAt : kind == "m2" ? projectedM2CompletedAt : at;
-                UpsertAi(ai, ReadString(message, "artifact_id"), kind, at, ReadPublishedText(message), started ?? at, completed ?? at,
+                UpsertAi(ai, ReadNestedString(message, "message", "message_id") ?? ReadString(message, "artifact_id"), kind, at, ReadPublishedText(message), started ?? at, completed ?? at,
                     ReadPublishedParts(message));
             }
         }
@@ -524,11 +527,6 @@ public static class CompanionEventProjection
     private static string? ReadPublishedText(JsonElement element) =>
         ReadNestedString(element, "message", "text_projection") ?? ReadString(element, "text");
 
-    private static bool IsPublishedKind(string kind) => kind is
-        "m0" or "m1" or "m2" or "ai_chat" or "chat" or "premarket" or "premarket_chat"
-        or "judgment_revision" or "system_fault" or "fault" or "outcome" or "reflection"
-        or "legacy_message" or "legacy_model" or "legacy_synthesis" or "history";
-
     private static string? ReadPublishedText(JsonElement element, string legacyProperty) =>
         ReadNestedString(element, "message", "text_projection") ?? ReadString(element, legacyProperty);
 
@@ -543,8 +541,15 @@ public static class CompanionEventProjection
             ReadString(part, "kind") ?? "speech",
             ReadString(part, "text") ?? ReadString(part, "markdown") ?? string.Empty,
             ReadString(part, "source_title"),
-            ReadString(part, "source_url"))).Where(part => !string.IsNullOrWhiteSpace(part.Text)).ToArray();
+            ReadString(part, "source_url"),
+            ReadString(part, "material_id"))).Where(part => !string.IsNullOrWhiteSpace(part.Text)).ToArray();
     }
+
+    private static string? ReadPublishedId(JsonElement element, string? fallback) =>
+        ReadNestedString(element, "message", "message_id") ?? fallback;
+
+    private static DateTimeOffset ReadPublishedAt(JsonElement element, DateTimeOffset fallback) =>
+        ReadDate(ReadNestedString(element, "message", "sealed_at")) ?? fallback;
 
     private static string? ReadCycleString(JsonElement payload, string property) =>
         ReadNestedString(payload, "cycle", property) ?? ReadString(payload, property);

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from ai_trading_companion.engine import CompanionEngine
@@ -38,6 +39,11 @@ def test_failed_stream_keeps_visible_prefix_as_incomplete_memory_message(tmp_pat
     cycle = store.ensure_daily_conversation("2026-09-01")
     stream = engine.chat_stream_started(cycle["cycle_id"], ["batch-1"], "ai_chat")
     engine.chat_stream_delta(cycle["cycle_id"], stream["stream_id"], "已经核验一半。")
+
+    delta = next(event for event in store.pending_events() if event["event_type"] == "chat.stream.delta")
+    payload = json.loads(delta["payload_json"])
+    assert payload["message"]["message_id"] == stream["stream_id"]
+    assert payload["message"]["sealed_at"] == stream["created_at"]
 
     engine.chat_stream_failed(cycle["cycle_id"], stream["stream_id"], "network")
 

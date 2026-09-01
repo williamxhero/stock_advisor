@@ -1,0 +1,17 @@
+{
+  "contract": "companion-message-publication-registry/v2",
+  "published_event_types": [
+    "m0.ready", "m1.ready", "m2.ready", "m1.recovered",
+    "chat.ready", "premarket.reply.ready", "outcome.ready", "reflection.ready",
+    "judgment.revised", "chat.stream.delta", "chat.stream.failed",
+    "research.failed", "m0.invalidated", "cycle.missed", "m1.failed",
+    "m2.deferred", "outcome.failed", "chat_research.failed"
+  ],
+  "published_kinds": [
+    "m0", "m1", "m2", "ai_chat", "chat", "premarket", "premarket_chat",
+    "judgment_revision", "system_fault", "fault", "outcome", "reflection", "recovery"
+  ],
+  "legacy_read_kinds": [
+    "legacy_message", "legacy_model", "legacy_synthesis", "history"
+  ]
+}

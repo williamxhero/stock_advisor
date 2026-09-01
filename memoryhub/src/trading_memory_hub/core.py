@@ -656,20 +656,48 @@ class MemoryHub:
         return [dict(row) for row in rows]
 
     def admin_episodes(
-        self, memory_space_id: str, *, cursor: int | None = None, limit: int = 50
+        self, memory_space_id: str, *, cursor: int | None = None, limit: int = 50,
+        query: str = "", episode_type: str = "", source_system: str = "",
+        authority: str = "", derivation_state: str = "",
+        occurred_from: str = "", occurred_to: str = "", known_from: str = "",
+        known_to: str = "", submitted_from: str = "", submitted_to: str = "",
     ) -> dict[str, Any]:
         if not memory_space_id:
             raise MemoryHubError("admin episode listing requires memory_space_id")
         page_size = max(1, min(int(limit), 200))
-        clauses = ["memory_space_id=?"]
+        clauses = ["e.memory_space_id=?"]
         values: list[Any] = [memory_space_id]
         if cursor is not None:
-            clauses.append("sequence<?")
+            clauses.append("e.sequence<?")
             values.append(max(1, int(cursor)))
+        for column, value in {
+            "e.episode_type": episode_type, "e.source_system": source_system,
+            "e.authority": authority, "j.state": derivation_state,
+        }.items():
+            if value:
+                clauses.append(f"{column}=?")
+                values.append(value)
+        for column, lower, upper in (
+            ("e.occurred_at", occurred_from, occurred_to),
+            ("e.known_at", known_from, known_to),
+            ("e.submitted_at", submitted_from, submitted_to),
+        ):
+            if lower:
+                clauses.append(f"{column}>=?")
+                values.append(_canonical_time(lower))
+            if upper:
+                clauses.append(f"{column}<=?")
+                values.append(_canonical_time(upper))
+        if query:
+            clauses.append("(e.body LIKE ? OR s.title LIKE ? OR s.searchable_text LIKE ?)")
+            values.extend([f"%{query}%"] * 3)
         values.append(page_size + 1)
         with self._connection() as connection:
             rows = list(connection.execute(
-                f"SELECT * FROM episode WHERE {' AND '.join(clauses)} ORDER BY sequence DESC LIMIT ?",
+                f"""SELECT e.* FROM episode e
+                       LEFT JOIN derivation_job j ON j.episode_id=e.episode_id
+                       LEFT JOIN source_search_index s ON s.episode_id=e.episode_id
+                       WHERE {' AND '.join(clauses)} ORDER BY e.sequence DESC LIMIT ?""",
                 values,
             ))
         has_more = len(rows) > page_size
@@ -679,6 +707,31 @@ class MemoryHub:
             "next_cursor": str(items[-1]["sequence"]) if has_more else None,
             "protocol_version": PROTOCOL_VERSION,
         }
+
+    def admin_episode(self, episode_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM episode WHERE episode_id=?", (episode_id,)).fetchone()
+            if row is None:
+                raise MemoryHubError("episode does not exist")
+            job = connection.execute("SELECT * FROM derivation_job WHERE episode_id=?", (episode_id,)).fetchone()
+            derived = connection.execute("SELECT * FROM derived_memory WHERE episode_id=?", (episode_id,)).fetchone()
+            related_rows = list(connection.execute(
+                """SELECT DISTINCT e.* FROM episode e WHERE e.memory_space_id=? AND e.episode_id<>? AND (
+                       e.corrects_episode_id=? OR e.episode_id=? OR e.episode_id IN (
+                         SELECT CASE WHEN left_episode_id=? THEN right_episode_id ELSE left_episode_id END
+                         FROM event_link WHERE left_episode_id=? OR right_episode_id=?)) ORDER BY e.sequence DESC""",
+                (row["memory_space_id"], episode_id, episode_id, row["corrects_episode_id"],
+                 episode_id, episode_id, episode_id),
+            ))
+        derivation: dict[str, Any] = {"state": job["state"] if job else "unavailable"}
+        if job:
+            derivation.update({"error": job["error"], "extractor_version": job["extractor_version"]})
+        if derived:
+            derivation["value"] = _loads(derived["value_json"])
+            derivation["extractor_version"] = derived["extractor_version"]
+        return {"episode": self._episode(row), "derivation": derivation,
+                "relations": [self._episode(item) for item in related_rows],
+                "protocol_version": PROTOCOL_VERSION}
 
     def export_space(self, memory_space_id: str) -> dict[str, Any]:
         if not memory_space_id:

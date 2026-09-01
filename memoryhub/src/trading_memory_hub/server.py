@@ -43,8 +43,20 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
                     _first(query, "memory_space_id") or "",
                     cursor=int(cursor) if cursor else None,
                     limit=int(_first(query, "limit") or "50"),
+                    **_admin_episode_filters(query),
                 )
                 self._reply(HTTPStatus.OK, {"result": result})
+            elif request.path.startswith("/v1/admin/episodes/") and request.path != "/v1/admin/episodes/export":
+                episode_id = unquote(request.path.removeprefix("/v1/admin/episodes/"))
+                self._reply(HTTPStatus.OK, {"result": hub.admin_episode(episode_id)})
+            elif request.path == "/v1/admin/timeline":
+                query = parse_qs(request.query)
+                self._reply(HTTPStatus.OK, {"result": hub.timeline(_first(query, "memory_space_id") or "")})
+            elif request.path == "/v1/admin/episodes/export":
+                query = parse_qs(request.query)
+                result = hub.admin_episodes(_first(query, "memory_space_id") or "", limit=10000,
+                                            **_admin_episode_filters(query))
+                self._download("memoryhub-episodes.json", {"result": result})
             else:
                 self._reply(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
@@ -148,12 +160,30 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
             self.end_headers()
             self.wfile.write(body)
 
+        def _download(self, filename: str, value: Any) -> None:
+            body = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
     return ThreadingHTTPServer((host, port), Handler)
 
 
 def _first(query: dict[str, list[str]], name: str) -> str | None:
     values = query.get(name) or []
     return values[0] if values else None
+
+
+def _admin_episode_filters(query: dict[str, list[str]]) -> dict[str, str]:
+    return {"query": _first(query, "q") or "", **{
+        name: _first(query, name) or "" for name in (
+            "episode_type", "source_system", "authority", "derivation_state",
+            "occurred_from", "occurred_to", "known_from", "known_to",
+            "submitted_from", "submitted_to",
+        )}}
 
 
 def main() -> None:

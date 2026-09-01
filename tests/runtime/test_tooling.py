@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import textwrap
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -365,6 +367,70 @@ class ToolRunnerTests(unittest.TestCase):
 
             self.assertFalse(result.succeeded)
             self.assertEqual("tool_access_restricted", result.error_code)
+
+    def test_browser_capture_executes_public_page_javascript_in_an_ephemeral_browser(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = b"<html><body><script>document.body.insertAdjacentHTML('beforeend','<p>dynamic market breadth 3210</p>')</script></body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                    1, "generic_browser_capture", "2026-09-01T01:30:00Z", 8.0,
+                    {"url": f"http://127.0.0.1:{server.server_port}/dynamic"},
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("dynamic", result.data["capture_mode"])
+                self.assertIn("dynamic market breadth 3210", result.data["text"])
+                self.assertEqual(("default:succeeded",), result.attempts)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_browser_capture_falls_back_to_static_read_when_browser_is_unavailable(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = b"<html><body>static market breadth fallback</body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                with mock.patch.dict(os.environ, {"AI_TRADING_COMPANION_DISABLE_DYNAMIC_BROWSER": "1"}):
+                    result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                        1, "generic_browser_capture", "2026-09-01T01:30:00Z", 4.0,
+                        {"url": f"http://127.0.0.1:{server.server_port}/page"},
+                    ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("static", result.data["capture_mode"])
+                self.assertIn("static market breadth fallback", result.data["text"])
+            finally:
+                server.shutdown()
+                server.server_close()
 
     def test_builtin_quote_tools_validate_a_share_identity_and_close_semantics(self) -> None:
         class Handler(BaseHTTPRequestHandler):

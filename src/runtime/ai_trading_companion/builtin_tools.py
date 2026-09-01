@@ -48,8 +48,12 @@ _CLI = r'''from __future__ import annotations
 import datetime as dt
 import html
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from urllib.parse import quote_plus, urlparse
 from urllib.request import Request, urlopen
 
@@ -98,6 +102,38 @@ def strip_html(value: str) -> str:
     value = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", " ", value)
     value = re.sub(r"(?s)<[^>]+>", " ", value)
     return " ".join(html.unescape(value).split())[:200_000]
+
+
+def browser_executable() -> str | None:
+    configured = os.environ.get("AI_TRADING_COMPANION_BROWSER_EXECUTABLE", "").strip()
+    candidates = [configured, shutil.which("chrome"), shutil.which("chrome.exe")]
+    for root in (os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", "")):
+        if root:
+            candidates.extend((
+                os.path.join(root, "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(root, "Microsoft", "Edge", "Application", "msedge.exe"),
+            ))
+    return next((path for path in candidates if path and os.path.isfile(path)), None)
+
+
+def capture_dynamic(url: str) -> str | None:
+    if os.environ.get("AI_TRADING_COMPANION_DISABLE_DYNAMIC_BROWSER") == "1":
+        return None
+    executable = browser_executable()
+    if not executable:
+        return None
+    with tempfile.TemporaryDirectory(prefix="ai-trading-browser-") as profile:
+        try:
+            completed = subprocess.run([
+                executable, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+                "--disable-sync", "--disable-extensions", "--user-data-dir=" + profile,
+                "--virtual-time-budget=1200", "--dump-dom", url,
+            ], capture_output=True, timeout=12, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    if completed.returncode != 0 or not completed.stdout:
+        return None
+    return completed.stdout.decode("utf-8", errors="replace")
 
 
 def result(data: dict[str, object], *, fact_as_of: str | None = None) -> None:
@@ -308,7 +344,13 @@ def main() -> None:
         links = re.findall(r'(?is)class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page)
         result({"url": url, "query": query, "results": [{"url": html.unescape(link), "title": strip_html(title)} for link, title in links[:10]]})
         return
-    url, body = fetch(safe_url(inputs.get("url")))
+    url = safe_url(inputs.get("url"))
+    if mode == "browser_capture":
+        dynamic = capture_dynamic(url)
+        if dynamic is not None:
+            result({"url": url, "capture_mode": "dynamic", "text": strip_html(dynamic)})
+            return
+    url, body = fetch(url)
     if mode == "http_json":
         try:
             parsed = json.loads(body)

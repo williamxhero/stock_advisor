@@ -22,6 +22,20 @@ def digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _merge_need_items(existing: list[Any], incoming: list[Any], *, limit: int = 20) -> list[Any]:
+    """Bounded, deterministic deduplication for caller-submitted development clues."""
+    merged: list[Any] = []
+    fingerprints: set[str] = set()
+    for item in [*existing, *incoming]:
+        fingerprint = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        if fingerprint not in fingerprints:
+            fingerprints.add(fingerprint)
+            merged.append(item)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
 class CompanionStore:
     def __init__(self, database: Path) -> None:
         self.database = Path(database)
@@ -173,18 +187,12 @@ class CompanionStore:
               source_sha256 TEXT NOT NULL, result_json TEXT, created_at TEXT NOT NULL,
               claimed_at TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, completed_at TEXT, error TEXT,
               UNIQUE(source_artifact_id, mode));
+            CREATE TABLE IF NOT EXISTS companion_chat_control (
+              cycle_id TEXT PRIMARY KEY REFERENCES companion_cycle(cycle_id), terminated_at TEXT, resumed_at TEXT, research_json TEXT);
             CREATE TABLE IF NOT EXISTS companion_action_receipt (
               action_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES companion_cognition_job(job_id),
               action_type TEXT NOT NULL, state TEXT NOT NULL, payload_sha256 TEXT NOT NULL,
               result_json TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS memory_proposition (
-              proposition_id TEXT PRIMARY KEY, subject TEXT NOT NULL, predicate TEXT NOT NULL,
-              object_json TEXT NOT NULL, proposition_kind TEXT NOT NULL, status TEXT NOT NULL,
-              confidence REAL, source_message_id TEXT NOT NULL REFERENCES companion_message(message_id),
-              source_start INTEGER NOT NULL, source_end INTEGER NOT NULL, source_quote TEXT NOT NULL,
-              known_at TEXT NOT NULL, supersedes_id TEXT, tombstoned_at TEXT, created_at TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS ix_memory_proposition_current
-              ON memory_proposition(subject,predicate,status,known_at);
             CREATE TABLE IF NOT EXISTS conversation_auto_submit_claim (
               task_key TEXT NOT NULL, scheduled_for TEXT NOT NULL, conversation_cycle_id TEXT NOT NULL,
               batch_id TEXT, claimed_at TEXT NOT NULL,
@@ -213,25 +221,10 @@ class CompanionStore:
               created_at TEXT NOT NULL, due_at TEXT, status TEXT NOT NULL DEFAULT 'pending',
               result_artifact_id TEXT, error TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
               UNIQUE(snapshot_id,horizon));
-            CREATE TABLE IF NOT EXISTS memory_index_entry (
-              artifact_id TEXT PRIMARY KEY, known_at TEXT NOT NULL,
-              tags_json TEXT NOT NULL, indexed_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS memory_retrieval_audit (
-              retrieval_id TEXT PRIMARY KEY, task_key TEXT NOT NULL, query_text TEXT NOT NULL,
-              known_at TEXT NOT NULL, selected_artifact_ids_json TEXT NOT NULL,
-              created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS memory_index_intent (
-              intent_id TEXT PRIMARY KEY, origin_type TEXT NOT NULL, origin_id TEXT NOT NULL,
-              content_sha256 TEXT NOT NULL, known_at TEXT NOT NULL, state TEXT NOT NULL,
-              created_at TEXT NOT NULL, completed_at TEXT, error TEXT,
-              UNIQUE(origin_type, origin_id, content_sha256));
             CREATE TABLE IF NOT EXISTS memory_backup (
               backup_id TEXT PRIMARY KEY, path TEXT NOT NULL, sha256 TEXT NOT NULL,
               database_kind TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL,
               verified_at TEXT, error TEXT);
-            CREATE TABLE IF NOT EXISTS memory_recovery_quarantine (
-              quarantine_id TEXT PRIMARY KEY, source_path TEXT NOT NULL, record_type TEXT NOT NULL,
-              record_id TEXT, reason TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS workflow_policy (
               policy_key TEXT PRIMARY KEY, policy_json TEXT NOT NULL, revision INTEGER NOT NULL,
               previous_policy_json TEXT, updated_at TEXT NOT NULL);
@@ -305,7 +298,18 @@ class CompanionStore:
               imported_artifact_id TEXT, imported_at TEXT NOT NULL,
               detail_json TEXT NOT NULL,
               PRIMARY KEY(source_name, source_id));
-            PRAGMA user_version = 18;
+            CREATE TABLE IF NOT EXISTS capability_need (
+              need_id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE,
+              capability TEXT NOT NULL, output_contract_json TEXT NOT NULL,
+              state TEXT NOT NULL, urgency TEXT NOT NULL,
+              examples_json TEXT NOT NULL, failure_traces_json TEXT NOT NULL,
+              source_hints_json TEXT NOT NULL, checkpoint_json TEXT,
+              occurrence_count INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              claimed_at TEXT, completed_at TEXT, error TEXT);
+            CREATE INDEX IF NOT EXISTS ix_capability_need_state_priority
+              ON capability_need(state, urgency, updated_at);
+            PRAGMA user_version = 19;
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
@@ -354,6 +358,9 @@ class CompanionStore:
             for name, declaration in {"claimed_at": "TEXT", "attempt_count": "INTEGER NOT NULL DEFAULT 0"}.items():
                 if name not in cognition_columns:
                     c.execute(f"ALTER TABLE companion_cognition_job ADD COLUMN {name} {declaration}")
+            control_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_chat_control)")}
+            if "research_json" not in control_columns:
+                c.execute("ALTER TABLE companion_chat_control ADD COLUMN research_json TEXT")
             artifact_columns = {row[1] for row in c.execute("PRAGMA table_info(narrative_artifact)")}
             if "occurred_at" not in artifact_columns:
                 c.execute("ALTER TABLE narrative_artifact ADD COLUMN occurred_at TEXT")
@@ -447,16 +454,6 @@ class CompanionStore:
             }.items():
                 if name not in cycle_columns:
                     c.execute(f"ALTER TABLE companion_cycle ADD COLUMN {name} {declaration}")
-            # v8 migration/backfill: existing immutable facts predate intents.
-            # Deterministic IDs make this safe on every startup and avoid losing
-            # the user's historical formal reasoning after the physical split.
-            c.execute("""INSERT OR IGNORE INTO memory_index_intent(intent_id,origin_type,origin_id,content_sha256,known_at,state,created_at)
-                         SELECT 'artifact:' || artifact_id || ':' || body_sha256,'artifact',artifact_id,body_sha256,COALESCE(known_at,sealed_at),'pending',?
-                         FROM narrative_artifact
-                         WHERE kind IN ('pre_m0','h0','m0','m1','m2','outcome','reflection','chat_human','ai_chat','premarket_chat')""", (now(),))
-            c.execute("""INSERT OR IGNORE INTO memory_index_intent(intent_id,origin_type,origin_id,content_sha256,known_at,state,created_at)
-                         SELECT 'evidence:' || evidence_id || ':' || COALESCE(content_sha256,''),'evidence',evidence_id,COALESCE(content_sha256,''),known_at,'pending',?
-                         FROM evidence_ledger_entry""", (now(),))
             # v9 migration/backfill: historical cycles were created before
             # templates had identities.  Default template keys deliberately
             # retain the former task keys, which makes this deterministic and
@@ -469,6 +466,101 @@ class CompanionStore:
                          ON r.schedule_id=t.schedule_id AND r.revision=t.current_revision WHERE t.task_key=companion_cycle.task_key)
                    WHERE schedule_id IS NULL AND EXISTS (SELECT 1 FROM schedule_template t WHERE t.task_key=companion_cycle.task_key)"""
             )
+
+    def submit_capability_need(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Runtime-owned write endpoint for a versioned, deduplicated tool need."""
+        self.initialize()
+        if not isinstance(request, dict) or request.get("contract") != "ai-trading-capability-need/v1":
+            raise ValueError("invalid_capability_need_contract")
+        capability = str(request.get("capability") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", capability):
+            raise ValueError("invalid_capability_need_capability")
+        output_contract = request.get("output_contract")
+        if not isinstance(output_contract, dict) or not output_contract:
+            raise ValueError("invalid_capability_need_output_contract")
+        urgency = str(request.get("urgency") or "normal")
+        levels = {"low": 0, "normal": 1, "high": 2, "critical": 3}
+        if urgency not in levels:
+            raise ValueError("invalid_capability_need_urgency")
+        examples = request.get("examples") or []
+        traces = request.get("failure_trace")
+        if traces is None:
+            traces = request.get("failure_traces") or []
+        traces = [traces] if isinstance(traces, dict) else traces
+        hints = request.get("source_hints") or []
+        if not isinstance(examples, list) or not isinstance(traces, list) or not isinstance(hints, list):
+            raise ValueError("invalid_capability_need_payload")
+        raw_contract = json.dumps(output_contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        raw_payload = json.dumps({"examples": examples, "traces": traces, "hints": hints}, ensure_ascii=False, sort_keys=True)
+        assert_safe(raw_payload, boundary="capability need")
+        dedupe_key = digest(capability + "|" + raw_contract)
+        submitted_at = now()
+        with self.connection() as c:
+            row = c.execute("SELECT * FROM capability_need WHERE dedupe_key=?", (dedupe_key,)).fetchone()
+            if row is None:
+                need_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"capability-need:{dedupe_key}"))
+                c.execute(
+                    """INSERT INTO capability_need(need_id,dedupe_key,capability,output_contract_json,state,urgency,examples_json,
+                       failure_traces_json,source_hints_json,checkpoint_json,occurrence_count,created_at,updated_at)
+                       VALUES(?,?,?,?, 'queued', ?,?,?,?,?,1,?,?)""",
+                    (need_id, dedupe_key, capability, raw_contract, urgency, json.dumps(examples[:20], ensure_ascii=False),
+                     json.dumps(traces[:20], ensure_ascii=False), json.dumps([str(item) for item in hints[:20]], ensure_ascii=False),
+                     None, submitted_at, submitted_at),
+                )
+            else:
+                existing = dict(row)
+                merged_examples = _merge_need_items(json.loads(existing["examples_json"]), examples)
+                merged_traces = _merge_need_items(json.loads(existing["failure_traces_json"]), traces)
+                merged_hints = _merge_need_items(json.loads(existing["source_hints_json"]), [str(item) for item in hints])
+                merged_urgency = urgency if levels[urgency] > levels.get(existing["urgency"], 1) else existing["urgency"]
+                c.execute(
+                    """UPDATE capability_need SET urgency=?,examples_json=?,failure_traces_json=?,source_hints_json=?,
+                       occurrence_count=occurrence_count+1,updated_at=? WHERE need_id=?""",
+                    (merged_urgency, json.dumps(merged_examples, ensure_ascii=False), json.dumps(merged_traces, ensure_ascii=False),
+                     json.dumps(merged_hints, ensure_ascii=False), submitted_at, existing["need_id"]),
+                )
+            stored = c.execute("SELECT * FROM capability_need WHERE dedupe_key=?", (dedupe_key,)).fetchone()
+        return self._capability_need_record(dict(stored))
+
+    def transition_capability_need(self, need_id: str, action: str) -> dict[str, Any]:
+        """Apply one idempotent, runtime-authorized queue transition."""
+        if action not in {"pause", "retry"}:
+            raise ValueError("invalid_capability_need_action")
+        self.initialize()
+        with self.connection() as c:
+            row = c.execute("SELECT * FROM capability_need WHERE need_id=?", (need_id,)).fetchone()
+            if row is None:
+                raise ValueError("capability_need_not_found")
+            current = dict(row)
+            target = "paused" if action == "pause" else "queued"
+            allowed = (action == "pause" and current["state"] in {"queued", "claimed", "paused"}) or (action == "retry" and current["state"] in {"paused", "failed", "queued"})
+            if not allowed:
+                raise ValueError("capability_need_transition_invalid")
+            if current["state"] != target:
+                c.execute("UPDATE capability_need SET state=?,updated_at=?,error=NULL WHERE need_id=?", (target, now(), need_id))
+            stored = c.execute("SELECT * FROM capability_need WHERE need_id=?", (need_id,)).fetchone()
+        return self._capability_need_record(dict(stored))
+
+    def list_capability_needs(self, *, states: tuple[str, ...] | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        self.initialize()
+        allowed = {"queued", "claimed", "paused", "sandbox_verified", "published", "failed", "disabled"}
+        selected = tuple(state for state in (states or ()) if state in allowed)
+        with self.connection() as c:
+            if selected:
+                marks = ",".join("?" for _ in selected)
+                rows = c.execute(f"SELECT * FROM capability_need WHERE state IN ({marks}) ORDER BY updated_at DESC LIMIT ?", (*selected, max(1, min(limit, 500)))).fetchall()
+            else:
+                rows = c.execute("SELECT * FROM capability_need ORDER BY updated_at DESC LIMIT ?", (max(1, min(limit, 500)),)).fetchall()
+        return [self._capability_need_record(dict(row)) for row in rows]
+
+    @staticmethod
+    def _capability_need_record(row: dict[str, Any]) -> dict[str, Any]:
+        for key, target in (("output_contract_json", "output_contract"), ("examples_json", "examples"),
+                            ("failure_traces_json", "failure_traces"), ("source_hints_json", "source_hints"),
+                            ("checkpoint_json", "checkpoint")):
+            value = row.pop(key, None)
+            row[target] = json.loads(value) if value else None if target == "checkpoint" else []
+        return row
 
     def history_page(self, *, before: str | None = None, limit: int = 31, search: str = "") -> dict[str, Any]:
         """Authoritative compact history, deduplicated by task and scheduled time."""
@@ -937,17 +1029,6 @@ class CompanionStore:
                  json.dumps(metadata,ensure_ascii=False,sort_keys=True),occurred_at or sealed,known_at or sealed),
             )
             c.execute("INSERT INTO narrative_fts(artifact_id,cycle_id,kind,body_markdown) VALUES(?,?,?,?)", (artifact_id,cycle_id,kind,body))
-            if kind in {"pre_m0", "h0", "m1", "m2", "outcome", "reflection", "m0", "chat_human", "ai_chat", "premarket_chat"}:
-                c.execute(
-                    "INSERT OR REPLACE INTO memory_index_entry(artifact_id,known_at,tags_json,indexed_at) VALUES(?,?,?,?)",
-                    (artifact_id, known_at or sealed, json.dumps(metadata.get("memory_tags", []), ensure_ascii=False), sealed),
-                )
-                c.execute(
-                    """INSERT OR IGNORE INTO memory_index_intent(
-                         intent_id,origin_type,origin_id,content_sha256,known_at,state,created_at)
-                       VALUES(?,?,?,?,?,'pending',?)""",
-                    (str(uuid.uuid4()), "artifact", artifact_id, digest(body), known_at or sealed, sealed),
-                )
             result["revision"] = revision
         result: dict[str, Any] = {}
         if connection is not None:
@@ -1117,78 +1198,6 @@ class CompanionStore:
             row = c.execute("SELECT * FROM companion_action_receipt WHERE action_id=?", (action_id,)).fetchone()
         return dict(row)
 
-    def record_proposition(self, proposition_id: str, proposition: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
-        span = proposition["source_span"]
-        supersedes_id = proposition.get("supersedes_id")
-        at = now()
-        with self.connection() as c:
-            if supersedes_id:
-                superseded = c.execute(
-                    "SELECT subject,predicate,status FROM memory_proposition WHERE proposition_id=?",
-                    (supersedes_id,),
-                ).fetchone()
-                if not superseded or superseded["status"] != "active" or superseded["subject"] != proposition["subject"] or superseded["predicate"] != proposition["predicate"]:
-                    raise ValueError("superseded proposition must be the active version of the same subject and predicate")
-                c.execute("UPDATE memory_proposition SET status='superseded' WHERE proposition_id=?", (supersedes_id,))
-            c.execute(
-                """INSERT OR IGNORE INTO memory_proposition(
-                     proposition_id,subject,predicate,object_json,proposition_kind,status,confidence,
-                     source_message_id,source_start,source_end,source_quote,known_at,supersedes_id,created_at)
-                   VALUES(?,?,?,?,?,'active',?,?,?,?,?,?,?,?)""",
-                (proposition_id, proposition["subject"], proposition["predicate"],
-                 json.dumps(proposition.get("object"), ensure_ascii=False, sort_keys=True), proposition["kind"],
-                 proposition.get("confidence"), message["message_id"], int(span["start"]), int(span["end"]),
-                 span["quote"], message["known_at"], supersedes_id, at),
-            )
-            row = c.execute("SELECT * FROM memory_proposition WHERE proposition_id=?", (proposition_id,)).fetchone()
-        return dict(row)
-
-    def current_propositions(self, known_at: str, *, exclude_cycle_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        exclusion = "AND m.cycle_id!=?" if exclude_cycle_id else ""
-        values: list[Any] = [known_at]
-        if exclude_cycle_id:
-            values.append(exclude_cycle_id)
-        values.append(limit)
-        with self.connection() as c:
-            return [dict(row) for row in c.execute(
-                f"""SELECT p.* FROM memory_proposition p
-                   JOIN companion_message m ON m.message_id=p.source_message_id
-                   WHERE p.status='active' AND p.tombstoned_at IS NULL AND p.known_at<=? {exclusion}
-                   ORDER BY p.known_at DESC,p.created_at DESC LIMIT ?""",
-                values,
-            )]
-
-    def active_proposition(self, subject: str, predicate: str) -> dict[str, Any] | None:
-        with self.connection() as c:
-            row = c.execute(
-                """SELECT * FROM memory_proposition WHERE subject=? AND predicate=?
-                   AND status='active' AND tombstoned_at IS NULL ORDER BY known_at DESC,created_at DESC LIMIT 1""",
-                (subject, predicate),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def relevant_propositions(
-        self, known_at: str, query_text: str, *, exclude_cycle_id: str | None = None, limit: int = 20,
-    ) -> list[dict[str, Any]]:
-        """Return text-relevant memory plus the small set of necessary stable facts."""
-        candidates = self.current_propositions(known_at, exclude_cycle_id=exclude_cycle_id, limit=100)
-        tokens = {
-            token.lower() for token in re.findall(r"[A-Za-z0-9_]{2,}", query_text)
-        }
-        necessary = {("user.account", "total_assets"), ("user", "risk_tolerance")}
-        ranked: list[tuple[int, dict[str, Any]]] = []
-        for row in candidates:
-            rendered = " ".join((
-                str(row.get("subject") or ""), str(row.get("predicate") or ""), str(row.get("object_json") or ""),
-            )).lower()
-            score = sum(token in rendered for token in tokens)
-            if (row["subject"], row["predicate"]) in necessary:
-                score += 100
-            if score:
-                ranked.append((score, row))
-        ranked.sort(key=lambda item: (-item[0], item[1]["known_at"], item[1]["proposition_id"]), reverse=False)
-        return [row for _, row in ranked[:limit]]
-
     def get_message(self, message_id: str) -> dict[str, Any]:
         with self.connection() as c:
             row = c.execute("SELECT * FROM companion_message WHERE message_id=?", (message_id,)).fetchone()
@@ -1300,6 +1309,63 @@ class CompanionStore:
                 [now(), artifact_id, *batch_ids],
             )
 
+    def terminate_chat_research(self, cycle_id: str) -> dict[str, Any]:
+        with self.connection() as c:
+            row = c.execute("SELECT research_json FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+            job = c.execute("SELECT result_json FROM companion_cognition_job WHERE cycle_id=? AND result_json IS NOT NULL ORDER BY completed_at DESC LIMIT 1", (cycle_id,)).fetchone()
+            research_json = row["research_json"] if row and row["research_json"] else job["result_json"] if job else None
+            c.execute(
+                """INSERT INTO companion_chat_control(cycle_id,terminated_at,research_json) VALUES(?,?,?)
+                   ON CONFLICT(cycle_id) DO UPDATE SET
+                     terminated_at=excluded.terminated_at,
+                     resumed_at=NULL,
+                     research_json=COALESCE(companion_chat_control.research_json, excluded.research_json)""",
+                (cycle_id, now(), research_json),
+            )
+            row = c.execute("SELECT * FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+        return dict(row)
+
+    def save_chat_research_checkpoint(
+        self, cycle_id: str, source_artifact_id: str, batch_ids: list[str], checkpoint: dict[str, Any],
+    ) -> None:
+        payload = {"source_artifact_id": source_artifact_id, "batch_ids": batch_ids, "checkpoint": checkpoint}
+        with self.connection() as c:
+            c.execute(
+                """INSERT INTO companion_chat_control(cycle_id,research_json) VALUES(?,?)
+                   ON CONFLICT(cycle_id) DO UPDATE SET research_json=excluded.research_json""",
+                (cycle_id, json.dumps(payload, ensure_ascii=False, sort_keys=True)),
+            )
+
+    def resumed_chat_research_checkpoint(self, cycle_id: str, source_artifact_id: str) -> dict[str, Any] | None:
+        with self.connection() as c:
+            row = c.execute("SELECT resumed_at,research_json FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+        if not row or not row["resumed_at"] or not row["research_json"]:
+            return None
+        try:
+            value = json.loads(row["research_json"])
+        except json.JSONDecodeError:
+            return None
+        return value if value.get("source_artifact_id") == source_artifact_id else None
+
+    def chat_research_terminated(self, cycle_id: str) -> bool:
+        with self.connection() as c:
+            row = c.execute("SELECT terminated_at,resumed_at FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+        return bool(row and row["terminated_at"] and not row["resumed_at"])
+
+    def continue_chat_research(self, cycle_id: str) -> dict[str, Any]:
+        with self.connection() as c:
+            continued = c.execute(
+                "UPDATE companion_chat_control SET resumed_at=? WHERE cycle_id=? AND terminated_at IS NOT NULL AND resumed_at IS NULL",
+                (now(), cycle_id),
+            ).rowcount == 1
+            row = c.execute("SELECT * FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
+        if not row:
+            return {"cycle_id": cycle_id, "state": "not_terminated"}
+        result = dict(row)
+        result["state"] = "resumed" if result.get("resumed_at") else "not_terminated"
+        result["continued_now"] = continued
+        return result
+
     def start_stream_message(self, cycle_id: str, batch_ids: list[str], kind: str) -> dict[str, Any]:
         stream_id = str(uuid.uuid4())
         with self.connection() as c:
@@ -1339,6 +1405,15 @@ class CompanionStore:
     def stream_messages(self, cycle_id: str) -> list[dict[str, Any]]:
         with self.connection() as c:
             ids = [row["stream_id"] for row in c.execute("SELECT stream_id FROM companion_stream_message WHERE cycle_id=? ORDER BY created_at", (cycle_id,))]
+        return [self.stream_message(stream_id) for stream_id in ids]
+
+    def interrupted_stream_messages(self) -> list[dict[str, Any]]:
+        with self.connection() as c:
+            ids = [
+                row["stream_id"] for row in c.execute(
+                    "SELECT stream_id FROM companion_stream_message WHERE state='streaming' ORDER BY created_at"
+                )
+            ]
         return [self.stream_message(stream_id) for stream_id in ids]
 
     def link_messages_to_artifact(self, message_ids: list[str], artifact_id: str) -> None:
@@ -1618,7 +1693,7 @@ class CompanionStore:
                 "exact_sizing_requires_portfolio_freshness_trading_days": 1,
             },
             "boundary": "用户实际交易具有事实权威；本立场只决定 AI 是否认可为合格执行建议。",
-        }, evidence={"source": "APP_DEVELOPMENT_PRINCIPLES.md", "revision": 1})
+        }, evidence={"source": "APP_DEVELOPMENT_PRINCIPLES", "revision": 1})
 
     def save_market_regime(self, cycle_id: str, as_of: str, regime: str, metrics: dict[str, Any], data_quality: str) -> None:
         if regime not in {"trend_expansion", "divergence", "risk_contraction", "unknown"}:
@@ -1704,12 +1779,6 @@ class CompanionStore:
                 ).rowcount
                 if changed:
                     inserted.append(evidence_id)
-                    c.execute(
-                        """INSERT OR IGNORE INTO memory_index_intent(
-                             intent_id,origin_type,origin_id,content_sha256,known_at,state,created_at)
-                           VALUES(?,?,?,?,?,'pending',?)""",
-                        (str(uuid.uuid4()), "evidence", evidence_id, fingerprint, known_at, now()),
-                    )
                 c.execute(
                     """INSERT OR IGNORE INTO evidence_cycle_use(cycle_id,evidence_id,stage,used_at)
                        VALUES(?,?,?,?)""",
@@ -1733,12 +1802,6 @@ class CompanionStore:
                 ).rowcount
                 if changed:
                     inserted.append(evidence_id)
-                    c.execute(
-                        """INSERT OR IGNORE INTO memory_index_intent(
-                             intent_id,origin_type,origin_id,content_sha256,known_at,state,created_at)
-                           VALUES(?,?,?,?,?,'pending',?)""",
-                        (str(uuid.uuid4()), "evidence", evidence_id, fingerprint, known_at, now()),
-                    )
                 c.execute(
                     """INSERT OR IGNORE INTO evidence_cycle_use(cycle_id,evidence_id,stage,used_at)
                        VALUES(?,?,?,?)""",

@@ -52,6 +52,31 @@ class EvidenceV3Tests(TestCase):
             _m1_research_as_of({"as_of": "2026-08-31T05:25:57Z"}, None),
         )
 
+    def test_1430_contract_requires_fresh_intraday_market_and_event_evidence(self):
+        contract = EvidenceContractFactory(_WeekdayCalendar()).build(
+            task_key="daily.execution.1430", stage="m0_research", as_of="2026-08-26T06:30:00Z",
+        )
+        market = next(item for item in contract["requirements"] if item["key"] == "current_market_state")
+        events = next(item for item in contract["requirements"] if item["key"] == "material_events_and_counterevidence")
+
+        self.assertEqual("after_start_to_end", market["window"]["mode"])
+        self.assertEqual("2026-08-26T06:15:00Z", market["window"]["start"])
+        self.assertEqual("2026-08-26T06:30:00Z", market["window"]["end"])
+        self.assertEqual("2026-08-26T02:30:00Z", events["window"]["start"])
+
+    def test_premarket_and_early_sessions_keep_separate_fact_windows(self):
+        factory = EvidenceContractFactory(_WeekdayCalendar())
+        premarket = factory.build(task_key="daily.opportunity.0900", stage="m0_research", as_of="2026-08-26T00:30:00Z")
+        at_0945 = factory.build(task_key="daily.execution.0945", stage="m0_research", as_of="2026-08-26T01:45:00Z")
+        at_1030 = factory.build(task_key="daily.execution.1030", stage="m0_research", as_of="2026-08-26T02:30:00Z")
+
+        premarket_market = next(item for item in premarket["requirements"] if item["key"] == "current_market_state")
+        early_market = next(item for item in at_0945["requirements"] if item["key"] == "current_market_state")
+        middle_market = next(item for item in at_1030["requirements"] if item["key"] == "current_market_state")
+        self.assertEqual("2026-08-25T07:00:00Z", premarket_market["window"]["end"])
+        self.assertEqual("2026-08-26T01:30:00Z", early_market["window"]["start"])
+        self.assertEqual("2026-08-26T02:15:00Z", middle_market["window"]["start"])
+
     def setUp(self):
         self.as_of = "2026-08-26T01:00:00Z"
         self.contract = EvidenceContractFactory(_WeekdayCalendar()).build(
@@ -100,15 +125,28 @@ class EvidenceV3Tests(TestCase):
         as_of = "2026-08-27T07:20:02.555Z"
         contract = EvidenceContractFactory(_WeekdayCalendar()).build(
             task_key="daily.review.1520", stage="m0_research", as_of=as_of,
+            internal_context={"prior_judgment_count": 3, "portfolio_entities": ["600000"]},
         )
-        market, events = contract["requirements"]
+        requirements = {row["key"]: row for row in contract["requirements"]}
 
         self.assertEqual(
             {"start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z", "mode": "exact"},
-            market["window"],
+            requirements["indices_close"]["window"],
         )
-        self.assertEqual("2026-08-26T07:00:00Z", events["window"]["start"])
-        self.assertEqual("2026-08-27T07:20:02.555000Z", events["window"]["end"])
+        self.assertEqual("2026-08-26T07:00:00Z", requirements["events_and_counterevidence"]["window"]["start"])
+        self.assertEqual("2026-08-27T07:20:02.555000Z", requirements["events_and_counterevidence"]["window"]["end"])
+        blockers = [row["key"] for row in contract["requirements"] if row["blocking"]]
+        self.assertEqual([
+            "indices_close", "turnover_compare", "market_breadth", "themes_and_capacity_cores",
+            "events_and_counterevidence", "prior_judgment_changes", "portfolio_close",
+        ], blockers)
+
+        rejected = EvidenceGate().evaluate(
+            {"schema_version": 3, "as_of": as_of, "sources": [], "coverage": [], "high_impact_events": []},
+            contract, [], as_of, attempt_id="attempt",
+        )
+        self.assertFalse(rejected["passed"])
+        self.assertEqual(set(blockers), set(rejected["missing_requirements"]))
 
     def test_intraday_contract_accepts_recent_market_facts_and_since_prior_checkpoint_events(self):
         contract_0945 = EvidenceContractFactory(_WeekdayCalendar()).build(

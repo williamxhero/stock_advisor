@@ -8,7 +8,7 @@ from datetime import datetime, time, timedelta
 class TaskPolicy:
     task_key: str
     task_name: str
-    protocol_path: str
+    protocol_id: str
     m1_publish_time: time | None
     m1_reserve: timedelta
     research_timeout: timedelta
@@ -36,15 +36,15 @@ _RESERVE = timedelta(minutes=10)
 _INTRADAY = timedelta(minutes=5)
 
 TASK_POLICIES = {
-    "daily.opportunity.0900": TaskPolicy("daily.opportunity.0900", "A股 09:00盘前机会发现", "protocols/09_OPPORTUNITY_DISCOVERY_PROTOCOL.md", time(9, 29), _RESERVE, timedelta(minutes=20), _INTRADAY, timedelta(minutes=15), "daily_open_close"),
-    "daily.execution.0945": TaskPolicy("daily.execution.0945", "A股 09:45异常发现", "protocols/07_DAILY_EXECUTION_PROTOCOL.md", time(10, 30), _RESERVE, _INTRADAY, _INTRADAY, timedelta(minutes=15), "daily_intraday"),
-    "daily.execution.1030": TaskPolicy("daily.execution.1030", "A股 10:30趋势确认", "protocols/07_DAILY_EXECUTION_PROTOCOL.md", time(14, 30), _RESERVE, _INTRADAY, _INTRADAY, timedelta(minutes=15), "daily_intraday"),
-    "daily.execution.1430": TaskPolicy("daily.execution.1430", "A股 14:30操作决策", "protocols/07_DAILY_EXECUTION_PROTOCOL.md", time(15, 20), _RESERVE, _INTRADAY, _INTRADAY, timedelta(minutes=15), "daily_intraday"),
-    "daily.review.1520": TaskPolicy("daily.review.1520", "A股 15:20收盘复盘", "protocols/07_DAILY_EXECUTION_PROTOCOL.md", time(16, 0), _RESERVE, _INTRADAY, _INTRADAY, timedelta(minutes=15), "daily_open_close"),
-    "manual.non_trading_outlook": TaskPolicy("manual.non_trading_outlook", "A股非交易日市场环境总结与下一交易日预判", "protocols/10_NON_TRADING_OUTLOOK_PROTOCOL.md", None, _RESERVE, timedelta(minutes=10), _INTRADAY, timedelta(minutes=15), "non_trading_outlook"),
-    "periodic.monthly": TaskPolicy("periodic.monthly", "A股月度复盘", "protocols/08_PERIODIC_REVIEW_PROTOCOL.md", None, _RESERVE, timedelta(minutes=10), _INTRADAY, timedelta(minutes=15), "periodic_review"),
-    "periodic.quarterly": TaskPolicy("periodic.quarterly", "A股季度复盘", "protocols/08_PERIODIC_REVIEW_PROTOCOL.md", None, _RESERVE, timedelta(minutes=10), _INTRADAY, timedelta(minutes=15), "periodic_review"),
-    "periodic.annual": TaskPolicy("periodic.annual", "A股年度复盘", "protocols/08_PERIODIC_REVIEW_PROTOCOL.md", None, _RESERVE, timedelta(minutes=10), _INTRADAY, timedelta(minutes=15), "periodic_review"),
+    "daily.opportunity.0900": TaskPolicy("daily.opportunity.0900", "A股 09:00盘前机会发现", "opportunity_discovery", time(9, 29), _RESERVE, timedelta(minutes=20), _INTRADAY, timedelta(minutes=15), "daily_open_close"),
+    "daily.execution.0945": TaskPolicy("daily.execution.0945", "A股 09:45异常发现", "daily_execution", time(10, 30), _RESERVE, _INTRADAY, _INTRADAY, timedelta(minutes=15), "daily_intraday"),
+    "daily.execution.1030": TaskPolicy("daily.execution.1030", "A股 10:30趋势确认", "daily_execution", time(14, 30), _RESERVE, _INTRADAY, _INTRADAY, timedelta(minutes=15), "daily_intraday"),
+    "daily.execution.1430": TaskPolicy("daily.execution.1430", "A股 14:30操作决策", "daily_execution", time(15, 20), _RESERVE, _INTRADAY, _INTRADAY, timedelta(minutes=15), "daily_intraday"),
+    "daily.review.1520": TaskPolicy("daily.review.1520", "A股 15:20收盘复盘", "daily_close_review", time(16, 0), _RESERVE, _INTRADAY, _INTRADAY, timedelta(minutes=15), "daily_open_close"),
+    "manual.non_trading_outlook": TaskPolicy("manual.non_trading_outlook", "A股非交易日市场环境总结与下一交易日预判", "non_trading_outlook", None, _RESERVE, timedelta(minutes=10), _INTRADAY, timedelta(minutes=15), "non_trading_outlook"),
+    "periodic.monthly": TaskPolicy("periodic.monthly", "A股月度复盘", "periodic_review", None, _RESERVE, timedelta(minutes=10), _INTRADAY, timedelta(minutes=15), "periodic_review"),
+    "periodic.quarterly": TaskPolicy("periodic.quarterly", "A股季度复盘", "periodic_review", None, _RESERVE, timedelta(minutes=10), _INTRADAY, timedelta(minutes=15), "periodic_review"),
+    "periodic.annual": TaskPolicy("periodic.annual", "A股年度复盘", "periodic_review", None, _RESERVE, timedelta(minutes=10), _INTRADAY, timedelta(minutes=15), "periodic_review"),
 }
 
 TERMINAL_STATES = {"complete", "reflected", "failed", "skipped", "missed"}

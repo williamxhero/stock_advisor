@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -12,6 +13,7 @@ from zoneinfo import ZoneInfo
 from .acquisition import AcquisitionBoundary
 from .evidence_gate import EvidenceGate
 from .broker_client import BrokerRequest, ProviderBrokerClient, canonical_packet_hash
+from .tooling import FactRequest, ToolRunner
 
 
 class ResearchPlanError(ValueError):
@@ -79,11 +81,12 @@ class BrokerResearchPlanner:
     """Ask Broker only for declarative JSON; acquisition stays local."""
 
     def __init__(self, broker: ProviderBrokerClient, *, intellect: str, effort: str,
-                 deadline: Callable[[], float] | None = None) -> None:
+                 deadline: Callable[[], float] | None = None, market_tool_available: bool = False) -> None:
         self.broker = broker
         self.deadline = deadline or (lambda: math.inf)
         self.intellect = intellect
         self.effort = effort
+        self.market_tool_available = market_tool_available
         self.outcomes: list[Any] = []
 
     def __call__(self, packet: dict[str, Any], gaps: list[str], round_number: int) -> dict[str, Any]:
@@ -105,12 +108,12 @@ class BrokerResearchPlanner:
             "available_backends": [
                 backend for backend in ("gateway", "market")
                 if backend in set(packet.get("allowed_research_backends") or ("gateway", "market"))
-                and (backend != "market" or packet.get("deterministic_market_facts"))
+                and (backend != "market" or packet.get("deterministic_market_facts") or self.market_tool_available)
             ],
             "instruction": (
                 "Return only a version 1 research plan. Use gateway web_search only for discovery and "
                 "gateway web_read for source verification. Use market operations only when market appears in "
-                "available_backends; they can read frozen caller-supplied market facts and never query external market systems. "
+                "available_backends; they read frozen caller-supplied facts when available, otherwise use promoted local public-market tools. "
                 "All timestamps in the evidence contract are UTC. For Chinese-market search terms, convert them to the "
                 "Asia/Shanghai local timestamps supplied in market_time_context. An exact 15:00 local market-state "
                 "requirement means the closing state: search for 收盘/闭市 evidence, never 早盘 or 开盘. "
@@ -147,6 +150,109 @@ class WebAccessGatewayBackend:
         )
         if operation == "web_browser": return self.tools.browser(arguments.get("session_id"), list(arguments.get("actions") or []))
         raise ValueError(f"unsupported read-only research operation: {operation}")
+
+
+class ToolCatalogResearchBackend:
+    """Compatibility projection from a research plan to promoted local CLI capabilities."""
+
+    def __init__(self, runner: ToolRunner, *, as_of: str, deadline: Callable[[], float]) -> None:
+        self.runner = runner
+        self.as_of = as_of
+        self.deadline = deadline
+
+    def __call__(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        capability, inputs = self._request_for(operation, arguments)
+        resolution = self.runner.resolve_with_fallback(FactRequest(
+            contract_version=1, capability=capability, required_at=self.as_of,
+            deadline_seconds=max(0.1, min(15.0, float(self.deadline()))), inputs=inputs,
+            context={}, freshness_seconds=0.0, finality="observed",
+        ))
+        if not resolution.succeeded or resolution.data is None:
+            raise RuntimeError(f"tool resolution failed: {capability}:{resolution.error_code}")
+        return self._project(operation, resolution)
+
+    @staticmethod
+    def _request_for(operation: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        if operation == "web_search":
+            return "generic_web_search", {"query": str(arguments.get("query") or "")}
+        if operation == "web_read":
+            return "generic_web_read", {"url": str(arguments.get("url") or "")}
+        if operation == "web_browser":
+            actions = arguments.get("actions") if isinstance(arguments.get("actions"), list) else []
+            url = str(arguments.get("url") or "")
+            for action in actions:
+                if isinstance(action, dict) and action.get("type") == "navigate" and action.get("url"):
+                    url = str(action["url"])
+            return "generic_browser_capture", {"url": url}
+        raise ValueError(f"unsupported ToolCatalog research operation: {operation}")
+
+    @staticmethod
+    def _project(operation: str, resolution: Any) -> dict[str, Any]:
+        data = resolution.data
+        artifact = resolution.raw_artifact_ref
+        if operation == "web_search":
+            results = [
+                {"url": str(item.get("url") or ""), "title": str(item.get("title") or ""),
+                 "excerpt_text": str(item.get("title") or ""), "fact_as_of": resolution.fact_as_of,
+                 "raw_artifact_ref": artifact}
+                for item in data.get("results") or [] if isinstance(item, dict) and item.get("url")
+            ]
+            return {"url": data.get("url"), "results": results, "raw_artifact_ref": artifact}
+        url, text = str(data.get("url") or ""), str(data.get("text") or "")
+        return {
+            "url": url, "text": text, "raw_artifact_ref": artifact,
+            "results": [{"url": url, "title": url, "excerpt_text": text, "fact_as_of": resolution.fact_as_of,
+                         "raw_artifact_ref": artifact}],
+        }
+
+
+class ToolCatalogMarketBackend:
+    """Resolve public market facts through promoted tools and expose evidence-shaped results."""
+
+    def __init__(self, runner: ToolRunner, *, contract: dict[str, Any], deadline: Callable[[], float]) -> None:
+        self.runner = runner
+        self.contract = contract
+        self.deadline = deadline
+        self.requirements = {
+            str(row.get("key") or ""): row
+            for row in contract.get("requirements") or [] if isinstance(row, dict)
+        }
+
+    def __call__(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        requirement_key = str(arguments.pop("_requirement_key", "") or "")
+        requirement = self.requirements.get(requirement_key) or {}
+        capability = {"market_snapshot": "cn_market_snapshot", "market_breadth": "cn_market_breadth"}.get(operation)
+        if capability is None:
+            raise ValueError(f"unsupported live market operation: {operation}")
+        window = requirement.get("window") if isinstance(requirement.get("window"), dict) else {}
+        required_at = str(window.get("end") or self.contract.get("as_of") or "")
+        mode = str(window.get("mode") or "")
+        finality = "official_close" if mode == "exact" and required_at[11:16] == "07:00" else "intraday"
+        resolution = self.runner.resolve_with_fallback(FactRequest(
+            contract_version=1, capability=capability, required_at=required_at,
+            deadline_seconds=max(0.1, min(25.0, float(self.deadline()))), inputs={}, context={},
+            freshness_seconds=900.0 if finality == "intraday" else 0.0, finality=finality,
+        ))
+        if not resolution.succeeded or resolution.data is None:
+            raise RuntimeError(f"tool resolution failed: {capability}:{resolution.error_code}")
+        source_rows = [row for row in resolution.data.get("source_evidence") or []
+                       if isinstance(row, dict) and str(row.get("url") or "").startswith(("http://", "https://"))]
+        if not source_rows:
+            source_rows = [{"url": url, "fact_as_of": resolution.fact_as_of, "data": resolution.data}
+                           for url in resolution.data.get("source_urls") or []
+                           if str(url).startswith(("http://", "https://"))]
+        if not source_rows:
+            raise RuntimeError(f"tool resolution has no public source URLs: {capability}")
+        results = []
+        for row in source_rows:
+            excerpt = json.dumps(row.get("data") if isinstance(row.get("data"), dict) else {}, ensure_ascii=False, sort_keys=True)[:8000]
+            results.append({"url": str(row["url"]), "title": str(resolution.data.get("source") or capability),
+                            "excerpt_text": excerpt, "fact_as_of": str(row.get("fact_as_of") or resolution.fact_as_of),
+                            "raw_artifact_ref": resolution.raw_artifact_ref})
+        return {
+            "url": results[0]["url"], "text": results[0]["excerpt_text"],
+            "raw_artifact_ref": resolution.raw_artifact_ref, "results": results,
+        }
 
 
 class DeterministicMarketBackend:
@@ -211,7 +317,7 @@ class ReadOnlyResearchExecutor:
                 continue
             operation = row["operation"] if row["operation"] in _OPERATIONS[backend] else _fallback_operation(backend)
             try:
-                result = adapter(operation, dict(row["arguments"]))
+                result = adapter(operation, {**row["arguments"], "_requirement_key": row["requirement_key"]})
                 if not isinstance(result, dict):
                     raise TypeError("backend result is not an object")
                 return backend, {**result, "backend": backend}
@@ -223,18 +329,21 @@ class ReadOnlyResearchExecutor:
 class LocalResearchChain:
     def __init__(self, planner: Callable[[dict[str, Any], list[str], int], dict[str, Any]],
                  executor: ReadOnlyResearchExecutor, *, gate: EvidenceGate | None = None,
-                 max_repairs: int = 2) -> None:
+                 max_repairs: int | None = 2,
+                 deadline: Callable[[], float] | None = None) -> None:
         self.planner = planner
         self.executor = executor
         self.gate = gate or EvidenceGate()
-        self.max_repairs = max(0, min(2, int(max_repairs)))
+        self.max_repairs = None if max_repairs is None else max(0, int(max_repairs))
+        self.deadline = deadline
 
     def run(self, packet: dict[str, Any], contract: dict[str, Any], *, attempt_id: str) -> FrozenResearchResult:
         boundary = AcquisitionBoundary(attempt_id)
         observations: list[dict[str, Any]] = []
         verifier: dict[str, Any] = {"passed": False, "problems": ["not_evaluated"], "missing_requirements": []}
         evidence: dict[str, Any] = {}
-        for round_number in range(self.max_repairs + 1):
+        round_number = 0
+        while self.deadline is None or self.deadline() > 1.0:
             round_observation_start = len(observations)
             gaps = list(verifier.get("missing_requirements") or verifier.get("problems") or [])
             planning_packet = {
@@ -298,13 +407,18 @@ class LocalResearchChain:
                 normalized = verifier.get("normalized_evidence") or evidence
                 bundle_bytes, bundle_hash = freeze_evidence_bundle(normalized)
                 return FrozenResearchResult(True, normalized, verifier, observations, bundle_bytes, bundle_hash, round_number)
+            round_number += 1
+            if self.max_repairs is not None and round_number > self.max_repairs:
+                break
         bundle_bytes, bundle_hash = freeze_evidence_bundle(evidence)
         failure = {
             "type": "stage_failure", "stage": str(packet.get("stage") or "research"),
-            "category": "evidence_insufficient", "problems": list(verifier.get("problems") or []),
+            "category": "evidence_insufficient",
+            "stop_reason": "reliability_deadline" if self.deadline is not None else "configured_test_rounds",
+            "problems": list(verifier.get("problems") or []),
         }
         return FrozenResearchResult(False, evidence, verifier, observations, bundle_bytes, bundle_hash,
-                                    self.max_repairs, [failure])
+                                    round_number, [failure])
 
 
 def freeze_evidence_bundle(evidence: dict[str, Any]) -> tuple[bytes, str]:
@@ -324,7 +438,10 @@ def _verify_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> dic
     gap_text = "\n".join(str(item) for item in packet.get("coverage_gaps") or [])
     required = {
         key for key, row in requirements.items()
-        if row.get("blocking", True) and (not gap_text or key in gap_text)
+        if row.get("blocking", True)
+        and row.get("evidence_class") != "internal_runtime"
+        and not (row.get("evidence_class") == "public_if_present" and not row.get("required_entities"))
+        and (not gap_text or key in gap_text)
     }
     planned = {
         str(row.get("requirement_key") or "")
@@ -527,7 +644,11 @@ def _compile_evidence(packet: dict[str, Any], contract: dict[str, Any], observat
         key = str(requirement.get("key") or "")
         refs = refs_by_requirement.get(key, [])
         allowed = set(requirement.get("allowed_coverage") or ["covered"])
-        if refs:
+        if requirement.get("evidence_class") == "internal_runtime":
+            status = "covered" if int(requirement.get("internal_record_count") or 0) > 0 else "checked_no_change"
+        elif requirement.get("evidence_class") == "public_if_present" and not requirement.get("required_entities"):
+            status = "checked_no_change"
+        elif refs:
             status = "covered"
         elif "checked_no_change" in allowed and _has_matching_negative_search(observations, requirement):
             status = "checked_no_change"

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import os
@@ -17,21 +16,12 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def lexicon(root: Path, extra: Path | None) -> list[str]:
+def lexicon(extra: Path | None) -> list[str]:
     context_terms: set[str] = set()
     terms: set[str] = {
         "集合竞价", "涨停", "跌停", "封板", "炸板", "承接", "分歧", "弱转强", "强更强",
         "北向资金", "主力资金", "龙虎榜", "量化", "成交额", "换手率", "情绪周期",
     }
-    for relative in ("state/10_THEME_STATE.csv", "state/11_STOCK_STATE.csv", "logs/12_OPPORTUNITY_LOG.csv"):
-        path = root / relative
-        if not path.exists():
-            continue
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            for row in csv.DictReader(handle):
-                for value in row.values():
-                    if value and 2 <= len(value.strip()) <= 24:
-                        terms.add(value.strip())
     if extra and extra.exists():
         context = extra.read_text(encoding="utf-8")
         context_terms.update(
@@ -47,12 +37,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--workspace-root", required=True)
     parser.add_argument("--context-file")
     parser.add_argument("--model", default="Systran/faster-whisper-medium")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     args = parser.parse_args()
-    source, output, root = Path(args.audio).resolve(), Path(args.output).resolve(), Path(args.workspace_root).resolve()
+    source, output = Path(args.audio).resolve(), Path(args.output).resolve()
     if not source.is_file():
         raise SystemExit(f"audio not found: {source}")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -60,7 +49,7 @@ def main() -> int:
         raise SystemExit(f"refusing to overwrite: {output}")
     from faster_whisper import WhisperModel
 
-    words = lexicon(root, Path(args.context_file) if args.context_file else None)
+    words = lexicon(Path(args.context_file) if args.context_file else None)
     initial_prompt = "以下是当前A股研判对话的口述。结合当前任务上下文优先识别股票、题材和交易术语，但不要凭上下文补写没有说出的内容。候选词包括：" + "、".join(words[:180])
     requested = "cuda" if args.device in {"auto", "cuda"} else "cpu"
     device, compute_type = requested, "float16" if requested == "cuda" else "int8"

@@ -1,8 +1,7 @@
-"""Idempotent, local-only migration from the predecessor applications.
+"""Idempotent, local-only migration from predecessor applications.
 
-The migration deliberately copies instead of moving.  A completed import leaves
-the predecessor workspace untouched so that the user can inspect or roll back
-without relying on a transient installer state.
+Structured facts are merged into the runtime database and retired text files
+are appended to MemoryHub. The predecessor data remains untouched for recovery.
 """
 from __future__ import annotations
 
@@ -18,6 +17,8 @@ from typing import Any
 from .paths import RuntimePaths
 from .observatory import EvaluationObservatory
 from .store import CompanionStore
+from .memory_port import MemoryPort
+from .memoryhub_migration import LegacyWorkspaceImporter
 
 
 def _now() -> str:
@@ -46,9 +47,14 @@ class LegacySources:
 
 
 class LegacyMigrator:
-    def __init__(self, target: RuntimePaths, sources: LegacySources) -> None:
+    def __init__(
+        self, target: RuntimePaths, sources: LegacySources,
+        *, memory: MemoryPort | None = None, memory_space_id: str = "ai-trading-companion",
+    ) -> None:
         self.target = target
         self.sources = sources
+        self.memory = memory
+        self.memory_space_id = memory_space_id
 
     def run(self) -> dict[str, Any]:
         self.target.ensure()
@@ -61,7 +67,10 @@ class LegacyMigrator:
             "copied_companion_database": copied_database,
             "decision_center_messages": self._import_decision_center(store),
             "automation_messages": self._import_automation_history(store),
-            "workspace_files": self._copy_workspace(),
+            "legacy_workspace": LegacyWorkspaceImporter(
+                self.sources.workspace, store, self.memory, self.memory_space_id,
+                migrated_at=_now(),
+            ).run() if self.memory is not None else {"state": "deferred_until_memoryhub_available"},
             "ui_files": self._copy_ui_state(),
             "observatory_backfill": EvaluationObservatory(
                 store, schedule_path=self.target.resources / "schedules" / "tasks.json",
@@ -112,8 +121,7 @@ class LegacyMigrator:
                 "portfolio_change_proposal", "portfolio_interpretation_job", "portfolio_render_intent",
                 "portfolio_meta", "portfolio_outbox", "knowledge_change_proposal", "llm_attempt",
                 "companion_research_job", "evidence_ledger_entry", "judgment_snapshot", "outcome_checkpoint",
-                "memory_index_entry", "memory_retrieval_audit", "memory_index_intent", "memory_backup",
-                "memory_recovery_quarantine", "workflow_policy", "timing_policy", "ai_risk_doctrine",
+                "memory_backup", "workflow_policy", "timing_policy", "ai_risk_doctrine",
                 "market_regime_snapshot", "router_policy_cell", "cognitive_route_decision", "router_shadow_job",
                 "router_evaluation", "evolution_hypothesis", "legacy_import_record",
             ]
@@ -229,25 +237,6 @@ class LegacyMigrator:
             if self._import_row(store, "codex-automation", str(row["run_id"]), dict(row)):
                 count += 1
         return count
-
-    def _copy_workspace(self) -> int:
-        copied = 0
-        for name in ("portfolio", "state", "logs", "reports"):
-            source = self.sources.workspace / name
-            destination = self.target.workspace / name
-            if not source.exists():
-                continue
-            for path in source.rglob("*"):
-                if not path.is_file():
-                    continue
-                relative = path.relative_to(source)
-                target = destination / relative
-                if target.exists():
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, target)
-                copied += 1
-        return copied
 
     def _copy_ui_state(self) -> int:
         copied = 0

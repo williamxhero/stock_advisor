@@ -1,3 +1,5 @@
 # 稳定事实源与可替换记忆检索
 
-原始消息、证据、判断和结果以本地不可变事实记录及发生时间/获知时间为长期依据，Markdown/CSV和记忆索引均为可重建投影。SQLite FTS先作为生产检索 adapter，未来 Memory Palace、向量库或知识图谱只能通过同一 MemoryRetriever seam接入并在回放评测后替换，避免检索技术成为不可追溯的唯一记忆。
+状态：superseded by ADR 0020
+
+本 ADR 记录已被替代的本地记忆方案，不再描述正式运行时。现行决定见 ADR 0020：跨任务长期事实由 MemoryHub 拥有，当前业务事实由 Runtime 数据库拥有；旧 Markdown/CSV 仅允许一次性迁移，不能作为投影、事实源或运行输入。

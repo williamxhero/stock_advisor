@@ -6,6 +6,7 @@ from pathlib import Path
 
 from ai_trading_companion.cognition import UnifiedCognition
 from ai_trading_companion.engine import CompanionEngine
+from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.portfolio import PortfolioService
 from ai_trading_companion.store import CompanionStore
 
@@ -14,7 +15,8 @@ class UserLearningTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.store = CompanionStore(Path(self.temp.name) / "companion.sqlite3")
-        self.engine = CompanionEngine(self.store)
+        self.memory = InMemoryMemoryAdapter()
+        self.engine = CompanionEngine(self.store, memory=self.memory)
         self.portfolio = PortfolioService(Path(self.temp.name), self.store)
 
     def tearDown(self) -> None:
@@ -30,26 +32,21 @@ class UserLearningTests(unittest.TestCase):
             "propositions": [], "actions": [],
         })
 
-    def test_explicit_preference_is_append_only_and_current_format_is_not_long_term(self):
+    def test_explicit_preferences_are_append_only_memoryhub_episodes(self) -> None:
         self.apply("以后少贴原文，发链接就好。")
         self.apply("这次请用列表展示。")
         self.apply("以后多贴原文。")
 
-        rows = self.store.current_propositions("2099-01-01T00:00:00Z")
-        current = [row for row in rows if row["predicate"] == "expression.material_density"]
-        self.assertEqual(1, len(current))
-        self.assertIn("more_source_excerpt", current[0]["object_json"])
-        with self.store.connection() as connection:
-            history = connection.execute("SELECT status FROM memory_proposition WHERE predicate='expression.material_density'").fetchall()
-        self.assertEqual({"active", "superseded"}, {row[0] for row in history})
+        rows = [row for row in self.memory._episodes if "expression.material_density" in row["body"]]
+        self.assertEqual(2, len(rows))
+        self.assertIn("more_source_excerpt", rows[-1]["body"])
 
-    def test_method_is_recorded_as_an_unverified_user_view(self):
+    def test_method_is_recorded_as_an_unverified_user_view(self) -> None:
         self.apply("我觉得这是诱多，因为高开后核心承接不住。")
 
-        row = next(row for row in self.store.current_propositions("2099-01-01T00:00:00Z") if row["subject"] == "user.market_method")
-        self.assertEqual("user_view", row["proposition_kind"])
-        self.assertIn("unverified", row["object_json"])
-        self.assertLess(row["confidence"], 1.0)
+        row = next(row for row in self.memory._episodes if "user.market_method" in row["body"])
+        self.assertEqual("proposition", row["episode_type"])
+        self.assertIn("unverified", row["body"])
 
 
 if __name__ == "__main__":

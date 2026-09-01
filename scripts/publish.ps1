@@ -37,8 +37,24 @@ if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish failed; no usable release artifact was generated."
 }
 
+$toolManagerOutput = Join-Path $output "ToolManager"
+$toolManagerArguments = @(
+    'publish', "$projectRoot\src\desktop\AITradingCompanion.ToolManager\AITradingCompanion.ToolManager.csproj",
+    '--configuration', 'Release', '--runtime', $Runtime, '--self-contained', 'true', '--output', $toolManagerOutput,
+    '-p:PublishSingleFile=true', '-p:IncludeNativeLibrariesForSelfExtract=true', '-p:UseSharedCompilation=false',
+    "-p:SourceRevisionId=$revision", '-m:1', '--disable-build-servers'
+)
+if ($NoRestore) { $toolManagerArguments += '--no-restore' }
+dotnet @toolManagerArguments
+if ($LASTEXITCODE -ne 0) {
+    throw "Tool Manager publish failed; no usable release artifact was generated."
+}
+
 foreach ($item in @(
-    @{ Source = 'resources'; Destination = 'resources' },
+    @{ Source = 'resources\contracts'; Destination = 'resources\contracts' },
+    @{ Source = 'resources\protocols'; Destination = 'resources\protocols' },
+    @{ Source = 'resources\schedules'; Destination = 'resources\schedules' },
+    @{ Source = 'resources\seeds'; Destination = 'resources\seeds' },
     @{ Source = 'src\runtime\ai_trading_companion'; Destination = 'runtime\ai_trading_companion' },
     @{ Source = 'scripts\run_companion_service.ps1'; Destination = 'scripts\run_companion_service.ps1' },
     @{ Source = 'scripts\verify-install.ps1'; Destination = 'scripts\verify-install.ps1' },
@@ -56,6 +72,14 @@ foreach ($item in @(
     else {
         Copy-Item -LiteralPath $source -Destination $destination -Force
     }
+}
+
+$retiredBusinessFiles = @(
+    Get-ChildItem -LiteralPath $output -Recurse -File |
+        Where-Object { $_.Extension -in @('.md', '.csv') }
+)
+if ($retiredBusinessFiles.Count -gt 0) {
+    throw "Release contains retired Markdown/CSV files: $($retiredBusinessFiles.FullName -join ', ')"
 }
 
 @{

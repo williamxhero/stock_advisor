@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import unittest
+import json
+import sys
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, WebAccessGatewayBackend
+from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, WebAccessGatewayBackend
+from ai_trading_companion.tooling import EvidenceResolution, FactRequest, ToolCatalog, ToolRunner
 
 CONTRACT = {"version": 3, "as_of": "2026-08-27T07:00:00Z", "requirements": [{"key": "market", "blocking": True, "allowed_coverage": ["covered"], "window": {"mode": "exact", "start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z"}}]}
 
@@ -134,6 +139,108 @@ class LocalResearchTests(unittest.TestCase):
         client.search.assert_called_once(); client.read.assert_called_once_with("https://example.test", "auto", CONTRACT["as_of"])
         with self.assertRaises(ValueError): backend("download", {})
 
+    def test_tool_catalog_adapter_maps_research_reads_to_fact_requests_without_context(self) -> None:
+        runner = mock.Mock()
+        runner.resolve_with_fallback.side_effect = [
+            EvidenceResolution(True, "generic_web_search", "1.0.0", CONTRACT["as_of"], CONTRACT["as_of"], {
+                "url": "https://search.test", "results": [{"url": "https://example.test/story", "title": "story"}],
+            }, "artifact:sha256:" + "a" * 64, None, ("tool_result_schema_valid",)),
+            EvidenceResolution(True, "generic_web_read", "1.0.0", CONTRACT["as_of"], CONTRACT["as_of"], {
+                "url": "https://example.test/story", "text": "verified source text",
+            }, "artifact:sha256:" + "b" * 64, None, ("tool_result_schema_valid",)),
+        ]
+        backend = ToolCatalogResearchBackend(runner, as_of=CONTRACT["as_of"], deadline=lambda: 30.0)
+
+        found = backend("web_search", row("web_search", query="close") ["arguments"])
+        read = backend("web_read", row("web_read", url="https://example.test/story")["arguments"])
+
+        self.assertEqual("https://example.test/story", found["results"][0]["url"])
+        self.assertEqual("verified source text", read["results"][0]["excerpt_text"])
+        first_request = runner.resolve_with_fallback.call_args_list[0].args[0]
+        second_request = runner.resolve_with_fallback.call_args_list[1].args[0]
+        self.assertEqual("generic_web_search", first_request.capability)
+        self.assertEqual("generic_web_read", second_request.capability)
+        self.assertEqual({}, first_request.context)
+        self.assertEqual(CONTRACT["as_of"], second_request.required_at)
+
+    def test_market_tool_adapter_freezes_a_live_intraday_snapshot_as_qualified_evidence(self) -> None:
+        contract = {
+            "version": 3, "as_of": "2026-09-01T06:30:00Z", "requirements": [{
+                "key": "market", "blocking": True, "allowed_coverage": ["covered"],
+                "window": {"mode": "after_start_to_end", "start": "2026-09-01T06:15:00Z", "end": "2026-09-01T06:30:00Z"},
+            }],
+        }
+        runner = mock.Mock()
+        runner.resolve_with_fallback.return_value = EvidenceResolution(
+            True, "cn_market_snapshot", "1.1.0", "2026-09-01T06:29:00Z", "2026-09-01T06:30:01Z", {
+                "source": "tencent_quote+eastmoney_breadth",
+                "source_urls": ["https://qt.gtimg.cn/q=sh000001", "https://push2delay.eastmoney.com/api/qt/clist/get"],
+                "source_evidence": [
+                    {"url": "https://qt.gtimg.cn/q=sh000001", "fact_as_of": "2026-09-01T06:29:00Z", "data": {"indices": [{"symbol": "000001", "price": 3500}]}},
+                    {"url": "https://push2delay.eastmoney.com/api/qt/clist/get", "fact_as_of": "2026-09-01T06:29:00Z", "data": {"breadth": {"up": 2000, "down": 1000, "flat": 50}}},
+                ],
+                "indices": [{"symbol": "000001", "price": 3500}],
+                "breadth": {"up": 2000, "down": 1000, "flat": 50},
+                "finality": "intraday",
+            }, "artifact:sha256:" + "c" * 64, None, ("tool_result_schema_valid",), attempts=("default:succeeded",),
+        )
+        backend = ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0)
+        plan = {"version": 1, "operations": [{
+            "requirement_key": "market", "backend": "market", "operation": "market_snapshot",
+            "arguments": {"query": None, "categories": None, "url": None, "symbol": None, "render": None, "session_id": None, "actions": None},
+            "fallback_backends": [],
+        }]}
+
+        result = LocalResearchChain(lambda *_: plan, ReadOnlyResearchExecutor({"market": backend}), max_repairs=0).run(
+            {"as_of": contract["as_of"]}, contract, attempt_id="live-market",
+        )
+
+        self.assertTrue(result.qualified, result.verifier["problems"])
+        request = runner.resolve_with_fallback.call_args.args[0]
+        self.assertEqual("cn_market_snapshot", request.capability)
+        self.assertEqual("intraday", request.finality)
+        self.assertEqual("2026-09-01T06:30:00Z", request.required_at)
+        self.assertEqual(2, len(result.evidence["sources"]))
+        self.assertIn("indices", result.evidence["sources"][0]["excerpt"])
+        self.assertNotIn("breadth", result.evidence["sources"][0]["excerpt"])
+        self.assertIn("breadth", result.evidence["sources"][1]["excerpt"])
+
+    def test_post_close_research_uses_tool_fallback_then_freezes_qualified_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            default = root / "generic_web_read" / "versions" / "1.0.0"; default.mkdir(parents=True)
+            (default / "tool.py").write_text("import sys; sys.exit(75)\n", encoding="utf-8")
+            (default / "manifest.json").write_text(json.dumps({"contract": "ai-trading-tool-manifest/v1", "capability": "generic_web_read", "version": "1.0.0", "state": "promoted", "command": [sys.executable, "tool.py"]}), encoding="utf-8")
+            (root / "generic_web_read" / "current.json").write_text(json.dumps({"contract": "ai-trading-tool-current/v1", "version": "1.0.0"}), encoding="utf-8")
+            backup = root / "generic_web_read" / "adapters" / "backup" / "versions" / "1.0.0"; backup.mkdir(parents=True)
+            (backup / "tool.py").write_text("""import json
+print(json.dumps({'contract':'ai-trading-tool-result/v1','fact_as_of':'2026-08-27T07:00:00Z','data':{'url':'https://public.example.test/close','text':'official close evidence'}}))
+""", encoding="utf-8")
+            (backup / "manifest.json").write_text(json.dumps({"contract": "ai-trading-tool-manifest/v1", "capability": "generic_web_read", "version": "1.0.0", "state": "promoted", "command": [sys.executable, "tool.py"]}), encoding="utf-8")
+            (root / "generic_web_read" / "routing.json").write_text(json.dumps({"contract": "ai-trading-tool-routing/v1", "candidates": [{"adapter": "default", "version": "1.0.0"}, {"adapter": "backup", "version": "1.0.0"}]}), encoding="utf-8")
+            backend = ToolCatalogResearchBackend(ToolRunner(ToolCatalog(root)), as_of=CONTRACT["as_of"], deadline=lambda: 2)
+            plan = {"version": 1, "operations": [row("web_read", url="https://public.example.test/close")]}
+
+            result = LocalResearchChain(lambda *_: plan, ReadOnlyResearchExecutor({"gateway": backend}), max_repairs=0).run({"as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="post-close")
+
+            self.assertTrue(result.qualified, result.verifier["problems"])
+            self.assertEqual("official close evidence", result.evidence["sources"][0]["excerpt"])
+            self.assertIn("backup:succeeded", (root / ".audit" / "resolutions.ndjson").read_text(encoding="utf-8"))
+
+    def test_post_close_all_tool_sources_fail_returns_unqualified_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"; version = root / "generic_web_read" / "versions" / "1.0.0"; version.mkdir(parents=True)
+            (version / "tool.py").write_text("import sys; sys.exit(75)\n", encoding="utf-8")
+            (version / "manifest.json").write_text(json.dumps({"contract": "ai-trading-tool-manifest/v1", "capability": "generic_web_read", "version": "1.0.0", "state": "promoted", "command": [sys.executable, "tool.py"]}), encoding="utf-8")
+            (root / "generic_web_read" / "current.json").write_text(json.dumps({"contract": "ai-trading-tool-current/v1", "version": "1.0.0"}), encoding="utf-8")
+            backend = ToolCatalogResearchBackend(ToolRunner(ToolCatalog(root)), as_of=CONTRACT["as_of"], deadline=lambda: 2)
+            plan = {"version": 1, "operations": [row("web_read", url="https://public.example.test/close")]}
+
+            result = LocalResearchChain(lambda *_: plan, ReadOnlyResearchExecutor({"gateway": backend}), max_repairs=0).run({"as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="post-close")
+
+            self.assertFalse(result.qualified)
+            self.assertEqual("evidence_insufficient", result.stage_failures[0]["category"])
+
     def test_search_listing_is_discovery_not_evidence(self) -> None:
         search = {"results": [{"url": "https://example.test/2026-08-27", "title": "收盘", "excerpt_text": "2026-08-27", "fact_as_of": "2026-08-27T07:00:00Z"}]}
         plan = {"version": 1, "operations": [row("web_search", query="收盘")]}
@@ -186,6 +293,28 @@ class LocalResearchTests(unittest.TestCase):
         result = LocalResearchChain(lambda *_: plan, ReadOnlyResearchExecutor({"gateway": lambda *_: read}), max_repairs=0).run({"as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="x")
         self.assertTrue(result.qualified)
         self.assertEqual("收盘事实", result.evidence["sources"][0]["excerpt"])
+
+    def test_production_research_keeps_replanning_past_two_repairs_until_qualified(self) -> None:
+        read = {"results": [{
+            "url": "https://example.test/2026-08-27", "title": "收盘",
+            "excerpt_text": "收盘事实", "fact_as_of": CONTRACT["as_of"], "primary": True,
+        }]}
+        rounds: list[int] = []
+
+        def planner(_packet: dict, _gaps: list[str], round_number: int) -> dict:
+            rounds.append(round_number)
+            operation = row("web_read", url="https://example.test/2026-08-27") if round_number >= 3 else row("web_search", query=f"收盘 修复 {round_number}")
+            return {"version": 1, "operations": [operation]}
+
+        result = LocalResearchChain(
+            planner,
+            ReadOnlyResearchExecutor({"gateway": lambda operation, _arguments: read if operation == "web_read" else {"results": []}}),
+            max_repairs=None,
+            deadline=lambda: 30.0,
+        ).run({"as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="continuous")
+
+        self.assertTrue(result.qualified, result.verifier["problems"])
+        self.assertEqual([0, 1, 2, 3], rounds)
 
     def test_failed_planned_read_uses_an_untried_discovery_without_new_search(self) -> None:
         search = {"results": [

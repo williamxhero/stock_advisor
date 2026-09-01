@@ -51,8 +51,10 @@
                 <TextBlock Text="{Binding StatusText}" Foreground="{StaticResource SecondaryTextBrush}" FontSize="12"
                            VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="260" />
                 <Button Content="任务管理" Click="TaskButton_Click" Padding="12,6" Margin="12,0,0,0" />
+                <Button Content="工具管理" Click="ToolManagerButton_Click" Padding="12,6" Margin="12,0,0,0" />
                 <Button Content="评测与进化中心" Click="ObservatoryButton_Click" Padding="12,6" Margin="12,0,0,0" />
                 <Button Content="持仓" Click="PortfolioButton_Click" Padding="12,6" Margin="12,0,0,0" />
+                <Button Content="记忆" Click="MemoryButton_Click" Padding="12,6" Margin="12,0,0,0" />
                 <Button Command="{Binding ToggleStartupCommand}" Padding="12,6" Margin="12,0,0,0">
                     <TextBlock><Run Text="开机启动：" /><Run Text="{Binding StartupStateText, Mode=OneWay}" /></TextBlock>
                 </Button>

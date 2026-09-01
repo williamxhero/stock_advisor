@@ -300,6 +300,16 @@ class _EvidenceGateV3:
             allowed = set(requirement.get("allowed_coverage") or ["covered"])
             if not row or row.get("status") not in allowed:
                 problems.append(f"blocking_requirement_missing:{key}"); missing.append(key); continue
+            if requirement.get("evidence_class") == "internal_runtime":
+                expected_status = "covered" if int(requirement.get("internal_record_count") or 0) > 0 else "checked_no_change"
+                if row.get("status") != expected_status:
+                    problems.append(f"internal_requirement_status_invalid:{key}"); missing.append(key)
+                continue
+            required_entities = [str(value) for value in requirement.get("required_entities") or [] if str(value)]
+            if requirement.get("evidence_class") == "public_if_present" and not required_entities:
+                if row.get("status") != "checked_no_change":
+                    problems.append(f"empty_portfolio_requirement_status_invalid:{key}"); missing.append(key)
+                continue
             refs = [str(ref) for ref in row.get("evidence_refs") or []]
             bound = [sources[ref] for ref in refs if ref in sources]
             if row.get("status") == "checked_no_change" and not refs:
@@ -314,6 +324,25 @@ class _EvidenceGateV3:
                 problems.append(f"blocking_requirement_stale:{key}"); missing.append(key); continue
             if row.get("status") == "checked_no_change" and not self._matching_negative_query(bound, requirement.get("negative_query_terms") or []):
                 problems.append(f"checked_no_change_query_not_matched:{key}"); missing.append(key)
+                continue
+            support = " ".join(EvidenceGate._normalize_text(item.get("excerpt")) for item in bound)
+            term_groups = requirement.get("evidence_terms") or []
+            if any(not any(str(term) in support for term in group) for group in term_groups):
+                problems.append(f"blocking_requirement_semantically_unsupported:{key}"); missing.append(key); continue
+            numeric_facts = set(re.findall(
+                r"(?<![\d.])\d+(?:\.\d+)?\s*(?:%|％|万亿元|亿元|万亿|亿|万家|家|只|股|元)", support,
+            ))
+            if len(numeric_facts) < int(requirement.get("minimum_numeric_facts") or 0):
+                problems.append(f"blocking_requirement_lacks_numeric_facts:{key}"); missing.append(key); continue
+            entities = {
+                name for name in re.findall(r"([\u4e00-\u9fffA-Za-z0-9]{2,12})(?:板块|概念|题材)", support)
+                if name not in {"领涨", "领跌", "强势", "弱势", "市场", "行业", "多个", "相关"}
+            }
+            if len(entities) < int(requirement.get("minimum_named_entities") or 0):
+                problems.append(f"blocking_requirement_lacks_named_entities:{key}"); missing.append(key); continue
+            absent_entities = [entity for entity in required_entities if entity not in support]
+            if absent_entities:
+                problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
         for event in evidence.get("high_impact_events") or []:
             if event.get("materiality") != "high":
                 continue

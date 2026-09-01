@@ -502,8 +502,8 @@ public sealed class MainViewModel : ObservableObject
         var taskName = new string(message.TaskType.Select(character => invalid.Contains(character) ? '_' : character).ToArray());
         var dialog = new Microsoft.Win32.SaveFileDialog
         {
-            Filter = "Markdown (*.md)|*.md",
-            FileName = $"{message.ScheduledFor:yyyyMMdd-HHmm}_{taskName}_{message.ExternalId[..Math.Min(8, message.ExternalId.Length)]}.md"
+            Filter = "Text (*.txt)|*.txt",
+            FileName = $"{message.ScheduledFor:yyyyMMdd-HHmm}_{taskName}_{message.ExternalId[..Math.Min(8, message.ExternalId.Length)]}.txt"
         };
         if (dialog.ShowDialog() == true)
         {

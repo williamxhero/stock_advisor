@@ -1,4 +1,4 @@
-"""Stable locations for the installed product and its mutable local workspace."""
+"""Stable locations for the installed product and its mutable structured state."""
 from __future__ import annotations
 
 import os
@@ -41,10 +41,6 @@ class RuntimePaths:
         return self.resources / "contracts"
 
     @property
-    def workspace(self) -> Path:
-        return self.home / "workspace"
-
-    @property
     def runtime(self) -> Path:
         return self.home / "runtime"
 
@@ -64,13 +60,19 @@ class RuntimePaths:
     def evidence(self) -> Path:
         return self.home / "evidence"
 
+    @property
+    def tools(self) -> Path:
+        return Path(os.environ.get("AI_TRADING_COMPANION_TOOLS_ROOT", self.runtime / "tools")).resolve()
+
     def ensure(self) -> None:
         for directory in (
-            self.home / "data", self.workspace / "portfolio", self.workspace / "state",
-            self.workspace / "logs", self.workspace / "reports", self.runtime / "runs",
+            self.home / "data", self.runtime / "runs",
             self.runtime / "logs", self.runtime / "backups", self.exchange / "to-runtime" / "pending",
             self.exchange / "to-client" / "pending", self.home / "ui", self.home / "cache",
             self.home / "migration", self.home / "config",
             self.evidence, self.runtime / "downloads" / "quarantine",
+            self.tools,
         ):
             directory.mkdir(parents=True, exist_ok=True)
+        from .builtin_tools import ensure_builtin_tools
+        ensure_builtin_tools(self.tools)

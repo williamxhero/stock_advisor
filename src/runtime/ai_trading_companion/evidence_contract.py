@@ -28,9 +28,10 @@ class EvidenceContractFactory:
     def build(
         self, *, task_key: str, stage: str, as_of: str,
         task_profile: dict[str, Any] | None = None,
+        internal_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         frozen = self._aware(as_of)
-        requirements = self._requirements(task_key, stage, frozen, task_profile)
+        requirements = self._requirements(task_key, stage, frozen, task_profile, internal_context or {})
         contract = {
             "version": 3,
             "as_of": frozen.isoformat().replace("+00:00", "Z"),
@@ -49,6 +50,7 @@ class EvidenceContractFactory:
     def _requirements(
         self, task_key: str, stage: str, as_of: datetime,
         task_profile: dict[str, Any] | None = None,
+        internal_context: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if task_profile is not None and stage == "m0_research":
             return self._manual_requirements(as_of, str(task_profile["evidence_family"]))
@@ -72,17 +74,61 @@ class EvidenceContractFactory:
             close = self._latest_completed_close(as_of)
             close_text = self._iso(close)
             prior_close_text = self._iso(self._latest_completed_close(close - timedelta(seconds=1)))
+            context = internal_context or {}
+            holdings = [str(value) for value in context.get("portfolio_entities") or [] if str(value)]
             return [
                 {
-                    "key": "current_market_state", "blocking": True,
+                    "key": "indices_close", "blocking": True,
                     "allowed_coverage": ["covered"],
                     "window": {"start": close_text, "end": close_text, "mode": "exact"},
+                    "evidence_terms": [["上证", "沪指"], ["深成指", "深证成指"], ["创业板"], ["涨", "跌", "%"]],
+                    "minimum_numeric_facts": 3,
                 },
                 {
-                    "key": "material_events_and_counterevidence", "blocking": True,
+                    "key": "turnover_compare", "blocking": True,
+                    "allowed_coverage": ["covered"],
+                    "window": {"start": close_text, "end": close_text, "mode": "exact"},
+                    "evidence_terms": [["成交额", "成交"], ["亿", "万亿"], ["昨日", "前一交易日", "上一交易日", "较前日", "较上日"]],
+                    "minimum_numeric_facts": 2,
+                },
+                {
+                    "key": "market_breadth", "blocking": True,
+                    "allowed_coverage": ["covered"],
+                    "window": {"start": close_text, "end": close_text, "mode": "exact"},
+                    "evidence_terms": [["上涨"], ["下跌"], ["家", "只"]],
+                    "minimum_numeric_facts": 2,
+                },
+                {
+                    "key": "themes_and_capacity_cores", "blocking": True,
+                    "allowed_coverage": ["covered"],
+                    "window": {"start": close_text, "end": close_text, "mode": "exact"},
+                    "evidence_terms": [["板块", "题材"], ["领涨", "涨幅居前", "强势"], ["领跌", "跌幅居前", "弱势"]],
+                    "minimum_named_entities": 2,
+                },
+                {
+                    "key": "events_and_counterevidence", "blocking": True,
                     "allowed_coverage": ["covered", "checked_no_change"],
                     "window": {"start": prior_close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
                     "negative_query_terms": ["公告", "政策", "风险"],
+                },
+                {
+                    "key": "prior_judgment_changes", "blocking": True,
+                    "allowed_coverage": ["covered", "checked_no_change"],
+                    "evidence_class": "internal_runtime",
+                    "internal_record_count": int(context.get("prior_judgment_count") or 0),
+                },
+                {
+                    "key": "portfolio_close", "blocking": True,
+                    "allowed_coverage": ["covered", "checked_no_change"],
+                    "window": {"start": close_text, "end": close_text, "mode": "exact"},
+                    "evidence_class": "public_if_present",
+                    "required_entities": holdings,
+                    "minimum_numeric_facts": 2 if holdings else 0,
+                },
+                {
+                    "key": "forum_and_sentiment", "blocking": False,
+                    "allowed_coverage": ["covered", "checked_no_change"],
+                    "window": {"start": prior_close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
                 },
             ]
         if task_key in _INTRADAY_EVENT_ANCHORS and stage in {"m0_research", "m1_research"}:

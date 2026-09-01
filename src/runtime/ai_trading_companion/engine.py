@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -31,12 +32,45 @@ class CompanionEngine:
     def __init__(
         self, store: Any, *, task_profiles: ManualAnalysisProfileResolver | None = None,
         evidence_contract_factory: EvidenceContractFactory | None = None,
+        memory: Any | None = None, memory_space_id: str = "ai-trading-companion",
     ) -> None:
         self.store = store
         self.store.initialize()
         self.judgments = JudgmentLifecycle(store)
         self.task_profiles = task_profiles or ManualAnalysisProfileResolver()
         self.evidence_contract_factory = evidence_contract_factory or EvidenceContractFactory(self.task_profiles.calendar)
+        self.memory = memory
+        self.memory_space_id = memory_space_id
+
+    def record_submitted_messages(self, cycle_id: str, messages: list[dict[str, Any]]) -> None:
+        if self.memory is None:
+            return
+        for message in messages:
+            submitted_at = str(message.get("submitted_at") or message["known_at"])
+            self.memory.append({
+                "memory_space_id": self.memory_space_id,
+                "source_system": "stock-advisor",
+                "source_event_id": str(message["message_id"]),
+                "content_hash": "auto",
+                "episode_type": "user_message",
+                "body": str(message["body_text"]),
+                "occurred_at": str(message.get("occurred_at") or submitted_at),
+                "known_at": str(message.get("known_at") or submitted_at),
+                "submitted_at": submitted_at,
+                "authority": "user_private_fact",
+                "protocol_version": "memoryhub/v1",
+                "metadata": {
+                    "message_id": message["message_id"], "cycle_id": cycle_id,
+                    "batch_id": message.get("batch_id"), "phase": message.get("phase"),
+                    "state": "submitted", "actor": "human",
+                },
+            })
+
+    def recover_interrupted_streams(self) -> int:
+        streams = self.store.interrupted_stream_messages()
+        for stream in streams:
+            self.chat_stream_failed(stream["cycle_id"], stream["stream_id"], "runtime restarted")
+        return len(streams)
 
     def start_cycle(
         self, task_key: str, scheduled_for: str, as_of: str | None = None, *,
@@ -344,6 +378,13 @@ class CompanionEngine:
                 result = self._commit_chat(cycle)
             elif typ == "commit_conversation_batch":
                 result = self._commit_conversation(cycle, reason="manual")
+            elif typ == "terminate_chat_research":
+                result = self.store.terminate_chat_research(cycle_id)
+                self.emit(cycle, "chat.research.terminated", {"cycle": cycle, "state": result})
+            elif typ == "continue_chat_research":
+                result = self.store.continue_chat_research(cycle_id)
+                if result.get("continued_now"):
+                    self.emit(cycle, "chat.research.continued", {"cycle": cycle, "state": result})
             else:
                 raise ValueError(f"unsupported command: {typ}")
         self.store.save_receipt(command["command_id"], cycle_id, typ, command, result)
@@ -670,11 +711,36 @@ class CompanionEngine:
     ) -> dict[str, Any]:
         if kind not in {"ai_chat", "premarket_chat"}:
             raise ValueError(f"unsupported chat artifact kind: {kind}")
+        if self.store.chat_research_terminated(cycle_id):
+            raise RuntimeError("chat research was terminated; late result is not published")
         cycle = self.store.get_cycle(cycle_id)
         presented = presented or self.present_for_publication(text, iso(utc_now()), kind, allow_structured_format=allow_structured_format)
+        published_at = iso(utc_now())
+        memory_message_id = stream_id or f"{cycle_id}:{kind}:{reply_to_batch_id or hashlib.sha256(presented.markdown.encode('utf-8')).hexdigest()}"
+        memory_receipt = None
+        if self.memory is not None:
+            memory_receipt = self.memory.append({
+                "memory_space_id": self.memory_space_id,
+                "source_system": "stock-advisor",
+                "source_event_id": memory_message_id,
+                "content_hash": "auto", "episode_type": "ai_message",
+                "body": presented.markdown, "occurred_at": published_at,
+                "known_at": published_at, "submitted_at": published_at,
+                "authority": "published_ai_message", "protocol_version": "memoryhub/v1",
+                "metadata": {
+                    "message_id": memory_message_id, "cycle_id": cycle_id,
+                    "reply_to_batch_id": reply_to_batch_id, "stream_id": stream_id,
+                    "kind": kind, "state": "published", "actor": "ai",
+                    "published_message": presented.message(),
+                },
+            })
         artifact = self.store.append_artifact(
-            cycle_id, kind, "model", presented.markdown, iso(utc_now()),
-            self._presentation_metadata({"reply_to_batch_id": reply_to_batch_id, "stream_id": stream_id}, presented),
+            cycle_id, kind, "model", presented.markdown, published_at,
+            self._presentation_metadata({
+                "reply_to_batch_id": reply_to_batch_id, "stream_id": stream_id,
+                "memory_message_id": memory_message_id,
+                "memory_episode_id": memory_receipt["episode_id"] if memory_receipt else None,
+            }, presented),
         )
         batch_ids = reply_to_batch_ids or ([reply_to_batch_id] if reply_to_batch_id else [])
         self.store.mark_batches_responded(batch_ids, artifact["artifact_id"])
@@ -729,6 +795,20 @@ class CompanionEngine:
 
     def chat_stream_failed(self, cycle_id: str, stream_id: str, reason: str) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
+        current = self.store.stream_message(stream_id)
+        if self.memory is not None and current["text"]:
+            occurred_at = str(current["created_at"])
+            self.memory.append({
+                "memory_space_id": self.memory_space_id,
+                "source_system": "stock-advisor", "source_event_id": stream_id,
+                "content_hash": "auto", "episode_type": "ai_message", "body": current["text"],
+                "occurred_at": occurred_at, "known_at": occurred_at, "submitted_at": occurred_at,
+                "authority": "published_ai_message", "protocol_version": "memoryhub/v1",
+                "metadata": {
+                    "message_id": stream_id, "cycle_id": cycle_id, "kind": "chat_incomplete",
+                    "state": "incomplete", "actor": "ai", "batch_ids": current["batch_ids"],
+                },
+            })
         stream = self.store.finish_stream_message(stream_id, error=reason)
         presented = self.present_for_publication(self._user_fault_message(reason, "聊天回复"), iso(utc_now()), "system_fault")
         artifact = self.store.append_artifact(cycle_id, "system_fault", "system", presented.markdown, iso(utc_now()), self._presentation_metadata({"stream_id": stream_id, "reason_category": self._diagnostic_code(reason)}, presented))
@@ -782,6 +862,39 @@ class CompanionEngine:
             for message in self.store.messages(cycle["cycle_id"])
             if message["state"] != "withdrawn"
         ]
+        if self.memory is not None:
+            timeline = [
+                item for item in self.memory.timeline(self.memory_space_id)
+                if (item.get("metadata") or {}).get("cycle_id") == cycle["cycle_id"]
+            ]
+            memory_users = {
+                str((item.get("metadata") or {}).get("message_id")): {
+                    "message_id": (item.get("metadata") or {}).get("message_id"),
+                    "state": "submitted", "phase": (item.get("metadata") or {}).get("phase"),
+                    "batch_id": (item.get("metadata") or {}).get("batch_id"),
+                    "text": item.get("body"), "at": item.get("occurred_at"),
+                    "submitted_at": item.get("submitted_at"), "source_artifact_id": None,
+                }
+                for item in timeline if item.get("episode_type") == "user_message"
+            }
+            user_messages = [
+                memory_users.get(str(message["message_id"]), message) for message in user_messages
+            ]
+            local_non_chat = [
+                message for message in ai_messages
+                if message["kind"] not in {"ai_chat", "premarket_chat"}
+            ]
+            memory_ai = [
+                ({
+                    "artifact_id": (item.get("metadata") or {}).get("message_id"),
+                    "kind": (item.get("metadata") or {}).get("kind", "ai_chat"),
+                    "at": item.get("submitted_at"), "as_of": item.get("known_at"),
+                    "text": item.get("body"), "metadata": json.dumps(item.get("metadata") or {}, ensure_ascii=False),
+                } | ({"message": (item.get("metadata") or {}).get("published_message")}
+                     if isinstance((item.get("metadata") or {}).get("published_message"), dict) else {}))
+                for item in timeline if item.get("episode_type") == "ai_message"
+            ]
+            ai_messages = local_non_chat + memory_ai
         latest = {kind: next((item for item in reversed(ai_messages) if item["kind"] == kind), None) for kind in ("m0", "m1", "m2")}
         judgments = [
             {

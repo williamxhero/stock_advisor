@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import csv
 import tempfile
 import unittest
 from pathlib import Path
 
 from ai_trading_companion.portfolio import PortfolioService, explicit_fixture_extraction
+from ai_trading_companion.memory_port import InMemoryMemoryAdapter
+from ai_trading_companion.memoryhub_migration import LegacyWorkspaceImporter
 from ai_trading_companion.store import CompanionStore
 
 
@@ -40,23 +41,17 @@ class PortfolioServiceTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         (self.root / "portfolio").mkdir(parents=True)
-        (self.root / "logs").mkdir(parents=True)
-        (self.root / "state").mkdir(parents=True)
         (self.root / "portfolio/01_CURRENT_PORTFOLIO.md").write_text(PORTFOLIO, encoding="utf-8")
-        headers = ["date", "time", "protocol_version", "code", "name", "position_before", "price_at_decision", "market_context", "signal", "advice", "shares_advised", "actual_action", "shares_actual", "position_after", "reason", "T1_return", "T3_return", "T5_return", "outcome", "rule_tags", "notes"]
-        with (self.root / "logs/05_DECISION_LOG.csv").open("w", encoding="utf-8", newline="") as handle:
-            csv.writer(handle).writerow(headers)
-        with (self.root / "state/11_STOCK_STATE.csv").open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(["as_of_date", "last_updated", "code", "name", "theme_id", "stock_role", "lifecycle_state", "invalidation", "evidence_summary", "data_quality"])
-            writer.writerow(["2026-08-25", "2026-08-25/09:00", "603179", "新泉股份", "THM-A", "follower", "cold", "跌破37", "等待广度", "A"])
-            writer.writerow(["2026-08-25", "2026-08-25/09:00", "603993", "洛阳钼业", "THM-B", "capacity_core", "divergence", "跌破18", "资源容量", "B"])
         self.store = CompanionStore(self.root / "runtime.sqlite3")
-        self.service = PortfolioService(self.root, self.store)
+        self.store.initialize()
+        self.memory = InMemoryMemoryAdapter()
+        LegacyWorkspaceImporter(
+            self.root, self.store, self.memory, "test", migrated_at="2026-08-25T00:00:00Z",
+        ).run()
+        self.service = PortfolioService(self.store)
 
     def test_empty_workspace_starts_with_an_empty_portfolio_baseline(self) -> None:
-        root = Path(self.temp.name) / "empty-workspace"
-        service = PortfolioService(root, CompanionStore(Path(self.temp.name) / "empty.sqlite3"))
+        service = PortfolioService(CompanionStore(Path(self.temp.name) / "empty.sqlite3"))
         self.assertEqual([], service.snapshot()["positions"])
 
     def tearDown(self) -> None:
@@ -68,16 +63,21 @@ class PortfolioServiceTests(unittest.TestCase):
     def test_baseline_import_is_idempotent(self):
         snapshot = self.service.snapshot()
         self.assertEqual(2, len(snapshot["positions"]))
-        PortfolioService(self.root, self.store)
+        replay = LegacyWorkspaceImporter(
+            self.root, self.store, self.memory, "test", migrated_at="2026-08-25T00:00:00Z",
+        ).run()
+        PortfolioService(self.store)
         with self.store.connection() as connection:
             self.assertEqual(2, connection.execute("SELECT COUNT(*) FROM portfolio_position").fetchone()[0])
+        self.assertEqual("already_imported", replay["state"])
 
-    def test_complete_buy_updates_projection_markdown_and_log_once(self):
+    def test_complete_buy_updates_database_once_without_rewriting_legacy_file(self):
+        legacy_before = (self.root / "portfolio/01_CURRENT_PORTFOLIO.md").read_text(encoding="utf-8")
         result = self.service.apply_extraction("我以39.5元买入新泉股份100股", self.extraction(), "cycle", "artifact")
         self.assertEqual("applied", result["state"])
         position = next(item for item in self.service.snapshot()["positions"] if item["code"] == "603179")
         self.assertEqual(200, position["shares"])
-        self.assertIn("AI交易伙伴成交记录", (self.root / "portfolio/01_CURRENT_PORTFOLIO.md").read_text(encoding="utf-8"))
+        self.assertEqual(legacy_before, (self.root / "portfolio/01_CURRENT_PORTFOLIO.md").read_text(encoding="utf-8"))
         result2 = self.service.apply_extraction("我以39.5元买入新泉股份100股", self.extraction(), "cycle", "artifact")
         self.assertEqual(result["transaction_ids"], result2["transaction_ids"])
         self.assertEqual(2, next(item for item in self.service.snapshot()["positions"] if item["code"] == "603179")["revision"])
@@ -136,12 +136,12 @@ class PortfolioServiceTests(unittest.TestCase):
         self.assertEqual(38.1, position["average_cost"])
         self.assertEqual("position_correction", self.service.snapshot()["transactions"][0]["action"])
 
-    def test_explicit_total_assets_correction_updates_account_without_decision_log_trade(self):
+    def test_explicit_total_assets_correction_updates_account_without_fake_trade(self):
         extraction = {"statement_type": "current_state", "changes": [{"action": "asset_correction", "code": None, "name": None, "shares": None, "price": None, "total_assets": 240000, "occurred_at": None, "evidence": {"instrument": None, "action": "总资产", "shares": None, "price": None, "total_assets": "24万元"}}]}
         result = self.service.apply_extraction("现在总资产是24万元", extraction, "cycle", "artifact")
         self.assertEqual("applied", result["state"])
         self.assertEqual(240000, self.service.snapshot()["total_assets"])
-        self.assertNotIn("portfolio_transaction_id", (self.root / "logs/05_DECISION_LOG.csv").read_text(encoding="utf-8"))
+        self.assertEqual("asset_correction", self.service.snapshot()["transactions"][0]["action"])
 
     def test_partial_position_table_never_zeros_omitted_holdings(self):
         extraction = {"statement_type": "current_state", "changes": [{"action": "position_correction", "code": "603179", "name": "新泉股份", "shares": 300, "price": 38.1, "average_cost": 38.1, "occurred_at": None, "evidence": {"instrument": "603179 新泉股份", "action": "持有", "shares": "300股", "price": "38.1", "average_cost": "38.1"}}]}
@@ -199,28 +199,25 @@ class PortfolioServiceTests(unittest.TestCase):
         inverse = next(item for item in transactions if item["transaction_id"] == reverted["reversal_transaction_id"])
         self.assertIsNotNone(inverse["reversal_of"])
 
-    def test_render_failure_reconciles_without_duplicate_log_row(self):
-        original_render = self.service._render_portfolio
-        self.service._render_portfolio = lambda: (_ for _ in ()).throw(OSError("simulated render failure"))
-        result = self.service.apply_extraction("我以39.5元买入新泉股份100股", self.extraction(), "cycle", "artifact")
-        self.assertTrue(result["projection_pending"])
-        self.service._render_portfolio = original_render
-        self.assertEqual([], self.service.reconcile())
-        log = (self.root / "logs/05_DECISION_LOG.csv").read_text(encoding="utf-8")
-        self.assertEqual(1, log.count("portfolio_transaction_id="))
-        self.assertEqual([], self.service.reconcile())
-        self.assertEqual(1, (self.root / "logs/05_DECISION_LOG.csv").read_text(encoding="utf-8").count("portfolio_transaction_id="))
-
-    def test_external_markdown_change_blocks_pending_render(self):
-        original_render = self.service._render_portfolio
-        self.service._render_portfolio = lambda: (_ for _ in ()).throw(OSError("simulated render failure"))
+    def test_legacy_projection_intents_are_retired_without_file_access(self):
         self.service.apply_extraction("我以39.5元买入新泉股份100股", self.extraction(), "cycle", "artifact")
-        self.service._render_portfolio = original_render
+        transaction_id = self.service.snapshot()["transactions"][0]["transaction_id"]
+        with self.store.connection() as connection:
+            connection.execute(
+                "INSERT INTO portfolio_render_intent VALUES('legacy-intent',?,NULL,'pending','2026-08-25T00:00:00Z',NULL,NULL)",
+                (transaction_id,),
+            )
+        self.assertEqual([], self.service.reconcile())
+        with self.store.connection() as connection:
+            state = connection.execute("SELECT state FROM portfolio_render_intent WHERE intent_id='legacy-intent'").fetchone()[0]
+        self.assertEqual("retired", state)
+
+    def test_external_markdown_change_cannot_override_database(self):
+        before = self.service.snapshot()
         path = self.root / "portfolio/01_CURRENT_PORTFOLIO.md"
-        path.write_text(path.read_text(encoding="utf-8") + "\n人工并发修改\n", encoding="utf-8")
-        errors = self.service.reconcile()
-        self.assertTrue(any("revision conflict" in error for error in errors))
-        self.assertIn("人工并发修改", path.read_text(encoding="utf-8"))
+        path.write_text("# 伪造持仓\n\n| 000001 | 不应读取 | 999999 |", encoding="utf-8")
+        self.assertEqual([], self.service.reconcile())
+        self.assertEqual(before, self.service.snapshot())
 
     def test_fixture_parser_distinguishes_plan_and_execution(self):
         self.assertEqual("planned", explicit_fixture_extraction("准备明天买入新泉股份100股，价格39.5")["statement_type"])

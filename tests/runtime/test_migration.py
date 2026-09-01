@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from ai_trading_companion.migration import LegacyMigrator, LegacySources
+from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.paths import RuntimePaths
 from ai_trading_companion.store import CompanionStore
 
@@ -58,8 +59,9 @@ class LegacyMigrationTests(unittest.TestCase):
             target = RuntimePaths(root / "install", root / "new-home")
             sources = LegacySources(old_runtime, automation, decision_home, workspace)
 
-            first = LegacyMigrator(target, sources).run()
-            second = LegacyMigrator(target, sources).run()
+            memory = InMemoryMemoryAdapter()
+            first = LegacyMigrator(target, sources, memory=memory).run()
+            second = LegacyMigrator(target, sources, memory=memory).run()
 
             self.assertEqual(first["copied_companion_database"], "copied")
             self.assertEqual(first["decision_center_messages"], 1)
@@ -67,7 +69,10 @@ class LegacyMigrationTests(unittest.TestCase):
             self.assertEqual(second["decision_center_messages"], 0)
             self.assertEqual(second["automation_messages"], 0)
             self.assertEqual(second["copied_companion_database"], "merged")
-            self.assertTrue((target.workspace / "portfolio" / "01_CURRENT_PORTFOLIO.md").exists())
+            self.assertEqual("imported", first["legacy_workspace"]["state"])
+            self.assertEqual("already_imported", second["legacy_workspace"]["state"])
+            self.assertFalse((target.home / "workspace").exists())
+            self.assertTrue(any(item["episode_type"] == "legacy_workspace_document" for item in memory._episodes))
             self.assertTrue((target.home / "ui" / "window-state.json").exists())
             self.assertTrue((target.home / "ui" / "legacy-message-cache.sqlite3").exists())
             with CompanionStore(target.database).connection() as connection:

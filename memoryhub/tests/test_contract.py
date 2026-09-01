@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from trading_memory_hub import EpisodeConflict, MemoryHub, SourceIntegrityError
+
+
+def episode(**overrides: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "memory_space_id": "partner-main",
+        "source_system": "stock-advisor",
+        "source_event_id": "message-1",
+        "content_hash": "auto",
+        "episode_type": "user_message",
+        "body": "我更重视长期复利。",
+        "occurred_at": "2026-08-31T01:00:00Z",
+        "known_at": "2026-08-31T01:00:00Z",
+        "submitted_at": "2026-08-31T01:00:01Z",
+        "authority": "user_private_fact",
+        "protocol_version": "memoryhub/v1",
+    }
+    value.update(overrides)
+    return value
+
+
+def test_append_is_idempotent_and_rejects_immutable_conflicts(tmp_path: Path) -> None:
+    hub = MemoryHub(tmp_path / "ledger.sqlite3")
+
+    first = hub.append(episode())
+    replay = hub.append(episode())
+
+    assert replay.episode_id == first.episode_id
+    assert replay.sequence == 1
+    with pytest.raises(EpisodeConflict):
+        hub.append(episode(content_hash="auto", body="被改写的内容"))
+
+
+def test_correction_appends_a_new_episode_without_rewriting_history(tmp_path: Path) -> None:
+    hub = MemoryHub(tmp_path / "ledger.sqlite3")
+    original = hub.append(episode())
+
+    correction = hub.append(
+        episode(
+            source_event_id="message-2",
+            content_hash="auto",
+            body="更正：我更重视风险调整后的长期复利。",
+            corrects_episode_id=original.episode_id,
+        )
+    )
+
+    assert correction.episode_id != original.episode_id
+    assert correction.sequence == 2
+    assert hub.health()["ledger"]["state"] == "ready"
+    assert hub.health()["ledger"]["episodes"] == 2
+
+
+def test_declared_body_hash_must_match_actual_content(tmp_path: Path) -> None:
+    hub = MemoryHub(tmp_path / "ledger.sqlite3")
+
+    with pytest.raises(SourceIntegrityError):
+        hub.append(episode(content_hash="sha256:not-the-body"))
+
+    assert hub.health()["ledger"]["episodes"] == 0
+
+
+def test_timeline_only_returns_submitted_and_published_message_events(tmp_path: Path) -> None:
+    hub = MemoryHub(tmp_path / "ledger.sqlite3")
+    hub.append(episode(source_event_id="user-1", episode_type="user_message", body="正式问题"))
+    hub.append(episode(source_event_id="candidate-1", episode_type="ai_candidate", body="未发布候选"))
+    hub.append(
+        episode(
+            source_event_id="ai-1", episode_type="ai_message", body="正式回答",
+            metadata={"message_id": "ai-1", "state": "published", "kind": "ai_chat"},
+        )
+    )
+
+    timeline = hub.timeline("partner-main")
+
+    assert [item["body"] for item in timeline] == ["正式问题", "正式回答"]
+    assert timeline[1]["metadata"]["state"] == "published"

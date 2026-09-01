@@ -10,13 +10,18 @@ from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.governance import RouterGovernance, classify_regime
 from ai_trading_companion.learning import JudgmentLifecycle, WorkflowEvolution
-from ai_trading_companion.packet_builder import RuntimePacketBuilder
-from ai_trading_companion.projection import LearningProjectionRenderer
+from ai_trading_companion.packet_builder import RuntimePacketBuilder as _RuntimePacketBuilder
+from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.router import CognitiveRouter
 from ai_trading_companion.store import CompanionStore
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def RuntimePacketBuilder(*args, **kwargs):
+    kwargs.setdefault("memory", InMemoryMemoryAdapter())
+    return _RuntimePacketBuilder(*args, **kwargs)
 
 
 class CompanionLearningTests(unittest.TestCase):
@@ -94,13 +99,18 @@ class CompanionLearningTests(unittest.TestCase):
         })
 
         self.assertEqual("incorrect", self.store.judgment_snapshots(cycle["cycle_id"])[0]["verification_status"])
-        packet = RuntimePacketBuilder(PROJECT_ROOT / "resources", PROJECT_ROOT / "data", self.store).build(
+        memory = InMemoryMemoryAdapter()
+        memory.append({
+            "memory_space_id": "ai-trading-companion", "source_system": "test", "source_event_id": "failed-case",
+            "content_hash": "test", "episode_type": "outcome", "body": "603179的方向验证错误，价格没有按预期走强。",
+            "occurred_at": "2026-08-26T08:10:00Z", "known_at": "2026-08-26T08:10:00Z", "submitted_at": "2026-08-26T08:10:00Z",
+            "authority": "test", "protocol_version": "memoryhub/v1",
+        })
+        packet = RuntimePacketBuilder(PROJECT_ROOT / "resources", PROJECT_ROOT / "data", self.store, memory=memory).build(
             cycle, "m0_compose", evidence={"sources": [{"title": "603179"}]}, as_of="2026-08-26T09:00:00Z"
         )
         self.assertIn("验证错误", json.dumps(packet["memories"], ensure_ascii=False))
-        with self.store.connection() as connection:
-            audit = connection.execute("SELECT selected_artifact_ids_json FROM memory_retrieval_audit ORDER BY created_at DESC LIMIT 1").fetchone()
-        self.assertIn(packet["memories"][0]["artifact_id"], json.loads(audit[0]))
+        self.assertTrue(packet["memories"][0]["episode_id"].startswith("test-episode-"))
 
     def test_workflow_change_requires_approval_and_can_rollback(self):
         cycle = self.cycle("daily.execution.0945", "2026-08-25T09:45:00+08:00", "2026-08-25T01:45:00Z")
@@ -315,22 +325,19 @@ class CompanionLearningTests(unittest.TestCase):
             schema = json.loads((PROJECT_ROOT / "resources" / "contracts" / name).read_text(encoding="utf-8"))
             check(schema, name)
 
-    def test_markdown_memory_is_a_rebuildable_projection_not_the_fact_source(self):
+    def test_learning_state_remains_in_database_without_file_projection(self):
         cycle = self.cycle("daily.execution.0945", "2026-08-25T09:45:00+08:00", "2026-08-25T01:45:00Z")
         artifact = self.store.append_artifact(cycle["cycle_id"], "m1", "model", "603179短线看多。", "2026-08-25T02:00:00Z")
         JudgmentLifecycle(self.store).capture(artifact, "m1", artifact["kind"] + " 603179短线看多。")
 
-        path = LearningProjectionRenderer(Path(self.temp.name), self.store).render()
-
-        text = path.read_text(encoding="utf-8")
-        self.assertIn("由确定性 renderer", text)
-        self.assertIn("603179", text)
+        self.assertTrue(any("603179" in row["snapshot_json"] for row in self.store.judgment_snapshots()))
+        self.assertEqual([], list(Path(self.temp.name).rglob("*.md")))
 
     def test_asr_lexicon_uses_current_task_context_without_copying_sentences(self):
         context = Path(self.temp.name) / "current-task.context.txt"
         context.write_text("新泉股份准备观察，机器人链相对地位需要核实。", encoding="utf-8")
 
-        words = lexicon(PROJECT_ROOT, context)
+        words = lexicon(context)
 
         self.assertIn("新泉股份准备观察", words)
         self.assertIn("机器人链相对地位需要核实", words)

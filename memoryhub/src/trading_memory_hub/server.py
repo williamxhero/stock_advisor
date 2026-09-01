@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .core import EpisodeConflict, MemoryHub, MemoryHubError, SourceIntegrityError
-from .sources import ArticleArchiveSourceAdapter, MarketHubSourceAdapter
+from .sources import ArticleArchiveSourceAdapter, MarketHubSourceAdapter, SourceUnavailable
 from .derivation import DerivationWorker, OllamaExtractor
 from .backup import BackupManager, BackupWorker
 
@@ -29,6 +29,8 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
                 self._do_get()
             except SourceIntegrityError as error:
                 self._reply(HTTPStatus.CONFLICT, {"error": "source_integrity", "detail": str(error)})
+            except SourceUnavailable as error:
+                self._reply(HTTPStatus.BAD_GATEWAY, {"error": "source_unavailable", "detail": str(error)})
             except (MemoryHubError, TypeError, ValueError) as error:
                 self._reply(HTTPStatus.BAD_REQUEST, {"error": "invalid_request", "detail": str(error)})
 
@@ -50,7 +52,7 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
                 result = hub.admin_episodes(
                     _first(query, "memory_space_id") or "",
                     cursor=int(cursor) if cursor else None,
-                    limit=int(_first(query, "limit") or "50"),
+                    limit=min(int(_first(query, "limit") or "50"), 200),
                     **_admin_episode_filters(query),
                 )
                 self._reply(HTTPStatus.OK, {"result": result})
@@ -66,11 +68,15 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
             elif request.path == "/v1/admin/snapshots":
                 query = parse_qs(request.query)
                 self._reply(HTTPStatus.OK, {"result": hub.admin_snapshots(
-                    _first(query, "memory_space_id") or "", limit=int(_first(query, "limit") or "100"))})
+                    _first(query, "memory_space_id") or "",
+                    cursor=int(_first(query, "cursor")) if _first(query, "cursor") else None,
+                    limit=int(_first(query, "limit") or "100"))})
             elif request.path == "/v1/admin/retrieval-audits":
                 query = parse_qs(request.query)
                 self._reply(HTTPStatus.OK, {"result": hub.admin_retrieval_audits(
-                    _first(query, "memory_space_id") or "", limit=int(_first(query, "limit") or "100"))})
+                    _first(query, "memory_space_id") or "",
+                    cursor=int(_first(query, "cursor")) if _first(query, "cursor") else None,
+                    limit=int(_first(query, "limit") or "100"))})
             elif request.path.startswith("/v1/admin/retrieval-bundles/"):
                 bundle_id = unquote(request.path.removeprefix("/v1/admin/retrieval-bundles/"))
                 self._reply(HTTPStatus.OK, {"result": hub.replay_bundle(bundle_id)})

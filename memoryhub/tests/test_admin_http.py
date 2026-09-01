@@ -9,15 +9,19 @@ from urllib.request import urlopen
 
 from trading_memory_hub import MemoryHub
 from trading_memory_hub.server import make_server
+from trading_memory_hub.sources import SourceUnavailable
 
 
 class ControllableSource:
     def __init__(self) -> None:
         self.body = "权威原文：机器人订单增长。"
         self.calls = 0
+        self.available = True
 
     def hydrate(self, reference: dict[str, str]) -> dict[str, str]:
         self.calls += 1
+        if not self.available:
+            raise SourceUnavailable("authority source is offline")
         return {"title": "权威记录", "body": self.body, "occurred_at": reference["date"] + "T00:00:00Z"}
 
     def health(self) -> dict[str, str]:
@@ -164,6 +168,13 @@ def test_external_source_is_hydrated_only_on_explicit_admin_request(tmp_path: Pa
         detail = get_json(base_url, f"/v1/admin/episodes/{receipt.episode_id}")
         assert source.calls == 1
         hydrated = get_json(base_url, f"/v1/admin/episodes/{receipt.episode_id}/source")
+        source.available = False
+        try:
+            get_json(base_url, f"/v1/admin/episodes/{receipt.episode_id}/source")
+            raise AssertionError("offline authority source must return a retryable HTTP error")
+        except HTTPError as error:
+            unavailable_status = error.code
+        source.available = True
         source.body = "被修改的原文"
         try:
             get_json(base_url, f"/v1/admin/episodes/{receipt.episode_id}/source")
@@ -179,6 +190,7 @@ def test_external_source_is_hydrated_only_on_explicit_admin_request(tmp_path: Pa
     assert detail["result"]["episode"]["body"] is None
     assert hydrated["result"]["body"] == "权威原文：机器人订单增长。"
     assert hydrated["result"]["retrieval"] == "on_demand"
+    assert unavailable_status == 502
     assert integrity_status == 409
     assert detail_after_failure["result"]["episode"]["episode_id"] == receipt.episode_id
     assert MemoryHub(database).health()["ledger"]["episodes"] == 1
@@ -190,14 +202,17 @@ def test_retrieval_audit_has_a_separate_read_only_workspace(tmp_path: Path) -> N
     hub.append({**episode("evidence"), "episode_type": "evidence", "body": "机器人订单增长证据"})
     snapshot = hub.begin_snapshot("partner-main", as_of="2026-08-31T02:00:00Z", stage="chat")
     bundle = hub.retrieve_bundle(snapshot.snapshot_id, "机器人", limit=10)
+    newer_snapshot = hub.begin_snapshot("partner-main", as_of="2026-08-31T03:00:00Z", stage="reflection")
+    hub.retrieve_bundle(newer_snapshot.snapshot_id, "订单", limit=10)
 
     server = make_server("127.0.0.1", 0, database, source_adapters={})
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base_url = f"http://127.0.0.1:{server.server_port}"
     try:
-        snapshots = get_json(base_url, "/v1/admin/snapshots?memory_space_id=partner-main")
-        audits = get_json(base_url, "/v1/admin/retrieval-audits?memory_space_id=partner-main")
+        snapshots = get_json(base_url, "/v1/admin/snapshots?memory_space_id=partner-main&limit=1")
+        snapshot_next = get_json(base_url, "/v1/admin/snapshots?memory_space_id=partner-main&limit=1&cursor=" + snapshots["result"]["next_cursor"])
+        audits = get_json(base_url, "/v1/admin/retrieval-audits?memory_space_id=partner-main&limit=1")
         replay = get_json(base_url, f"/v1/admin/retrieval-bundles/{bundle['bundle_id']}")
         episodes = get_json(base_url, "/v1/admin/episodes?memory_space_id=partner-main")
         timeline = get_json(base_url, "/v1/admin/timeline?memory_space_id=partner-main")
@@ -206,9 +221,36 @@ def test_retrieval_audit_has_a_separate_read_only_workspace(tmp_path: Path) -> N
         thread.join()
         server.server_close()
 
-    assert snapshots["result"]["items"][0]["watermark"] == 1
-    assert audits["result"]["items"][0]["query"] == "机器人"
+    assert snapshots["result"]["items"][0]["stage"] == "reflection"
+    assert snapshot_next["result"]["items"][0]["stage"] == "chat"
+    assert audits["result"]["items"][0]["query"] == "订单"
+    assert audits["result"]["items"][0]["bundle_id"]
     assert audits["result"]["items"][0]["versions"]["policy"] == "memory-policy/v1"
     assert replay["result"]["bundle_id"] == bundle["bundle_id"]
     assert [item["episode_type"] for item in episodes["result"]["items"]] == ["evidence"]
     assert timeline["result"] == []
+
+
+def test_admin_surface_is_packaged_accessible_and_has_no_mutation_calls(tmp_path: Path) -> None:
+    server = make_server("127.0.0.1", 0, tmp_path / "ledger.sqlite3", source_adapters={})
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urlopen(base_url + "/admin/") as response:
+            html = response.read().decode("utf-8")
+        with urlopen(base_url + "/admin/assets/admin.js") as response:
+            script = response.read().decode("utf-8")
+        with urlopen(base_url + "/admin/assets/admin.css") as response:
+            stylesheet = response.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+    assert 'lang="zh-CN"' in html
+    assert 'aria-label="记忆空间"' in html
+    assert 'aria-label="搜索记忆"' in html
+    assert "prefers-reduced-motion" in stylesheet
+    assert "method: 'POST'" not in script
+    assert all(term not in html + script for term in ("clear/prepare", "promotions", "删除记忆", "修改记忆"))

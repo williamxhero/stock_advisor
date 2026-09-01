@@ -664,7 +664,7 @@ class MemoryHub:
     ) -> dict[str, Any]:
         if not memory_space_id:
             raise MemoryHubError("admin episode listing requires memory_space_id")
-        page_size = max(1, min(int(limit), 200))
+        page_size = max(1, min(int(limit), 10000))
         clauses = ["e.memory_space_id=?"]
         values: list[Any] = [memory_space_id]
         if cursor is not None:
@@ -747,26 +747,44 @@ class MemoryHub:
         return {**hydrated, "source_reference": reference, "retrieval": "on_demand",
                 "content_hash": row["content_hash"], "protocol_version": PROTOCOL_VERSION}
 
-    def admin_snapshots(self, memory_space_id: str, *, limit: int = 100) -> dict[str, Any]:
+    def admin_snapshots(
+        self, memory_space_id: str, *, cursor: int | None = None, limit: int = 100
+    ) -> dict[str, Any]:
+        clauses, values = ["memory_space_id=?"], [memory_space_id]
+        if cursor is not None:
+            clauses.append("rowid<?")
+            values.append(int(cursor))
+        page_size = max(1, min(int(limit), 200))
+        values.append(page_size + 1)
         with self._connection() as connection:
             rows = list(connection.execute(
-                """SELECT * FROM memory_snapshot WHERE memory_space_id=?
-                   ORDER BY rowid DESC LIMIT ?""",
-                (memory_space_id, max(1, min(int(limit), 200))),
+                f"""SELECT rowid AS admin_cursor,* FROM memory_snapshot
+                    WHERE {' AND '.join(clauses)} ORDER BY rowid DESC LIMIT ?""", values,
             ))
-        return {"items": [dict(row) for row in rows], "protocol_version": PROTOCOL_VERSION}
+        items = [dict(row) for row in rows[:page_size]]
+        return {"items": items, "next_cursor": str(items[-1]["admin_cursor"])
+                if len(rows) > page_size else None, "protocol_version": PROTOCOL_VERSION}
 
-    def admin_retrieval_audits(self, memory_space_id: str, *, limit: int = 100) -> dict[str, Any]:
+    def admin_retrieval_audits(
+        self, memory_space_id: str, *, cursor: int | None = None, limit: int = 100
+    ) -> dict[str, Any]:
+        clauses, values = ["s.memory_space_id=?"], [memory_space_id]
+        if cursor is not None:
+            clauses.append("a.rowid<?")
+            values.append(int(cursor))
+        page_size = max(1, min(int(limit), 200))
+        values.append(page_size + 1)
         with self._connection() as connection:
             rows = list(connection.execute(
-                """SELECT a.value_json FROM retrieval_audit a
+                f"""SELECT a.rowid AS admin_cursor,a.value_json,b.bundle_id FROM retrieval_audit a
                    JOIN retrieval_bundle b ON b.audit_id=a.audit_id
                    JOIN memory_snapshot s ON s.snapshot_id=b.snapshot_id
-                   WHERE s.memory_space_id=? ORDER BY a.rowid DESC LIMIT ?""",
-                (memory_space_id, max(1, min(int(limit), 200))),
+                   WHERE {' AND '.join(clauses)} ORDER BY a.rowid DESC LIMIT ?""", values,
             ))
-        return {"items": [_loads(row["value_json"]) for row in rows],
-                "protocol_version": PROTOCOL_VERSION}
+        items = [{**_loads(row["value_json"]), "bundle_id": row["bundle_id"],
+                  "admin_cursor": row["admin_cursor"]} for row in rows[:page_size]]
+        return {"items": items, "next_cursor": str(items[-1]["admin_cursor"])
+                if len(rows) > page_size else None, "protocol_version": PROTOCOL_VERSION}
 
     def export_space(self, memory_space_id: str) -> dict[str, Any]:
         if not memory_space_id:

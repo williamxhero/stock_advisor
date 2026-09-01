@@ -253,6 +253,9 @@ class EvidenceV3Tests(TestCase):
             engine.research_started(cycle["cycle_id"])
             engine.research_failed(cycle["cycle_id"], "evidence rejected", details={"problems": ["foreign ref"]})
             self.assertEqual([], store.artifacts(cycle["cycle_id"]))
+            failed_event = next(event for event in store.pending_events() if event["event_type"] == "research.failed")
+            payload = json.loads(failed_event["payload_json"])
+            self.assertEqual("companion-published-message/v2", payload["message"]["contract"])
             with store.connection() as connection:
                 checkpoint = connection.execute("SELECT 1 FROM stage_checkpoint WHERE cycle_id=?", (cycle["cycle_id"],)).fetchone()
             self.assertIsNone(checkpoint)

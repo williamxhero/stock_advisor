@@ -203,7 +203,13 @@ class CompanionEngine:
     def research_failed(self, cycle_id: str, reason: str, *, details: dict[str, Any] | None = None) -> dict[str, Any]:
         message = self._stage_failure_message("M0", reason, details)
         cycle = self.store.transition(cycle_id, "failed")
-        self._emit_failure(cycle, "research.failed", message, reason)
+        presented = self.present_for_publication(message, iso(utc_now()), "system_fault")
+        self.emit(cycle, "research.failed", {
+            "cycle": cycle, "reason": presented.markdown,
+            "presentation": presented.metadata()["presentation"],
+            "message": presented.message(),
+            "diagnostic_code": self._diagnostic_code(reason),
+        })
         return cycle
 
     def research_retrying(self, cycle_id: str, reason: str, attempt: int) -> dict[str, Any]:

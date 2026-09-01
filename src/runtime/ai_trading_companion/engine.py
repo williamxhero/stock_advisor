@@ -10,7 +10,7 @@ from .learning import JudgmentLifecycle
 from .evidence_contract import EvidenceContractFactory
 from .message_presentation import MessageQualificationError, PresentedMessage, present_message, repair_message_draft
 from .publication_registry import published_event_types
-from .stage_expression import express_stage_semantics
+from .stage_expression import normalize_stage_output
 from .models import TASK_POLICIES
 from .secret_guard import assert_safe
 from .task_profiles import ManualAnalysisProfileResolver
@@ -247,7 +247,7 @@ class CompanionEngine:
         self.store.verified_attempt(evidence_attempt_id, cycle_id, "m0_research", evidence_packet_hash)
         compose_attempt = self.store.verified_attempt(compose_attempt_id, cycle_id, "m0_compose", packet_hash)
         compose_output = json.loads(compose_attempt.get("output_json") or "null")
-        verified_m0 = express_stage_semantics("m0", compose_output["semantic"]) if isinstance(compose_output, dict) and isinstance(compose_output.get("semantic"), dict) else compose_output.get("m0_markdown") if isinstance(compose_output, dict) else None
+        verified_m0 = normalize_stage_output("m0_compose", compose_output if isinstance(compose_output, dict) else {}).text
         if verified_m0 != m0:
             raise ValueError("M0 body does not match the verified compose attempt")
         ready_at = utc_now()
@@ -602,11 +602,12 @@ class CompanionEngine:
         self.store.verified_attempt(research_attempt_id, cycle_id, "m1_research", research_packet_hash)
         judgment_attempt = self.store.verified_attempt(judgment_attempt_id, cycle_id, "m1_judgment", judgment_packet_hash)
         verified_output = json.loads(judgment_attempt.get("output_json") or "null")
-        verified_m1 = express_stage_semantics("m1", verified_output["semantic"]) if isinstance(verified_output, dict) and isinstance(verified_output.get("semantic"), dict) else verified_output.get("m1_markdown") if isinstance(verified_output, dict) else None
+        normalized_output = normalize_stage_output("m1_judgment", verified_output if isinstance(verified_output, dict) else {})
+        verified_m1 = normalized_output.text
         if verified_m1 != m1:
             raise ValueError("M1 body does not match the verified judgment attempt")
-        verified_snapshot = verified_output.get("snapshot") if isinstance(verified_output.get("snapshot"), dict) else snapshot
-        verified_qualified = bool(verified_output.get("judgment_qualified", qualified))
+        verified_snapshot = normalized_output.snapshot or snapshot
+        verified_qualified = normalized_output.qualified if normalized_output.qualified is not None else qualified
         if isinstance(verified_snapshot, dict) and bool(verified_snapshot.get("qualified")) != verified_qualified:
             raise ValueError("M1 judgment qualification conflicts with the verified snapshot")
         if snapshot is not None and verified_output.get("snapshot") is not None and snapshot != verified_output.get("snapshot"):
@@ -684,7 +685,7 @@ class CompanionEngine:
         cycle = self.store.get_cycle(cycle_id)
         verified_attempt = self.store.verified_attempt(attempt_id, cycle_id, "m2", packet_hash)
         verified_output = json.loads(verified_attempt.get("output_json") or "null")
-        verified_m2 = express_stage_semantics("m2", verified_output["semantic"]) if isinstance(verified_output, dict) and isinstance(verified_output.get("semantic"), dict) else verified_output.get("m2_markdown") if isinstance(verified_output, dict) else None
+        verified_m2 = normalize_stage_output("m2", verified_output if isinstance(verified_output, dict) else {}).text
         if verified_m2 != m2:
             raise ValueError("M2 body does not match the verified synthesis attempt")
         if not cycle.get("has_h0"):

@@ -204,6 +204,30 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertFalse(conflict["passed"])
         self.assertIn("judgment_qualification_conflicts_with_snapshot", conflict["problems"])
 
+    def test_v2_m1_uses_semantic_qualification_and_checks_snapshot_boundaries(self):
+        router = CognitiveRouter()
+        semantic = {
+            "summary": "核心承接改善。", "direction": "bullish", "qualified": True,
+            "triggers": ["核心同步转强"], "invalidations": ["放量跌破"],
+            "risks": ["冲高回落"], "unknowns": ["扩散持续性"],
+        }
+        snapshot = {
+            "direction": "bullish", "qualified": True,
+            "triggers": ["核心同步转强"], "invalidations": ["放量跌破"],
+            "risks": ["冲高回落"], "unknowns": ["扩散持续性"],
+        }
+
+        accepted = router.verify("m1_judgment", {"task_key": "daily.review.1520"}, {
+            "semantic": semantic, "snapshot": snapshot,
+        })
+        conflicting = router.verify("m1_judgment", {"task_key": "daily.review.1520"}, {
+            "semantic": {**semantic, "direction": "bearish"}, "snapshot": snapshot,
+        })
+
+        self.assertTrue(accepted["passed"], accepted["problems"])
+        self.assertFalse(conflicting["passed"])
+        self.assertIn("judgment_semantic_conflicts_with_snapshot", conflicting["problems"])
+
     def test_packet_and_verifier_reject_a_false_non_trading_day_m0(self):
         class TradingDayCalendar:
             @staticmethod
@@ -234,6 +258,18 @@ class CompanionLearningTests(unittest.TestCase):
         action_leak = CognitiveRouter().verify("m0_compose", packet, {
             "m0_markdown": "今天的可执行建议为：不新增仓、不加仓、不减仓，建议卖出股数为0。",
         })
+        v2_action_leak = CognitiveRouter().verify("m0_compose", packet, {
+            "semantic": {
+                "summary": "今天建议买入核心股。", "observations": ["可以加仓"],
+                "risks": [], "unknowns": [],
+            },
+        })
+        v2_direction_leak = CognitiveRouter().verify("m0_compose", packet, {
+            "semantic": {
+                "summary": "当前方向偏多。", "observations": ["后续继续看多"],
+                "risks": [], "unknowns": [],
+            },
+        })
 
         self.assertFalse(rejected["passed"])
         self.assertIn("m0_calendar_context_conflict", rejected["problems"])
@@ -241,6 +277,10 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertTrue(accepted["passed"])
         self.assertFalse(action_leak["passed"])
         self.assertIn("m0_contains_direction_or_action", action_leak["problems"])
+        self.assertFalse(v2_action_leak["passed"])
+        self.assertIn("m0_contains_direction_or_action", v2_action_leak["problems"])
+        self.assertFalse(v2_direction_leak["passed"])
+        self.assertIn("m0_contains_direction_or_action", v2_direction_leak["problems"])
 
     def test_router_store_queues_frozen_shadow_with_daily_budget(self):
         cycle = self.cycle("daily.execution.1430", "2026-08-25T14:30:00+08:00", "2026-08-25T06:30:00Z")

@@ -1,6 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
+
+
+@dataclass(frozen=True)
+class NormalizedStageOutput:
+    stage: str
+    semantic: dict[str, Any]
+    snapshot: dict[str, Any]
+    text: str
+    qualified: bool | None
+    legacy: bool
 
 
 def express_stage_semantics(stage: str, semantic: dict[str, Any]) -> str:
@@ -34,3 +45,35 @@ def legacy_stage_semantics(stage: str, markdown: str, snapshot: dict[str, Any] |
             if key in snapshot:
                 result[key] = snapshot[key]
     return result
+
+
+def normalize_stage_output(stage: str, output: dict[str, Any]) -> NormalizedStageOutput:
+    """Give v2 semantics and read-only v1 results one canonical runtime shape."""
+    snapshot = dict(output.get("snapshot") or {}) if isinstance(output.get("snapshot"), dict) else {}
+    semantic = output.get("semantic")
+    legacy = not isinstance(semantic, dict)
+    if legacy:
+        field = {"m0_compose": "m0_markdown", "m1_judgment": "m1_markdown", "m2": "m2_markdown"}.get(stage)
+        if field is None:
+            return NormalizedStageOutput(stage, {}, snapshot, "", None, True)
+        semantic = legacy_stage_semantics(stage.removesuffix("_compose").removesuffix("_judgment"), str(output.get(field) or ""), snapshot)
+        text = str(output.get(field) or "")
+        qualified = (
+            bool(output["judgment_qualified"]) if stage == "m1_judgment" and "judgment_qualified" in output
+            else bool(snapshot["qualified"]) if stage in {"m1_judgment", "m2"} and "qualified" in snapshot
+            else None
+        )
+    else:
+        semantic = dict(semantic)
+        text = express_stage_semantics(stage.removesuffix("_compose").removesuffix("_judgment"), semantic)
+        qualified = bool(semantic.get("qualified")) if stage in {"m1_judgment", "m2"} else None
+    return NormalizedStageOutput(stage, semantic, snapshot, text, qualified, legacy)
+
+
+def semantic_snapshot_conflicts(result: NormalizedStageOutput) -> tuple[str, ...]:
+    if result.legacy or result.stage not in {"m1_judgment", "m2"}:
+        return ()
+    return tuple(
+        key for key in ("direction", "qualified", "triggers", "invalidations", "risks", "unknowns")
+        if result.semantic.get(key) != result.snapshot.get(key)
+    )

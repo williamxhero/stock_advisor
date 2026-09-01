@@ -45,7 +45,7 @@ from .scheduler import SHANGHAI, conversation_auto_submit_at, ensure_registered_
 from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
 from .runtime_strategy_policy import RuntimeStrategyControls, RuntimeStrategyPolicy
-from .stage_expression import express_stage_semantics, legacy_stage_semantics
+from .stage_expression import normalize_stage_output
 from .local_research import (
     BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
     ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend,
@@ -866,9 +866,9 @@ def run_research(
                 )
                 m0_output, compose_attempt_id = compose_stage.output, compose_stage.attempt_id
                 store.save_stage_checkpoint(cycle["cycle_id"], "m0_compose", local_packet["sha256"], compose_attempt_id, m0_output)
-            m0_semantic = m0_output.get("semantic") if isinstance(m0_output.get("semantic"), dict) else legacy_stage_semantics("m0", m0_output["m0_markdown"])
+            m0_result = normalize_stage_output("m0_compose", m0_output)
             ready = engine.research_ready(
-                cycle["cycle_id"], express_stage_semantics("m0", m0_semantic),
+                cycle["cycle_id"], m0_result.text,
                 evidence_attempt_id=evidence_attempt_id, compose_attempt_id=compose_attempt_id,
                 evidence_packet_hash=public_packet["sha256"], packet_hash=local_packet["sha256"],
                 evidence_as_of=evidence.get("as_of"),
@@ -987,12 +987,12 @@ def run_m1(
                 )
                 judgment, judgment_attempt_id = judgment_stage.output, judgment_stage.attempt_id
                 store.save_stage_checkpoint(cycle_id, "m1_judgment", local_packet["sha256"], judgment_attempt_id, judgment)
-            m1_semantic = judgment.get("semantic") if isinstance(judgment.get("semantic"), dict) else legacy_stage_semantics("m1", judgment["m1_markdown"], judgment.get("snapshot"))
+            m1_result = normalize_stage_output("m1_judgment", judgment)
             return engine.m1_ready(
-                cycle_id, express_stage_semantics("m1", m1_semantic), as_of=evidence.get("as_of"),
+                cycle_id, m1_result.text, as_of=evidence.get("as_of"),
                 research_attempt_id=evidence_attempt_id, judgment_attempt_id=judgment_attempt_id,
                 research_packet_hash=public_packet["sha256"], judgment_packet_hash=local_packet["sha256"],
-                snapshot=judgment.get("snapshot"), qualified=bool(m1_semantic.get("qualified", judgment.get("judgment_qualified"))),
+                snapshot=m1_result.snapshot, qualified=bool(m1_result.qualified),
             )
         except Exception as exc:
             try:
@@ -1034,9 +1034,9 @@ def run_m2(engine: CompanionEngine, store: CompanionStore, cycle_id: str, execut
         search=False, timeout=timeout, frozen_controls=controls,
     )
     store.save_stage_checkpoint(cycle_id, "m2", packet["sha256"], stage_result.attempt_id, stage_result.output)
-    m2_semantic = stage_result.output.get("semantic") if isinstance(stage_result.output.get("semantic"), dict) else legacy_stage_semantics("m2", stage_result.output["m2_markdown"], stage_result.output.get("snapshot"))
+    m2_result = normalize_stage_output("m2", stage_result.output)
     return engine.m2_ready(
-        cycle_id, express_stage_semantics("m2", m2_semantic), snapshot=stage_result.output.get("snapshot"), as_of=frozen_as_of,
+        cycle_id, m2_result.text, snapshot=m2_result.snapshot, as_of=frozen_as_of,
         attempt_id=stage_result.attempt_id, packet_hash=packet["sha256"],
     )
 

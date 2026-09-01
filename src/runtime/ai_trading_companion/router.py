@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from .effort_policy import CognitiveEffortPolicy, EffortPolicyFacts
+from .stage_expression import normalize_stage_output, semantic_snapshot_conflicts
 
 
 RESEARCH_STAGES = frozenset({"m0_research", "m1_research", "outcome_research", "chat_research"})
@@ -148,12 +149,14 @@ class CognitiveRouter:
     def verify(self, stage: str, packet: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
         problems: list[str] = []
         profile = self.profile(stage, packet, 1)
+        normalized = normalize_stage_output(stage, output)
         if stage == "m0_compose":
             calendar = packet.get("calendar_context") if isinstance(packet.get("calendar_context"), dict) else {}
-            body = "".join(str(output.get("m0_markdown") or "").split()).lower()
+            body = "".join(normalized.text.split()).lower()
             if any(marker in body for marker in (
                 "建议买入", "建议卖出", "建议加仓", "建议减仓", "不新增仓", "不加仓", "不减仓", "不清仓",
                 "买入股数", "卖出股数", "持有观察", "今日动作",
+                "看多", "看空", "偏多", "偏空", "做多", "做空", "bullish", "bearish",
             )):
                 problems.append("m0_contains_direction_or_action")
             if calendar.get("is_xshg_trading_day") is True and any(marker in body for marker in (
@@ -169,9 +172,11 @@ class CognitiveRouter:
                     problems.append("m0_calendar_weekday_conflict")
         if stage == "m1_judgment" and not profile.m1_blind:
             problems.append("m1_packet_contains_human_input")
-        snapshot = output.get("snapshot") if isinstance(output.get("snapshot"), dict) else None
-        if stage == "m1_judgment" and snapshot is not None and bool(output.get("judgment_qualified")) != bool(snapshot.get("qualified")):
+        snapshot = normalized.snapshot or None
+        if stage == "m1_judgment" and snapshot is not None and normalized.qualified != bool(snapshot.get("qualified")):
             problems.append("judgment_qualification_conflicts_with_snapshot")
+        if semantic_snapshot_conflicts(normalized):
+            problems.append("judgment_semantic_conflicts_with_snapshot")
         if stage in {"m1_judgment", "m2"} and snapshot:
             if snapshot.get("qualified") and snapshot.get("direction") in {"unknown", "unqualified"}:
                 problems.append("qualified_snapshot_has_no_direction")

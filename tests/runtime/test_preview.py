@@ -10,9 +10,10 @@ from unittest.mock import patch
 
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.preview import (
-    BUNDLE_SCHEMA_VERSION, approve_bundle, build_bundle, prepare_preview_home, preview_signing_key, seal_bundle,
+    BUNDLE_SCHEMA_VERSION, approve_bundle, build_bundle, prepare_preview_home, preview_signing_key, seal_bundle, verify_bundle,
     source_fingerprint,
 )
+from ai_trading_companion.stage_expression import express_stage_semantics
 from ai_trading_companion.store import CompanionStore
 
 
@@ -191,6 +192,60 @@ class PreviewTests(unittest.TestCase):
         seal_bundle(invalid_m2, signing_key)
         with self.assertRaisesRegex(ValueError, "qualified frozen M1"):
             approve_bundle(self.store, invalid_m2, signing_key=signing_key)
+
+        v2_bundle = copy.deepcopy(bundle)
+        v2_bundle["preview_id"] = "preview-approval-v2"
+        v2_outputs = {
+            "m0_compose": {"semantic": {
+                "summary": "先看客观承接。", "observations": ["核心仍有分化"],
+                "risks": ["量能不足"], "unknowns": ["扩散强度"],
+            }},
+            "m1_judgment": {"semantic": {
+                "summary": "承接有所改善。", "direction": "bullish", "qualified": True,
+                "triggers": ["核心同步转强"], "invalidations": ["放量跌破"],
+                "risks": ["冲高回落"], "unknowns": ["扩散持续性"],
+            }, "snapshot": {
+                "direction": "bullish", "qualified": True,
+                "triggers": ["核心同步转强"], "invalidations": ["放量跌破"],
+                "risks": ["冲高回落"], "unknowns": ["扩散持续性"],
+            }},
+        }
+        for stage, output in v2_outputs.items():
+            next(item for item in v2_bundle["attempts"] if item["stage"] == stage)["output"] = output
+            checkpoint = next(item for item in v2_bundle["stage_checkpoints"] if item["stage"] == stage)
+            checkpoint["output"] = output
+            raw = json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            checkpoint["output_sha256"] = hashlib.sha256(raw.encode()).hexdigest()
+        for kind, stage in (("m0", "m0_compose"), ("m1", "m1_judgment")):
+            artifact_item = next(item for item in v2_bundle["artifacts"] if item["kind"] == kind)
+            semantic = v2_outputs[stage]["semantic"]
+            artifact_item["body_markdown"] = express_stage_semantics(kind, semantic)
+            artifact_item["body_sha256"] = hashlib.sha256(artifact_item["body_markdown"].encode()).hexdigest()
+        v2_m2 = {"semantic": {
+            "summary": "综合后仍以承接确认优先。", "direction": "bullish", "qualified": True,
+            "triggers": ["核心同步转强"], "invalidations": ["放量跌破"],
+            "risks": ["冲高回落"], "unknowns": ["扩散持续性"],
+        }, "snapshot": {
+            "direction": "bullish", "qualified": True,
+            "triggers": ["核心同步转强"], "invalidations": ["放量跌破"],
+            "risks": ["冲高回落"], "unknowns": ["扩散持续性"],
+        }}
+        v2_bundle["attempts"].append({
+            "attempt_id": "a-v2-m2", "stage": "m2", "attempt_number": 1, "status": "succeeded",
+            "as_of": known_at, "started_at": known_at, "completed_at": known_at,
+            "input_sha256": m2_hash, "output_sha256": "v2-m2", "verifier": {"passed": True},
+            "usage": {}, "tool_trace": [], "input_packet": m2_packet, "output": v2_m2,
+        })
+        v2_m2_raw = json.dumps(v2_m2, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        v2_bundle["stage_checkpoints"].append({
+            "cycle_id": "preview-cycle", "stage": "m2", "packet_sha256": m2_hash,
+            "attempt_id": "a-v2-m2", "output": v2_m2,
+            "output_sha256": hashlib.sha256(v2_m2_raw.encode()).hexdigest(), "created_at": known_at,
+        })
+        v2_bundle["artifacts"].append(artifact("m2", express_stage_semantics("m2", v2_m2["semantic"])))
+        seal_bundle(v2_bundle, signing_key)
+
+        verify_bundle(v2_bundle, require_qualified=True, signing_key=signing_key)
 
         with patch("ai_trading_companion.broker_client.ProviderBrokerClient.invoke", side_effect=AssertionError("broker must not run")):
             with ThreadPoolExecutor(max_workers=2) as executor:

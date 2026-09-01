@@ -19,6 +19,7 @@ from .config import settings_path
 from .evidence_gate import EvidenceGate
 from .router import CognitiveRouter
 from .secret_guard import assert_safe
+from .stage_expression import normalize_stage_output
 from .store import CompanionStore, digest, now
 
 
@@ -335,29 +336,28 @@ def verify_bundle(
             if not evidence_verifier.get("passed"):
                 raise ValueError(f"evidence gate rejected frozen output: {stage}")
     if "m2" in required_stages:
-        m1_output = checkpoints["m1_judgment"]["output"]
-        m1_snapshot = m1_output.get("snapshot") if isinstance(m1_output.get("snapshot"), dict) else {}
-        if not bool(m1_output.get("judgment_qualified")) or not bool(m1_snapshot.get("qualified")):
+        m1_result = normalize_stage_output("m1_judgment", checkpoints["m1_judgment"]["output"])
+        if not m1_result.qualified or not bool(m1_result.snapshot.get("qualified")):
             raise ValueError("M2 requires a qualified frozen M1 judgment")
     artifacts_by_kind = {artifact["kind"]: artifact for artifact in artifacts}
     bindings = {
-        "evidence": ("m0_research", None), "m0": ("m0_compose", "m0_markdown"),
-        "m1_evidence": ("m1_research", None), "m1": ("m1_judgment", "m1_markdown"),
-        "m2": ("m2", "m2_markdown"),
+        "evidence": ("m0_research", False), "m0": ("m0_compose", True),
+        "m1_evidence": ("m1_research", False), "m1": ("m1_judgment", True),
+        "m2": ("m2", True),
     }
-    for kind, (stage, field) in bindings.items():
+    for kind, (stage, is_judgment) in bindings.items():
         artifact = artifacts_by_kind.get(kind)
         if not artifact:
             continue
         output = checkpoints[stage]["output"]
-        if field is None:
+        if not is_judgment:
             try:
                 body = json.loads(artifact["body_markdown"])
             except json.JSONDecodeError as exc:
                 raise ValueError(f"invalid structured artifact: {kind}") from exc
             if body != output:
                 raise ValueError(f"artifact is not bound to checkpoint: {kind}")
-        elif artifact["body_markdown"] != output.get(field):
+        elif artifact["body_markdown"] != normalize_stage_output(stage, output).text:
             raise ValueError(f"artifact is not bound to checkpoint: {kind}")
 
 

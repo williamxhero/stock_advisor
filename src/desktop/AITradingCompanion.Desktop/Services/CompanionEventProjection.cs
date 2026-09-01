@@ -147,7 +147,7 @@ public static class CompanionEventProjection
                 case "m0.ready":
                     ai.Remove("action-pending-m0");
                     UpsertAi(ai, ReadString(payload, "source_artifact_id"), "m0", item.At,
-                        ReadString(payload, "m0"), m0StartedAt, item.At);
+                        ReadPublishedText(payload, "m0"), m0StartedAt, item.At, ReadPublishedParts(payload));
                     break;
                 case "brief.ready": // v1 compatibility
                     UpsertAi(ai, null, "m0", item.At, ReadString(payload, "brief"), m0StartedAt, item.At);
@@ -187,7 +187,7 @@ public static class CompanionEventProjection
                         ai.Remove(fault);
                     errorText = null;
                     UpsertAi(ai, ReadString(payload, "source_artifact_id"), "m1", item.At,
-                        ReadString(payload, "m1"), m1StartedAt, item.At);
+                        ReadPublishedText(payload, "m1"), m1StartedAt, item.At, ReadPublishedParts(payload));
                     break;
                 case "m1.recovered":
                     foreach (var fault in ai.Where(pair => pair.Value.Kind == "fault").Select(pair => pair.Key).ToArray())
@@ -214,7 +214,7 @@ public static class CompanionEventProjection
                         ai.Remove(fault);
                     errorText = null;
                     UpsertAi(ai, ReadString(payload, "source_artifact_id"), "m2", item.At,
-                        ReadString(payload, "m2"), m2StartedAt, item.At);
+                        ReadPublishedText(payload, "m2"), m2StartedAt, item.At, ReadPublishedParts(payload));
                     break;
                 case "chat.ready":
                     isCompanionThinking = false;
@@ -506,6 +506,9 @@ public static class CompanionEventProjection
 
     private static string? ReadPublishedText(JsonElement element) =>
         ReadNestedString(element, "message", "text_projection") ?? ReadString(element, "text");
+
+    private static string? ReadPublishedText(JsonElement element, string legacyProperty) =>
+        ReadNestedString(element, "message", "text_projection") ?? ReadString(element, legacyProperty);
 
     private static CompanionMessagePart[]? ReadPublishedParts(JsonElement element)
     {

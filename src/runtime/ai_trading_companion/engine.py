@@ -243,6 +243,7 @@ class CompanionEngine:
                 "cycle": cycle,
                 "m0": presented.markdown,
                 "presentation": presented.metadata()["presentation"],
+                "message": presented.message(),
                 "source_artifact_id": artifact["artifact_id"],
                 "h0_auto_submit_at": cycle["h0_auto_submit_at"],
                 "m1_publish_deadline": cycle["m1_publish_deadline"],
@@ -586,7 +587,7 @@ class CompanionEngine:
                 m2_started_at=completed if next_state == "synthesizing_m2" else None,
             )
             self.store.queue_event(
-                cycle_id, "m1.ready", {"cycle": cycle, "m1": presented.markdown, "presentation": presented.metadata()["presentation"], "source_artifact_id": artifact["artifact_id"]},
+                cycle_id, "m1.ready", {"cycle": cycle, "m1": presented.markdown, "presentation": presented.metadata()["presentation"], "message": presented.message(), "source_artifact_id": artifact["artifact_id"]},
                 connection=connection,
             )
             if next_state == "synthesizing_m2":
@@ -649,7 +650,7 @@ class CompanionEngine:
             )
             cycle = self.store.transition(cycle_id, "complete", connection=connection, m2_completed_at=iso(utc_now()))
             self.store.queue_event(
-                cycle_id, "m2.ready", {"cycle": cycle, "m2": presented.markdown, "presentation": presented.metadata()["presentation"], "source_artifact_id": artifact["artifact_id"]},
+                cycle_id, "m2.ready", {"cycle": cycle, "m2": presented.markdown, "presentation": presented.metadata()["presentation"], "message": presented.message(), "source_artifact_id": artifact["artifact_id"]},
                 connection=connection,
             )
         return cycle

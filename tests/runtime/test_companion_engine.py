@@ -81,6 +81,10 @@ Protocol: OpportunityDiscovery-v1.3
             message["message"]["parts"],
         )
 
+        event = next(item for item in self.store.pending_events() if item["event_type"] == "m0.ready")
+        payload = json.loads(event["payload_json"])
+        self.assertEqual("companion-published-message/v2", payload["message"]["contract"])
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.store = CompanionStore(Path(self.temp.name) / "companion.sqlite3")
@@ -313,6 +317,18 @@ Protocol: OpportunityDiscovery-v1.3
             self.publish_m1("另一份 M1")
         completed = self.publish_m2("综合后仍然偏谨慎。")
         self.assertEqual("complete", completed["state"])
+        formal_events = {
+            item["event_type"]: json.loads(item["payload_json"])
+            for item in self.store.pending_events()
+            if item["event_type"] in {"m0.ready", "m1.ready", "m2.ready"}
+        }
+        self.assertEqual({"m0.ready", "m1.ready", "m2.ready"}, set(formal_events))
+        for payload in formal_events.values():
+            self.assertEqual("companion-published-message/v2", payload["message"]["contract"])
+            visible = payload["message"]["text_projection"]
+            self.assertNotIn("time_scope:", visible)
+            self.assertNotIn("reference_at:", visible)
+            self.assertNotIn("Protocol:", visible)
 
     def test_no_h0_skips_m2(self):
         self.ready()

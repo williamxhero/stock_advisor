@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .backup import BackupManager
-from .cognition import ReplyMarkdownStream, UnifiedCognition
+from .cognition import UnifiedCognition
+from .cognition_expression import express_cognition_answer
 from .adaptive_memory import AdaptiveMemoryResearch, MemoryResearchError
 from .broker_client import BrokerError, BrokerRequest, BrokerResponse, ProviderBrokerClient, canonical_packet_hash
 from .config import load_settings, remove_legacy_provider_settings, save_research_settings
@@ -816,7 +817,7 @@ def run_research(
         result = engine.research_ready(
             cycle["cycle_id"], "Fixture 模式：这里会显示自然、无方向的 M0 客观观察。",
             evidence_attempt_id=_fixture_attempt(store, cycle["cycle_id"], "m0_research", evidence_hash, evidence),
-            compose_attempt_id=_fixture_attempt(store, cycle["cycle_id"], "m0_compose", compose_hash, {"m0_markdown": "Fixture 模式：这里会显示自然、无方向的 M0 客观观察。"}),
+            compose_attempt_id=_fixture_attempt(store, cycle["cycle_id"], "m0_compose", compose_hash, {"semantic": {"summary": "Fixture 模式：这里会显示自然、无方向的 M0 客观观察。", "observations": [], "risks": [], "unknowns": []}}),
             evidence_packet_hash=evidence_hash, packet_hash=compose_hash,
         )
         publish_observatory_evaluation(store, cycle["cycle_id"])
@@ -917,7 +918,7 @@ def run_m1(
         result = engine.m1_ready(
             cycle_id, "Fixture 模式：这里会显示与 H0 隔离的独立 M1 判断。",
             research_attempt_id=_fixture_attempt(store, cycle_id, "m1_research", research_hash, {}),
-            judgment_attempt_id=_fixture_attempt(store, cycle_id, "m1_judgment", judgment_hash, {"m1_markdown": "Fixture 模式：这里会显示与 H0 隔离的独立 M1 判断。"}),
+            judgment_attempt_id=_fixture_attempt(store, cycle_id, "m1_judgment", judgment_hash, {"semantic": {"summary": "Fixture 模式：这里会显示与 H0 隔离的独立 M1 判断。", "direction": "中性", "qualified": False, "triggers": [], "invalidations": [], "risks": [], "unknowns": ["fixture mode"]}, "snapshot": {"direction": "中性", "qualified": False, "triggers": [], "invalidations": [], "risks": [], "unknowns": ["fixture mode"]}}),
             research_packet_hash=research_hash, judgment_packet_hash=judgment_hash,
         )
         return result
@@ -1021,7 +1022,7 @@ def run_m2(engine: CompanionEngine, store: CompanionStore, cycle_id: str, execut
         packet_hash = "fixture-m2"
         return engine.m2_ready(
             cycle_id, "Fixture 模式：这里会显示 M0、H0和独立 M1的伴生综合 M2。",
-            attempt_id=_fixture_attempt(store, cycle_id, "m2", packet_hash, {"m2_markdown": "Fixture 模式：这里会显示 M0、H0和独立 M1的伴生综合 M2。"}), packet_hash=packet_hash,
+            attempt_id=_fixture_attempt(store, cycle_id, "m2", packet_hash, {"semantic": {"summary": "Fixture 模式：这里会显示 M0、H0 和独立 M1 的伴生综合 M2。", "direction": "中性", "qualified": False, "triggers": [], "invalidations": [], "risks": [], "unknowns": ["fixture mode"]}, "snapshot": {"direction": "中性", "qualified": False, "triggers": [], "invalidations": [], "risks": [], "unknowns": ["fixture mode"]}}), packet_hash=packet_hash,
         )
     frozen_as_of = str(cycle.get("m1_completed_at") or cycle["as_of"])
     timeout = int(TASK_POLICIES[cycle["task_key"]].m2_timeout.total_seconds())
@@ -1100,19 +1101,20 @@ def run_reflection(
     ):
         return None
     if not execute:
-        data = {"reflection_markdown": "Fixture 模式：结果已记录，等待真实复盘。", "memory_tags": ["fixture"], "workflow_proposal": None}
+        data = {"answer": {"points": ["Fixture 模式：结果已记录，等待真实复盘。"], "material_ids": []}, "memory_tags": ["fixture"], "workflow_proposal": None}
     else:
         packet = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
             cycle, "reflection", context={"checkpoint_id": checkpoint_id},
             as_of=iso(datetime.now(timezone.utc)),
         )
         data, _ = _call_stage(
-            store, cycle, "reflection", packet, "companion-reflection-result-v1.schema.json",
+            store, cycle, "reflection", packet, "companion-reflection-result-v2.schema.json",
             search=False, timeout=int(TASK_POLICIES[cycle["task_key"]].m1_timeout.total_seconds()),
         )
+    reflection = express_cognition_answer(data["answer"])
     artifact = engine.publish_proactive_message(
-        cycle_id, "reflection", data["reflection_markdown"],
-        meaningful=not str(data["reflection_markdown"]).startswith("Fixture "),
+        cycle_id, "reflection", reflection,
+        meaningful=not reflection.startswith("Fixture "),
         metadata={"checkpoint_id": checkpoint_id, "memory_tags": data.get("memory_tags") or []},
     )
     proposal = None
@@ -1247,10 +1249,16 @@ def run_chat_research(
             context={"fresh_search_completed": True}, as_of=str(evidence.get("as_of") or iso(datetime.now(timezone.utc))),
         )
         data, _ = _call_stage(
-            store, cycle, "chat_followup", local_packet, "companion-chat-result-v1.schema.json",
+            store, cycle, "chat_followup", local_packet, "companion-chat-result-v2.schema.json",
             search=False, timeout=int(TASK_POLICIES[cycle["task_key"]].m1_timeout.total_seconds()),
         )
-        reply = data["reply_markdown"]
+        reply = express_cognition_answer(data["answer"])
+        revision = data.get("judgment_revision")
+        if isinstance(revision, dict):
+            engine.judgment_revision_ready(
+                cycle["cycle_id"], express_cognition_answer(revision["answer"]),
+                str(revision["revises_artifact_id"]),
+            )
     # Ordinary conversation can inform later work, but never silently rewrites
     # a published M1/M2.  A formal rerun remains an explicit user action.
     store.finish_research_job(job["job_id"])
@@ -1283,19 +1291,20 @@ def run_pending_workflow_feedback(
         ):
             continue
         if not execute:
-            data = {"reflection_markdown": "Fixture 模式：这条工作流反馈已记录。", "memory_tags": ["workflow_feedback"], "workflow_proposal": None}
+            data = {"answer": {"points": ["Fixture 模式：这条工作流反馈已记录。"], "material_ids": []}, "memory_tags": ["workflow_feedback"], "workflow_proposal": None}
         else:
             packet = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
                 cycle, "workflow_feedback", context={"source_artifact_id": h0["artifact_id"]},
                 as_of=iso(datetime.now(timezone.utc)),
             )
             data, _ = _call_stage(
-                store, cycle, "workflow_feedback", packet, "companion-reflection-result-v1.schema.json",
+                store, cycle, "workflow_feedback", packet, "companion-reflection-result-v2.schema.json",
                 search=False, timeout=int(TASK_POLICIES[cycle["task_key"]].m1_timeout.total_seconds()),
             )
+        feedback = express_cognition_answer(data["answer"])
         artifact = engine.publish_proactive_message(
-            cycle["cycle_id"], "ai_chat", data["reflection_markdown"],
-            meaningful=not str(data["reflection_markdown"]).startswith("Fixture "),
+            cycle["cycle_id"], "ai_chat", feedback,
+            meaningful=not feedback.startswith("Fixture "),
             metadata={"workflow_feedback_source": h0["artifact_id"], "memory_tags": data.get("memory_tags") or []},
         )
         proposal = None
@@ -1664,7 +1673,7 @@ def run_unified_cognition(
         if not execute:
             data = cognition.fixture_result(messages, mode)
         elif job["state"] == "completed" and job.get("result_json"):
-            data = {"reply_markdown": None, "needs_fresh_search": False, "public_search_request": None, "propositions": [], "actions": []}
+            data = {"answer": None, "needs_fresh_search": False, "public_search_request": None, "propositions": [], "actions": []}
         else:
             # The ordinary chat entrypoint provides only a real, frozen
             # MemoryHub context.  Direct unit callers intentionally see no
@@ -1678,16 +1687,6 @@ def run_unified_cognition(
             if expression_profile:
                 memories.append({"kind": "expression_preference", "object": expression_profile})
             stream = engine.chat_stream_started(cycle_id, batch_ids, reply_kind) if mode != "h0" else None
-            reply_stream = ReplyMarkdownStream()
-            streamed_reply = ""
-
-            def on_delta(delta: str) -> None:
-                nonlocal streamed_reply
-                if cancelled and cancelled():
-                    raise MemoryResearchError("memory research was terminated by the user")
-                visible = reply_stream.feed(delta)
-                streamed_reply += visible
-
             request_packet = {
                 "mode": mode,
                 "cognition_prompt": cognition.prompt(cycle, messages, mode, memories),
@@ -1704,9 +1703,8 @@ def run_unified_cognition(
                 intellect=_conversation_retry_intellect(chat_decision.intellect, int(job["attempt_count"])),
                 effort=chat_decision.reasoning_effort,
                 output_token_limit=6_000,
-                schema=json.loads((SCHEMAS / "companion-cognition-result-v1.schema.json").read_text(encoding="utf-8")),
-                visible_stream=stream is not None,
-                on_delta=on_delta if stream else None,
+                schema=json.loads((SCHEMAS / "companion-cognition-result-v2.schema.json").read_text(encoding="utf-8")),
+                visible_stream=False,
                 absolute_deadline=deadline,
                 verifier_name="unified-cognition/v1",
                 verifier=lambda _output: {"passed": True, "problems": []},
@@ -1723,13 +1721,6 @@ def run_unified_cognition(
             if engine.store.chat_research_terminated(cycle_id):
                 engine.emit(cycle, "chat.stream.cancelled", {"cycle": cycle, "stream_id": stream["stream_id"]})
             else:
-                safe_prefix = _receipt_safe_stream_prefix(streamed_reply)
-                if safe_prefix:
-                    presented_prefix = engine.present_for_publication(
-                        safe_prefix, cycle["as_of"], reply_kind,
-                        allow_structured_format=any(explicit_format_requested(item["body_text"]) for item in messages),
-                    )
-                    engine.chat_stream_delta(cycle_id, stream["stream_id"], presented_prefix.markdown)
                 engine.chat_stream_failed(cycle_id, stream["stream_id"], str(exc))
             if on_progress:
                 on_progress()
@@ -1741,14 +1732,14 @@ def run_unified_cognition(
     })
     if outcome.needs_fresh_search and outcome.public_search_request:
         store.queue_research_job(cycle_id, source["artifact_id"], outcome.public_search_request)
-    if outcome.reply_markdown:
+    if outcome.answer:
         if cancelled and cancelled():
             raise MemoryResearchError("memory research was terminated by the user")
         allow_structured_format = any(explicit_format_requested(item["body_text"]) for item in messages)
         material_registry = _frozen_material_registry(list(memory_context or []))
         stream_identity = store.stream_message(stream["stream_id"]) if stream else None
         presented = engine.present_for_publication(
-            outcome.reply_markdown, cycle["as_of"], reply_kind,
+            express_cognition_answer(outcome.answer), cycle["as_of"], reply_kind,
             allow_structured_format=allow_structured_format,
             expression_profile=expression_profile,
             material_registry=material_registry,
@@ -1775,7 +1766,7 @@ def run_unified_cognition(
         store.mark_batches_responded(batch_ids, source["artifact_id"])
     return {
         "cycle_id": cycle_id, "job_id": outcome.job_id, "receipts": list(outcome.receipts),
-        "reply_markdown": outcome.reply_markdown,
+        "answer": outcome.answer,
     }
 
 

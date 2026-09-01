@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.memoryhub_migration import LegacyWorkspaceImporter, MemoryHubMigrator, run_shadow_comparison
@@ -77,7 +78,8 @@ def test_legacy_workspace_is_imported_once_then_never_read_as_runtime_input(tmp_
 
     first = importer.run()
     portfolio.write_text("this must never be read after the marker", encoding="utf-8")
-    second = importer.run()
+    with patch.object(Path, "rglob", side_effect=AssertionError("marker must precede directory enumeration")):
+        second = importer.run()
 
     assert first["memoryhub_episodes"] == 2
     assert first["portfolio_positions"] == 1
@@ -86,5 +88,10 @@ def test_legacy_workspace_is_imported_once_then_never_read_as_runtime_input(tmp_
         position = dict(connection.execute("SELECT * FROM portfolio_position").fetchone())
     assert position["code"] == "600000"
     assert position["shares"] == 100
+    portfolio_episode = next(
+        row for row in memory._episodes
+        if row["metadata"].get("legacy_relative_path") == "portfolio/01_CURRENT_PORTFOLIO.md"
+    )
+    assert "600000" in portfolio_episode["body"]
     snapshot = memory.begin_snapshot({"memory_space_id": "private", "as_of": "2026-09-01T08:00:00Z", "stage": "chat", "cycle_id": "test"})
     assert memory.search(snapshot["snapshot_id"], "机器人")

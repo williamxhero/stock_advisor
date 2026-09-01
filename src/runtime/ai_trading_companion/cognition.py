@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .learning import WorkflowEvolution
+from .cognition_compat import adapt_legacy_cognition_result
 from .portfolio import explicit_fixture_extraction, is_portfolio_statement
 from .store import digest
 from .task_profiles import AnalysisClarificationRequired
@@ -16,69 +17,11 @@ from .user_learning import explicit_expression_preference, user_method_claim
 @dataclass(frozen=True)
 class CognitionOutcome:
     job_id: str
-    reply_markdown: str | None
+    answer: dict[str, Any] | None
     receipts: tuple[dict[str, Any], ...]
     propositions_recorded: int
     needs_fresh_search: bool
     public_search_request: dict[str, Any] | None
-
-
-class ReplyMarkdownStream:
-    """Extract only the reply JSON string while structured output is arriving."""
-
-    def __init__(self) -> None:
-        self.buffer = ""
-        self.cursor = 0
-        self.started = False
-        self.finished = False
-
-    def feed(self, delta: str) -> str:
-        if self.finished or not delta:
-            return ""
-        self.buffer += delta
-        if not self.started:
-            key = self.buffer.find('"reply_markdown"')
-            if key < 0:
-                return ""
-            colon = self.buffer.find(":", key + len('"reply_markdown"'))
-            if colon < 0:
-                return ""
-            index = colon + 1
-            while index < len(self.buffer) and self.buffer[index].isspace():
-                index += 1
-            if index >= len(self.buffer):
-                return ""
-            if self.buffer.startswith("null", index):
-                self.finished = True
-                return ""
-            if self.buffer[index] != '"':
-                return ""
-            self.started = True
-            self.cursor = index + 1
-        raw: list[str] = []
-        index = self.cursor
-        while index < len(self.buffer):
-            char = self.buffer[index]
-            if char == '"':
-                self.finished = True
-                index += 1
-                break
-            if char == "\\":
-                if index + 1 >= len(self.buffer):
-                    break
-                escape = self.buffer[index + 1]
-                width = 6 if escape == "u" else 2
-                if index + width > len(self.buffer):
-                    break
-                raw.append(self.buffer[index:index + width])
-                index += width
-                continue
-            raw.append(char)
-            index += 1
-        self.cursor = index
-        if not raw:
-            return ""
-        return json.loads('"' + "".join(raw) + '"')
 
 
 class UnifiedCognition:
@@ -105,7 +48,7 @@ class UnifiedCognition:
         )
         if transaction_only:
             instructions += (
-                "这是 H0 的秘书处理分支：reply_markdown 必须为 null，不搜索，不评价策略；只提取个人事实、记忆与受控动作。"
+                "这是 H0 的事实处理分支：answer 必须为 null，不搜索，不评价策略；只提取个人事实、记忆与受控动作。"
                 "同一原文会被独立交给策略分支，但本分支的结果不得进入当前 M1。"
             )
         else:
@@ -153,7 +96,7 @@ class UnifiedCognition:
                 "source_span": {"message_id": message["message_id"], "start": 0, "end": len(text), "quote": text},
             })
         return {
-            "reply_markdown": None if mode == "h0" else "已收到这批消息。我会把你说的个人事实作为最新口径；涉及市场的判断仍由我独立核验。",
+            "answer": None if mode == "h0" else {"points": ["已收到这批消息。我会把你说的个人事实作为最新口径；涉及市场的判断仍由我独立核验。"], "material_ids": []},
             "needs_fresh_search": False, "public_search_request": None,
             "propositions": [], "actions": actions,
         }
@@ -165,12 +108,13 @@ class UnifiedCognition:
         source_text = str(source_artifact.get("body_markdown") or "\n\n".join(item["body_text"] for item in messages))
         job = self.store.start_cognition_job(cycle["cycle_id"], source_artifact["artifact_id"], mode, source_text)
         if job["state"] == "completed" and job.get("result_json"):
-            saved = json.loads(job["result_json"])
+            saved = adapt_legacy_cognition_result(json.loads(job["result_json"]))
             return CognitionOutcome(
-                job["job_id"], saved.get("reply_markdown"), tuple(saved.get("receipts") or ()),
+                job["job_id"], saved.get("answer"), tuple(saved.get("receipts") or ()),
                 int(saved.get("propositions_recorded") or 0), bool(saved.get("needs_fresh_search")), saved.get("public_search_request"),
             )
 
+        result = adapt_legacy_cognition_result(result)
         by_id = {item["message_id"]: item for item in messages}
         propositions_recorded = 0
         for index, proposition in enumerate(result.get("propositions") or []):
@@ -235,16 +179,16 @@ class UnifiedCognition:
             self.store.save_action_receipt(action_id, job["job_id"], action_type, payload, receipt["state"], receipt)
             receipts.append(receipt)
 
-        reply = None if mode == "h0" else self._final_reply(result.get("reply_markdown"), receipts)
+        answer = None if mode == "h0" else self._final_answer(result.get("answer"), receipts)
         saved = {
-            "reply_markdown": reply, "receipts": receipts, "propositions_recorded": propositions_recorded,
+            "answer": answer, "receipts": receipts, "propositions_recorded": propositions_recorded,
             "needs_fresh_search": bool(result.get("needs_fresh_search")),
             "public_search_request": result.get("public_search_request"),
             "memory_research": memory_research,
         }
         self.store.finish_cognition_job(job["job_id"], saved)
         return CognitionOutcome(
-            job["job_id"], reply, tuple(receipts), propositions_recorded,
+            job["job_id"], answer, tuple(receipts), propositions_recorded,
             saved["needs_fresh_search"], saved["public_search_request"],
         )
 
@@ -371,10 +315,11 @@ class UnifiedCognition:
         return {"action_id": action_id, "action_type": action_type, "state": "rejected", "reason": "动作不在允许范围内"}
 
     @staticmethod
-    def _final_reply(reply: Any, receipts: list[dict[str, Any]]) -> str:
-        text = str(reply or "收到。").strip()
+    def _final_answer(answer: Any, receipts: list[dict[str, Any]]) -> dict[str, Any]:
+        value = dict(answer) if isinstance(answer, dict) else {"points": ["收到。"], "material_ids": []}
+        points = [str(point) for point in value.get("points") or []]
         if not receipts:
-            return text
+            return {"points": points, "material_ids": list(value.get("material_ids") or [])}
         summaries = []
         for receipt in receipts:
             state = receipt.get("state")
@@ -390,4 +335,6 @@ class UnifiedCognition:
                 summaries.append("有一项变更信息不足，未修改；还需要：" + "、".join(receipt.get("missing_fields") or []))
             elif state in {"failed", "rejected"}:
                 summaries.append("有一项变更未执行：" + str(receipt.get("reason") or "未通过本地校验"))
-        return text + ("\n\n" + "；".join(summaries) + "。" if summaries else "")
+        if summaries:
+            points.append("；".join(summaries) + "。")
+        return {"points": points, "material_ids": list(value.get("material_ids") or [])}

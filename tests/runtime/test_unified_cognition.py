@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from datetime import date, datetime, timezone
@@ -10,7 +11,8 @@ from unittest.mock import Mock, patch
 
 from ai_trading_companion.__main__ import _conversation_retry_intellect, run_unified_cognition
 from ai_trading_companion.broker_client import BrokerError, BrokerResponse
-from ai_trading_companion.cognition import ReplyMarkdownStream, UnifiedCognition
+from ai_trading_companion.cognition import UnifiedCognition
+from ai_trading_companion.cognition_expression import express_cognition_answer
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.packet_builder import RuntimePacketBuilder as _RuntimePacketBuilder
@@ -34,6 +36,30 @@ class _WeekdayCalendar:
 
 
 class UnifiedCognitionTests(unittest.TestCase):
+    def test_active_provider_call_graph_is_semantic_and_never_writes_legacy_markdown_fields(self):
+        schema_path = PROJECT_ROOT / "resources" / "contracts" / "companion-cognition-result-v2.schema.json"
+        self.assertTrue(schema_path.is_file())
+        schema_text = schema_path.read_text(encoding="utf-8")
+        self.assertNotIn("reply_markdown", schema_text)
+        self.assertIn('"answer"', schema_text)
+
+        runtime_root = PROJECT_ROOT / "src" / "runtime" / "ai_trading_companion"
+        main_text = (runtime_root / "__main__.py").read_text(encoding="utf-8")
+        active_schemas = set(re.findall(r'"(companion-[a-z0-9-]+\.schema\.json)"', main_text))
+        self.assertIn("companion-reflection-result-v2.schema.json", active_schemas)
+        contracts = PROJECT_ROOT / "resources" / "contracts"
+        forbidden = ("reply_markdown", "revision_markdown", "reflection_markdown", "m0_markdown", "m1_markdown", "m2_markdown")
+        for name in active_schemas:
+            schema = (contracts / name).read_text(encoding="utf-8")
+            for field in forbidden:
+                self.assertNotIn(field, schema, name)
+        compat = {"cognition_compat.py", "stage_output_compat.py"}
+        for path in runtime_root.glob("*.py"):
+            if path.name in compat:
+                continue
+            source = path.read_text(encoding="utf-8")
+            for field in forbidden:
+                self.assertNotIn(field, source, str(path))
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -89,7 +115,7 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.assertEqual("expert", _conversation_retry_intellect("expert", 2))
 
     def test_cognition_schema_declares_types_for_enum_and_const_properties(self) -> None:
-        schema = json.loads((PROJECT_ROOT / "resources" / "contracts" / "companion-cognition-result-v1.schema.json").read_text(encoding="utf-8"))
+        schema = json.loads((PROJECT_ROOT / "resources" / "contracts" / "companion-cognition-result-v2.schema.json").read_text(encoding="utf-8"))
         missing: list[str] = []
 
         def visit(node: object, path: str = "$") -> None:
@@ -129,7 +155,7 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.assertNotIn(text, rendered)
         self.assertNotIn(outcome.receipts[0]["cycle_id"], rendered)
 
-    def test_failed_stream_keeps_only_prefix_without_unreceipted_success_claim(self) -> None:
+    def test_failed_generation_publishes_no_unqualified_semantic_prefix(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-08-27")
         text = "Analyze the AI sector."
         self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="stream")
@@ -142,7 +168,7 @@ class UnifiedCognitionTests(unittest.TestCase):
         broker = Mock()
 
         def interrupted(request):
-            request.on_delta('{"reply_markdown":"Checking market first. Task created"}')
+            self.assertIsNone(request.on_delta)
             raise BrokerError("connection lost", category="broker_unavailable")
 
         broker.invoke.side_effect = interrupted
@@ -151,8 +177,7 @@ class UnifiedCognitionTests(unittest.TestCase):
 
         stream = self.store.stream_messages(conversation["cycle_id"])[0]
         self.assertEqual("failed", stream["state"])
-        self.assertEqual("Checking market first.", stream["text"])
-        self.assertNotIn("Task created", stream["text"])
+        self.assertEqual("", stream["text"])
 
     @unittest.skip("superseded by MemoryHub adaptive retrieval contract")
     def test_relevant_memory_keeps_matching_and_necessary_facts_but_excludes_unrelated(self) -> None:
@@ -176,17 +201,6 @@ class UnifiedCognitionTests(unittest.TestCase):
 
         self.assertEqual({"market.ai", "user.account"}, {item["subject"] for item in rows})
 
-    def test_structured_cognition_stream_exposes_only_reply_text(self) -> None:
-        parser = ReplyMarkdownStream()
-
-        chunks = [
-            parser.feed('{"reply_mark'),
-            parser.feed('down":"你好\\n'),
-            parser.feed('世界\\"好","needs_fresh_search":false}'),
-        ]
-
-        self.assertEqual("你好\n世界\"好", "".join(chunks))
-
     def test_unified_cognition_uses_visible_provider_broker_without_native_search(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-08-27")
         text = "请记住我偏好长线"
@@ -198,7 +212,7 @@ class UnifiedCognitionTests(unittest.TestCase):
         source = next(item for item in self.store.artifacts(conversation["cycle_id"])
                       if item["artifact_id"] == created["artifact_id"])
         result = {
-            "reply_markdown": "记住了",
+            "answer": {"points": ["记住了"], "material_ids": []},
             "needs_fresh_search": False,
             "public_search_request": None,
             "propositions": [],
@@ -217,13 +231,22 @@ class UnifiedCognitionTests(unittest.TestCase):
             )
 
         request = broker.invoke.call_args.args[0]
-        self.assertTrue(request.visible_stream)
+        self.assertFalse(request.visible_stream)
         self.assertEqual("standard", request.intellect)
         self.assertEqual(6_000, request.output_token_limit)
         self.assertNotIn("tools", json.dumps(request.packet, ensure_ascii=False))
-        self.assertEqual("记住了", output["reply_markdown"])
+        self.assertEqual("记住了", express_cognition_answer(output["answer"]))
         with self.store.connection() as connection:
+            persisted = connection.execute(
+                "SELECT result_json FROM companion_cognition_job WHERE cycle_id=? ORDER BY completed_at DESC LIMIT 1",
+                (conversation["cycle_id"],),
+            ).fetchone()[0]
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM companion_cycle WHERE trigger='manual_chat'").fetchone()[0])
+        self.assertNotIn("reply_markdown", persisted)
+        published = next(event for event in self.store.pending_events() if event["event_type"] == "chat.ready")
+        payload = json.loads(published["payload_json"])
+        self.assertEqual("companion-published-message/v2", payload["message"]["contract"])
+        self.assertEqual("记住了", payload["message"]["text_projection"])
 
     def test_auto_submit_claim_is_once_per_formal_task(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-08-27")
@@ -348,7 +371,7 @@ class UnifiedCognitionTests(unittest.TestCase):
         cycle = self.store.get_cycle(receipt["cycle_id"])
         self.assertEqual("manual_chat", cycle["trigger"])
         self.assertEqual("analysis", json.loads(cycle["request_source_json"])["message_id"])
-        self.assertIn("正式研判任务已创建", outcome.reply_markdown)
+        self.assertIn("正式研判任务已创建", express_cognition_answer(outcome.answer))
 
     def test_unique_verbatim_analysis_quote_rebinds_miscalculated_offsets(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-08-27")
@@ -423,7 +446,7 @@ class UnifiedCognitionTests(unittest.TestCase):
             )
 
         self.assertEqual("created", output["receipts"][0]["state"])
-        self.assertIn("正式研判任务已创建", output["reply_markdown"])
+        self.assertIn("正式研判任务已创建", express_cognition_answer(output["answer"]))
         with self.store.connection() as connection:
             self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM companion_cycle WHERE trigger='manual_chat'").fetchone()[0])
 

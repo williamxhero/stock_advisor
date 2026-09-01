@@ -99,7 +99,7 @@ class RealMemoryHubChatIntegrationTests(unittest.TestCase):
                     _response({"operation": "expand", "query": None, "episode_id": None}),
                     _response({"operation": "complete", "query": None, "episode_id": None}),
                     _response({
-                        "reply_markdown": "The semiconductor drawdown lesson is still relevant.",
+                        "answer": {"points": ["The semiconductor drawdown lesson is still relevant."], "material_ids": []},
                         "needs_fresh_search": False, "public_search_request": None, "propositions": [], "actions": [],
                     }),
                 ]
@@ -112,7 +112,7 @@ class RealMemoryHubChatIntegrationTests(unittest.TestCase):
                         return _response({"operation": "expand", "query": None, "episode_id": state["known_episode_ids"][0]})
                     if len(broker.invoke.mock_calls) == 3:
                         return _response({"operation": "complete", "query": None, "episode_id": None})
-                    return _response({"reply_markdown": "The semiconductor drawdown lesson is still relevant.", "needs_fresh_search": False, "public_search_request": None, "propositions": [], "actions": []})
+                    return _response({"answer": {"points": ["The semiconductor drawdown lesson is still relevant."], "material_ids": []}, "needs_fresh_search": False, "public_search_request": None, "propositions": [], "actions": []})
                 broker.invoke.side_effect = invoke
 
                 with patch("ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker):
@@ -120,7 +120,7 @@ class RealMemoryHubChatIntegrationTests(unittest.TestCase):
                 flush(store, exchange)
                 events = [value for _path, value in exchange.receive("to-client")]
 
-            self.assertEqual("The semiconductor drawdown lesson is still relevant.", result["reply_markdown"])
+            self.assertEqual(["The semiconductor drawdown lesson is still relevant."], result["answer"]["points"])
             self.assertTrue(any(event["type"] == "chat.ready" for event in events))
             self.assertNotIn("search", json.dumps(events, ensure_ascii=False).lower())
         finally:
@@ -195,7 +195,7 @@ class RealMemoryHubChatIntegrationTests(unittest.TestCase):
                 resumed_broker = Mock()
                 resumed_broker.invoke.side_effect = [
                     _response({"operation": "complete", "query": None, "episode_id": None}),
-                    _response({"reply_markdown": "Qualified evidence is reused after the pause.", "needs_fresh_search": False, "public_search_request": None, "propositions": [], "actions": []}),
+                    _response({"answer": {"points": ["Qualified evidence is reused after the pause."], "material_ids": []}, "needs_fresh_search": False, "public_search_request": None, "propositions": [], "actions": []}),
                 ]
                 exchange.send("to-runtime", "continue", {
                     "contract": "companion-user-command/v1", "command_id": "continue",

@@ -100,7 +100,7 @@ class AdaptiveMemoryResearchTests(unittest.TestCase):
                 _response({"operation": "search", "query": "semiconductor", "episode_id": None}),
                 _response({"operation": "complete", "query": None, "episode_id": None}),
                 _response({
-                    "reply_markdown": "The prior semiconductor drawdown remains the relevant lesson.",
+                    "answer": {"points": ["The prior semiconductor drawdown remains the relevant lesson."], "material_ids": []},
                     "needs_fresh_search": False, "public_search_request": None, "propositions": [], "actions": [],
                 }),
             ]
@@ -108,7 +108,7 @@ class AdaptiveMemoryResearchTests(unittest.TestCase):
             with patch("ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker):
                 result = run_chat(engine, store, portfolio, conversation["cycle_id"], batch_id, True)
 
-            self.assertEqual("The prior semiconductor drawdown remains the relevant lesson.", result["reply_markdown"])
+            self.assertEqual("The prior semiconductor drawdown remains the relevant lesson.", result["answer"]["points"][0])
             requests = [call.args[0] for call in broker.invoke.call_args_list]
             self.assertEqual(["chat_research", "chat_research", "chat"], [request.stage for request in requests])
             self.assertEqual("test-snapshot-1", requests[0].packet["research_state"]["snapshot"]["snapshot_id"])

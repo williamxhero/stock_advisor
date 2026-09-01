@@ -361,7 +361,7 @@ class RuntimePacketBuilder:
     @staticmethod
     def prompt(packet: dict[str, Any]) -> str:
         display_contract = (
-            "\n\nUI 展示合同：输出中的 *_markdown/reply_markdown 字段虽然沿用旧字段名，内容必须是给用户看的口语化正文。"
+            "\n\n用户可见内容必须先输出结构化语义，再经统一表达与发布资格门；不得生成可直接发布的 Markdown 字段。"
             "像一位熟悉用户的专业炒股搭档直接说话，使用 2 到 7 个自然段；禁止标题、表格、项目符号、编号清单、"
             "字段名堆砌、Protocol 名称和报告腔。不要把输入资料原样重排或复述。结构化事实已经由系统另存，"
             "正文只讲经过取舍后真正重要的观察、判断与不确定性。数据或网络异常要自然说清其实际影响。"

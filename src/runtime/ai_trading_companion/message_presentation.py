@@ -107,10 +107,14 @@ def present_message(
             rendered.append(natural)
             parts.append({"kind": "speech", "text": natural})
     for material in materials:
-        excerpt = _bound_material(material)
+        url = _first_url(material)
+        title = _source_title(material)
+        excerpt = _bound_material(material, title, url)
         rendered.append(excerpt)
-        url = _first_url(excerpt)
-        parts.append({"kind": "material", "markdown": excerpt, "source_url": url})
+        parts.append({
+            "kind": "material", "markdown": excerpt,
+            "source_title": title, "source_url": url,
+        })
     if not rendered:
         natural = _naturalize_speech(source, as_of, allow_structured_format)
         rendered.append(natural)
@@ -301,13 +305,24 @@ def _spoken_clock(hour: int, minute: int) -> str:
     return f"{period}{spoken_hour}点{spoken_minute}分"
 
 
-def _bound_material(markdown: str) -> str:
+def _bound_material(markdown: str, title: str, url: str | None) -> str:
     max_characters = 1_200
     if len(markdown) <= max_characters:
         return markdown
-    url = _first_url(markdown)
-    suffix = f"\n\n原文较长，我先摘到这里。{url or ''}".rstrip()
-    return markdown[: max_characters - len(suffix)].rstrip() + suffix
+    if url:
+        return f"[查看{title}]({url})"
+    raise MessageQualificationError(["long_material_without_source"])
+
+
+def _source_title(markdown: str) -> str:
+    for line in markdown.splitlines():
+        candidate = line.strip().lstrip(">").strip().rstrip("：:")
+        if not candidate or candidate.startswith(("-", "*", "+", "[", "http")):
+            continue
+        if len(candidate) <= 40:
+            return candidate
+    link = re.search(r"\[([^\]]+)\]\(https?://[^)]+\)", markdown)
+    return link.group(1) if link else "原文"
 
 
 def _first_url(text: str) -> str | None:

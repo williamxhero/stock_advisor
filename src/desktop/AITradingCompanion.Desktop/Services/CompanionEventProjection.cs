@@ -3,13 +3,20 @@ using System.Text.Json;
 
 namespace AITradingCompanion.Desktop.Services;
 
+public sealed record CompanionMessagePart(
+    string Kind,
+    string Text,
+    string? SourceTitle = null,
+    string? SourceUrl = null);
+
 public sealed record CompanionAiTimelineEntry(
     string ArtifactId,
     string Kind,
     DateTimeOffset At,
     string Text,
     DateTimeOffset? StartedAt = null,
-    DateTimeOffset? CompletedAt = null);
+    DateTimeOffset? CompletedAt = null,
+    IReadOnlyList<CompanionMessagePart>? Parts = null);
 
 public sealed record CompanionTimelineEntry(
     DateTimeOffset At,
@@ -383,7 +390,8 @@ public static class CompanionEventProjection
                 var at = ReadDate(ReadString(message, "at")) ?? DateTimeOffset.MinValue;
                 var started = kind == "m1" ? projectedM1StartedAt : kind == "m2" ? projectedM2StartedAt : at;
                 var completed = kind == "m1" ? projectedM1CompletedAt : kind == "m2" ? projectedM2CompletedAt : at;
-                UpsertAi(ai, ReadString(message, "artifact_id"), kind, at, ReadPublishedText(message), started ?? at, completed ?? at);
+                UpsertAi(ai, ReadString(message, "artifact_id"), kind, at, ReadPublishedText(message), started ?? at, completed ?? at,
+                    ReadPublishedParts(message));
             }
         }
         if (payload.TryGetProperty("user_messages", out var userMessages) && userMessages.ValueKind == JsonValueKind.Array)
@@ -450,7 +458,8 @@ public static class CompanionEventProjection
         DateTimeOffset at,
         string? text,
         DateTimeOffset? started,
-        DateTimeOffset? completed)
+        DateTimeOffset? completed,
+        IReadOnlyList<CompanionMessagePart>? parts = null)
     {
         if (string.IsNullOrWhiteSpace(text)) return;
         var id = artifactId ?? $"{kind}-{at:O}";
@@ -458,8 +467,9 @@ public static class CompanionEventProjection
         {
             started = existing.StartedAt ?? started;
             completed = existing.CompletedAt ?? completed;
+            parts ??= existing.Parts;
         }
-        ai[id] = new CompanionAiTimelineEntry(id, kind, at, text, started, completed);
+        ai[id] = new CompanionAiTimelineEntry(id, kind, at, text, started, completed, parts);
     }
 
     private static CompanionEvent? TryParse(string json)
@@ -491,6 +501,20 @@ public static class CompanionEventProjection
 
     private static string? ReadPublishedText(JsonElement element) =>
         ReadNestedString(element, "message", "text_projection") ?? ReadString(element, "text");
+
+    private static CompanionMessagePart[]? ReadPublishedParts(JsonElement element)
+    {
+        if (!element.TryGetProperty("message", out var message)
+            || message.ValueKind != JsonValueKind.Object
+            || ReadString(message, "contract") != "companion-published-message/v2"
+            || !message.TryGetProperty("parts", out var parts)
+            || parts.ValueKind != JsonValueKind.Array) return null;
+        return parts.EnumerateArray().Select(part => new CompanionMessagePart(
+            ReadString(part, "kind") ?? "speech",
+            ReadString(part, "text") ?? ReadString(part, "markdown") ?? string.Empty,
+            ReadString(part, "source_title"),
+            ReadString(part, "source_url"))).Where(part => !string.IsNullOrWhiteSpace(part.Text)).ToArray();
+    }
 
     private static string? ReadCycleString(JsonElement payload, string property) =>
         ReadNestedString(payload, "cycle", property) ?? ReadString(payload, property);

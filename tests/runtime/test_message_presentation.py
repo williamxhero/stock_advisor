@@ -121,7 +121,21 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertEqual("speech", presented.parts[0]["kind"])
         self.assertEqual("material", presented.parts[1]["kind"])
         self.assertEqual("https://example.com/notice", presented.parts[1]["source_url"])
+        self.assertEqual("公告原文", presented.parts[1]["source_title"])
         self.assertIn("> - 事项仍在推进", presented.markdown)
+
+    def test_long_material_becomes_a_link_instead_of_a_truncated_dump(self):
+        presented = present_message(
+            "我先说和判断有关的部分。\n\n> 公告原文：\n> " + ("很长的原文。" * 300) + "\n> [查看原文](https://example.com/long)",
+            as_of="2026-09-01T01:00:00Z",
+            kind="ai_chat",
+        )
+
+        material = presented.parts[1]
+        self.assertEqual("material", material["kind"])
+        self.assertEqual("https://example.com/long", material["source_url"])
+        self.assertLess(len(material["markdown"]), 120)
+        self.assertEqual("[查看公告原文](https://example.com/long)", material["markdown"])
 
     def test_unattributed_quote_does_not_get_material_format_privilege(self):
         presented = present_message(

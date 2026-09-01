@@ -9,6 +9,10 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $output = Join-Path $projectRoot "dist\$Runtime\AITradingCompanion"
 $outputParent = Split-Path -Parent $output
+$revision = (& git -C $projectRoot rev-parse HEAD 2>$null)
+if (-not $revision) { throw 'A formal package requires a Git source revision.' }
+$dirty = -not [string]::IsNullOrWhiteSpace((& git -C $projectRoot status --short 2>$null | Out-String))
+if ($dirty) { throw 'A formal package requires a clean Git worktree. Commit or remove release-scope changes first.' }
 if (Test-Path -LiteralPath $output) {
     $resolvedOutput = [IO.Path]::GetFullPath($output)
     $resolvedParent = [IO.Path]::GetFullPath($outputParent)
@@ -21,10 +25,6 @@ if (Test-Path -LiteralPath $output) {
     # directly rather than widening deletion scope or silently reusing files.
     [IO.Directory]::Delete($resolvedOutput, $true)
 }
-$revision = (& git -C $projectRoot rev-parse --short HEAD 2>$null)
-if (-not $revision) { $revision = 'unknown' }
-$dirty = -not [string]::IsNullOrWhiteSpace((& git -C $projectRoot status --short 2>$null | Out-String))
-
 $publishArguments = @(
     'publish', "$projectRoot\src\desktop\AITradingCompanion.Desktop\AITradingCompanion.Desktop.csproj",
     '--configuration', 'Release', '--runtime', $Runtime, '--self-contained', 'true', '--output', $output,

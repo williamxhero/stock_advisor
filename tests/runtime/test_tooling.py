@@ -515,6 +515,47 @@ class ToolRunnerTests(unittest.TestCase):
             self.assertFalse(intraday.succeeded)
             self.assertEqual("tool_quote_finality_invalid", intraday.error_code)
 
+    def test_quote_tool_falls_back_from_tencent_to_sina_with_source_and_close_time(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/tencent"):
+                    body, content_type = b'v_sh600000="broken";', "text/plain; charset=utf-8"
+                else:
+                    body = ('var hq_str_sh600000="浦发银行,9.130,9.160,9.280,9.290,9.100,9.280,9.290,65362772,604326301.000,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2026-09-01,15:01:00,00,";').encode("gb18030")
+                    content_type = "text/plain; charset=gb18030"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                    1, "cn_equity_quote_batch", "2026-09-01T07:01:00Z", 4.0,
+                    {
+                        "symbols": ["600000"],
+                        "tencent_quote_url": f"http://127.0.0.1:{server.server_port}/tencent?q=",
+                        "sina_quote_url": f"http://127.0.0.1:{server.server_port}/sina?list=",
+                    },
+                    finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("sina_quote", result.data["source"])
+                self.assertEqual("2026-09-01T15:01:00+08:00", result.data["quotes"][0]["quote_at"])
+                self.assertEqual(("tencent:tool_process_failed", "sina:succeeded"), result.attempts)
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_market_tools_return_indices_breadth_and_theme_snapshot_with_fact_time(self) -> None:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802

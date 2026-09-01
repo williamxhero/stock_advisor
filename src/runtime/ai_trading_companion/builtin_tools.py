@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.0.0"
+_VERSION = "1.1.0"
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -18,6 +18,10 @@ _CAPABILITIES = {
     "cn_equity_quote_batch": "cn_equity_quote_batch",
     "cn_market_index_batch": "cn_market_index_batch",
     "cn_market_snapshot": "cn_market_snapshot",
+}
+_ADAPTERS = {
+    "cn_equity_quote_batch": {"tencent": "cn_equity_quote_tencent", "sina": "cn_equity_quote_sina"},
+    "cn_market_index_batch": {"tencent": "cn_market_index_tencent", "sina": "cn_market_index_sina"},
 }
 
 
@@ -40,6 +44,24 @@ def ensure_builtin_tools(root: Path) -> None:
         if not current.exists():
             current.write_text(json.dumps({
                 "contract": "ai-trading-tool-current/v1", "version": _VERSION,
+            }, sort_keys=True), encoding="utf-8")
+    for capability, adapters in _ADAPTERS.items():
+        for adapter, mode in adapters.items():
+            version_root = root / capability / "adapters" / adapter / "versions" / _VERSION
+            manifest = version_root / "manifest.json"
+            if not manifest.exists():
+                version_root.mkdir(parents=True, exist_ok=True)
+                (version_root / "tool.py").write_text(_CLI, encoding="utf-8")
+                manifest.write_text(json.dumps({
+                    "contract": "ai-trading-tool-manifest/v1", "capability": capability,
+                    "version": _VERSION, "state": "promoted",
+                    "command": [sys.executable, "tool.py", mode],
+                }, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        routing = root / capability / "routing.json"
+        if not routing.exists():
+            routing.write_text(json.dumps({
+                "contract": "ai-trading-tool-routing/v1",
+                "candidates": [{"adapter": adapter, "version": _VERSION} for adapter in adapters],
             }, sort_keys=True), encoding="utf-8")
 
 
@@ -198,6 +220,41 @@ def quote_payload(body: str, symbols: list[dict[str, str]], finality: str) -> tu
     return {"quotes": quotes, "finality": finality, "source": "tencent_quote"}, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def sina_payload(body: str, symbols: list[dict[str, str]], finality: str, *, kind: str) -> tuple[dict[str, object], str]:
+    records = {match.group(1): match.group(2).split(",") for match in re.finditer(r'var hq_str_([a-z]{2}\d{6})="([^"]*)";', body)}
+    rows: list[dict[str, object]] = []
+    latest: dt.datetime | None = None
+    for item in symbols:
+        fields = records.get(item["vendor_symbol"])
+        if not fields or len(fields) < 32 or not fields[0].strip():
+            fail(75, "sina quote response has missing or mismatched symbol")
+        try:
+            price, previous_close = float(fields[3]), float(fields[2])
+            moment = dt.datetime.strptime(fields[30] + " " + fields[31], "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        except (ValueError, IndexError):
+            fail(75, "sina quote timestamp or price is invalid")
+        if price <= 0 or previous_close < 0:
+            fail(75, "sina quote price is invalid")
+        close_ready = moment.time() >= dt.time(15, 0)
+        if finality in {"close", "official_close"} and not close_ready:
+            fail(75, "sina quote does not meet close finality")
+        latest = max(latest, moment) if latest else moment
+        row = {
+            "symbol": item["symbol"], "name": fields[0].strip(), "exchange": item["exchange"],
+            "price": price, "previous_close": previous_close,
+            "quote_at": moment.isoformat(), "trading_date": moment.date().isoformat(),
+            "status": "closed" if close_ready else "trading", "source": "sina_quote",
+        }
+        if kind == "equity":
+            row["market"] = "CN-A"
+        rows.append(row)
+    if latest is None:
+        fail(64, "at least one symbol is required")
+    key = "quotes" if kind == "equity" else "indices"
+    return {key: rows, "finality": finality, "source": "sina_quote"}, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def index_identity(symbol: object) -> dict[str, str]:
     code = str(symbol or "").strip()
     known = {
@@ -276,7 +333,7 @@ def main() -> None:
             fail(64, "symbols must be a non-empty array")
         result({"identities": [identity(symbol) for symbol in symbols], "source": "a_share_code_rules"})
         return
-    if mode == "cn_equity_quote_batch":
+    if mode in {"cn_equity_quote_batch", "cn_equity_quote_tencent", "cn_equity_quote_sina"}:
         symbols = inputs.get("symbols")
         if not isinstance(symbols, list) or not symbols:
             fail(64, "symbols must be a non-empty array")
@@ -284,13 +341,20 @@ def main() -> None:
         if finality not in {"intraday", "realtime", "close", "official_close"}:
             fail(64, "unsupported quote finality")
         normalized = [identity(symbol) for symbol in symbols]
-        quote_url = safe_url(inputs.get("quote_url") or "https://qt.gtimg.cn/q=")
+        if mode == "cn_equity_quote_sina":
+            quote_url = safe_url(inputs.get("sina_quote_url") or "https://hq.sinajs.cn/list=")
+            separator = "" if quote_url.endswith(("=", ",")) else "&list="
+            _url, body = fetch(quote_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
+            payload, fact_as_of = sina_payload(body, normalized, finality, kind="equity")
+            result(payload, fact_as_of=fact_as_of)
+            return
+        quote_url = safe_url(inputs.get("tencent_quote_url") or inputs.get("quote_url") or "https://qt.gtimg.cn/q=")
         separator = "" if quote_url.endswith(("=", ",")) else "&q="
         _url, body = fetch(quote_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
         payload, fact_as_of = quote_payload(body, normalized, finality)
         result(payload, fact_as_of=fact_as_of)
         return
-    if mode == "cn_market_index_batch":
+    if mode in {"cn_market_index_batch", "cn_market_index_tencent", "cn_market_index_sina"}:
         symbols = inputs.get("symbols")
         if not isinstance(symbols, list) or not symbols:
             fail(64, "symbols must be a non-empty array")
@@ -298,7 +362,14 @@ def main() -> None:
         if finality not in {"intraday", "realtime", "close", "official_close"}:
             fail(64, "unsupported index finality")
         normalized = [index_identity(symbol) for symbol in symbols]
-        index_url = safe_url(inputs.get("index_url") or "https://qt.gtimg.cn/q=")
+        if mode == "cn_market_index_sina":
+            index_url = safe_url(inputs.get("sina_index_url") or "https://hq.sinajs.cn/list=")
+            separator = "" if index_url.endswith(("=", ",")) else "&list="
+            _url, body = fetch(index_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
+            payload, fact_as_of = sina_payload(body, normalized, finality, kind="index")
+            result(payload, fact_as_of=fact_as_of)
+            return
+        index_url = safe_url(inputs.get("tencent_index_url") or inputs.get("index_url") or "https://qt.gtimg.cn/q=")
         separator = "" if index_url.endswith(("=", ",")) else "&q="
         _url, body = fetch(index_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
         payload, fact_as_of = index_payload(body, normalized, finality)

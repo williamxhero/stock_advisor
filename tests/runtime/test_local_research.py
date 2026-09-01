@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from ai_trading_companion.broker_client import BrokerError
 from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, WebAccessGatewayBackend
 from ai_trading_companion.tooling import EvidenceResolution, FactRequest, ToolCatalog, ToolRunner
 
@@ -17,6 +18,27 @@ def row(operation: str, *, query: str | None = None, url: str | None = None) -> 
     return {"requirement_key": "market", "backend": "gateway", "operation": operation, "arguments": {"query": query, "categories": "news", "url": url, "symbol": None, "render": "auto", "session_id": None, "actions": None}, "fallback_backends": []}
 
 class LocalResearchTests(unittest.TestCase):
+    def test_invalid_broker_plan_uses_the_existing_bounded_repair_round(self) -> None:
+        calls = 0
+
+        def planner(*_args: object) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise BrokerError("invalid plan", category="broker_output_invalid")
+            return {"version": 1, "operations": [row("web_read", url="https://example.test/close")]}
+
+        backend = lambda *_: {"results": [{
+            "url": "https://example.test/close", "title": "close", "excerpt_text": "close",
+            "fact_as_of": CONTRACT["as_of"], "primary": True,
+        }]}
+        result = LocalResearchChain(
+            planner, ReadOnlyResearchExecutor({"gateway": backend}), max_repairs=1,
+        ).run({"as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="repair-plan")
+
+        self.assertTrue(result.qualified)
+        self.assertEqual(2, calls)
+
     def test_planner_requires_an_explicit_effort_decision(self) -> None:
         with self.assertRaises(TypeError):
             BrokerResearchPlanner(mock.Mock(), deadline=lambda: 123.0)

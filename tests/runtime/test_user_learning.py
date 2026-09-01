@@ -37,6 +37,7 @@ class UserLearningTests(unittest.TestCase):
         self.apply("这次请用列表展示。")
         self.apply("以后多贴原文。")
 
+        self.assertEqual({"chat"}, {snapshot["stage"] for snapshot in self.memory._snapshots.values()})
         rows = [row for row in self.memory._episodes if "expression.material_density" in row["body"]]
         self.assertEqual(2, len(rows))
         self.assertIn("more_source_excerpt", rows[-1]["body"])

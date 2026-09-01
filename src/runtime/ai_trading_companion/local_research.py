@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 from .acquisition import AcquisitionBoundary
 from .evidence_gate import EvidenceGate
-from .broker_client import BrokerRequest, ProviderBrokerClient, canonical_packet_hash
+from .broker_client import BrokerError, BrokerRequest, ProviderBrokerClient, canonical_packet_hash
 from .tooling import FactRequest, ToolRunner
 
 
@@ -350,7 +350,15 @@ class LocalResearchChain:
                 **packet,
                 "research_discoveries": _discovery_digest(observations, contract),
             }
-            plan = self.planner(planning_packet, gaps, round_number)
+            try:
+                plan = self.planner(planning_packet, gaps, round_number)
+            except BrokerError as exc:
+                if exc.category != "broker_output_invalid":
+                    raise
+                round_number += 1
+                if self.max_repairs is not None and round_number > self.max_repairs:
+                    raise
+                continue
             operations = self.executor.validate_plan(plan)
             for row in operations:
                 try:

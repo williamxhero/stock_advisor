@@ -4,10 +4,24 @@ import json
 from pathlib import Path
 from threading import Thread
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 from trading_memory_hub import MemoryHub
 from trading_memory_hub.server import make_server
+
+
+class ControllableSource:
+    def __init__(self) -> None:
+        self.body = "权威原文：机器人订单增长。"
+        self.calls = 0
+
+    def hydrate(self, reference: dict[str, str]) -> dict[str, str]:
+        self.calls += 1
+        return {"title": "权威记录", "body": self.body, "occurred_at": reference["date"] + "T00:00:00Z"}
+
+    def health(self) -> dict[str, str]:
+        return {"state": "ready"}
 
 
 def episode(event_id: str, *, space: str = "partner-main", body: str = "长期复利") -> dict[str, object]:
@@ -125,3 +139,46 @@ def test_operator_can_filter_inspect_timeline_and_download_without_writes(tmp_pa
     assert exported["result"]["items"][0]["episode_id"] == corrected.episode_id
     assert "attachment" in disposition
     assert MemoryHub(database).health()["ledger"]["episodes"] == before
+
+
+def test_external_source_is_hydrated_only_on_explicit_admin_request(tmp_path: Path) -> None:
+    database = tmp_path / "ledger.sqlite3"
+    source = ControllableSource()
+    hub = MemoryHub(database, source_adapters={"8815": source})
+    receipt = hub.append({
+        **episode("article-1"),
+        "source_system": "8815",
+        "body": None,
+        "source_reference": {
+            "source_system": "8815", "record_type": "news",
+            "date": "2026-08-31", "code": "600000", "event_id": "article-1",
+        },
+    })
+    assert source.calls == 1
+
+    server = make_server("127.0.0.1", 0, database, source_adapters={"8815": source})
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        detail = get_json(base_url, f"/v1/admin/episodes/{receipt.episode_id}")
+        assert source.calls == 1
+        hydrated = get_json(base_url, f"/v1/admin/episodes/{receipt.episode_id}/source")
+        source.body = "被修改的原文"
+        try:
+            get_json(base_url, f"/v1/admin/episodes/{receipt.episode_id}/source")
+            raise AssertionError("changed authority source must fail integrity verification")
+        except HTTPError as error:
+            integrity_status = error.code
+        detail_after_failure = get_json(base_url, f"/v1/admin/episodes/{receipt.episode_id}")
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+    assert detail["result"]["episode"]["body"] is None
+    assert hydrated["result"]["body"] == "权威原文：机器人订单增长。"
+    assert hydrated["result"]["retrieval"] == "on_demand"
+    assert integrity_status == 409
+    assert detail_after_failure["result"]["episode"]["episode_id"] == receipt.episode_id
+    assert MemoryHub(database).health()["ledger"]["episodes"] == 1

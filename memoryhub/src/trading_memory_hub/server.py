@@ -25,6 +25,14 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
+            try:
+                self._do_get()
+            except SourceIntegrityError as error:
+                self._reply(HTTPStatus.CONFLICT, {"error": "source_integrity", "detail": str(error)})
+            except (MemoryHubError, TypeError, ValueError) as error:
+                self._reply(HTTPStatus.BAD_REQUEST, {"error": "invalid_request", "detail": str(error)})
+
+        def _do_get(self) -> None:
             request = urlsplit(self.path)
             if request.path == "/health":
                 self._reply(HTTPStatus.OK, hub.health())
@@ -46,6 +54,9 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
                     **_admin_episode_filters(query),
                 )
                 self._reply(HTTPStatus.OK, {"result": result})
+            elif request.path.startswith("/v1/admin/episodes/") and request.path.endswith("/source"):
+                episode_id = unquote(request.path.removeprefix("/v1/admin/episodes/").removesuffix("/source"))
+                self._reply(HTTPStatus.OK, {"result": hub.admin_source(episode_id)})
             elif request.path.startswith("/v1/admin/episodes/") and request.path != "/v1/admin/episodes/export":
                 episode_id = unquote(request.path.removeprefix("/v1/admin/episodes/"))
                 self._reply(HTTPStatus.OK, {"result": hub.admin_episode(episode_id)})

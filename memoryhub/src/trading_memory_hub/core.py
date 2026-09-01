@@ -733,6 +733,20 @@ class MemoryHub:
                 "relations": [self._episode(item) for item in related_rows],
                 "protocol_version": PROTOCOL_VERSION}
 
+    def admin_source(self, episode_id: str) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM episode WHERE episode_id=?", (episode_id,)).fetchone()
+        if row is None:
+            raise MemoryHubError("episode does not exist")
+        reference = _loads(row["source_reference_json"])
+        if not reference:
+            raise MemoryHubError("episode has no immutable source reference")
+        hydrated = self._hydrate(reference)
+        if _content_hash(hydrated["body"]) != row["content_hash"]:
+            raise SourceIntegrityError("authority source no longer matches immutable episode hash")
+        return {**hydrated, "source_reference": reference, "retrieval": "on_demand",
+                "content_hash": row["content_hash"], "protocol_version": PROTOCOL_VERSION}
+
     def export_space(self, memory_space_id: str) -> dict[str, Any]:
         if not memory_space_id:
             raise MemoryHubError("export requires memory_space_id")

@@ -1,0 +1,21 @@
+[Unit]
+Description=Trading MemoryHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yosef
+Group=yosef
+WorkingDirectory=/data/services/memoryhub/current
+Environment=PYTHONPATH=/data/services/memoryhub/current/src
+ExecStart=/usr/bin/python3 -m trading_memory_hub.server --host 0.0.0.0 --port 8820 --database /data/services/memoryhub/data/ledger.sqlite3 --backup-dir /data/services/memoryhub/backups
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/data/services/memoryhub/data /data/services/memoryhub/backups
+
+[Install]
+WantedBy=multi-user.target

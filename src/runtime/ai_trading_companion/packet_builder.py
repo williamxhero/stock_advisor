@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .learning import WorkflowEvolution
-from .memory import MemoryLibrary, MemoryQuery, MemoryRequest, MemoryRetriever, SqliteMemoryRetriever
+from .memory_port import MemoryPort, MemoryUnavailable
 from .secret_guard import assert_safe
 from .evidence_contract import EvidenceContractFactory
 from .models import TASK_POLICIES
@@ -25,14 +25,15 @@ class RuntimePacketBuilder:
         resources_root: Path,
         workspace_root: Path,
         store: Any,
-        memory: MemoryRetriever | None = None,
+        memory: MemoryPort | None = None,
+        memory_space_id: str = "ai-trading-companion",
         evidence_contract_factory: EvidenceContractFactory | None = None,
     ) -> None:
         self.resources_root = Path(resources_root)
         self.workspace_root = Path(workspace_root)
         self.store = store
-        self.memory = memory or SqliteMemoryRetriever(store)
-        self.memory_library = MemoryLibrary(store) if memory is None else None
+        self.memory = memory
+        self.memory_space_id = memory_space_id
         self.evidence_contract_factory = evidence_contract_factory or EvidenceContractFactory()
 
     def build(
@@ -80,7 +81,6 @@ class RuntimePacketBuilder:
             packet["evidence"] = evidence or {}
             packet["artifacts"] = self._stage_artifacts(cycle, stage)
             packet["memories"] = memory_cards
-            packet["proposition_memory"] = self._proposition_memory(cycle, stage, packet_as_of)
             packet["active_workflow_policy"] = WorkflowEvolution(self.store).active_policy()
             if message_batch is not None:
                 packet["message_batch"] = message_batch
@@ -119,13 +119,17 @@ class RuntimePacketBuilder:
         }
 
     def _memory_cards(self, cycle: dict[str, Any], stage: str, packet_as_of: str, evidence: dict[str, Any] | None) -> list[dict[str, Any]]:
-        query = MemoryQuery(task_key=cycle["task_key"], known_at=packet_as_of, text=self._memory_query_text(evidence), cycle_id=cycle["cycle_id"], stage=stage)
-        if self.memory_library is None:
-            return self.memory.retrieve(query)
-        return self.memory_library.retrieve_bundle(MemoryRequest(
-            task_key=cycle["task_key"], known_at=packet_as_of, stage=stage,
-            query_text=query.text, cycle_id=cycle["cycle_id"],
-        )).cards
+        if self.memory is None:
+            raise MemoryUnavailable("MemoryHub is required; local long-term memory fallback is disabled")
+        access_stage = {"m2": "m2_synthesis", "outcome_research": "reflection"}.get(stage, stage)
+        snapshot = self.memory.begin_snapshot({
+            "memory_space_id": self.memory_space_id, "as_of": packet_as_of,
+            "stage": access_stage, "cycle_id": cycle["cycle_id"],
+        })
+        bundle = self.memory.retrieve_bundle(
+            str(snapshot["snapshot_id"]), self._memory_query_text(evidence), limit=80,
+        )
+        return list(bundle.get("results") or [])
 
     def _public_scope(
         self,
@@ -291,18 +295,6 @@ class RuntimePacketBuilder:
             inputs.insert(0, {"path": "runtime://private-context-before-h0", "text": cycle["private_context_json"]})
         return inputs
 
-    def _proposition_memory(self, cycle: dict[str, Any], stage: str, known_at: str) -> list[dict[str, Any]]:
-        rows = self.store.current_propositions(
-            known_at,
-            exclude_cycle_id=cycle["cycle_id"] if stage == "m1_judgment" else None,
-            limit=80,
-        )
-        return [{
-            "proposition_id": row["proposition_id"], "kind": row["proposition_kind"],
-            "subject": row["subject"], "predicate": row["predicate"],
-            "object": json.loads(row["object_json"]), "known_at": row["known_at"],
-        } for row in rows]
-
     def _stage_artifacts(self, cycle: dict[str, Any], stage: str) -> list[dict[str, Any]]:
         allowed = {
             "m0_compose": {"pre_m0", "premarket_chat", "evidence"},
@@ -344,6 +336,9 @@ class RuntimePacketBuilder:
             "像一位熟悉用户的专业炒股搭档直接说话，使用 2 到 7 个自然段；禁止标题、表格、项目符号、编号清单、"
             "字段名堆砌、Protocol 名称和报告腔。不要把输入资料原样重排或复述。结构化事实已经由系统另存，"
             "正文只讲经过取舍后真正重要的观察、判断与不确定性。数据或网络异常要自然说清其实际影响。"
+            "如果需要转贴短小外部材料，先用一句自己的话说明为什么值得看，再把材料放进 Markdown 引用块，"
+            "并附上可点击的来源链接；材料的列表、表格和强调只属于引用块，不能扩散到自己的话。"
+            "材料较长时默认只讲自然摘要并给链接，除非用户明确要原文。"
         )
         instruction = {
             "m0_research": "广泛搜索公开市场信息并输出 Evidence v3 证据剪报。输出 as_of 必须逐字使用 Stage Packet 的 as_of，逐项填写 evidence_contract.requirements 的 coverage。sources、coverage、conflicts 与 high_impact_events 只能引用本轮工具返回的 opaque evidence_ref；source 只能写 evidence_ref、连续原文 excerpt 和分析字段，绝不写 URL、标题、来源身份或任何时间戳。checked_no_change 必须由本轮匹配的负查询支持。严格遵守冻结窗口；区分事实可靠性与传播影响，记录实际覆盖和关键失败。可以用 companion_context 调整搜索重点，但只把其中公开股票、题材和事件用于搜索，禁止把账户、成交、身份、路径或其他私密细节写入搜索词。除本包明确提供的内容外，不读取本地文件或用户资料。",

@@ -911,6 +911,17 @@ public partial class MainWindow : Window, IDisposable
         }
     }
 
+    private void ToolManagerButton_Click(object sender, RoutedEventArgs e)
+    {
+        var executable = Path.Combine(ProjectRoot(), "ToolManager", "AITradingCompanion.ToolManager.exe");
+        if (!File.Exists(executable))
+        {
+            MessageBox.Show("工具管理程序尚未安装。请重新发布 AI 交易伙伴。", "工具管理", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        Process.Start(new ProcessStartInfo(executable) { UseShellExecute = true });
+    }
+
     private void ObservatoryButton_Click(object sender, RoutedEventArgs e)
     {
         if (_evaluationObservatoryWindow is null)

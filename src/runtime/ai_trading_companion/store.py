@@ -22,6 +22,20 @@ def digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _merge_need_items(existing: list[Any], incoming: list[Any], *, limit: int = 20) -> list[Any]:
+    """Bounded, deterministic deduplication for caller-submitted development clues."""
+    merged: list[Any] = []
+    fingerprints: set[str] = set()
+    for item in [*existing, *incoming]:
+        fingerprint = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        if fingerprint not in fingerprints:
+            fingerprints.add(fingerprint)
+            merged.append(item)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
 class CompanionStore:
     def __init__(self, database: Path) -> None:
         self.database = Path(database)
@@ -284,7 +298,18 @@ class CompanionStore:
               imported_artifact_id TEXT, imported_at TEXT NOT NULL,
               detail_json TEXT NOT NULL,
               PRIMARY KEY(source_name, source_id));
-            PRAGMA user_version = 18;
+            CREATE TABLE IF NOT EXISTS capability_need (
+              need_id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE,
+              capability TEXT NOT NULL, output_contract_json TEXT NOT NULL,
+              state TEXT NOT NULL, urgency TEXT NOT NULL,
+              examples_json TEXT NOT NULL, failure_traces_json TEXT NOT NULL,
+              source_hints_json TEXT NOT NULL, checkpoint_json TEXT,
+              occurrence_count INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              claimed_at TEXT, completed_at TEXT, error TEXT);
+            CREATE INDEX IF NOT EXISTS ix_capability_need_state_priority
+              ON capability_need(state, urgency, updated_at);
+            PRAGMA user_version = 19;
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
@@ -441,6 +466,101 @@ class CompanionStore:
                          ON r.schedule_id=t.schedule_id AND r.revision=t.current_revision WHERE t.task_key=companion_cycle.task_key)
                    WHERE schedule_id IS NULL AND EXISTS (SELECT 1 FROM schedule_template t WHERE t.task_key=companion_cycle.task_key)"""
             )
+
+    def submit_capability_need(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Runtime-owned write endpoint for a versioned, deduplicated tool need."""
+        self.initialize()
+        if not isinstance(request, dict) or request.get("contract") != "ai-trading-capability-need/v1":
+            raise ValueError("invalid_capability_need_contract")
+        capability = str(request.get("capability") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", capability):
+            raise ValueError("invalid_capability_need_capability")
+        output_contract = request.get("output_contract")
+        if not isinstance(output_contract, dict) or not output_contract:
+            raise ValueError("invalid_capability_need_output_contract")
+        urgency = str(request.get("urgency") or "normal")
+        levels = {"low": 0, "normal": 1, "high": 2, "critical": 3}
+        if urgency not in levels:
+            raise ValueError("invalid_capability_need_urgency")
+        examples = request.get("examples") or []
+        traces = request.get("failure_trace")
+        if traces is None:
+            traces = request.get("failure_traces") or []
+        traces = [traces] if isinstance(traces, dict) else traces
+        hints = request.get("source_hints") or []
+        if not isinstance(examples, list) or not isinstance(traces, list) or not isinstance(hints, list):
+            raise ValueError("invalid_capability_need_payload")
+        raw_contract = json.dumps(output_contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        raw_payload = json.dumps({"examples": examples, "traces": traces, "hints": hints}, ensure_ascii=False, sort_keys=True)
+        assert_safe(raw_payload, boundary="capability need")
+        dedupe_key = digest(capability + "|" + raw_contract)
+        submitted_at = now()
+        with self.connection() as c:
+            row = c.execute("SELECT * FROM capability_need WHERE dedupe_key=?", (dedupe_key,)).fetchone()
+            if row is None:
+                need_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"capability-need:{dedupe_key}"))
+                c.execute(
+                    """INSERT INTO capability_need(need_id,dedupe_key,capability,output_contract_json,state,urgency,examples_json,
+                       failure_traces_json,source_hints_json,checkpoint_json,occurrence_count,created_at,updated_at)
+                       VALUES(?,?,?,?, 'queued', ?,?,?,?,?,1,?,?)""",
+                    (need_id, dedupe_key, capability, raw_contract, urgency, json.dumps(examples[:20], ensure_ascii=False),
+                     json.dumps(traces[:20], ensure_ascii=False), json.dumps([str(item) for item in hints[:20]], ensure_ascii=False),
+                     None, submitted_at, submitted_at),
+                )
+            else:
+                existing = dict(row)
+                merged_examples = _merge_need_items(json.loads(existing["examples_json"]), examples)
+                merged_traces = _merge_need_items(json.loads(existing["failure_traces_json"]), traces)
+                merged_hints = _merge_need_items(json.loads(existing["source_hints_json"]), [str(item) for item in hints])
+                merged_urgency = urgency if levels[urgency] > levels.get(existing["urgency"], 1) else existing["urgency"]
+                c.execute(
+                    """UPDATE capability_need SET urgency=?,examples_json=?,failure_traces_json=?,source_hints_json=?,
+                       occurrence_count=occurrence_count+1,updated_at=? WHERE need_id=?""",
+                    (merged_urgency, json.dumps(merged_examples, ensure_ascii=False), json.dumps(merged_traces, ensure_ascii=False),
+                     json.dumps(merged_hints, ensure_ascii=False), submitted_at, existing["need_id"]),
+                )
+            stored = c.execute("SELECT * FROM capability_need WHERE dedupe_key=?", (dedupe_key,)).fetchone()
+        return self._capability_need_record(dict(stored))
+
+    def transition_capability_need(self, need_id: str, action: str) -> dict[str, Any]:
+        """Apply one idempotent, runtime-authorized queue transition."""
+        if action not in {"pause", "retry"}:
+            raise ValueError("invalid_capability_need_action")
+        self.initialize()
+        with self.connection() as c:
+            row = c.execute("SELECT * FROM capability_need WHERE need_id=?", (need_id,)).fetchone()
+            if row is None:
+                raise ValueError("capability_need_not_found")
+            current = dict(row)
+            target = "paused" if action == "pause" else "queued"
+            allowed = (action == "pause" and current["state"] in {"queued", "claimed", "paused"}) or (action == "retry" and current["state"] in {"paused", "failed", "queued"})
+            if not allowed:
+                raise ValueError("capability_need_transition_invalid")
+            if current["state"] != target:
+                c.execute("UPDATE capability_need SET state=?,updated_at=?,error=NULL WHERE need_id=?", (target, now(), need_id))
+            stored = c.execute("SELECT * FROM capability_need WHERE need_id=?", (need_id,)).fetchone()
+        return self._capability_need_record(dict(stored))
+
+    def list_capability_needs(self, *, states: tuple[str, ...] | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        self.initialize()
+        allowed = {"queued", "claimed", "paused", "sandbox_verified", "published", "failed", "disabled"}
+        selected = tuple(state for state in (states or ()) if state in allowed)
+        with self.connection() as c:
+            if selected:
+                marks = ",".join("?" for _ in selected)
+                rows = c.execute(f"SELECT * FROM capability_need WHERE state IN ({marks}) ORDER BY updated_at DESC LIMIT ?", (*selected, max(1, min(limit, 500)))).fetchall()
+            else:
+                rows = c.execute("SELECT * FROM capability_need ORDER BY updated_at DESC LIMIT ?", (max(1, min(limit, 500)),)).fetchall()
+        return [self._capability_need_record(dict(row)) for row in rows]
+
+    @staticmethod
+    def _capability_need_record(row: dict[str, Any]) -> dict[str, Any]:
+        for key, target in (("output_contract_json", "output_contract"), ("examples_json", "examples"),
+                            ("failure_traces_json", "failure_traces"), ("source_hints_json", "source_hints"),
+                            ("checkpoint_json", "checkpoint")):
+            value = row.pop(key, None)
+            row[target] = json.loads(value) if value else None if target == "checkpoint" else []
+        return row
 
     def history_page(self, *, before: str | None = None, limit: int = 31, search: str = "") -> dict[str, Any]:
         """Authoritative compact history, deduplicated by task and scheduled time."""

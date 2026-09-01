@@ -45,11 +45,12 @@ from .scheduler import SHANGHAI, conversation_auto_submit_at, ensure_registered_
 from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
 from .runtime_strategy_policy import RuntimeStrategyControls, RuntimeStrategyPolicy
-from .web_access_gateway import WebAccessGatewayClient
 from .local_research import (
     BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
-    ReadOnlyResearchExecutor, WebAccessGatewayBackend,
+    ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend,
 )
+from .tooling import ToolCatalog, ToolRunner
+from .tool_manager import ToolManagerRuntime
 from .store import CompanionStore
 from .trading_calendar import XshgTradingCalendar
 
@@ -330,6 +331,7 @@ def flush(store: CompanionStore, exchange: LocalExchange) -> int:
         exchange.send("to-client", event["event_id"], payload)
         store.mark_schedule_event_delivered(event["event_id"])
         count += 1
+    ToolManagerRuntime(store, PATHS.tools, exchange_root()).publish_projection()
     return count
 
 
@@ -373,6 +375,8 @@ def run_gateway(execute: bool = False) -> None:
             result = _schedule_command(store, payload)
         elif contract == "portfolio-user-command/v1":
             result = _portfolio_command(store, portfolio, payload)
+        elif contract == "ai-trading-tool-manager-command/v1":
+            result = ToolManagerRuntime(store, PATHS.tools, exchange_root()).command(payload)
         else:
             result = engine.command(payload)
         flush(store, exchange)
@@ -472,14 +476,22 @@ def _call_stage(
                 }
             planner = BrokerResearchPlanner(
                 broker, deadline=lambda: deadline, intellect=decision.intellect, effort=decision.reasoning_effort,
+                market_tool_available="market" in controls.enabled_backends,
             )
-            web = WebAccessGatewayBackend(
-                WebAccessGatewayClient(settings.research), as_of=_evidence_read_cutoff(packet, contract),
+            tool_runner = ToolRunner(ToolCatalog(PATHS.tools), need_reporter=store.submit_capability_need)
+            web = ToolCatalogResearchBackend(
+                tool_runner,
+                as_of=_evidence_read_cutoff(packet, contract),
+                deadline=lambda: deadline - time.monotonic(),
             )
             market_facts = packet.get("deterministic_market_facts")
             backends = {"gateway": web} if "gateway" in controls.enabled_backends else {}
-            if "market" in controls.enabled_backends and isinstance(market_facts, dict) and market_facts:
-                backends["market"] = DeterministicMarketBackend(market_facts)
+            if "market" in controls.enabled_backends:
+                backends["market"] = (
+                    DeterministicMarketBackend(market_facts)
+                    if isinstance(market_facts, dict) and market_facts
+                    else ToolCatalogMarketBackend(tool_runner, contract=contract, deadline=lambda: deadline - time.monotonic())
+                )
             executor = ReadOnlyResearchExecutor(backends, max_operations=controls.max_operations)
             research = LocalResearchChain(planner, executor, max_repairs=2).run(
                 packet, contract, attempt_id=attempt["attempt_id"],
@@ -1927,6 +1939,11 @@ def consume(
                 continue
             if command.get("contract") == "portfolio-user-command/v1":
                 result = _portfolio_command(store, portfolio, command)
+                exchange.acknowledge("to-runtime", path)
+                results.append(result)
+                continue
+            if command.get("contract") == "ai-trading-tool-manager-command/v1":
+                result = ToolManagerRuntime(store, PATHS.tools, exchange_root()).command(command)
                 exchange.acknowledge("to-runtime", path)
                 results.append(result)
                 continue

@@ -6,6 +6,17 @@ namespace AITradingCompanion.Tests;
 public sealed class CompanionEventProjectionTests
 {
     [Fact]
+    public void ProjectionRejectsAnUnknownNewAiMessageKind()
+    {
+        var payload = """{"contract":"companion-client-event/v1","event_id":"projection","cycle_id":"c1","type":"projection.ready","created_at":"2026-08-25T01:00:00Z","payload":{"cycle":{"task_key":"conversation.daily"},"ai_messages":[{"artifact_id":"a1","kind":"future_internal_stage","at":"2026-08-25T01:00:00Z","text":"must stay hidden"}]}}""";
+
+        var projection = CompanionEventProjection.Project([payload]);
+
+        Assert.NotNull(projection);
+        Assert.Empty(projection.AiMessages);
+    }
+
+    [Fact]
     public void ProjectionPrefersTheVersionedPublishedMessageOverLegacyText()
     {
         var events = new[]

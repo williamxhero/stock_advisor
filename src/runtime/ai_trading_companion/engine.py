@@ -9,6 +9,14 @@ from zoneinfo import ZoneInfo
 from .learning import JudgmentLifecycle
 from .evidence_contract import EvidenceContractFactory
 from .message_presentation import PresentedMessage, present_message
+
+
+PUBLISHED_MESSAGE_EVENT_TYPES = frozenset({
+    "m0.ready", "m1.ready", "m2.ready", "chat.ready", "premarket.reply.ready",
+    "outcome.ready", "reflection.ready", "judgment.revised", "chat.stream.delta",
+    "chat.stream.failed", "research.failed", "m0.invalidated", "cycle.missed",
+    "m1.failed", "m2.deferred", "outcome.failed", "chat_research.failed",
+})
 from .models import TASK_POLICIES
 from .secret_guard import assert_safe
 from .task_profiles import ManualAnalysisProfileResolver
@@ -789,8 +797,12 @@ class CompanionEngine:
 
     def chat_stream_delta(self, cycle_id: str, stream_id: str, text: str) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
-        stream = self.store.append_stream_chunk(stream_id, text)
-        self.emit(cycle, "chat.stream.delta", {"cycle": cycle, "stream_id": stream_id, "text": text, "state": stream["state"]})
+        presented = self.present_for_publication(text, cycle["as_of"], "ai_chat")
+        stream = self.store.append_stream_chunk(stream_id, presented.markdown)
+        self.emit(cycle, "chat.stream.delta", {
+            "cycle": cycle, "stream_id": stream_id, "text": presented.markdown,
+            "message": presented.message(), "state": stream["state"],
+        })
         return stream
 
     def chat_stream_failed(self, cycle_id: str, stream_id: str, reason: str) -> dict[str, Any]:
@@ -916,6 +928,10 @@ class CompanionEngine:
         }
 
     def emit(self, cycle: dict[str, Any], event_type: str, payload: dict[str, Any]) -> None:
+        if event_type in PUBLISHED_MESSAGE_EVENT_TYPES:
+            message = payload.get("message")
+            if not isinstance(message, dict) or message.get("contract") != "companion-published-message/v2":
+                raise ValueError(f"published event requires companion-published-message/v2: {event_type}")
         self.store.queue_event(cycle["cycle_id"], event_type, payload)
 
     @staticmethod

@@ -41,6 +41,11 @@ def packet_builder(store: CompanionStore) -> RuntimePacketBuilder:
 
 
 class CompanionEngineTests(unittest.TestCase):
+    def test_user_visible_event_cannot_bypass_the_v2_publication_contract(self):
+        with self.assertRaisesRegex(ValueError, "requires companion-published-message/v2"):
+            self.engine.emit(self.cycle, "chat.ready", {"cycle": self.cycle, "text": "raw bypass"})
+        self.assertFalse(any(item["event_type"] == "chat.ready" for item in self.store.pending_events()))
+
     def test_unqualified_chat_candidate_is_not_sealed_as_an_artifact(self):
         with self.assertRaisesRegex(ValueError, "message qualification failed"):
             self.engine.chat_ready(

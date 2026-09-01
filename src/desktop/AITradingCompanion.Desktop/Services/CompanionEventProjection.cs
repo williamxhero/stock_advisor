@@ -232,7 +232,7 @@ public static class CompanionEventProjection
                         var existingText = ai.TryGetValue(streamId, out var existing) && existing.Kind != "chat_pending"
                             ? existing.Text
                             : string.Empty;
-                        UpsertAi(ai, streamId, "chat", item.At, existingText + (ReadString(payload, "text") ?? string.Empty), item.At, null);
+                        UpsertAi(ai, streamId, "chat", item.At, existingText + (ReadPublishedText(payload) ?? string.Empty), item.At, null);
                     }
                     break;
                 case "chat.stream.failed":
@@ -404,9 +404,10 @@ public static class CompanionEventProjection
                 var kind = ReadString(message, "kind") switch
                 {
                     "premarket_chat" => "premarket",
-                    { } value => value,
-                    _ => "chat",
+                    { } value when IsPublishedKind(value) => value,
+                    _ => null,
                 };
+                if (kind is null) continue;
                 var at = ReadDate(ReadString(message, "at")) ?? DateTimeOffset.MinValue;
                 var started = kind == "m1" ? projectedM1StartedAt : kind == "m2" ? projectedM2StartedAt : at;
                 var completed = kind == "m1" ? projectedM1CompletedAt : kind == "m2" ? projectedM2CompletedAt : at;
@@ -522,6 +523,11 @@ public static class CompanionEventProjection
 
     private static string? ReadPublishedText(JsonElement element) =>
         ReadNestedString(element, "message", "text_projection") ?? ReadString(element, "text");
+
+    private static bool IsPublishedKind(string kind) => kind is
+        "m0" or "m1" or "m2" or "ai_chat" or "chat" or "premarket" or "premarket_chat"
+        or "judgment_revision" or "system_fault" or "fault" or "outcome" or "reflection"
+        or "legacy_message" or "legacy_model" or "legacy_synthesis" or "history";
 
     private static string? ReadPublishedText(JsonElement element, string legacyProperty) =>
         ReadNestedString(element, "message", "text_projection") ?? ReadString(element, legacyProperty);

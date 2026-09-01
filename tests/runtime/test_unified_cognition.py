@@ -280,9 +280,9 @@ class UnifiedCognitionTests(unittest.TestCase):
         packet = RuntimePacketBuilder(PROJECT_ROOT / "resources", self.root, self.store).build(
             cycle, "m1_judgment", evidence={}, as_of="2026-08-27T01:40:00Z"
         )
-        private = next(item for item in packet["local_inputs"] if item["path"].startswith("runtime://"))
+        private = packet["business_context"]["private_context_before_h0"]
 
-        self.assertEqual(100, json.loads(private["text"])["positions"][0]["shares"])
+        self.assertEqual(100, private["positions"][0]["shares"])
         self.assertNotIn('"shares": 300', json.dumps(packet, ensure_ascii=False))
 
     def test_invalid_source_span_rejects_only_affected_action(self) -> None:

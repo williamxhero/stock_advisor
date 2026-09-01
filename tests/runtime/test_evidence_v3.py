@@ -125,15 +125,28 @@ class EvidenceV3Tests(TestCase):
         as_of = "2026-08-27T07:20:02.555Z"
         contract = EvidenceContractFactory(_WeekdayCalendar()).build(
             task_key="daily.review.1520", stage="m0_research", as_of=as_of,
+            internal_context={"prior_judgment_count": 3, "portfolio_entities": ["600000"]},
         )
-        market, events = contract["requirements"]
+        requirements = {row["key"]: row for row in contract["requirements"]}
 
         self.assertEqual(
             {"start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z", "mode": "exact"},
-            market["window"],
+            requirements["indices_close"]["window"],
         )
-        self.assertEqual("2026-08-26T07:00:00Z", events["window"]["start"])
-        self.assertEqual("2026-08-27T07:20:02.555000Z", events["window"]["end"])
+        self.assertEqual("2026-08-26T07:00:00Z", requirements["events_and_counterevidence"]["window"]["start"])
+        self.assertEqual("2026-08-27T07:20:02.555000Z", requirements["events_and_counterevidence"]["window"]["end"])
+        blockers = [row["key"] for row in contract["requirements"] if row["blocking"]]
+        self.assertEqual([
+            "indices_close", "turnover_compare", "market_breadth", "themes_and_capacity_cores",
+            "events_and_counterevidence", "prior_judgment_changes", "portfolio_close",
+        ], blockers)
+
+        rejected = EvidenceGate().evaluate(
+            {"schema_version": 3, "as_of": as_of, "sources": [], "coverage": [], "high_impact_events": []},
+            contract, [], as_of, attempt_id="attempt",
+        )
+        self.assertFalse(rejected["passed"])
+        self.assertEqual(set(blockers), set(rejected["missing_requirements"]))
 
     def test_intraday_contract_accepts_recent_market_facts_and_since_prior_checkpoint_events(self):
         contract_0945 = EvidenceContractFactory(_WeekdayCalendar()).build(

@@ -33,6 +33,7 @@ from .memory_commands import handle_memory_command
 from .memory_port import HttpMemoryAdapter, MemoryUnavailable
 from .memory_health import MemoryCapabilityPolicy
 from .memory_evidence import MemoryEvidenceRegistrar
+from .memoryhub_migration import LegacyWorkspaceImporter
 from .migration import LegacyMigrator, LegacySources
 from .models import TASK_POLICIES
 from .observatory import EvaluationObservatory, EvaluationRequest, ExperimentRequest, ForecastRequest
@@ -40,7 +41,6 @@ from .packet_builder import RuntimePacketBuilder
 from .paths import RuntimePaths
 from .portfolio import PortfolioService
 from .preview import approve_bundle, build_bundle, find_source_cycle, launch_preview, seal_bundle, write_bundle
-from .projection import LearningProjectionRenderer
 from .scheduler import SHANGHAI, conversation_auto_submit_at, ensure_registered_policy, run_registry_schedule
 from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
@@ -53,11 +53,11 @@ from .tooling import ToolCatalog, ToolRunner
 from .tool_manager import ToolManagerRuntime
 from .store import CompanionStore
 from .trading_calendar import XshgTradingCalendar
+from .web_access_gateway import WebAccessGatewayClient
 
 
 PATHS = RuntimePaths.discover()
 INSTALL_ROOT = PATHS.install_root
-WORKSPACE = PATHS.workspace
 RUNTIME = Path(os.environ.get("AI_TRADING_COMPANION_RUNTIME", str(PATHS.runtime)))
 DB = Path(os.environ.get("AI_TRADING_COMPANION_DATABASE", str(PATHS.database)))
 SCHEMAS = PATHS.contracts
@@ -268,7 +268,11 @@ def runtime() -> tuple[CompanionEngine, CompanionStore, LocalExchange, Portfolio
     JudgmentLifecycle(store).backfill()
     exchange = LocalExchange(exchange_root())
     exchange.ensure()
-    portfolio = PortfolioService(WORKSPACE, store)
+    LegacyWorkspaceImporter(
+        PATHS.home / "workspace", store, memory, engine.memory_space_id,
+        migrated_at=iso(datetime.now(timezone.utc)),
+    ).run()
+    portfolio = PortfolioService(store)
     portfolio.reconcile()
     return engine, store, exchange, portfolio
 
@@ -336,7 +340,8 @@ def flush(store: CompanionStore, exchange: LocalExchange) -> int:
 
 
 def render_learning(store: CompanionStore) -> None:
-    LearningProjectionRenderer(WORKSPACE, store).render()
+    """Compatibility no-op: file-based learning projections are retired."""
+    return None
 
 
 def broker_client(settings: Any | None = None) -> ProviderBrokerClient:
@@ -493,7 +498,10 @@ def _call_stage(
                     else ToolCatalogMarketBackend(tool_runner, contract=contract, deadline=lambda: deadline - time.monotonic())
                 )
             executor = ReadOnlyResearchExecutor(backends, max_operations=controls.max_operations)
-            research = LocalResearchChain(planner, executor, max_repairs=2).run(
+            research = LocalResearchChain(
+                planner, executor, max_repairs=None,
+                deadline=lambda: deadline - time.monotonic(),
+            ).run(
                 packet, contract, attempt_id=attempt["attempt_id"],
             )
             tool_trace = [*research.observations, *_broker_call_trace(planner.outcomes)]
@@ -798,7 +806,7 @@ def run_research(
     publish_observatory_forecast(store, cycle["cycle_id"], trigger="stage:m0_started")
     if on_progress:
         on_progress()
-    builder = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
+    builder = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
     if not execute:
         evidence = {"as_of": cycle["as_of"], "spoken_summary": "Fixture 模式：等待真实公开信息搜索。", "sources": [], "critical_gaps": []}
         store.append_artifact(cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False), cycle["as_of"])
@@ -900,7 +908,7 @@ def run_m1(
         cycle = engine.resume_m1_after_repair(cycle_id)
     if cycle["state"] not in {"researching_m1", "m1_retry_wait"}:
         raise RuntimeError(f"cycle is not waiting for M1: {cycle['state']}")
-    builder = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
+    builder = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
     if not execute:
         engine.m1_judgment_started(cycle_id)
         research_hash, judgment_hash = "fixture-m1-research", "fixture-m1-judgment"
@@ -1016,7 +1024,7 @@ def run_m2(engine: CompanionEngine, store: CompanionStore, cycle_id: str, execut
     timeout = int(TASK_POLICIES[cycle["task_key"]].m2_timeout.total_seconds())
     controls = resolve_stage_controls(store, "m2", timeout=timeout, search=False)
     packet = finalize_stage_packet(
-        RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(cycle, "m2", as_of=frozen_as_of), controls,
+        RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(cycle, "m2", as_of=frozen_as_of), controls,
     )
     stage_result = _call_stage(
         store, cycle, "m2", packet, "companion-m2-result-v1.schema.json",
@@ -1090,7 +1098,7 @@ def run_reflection(
     if not execute:
         data = {"reflection_markdown": "Fixture 模式：结果已记录，等待真实复盘。", "memory_tags": ["fixture"], "workflow_proposal": None}
     else:
-        packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
+        packet = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
             cycle, "reflection", context={"checkpoint_id": checkpoint_id},
             as_of=iso(datetime.now(timezone.utc)),
         )
@@ -1128,7 +1136,7 @@ def run_outcome(
             "observations": [], "data_gaps": ["fixture mode"],
         }
     else:
-        packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
+        packet = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
             cycle,
             "outcome_research",
             context={
@@ -1219,7 +1227,7 @@ def run_chat_research(
         reply = "Fixture 模式：补查完成后，我会把新增信息继续发在这里。"
         data = None
     else:
-        builder = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
+        builder = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
         research_packet = builder.build(
             cycle, "chat_research", context=public_scope,
             as_of=iso(datetime.now(timezone.utc)),
@@ -1272,7 +1280,7 @@ def run_pending_workflow_feedback(
         if not execute:
             data = {"reflection_markdown": "Fixture 模式：这条工作流反馈已记录。", "memory_tags": ["workflow_feedback"], "workflow_proposal": None}
         else:
-            packet = RuntimePacketBuilder(PATHS.resources, WORKSPACE, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
+            packet = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
                 cycle, "workflow_feedback", context={"source_artifact_id": h0["artifact_id"]},
                 as_of=iso(datetime.now(timezone.utc)),
             )
@@ -2095,7 +2103,11 @@ def main() -> int:
                 decision_center_home=sources.decision_center_home,
                 workspace=legacy_data,
             )
-        print(json.dumps(LegacyMigrator(PATHS, sources).run(), ensure_ascii=False, indent=2))
+        migration_memory = HttpMemoryAdapter(os.environ.get("MEMORYHUB_URL", "http://yosef-server:8820"))
+        print(json.dumps(LegacyMigrator(
+            PATHS, sources, memory=migration_memory,
+            memory_space_id=os.environ.get("MEMORYHUB_SPACE_ID", "ai-trading-companion"),
+        ).run(), ensure_ascii=False, indent=2))
         return 0
     if args.cmd == "configure-web-access-gateway":
         settings = load_settings(PATHS.home)

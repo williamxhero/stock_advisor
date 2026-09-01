@@ -12,7 +12,6 @@ from ai_trading_companion.governance import RouterGovernance, classify_regime
 from ai_trading_companion.learning import JudgmentLifecycle, WorkflowEvolution
 from ai_trading_companion.packet_builder import RuntimePacketBuilder as _RuntimePacketBuilder
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
-from ai_trading_companion.projection import LearningProjectionRenderer
 from ai_trading_companion.router import CognitiveRouter
 from ai_trading_companion.store import CompanionStore
 
@@ -326,22 +325,19 @@ class CompanionLearningTests(unittest.TestCase):
             schema = json.loads((PROJECT_ROOT / "resources" / "contracts" / name).read_text(encoding="utf-8"))
             check(schema, name)
 
-    def test_markdown_memory_is_a_rebuildable_projection_not_the_fact_source(self):
+    def test_learning_state_remains_in_database_without_file_projection(self):
         cycle = self.cycle("daily.execution.0945", "2026-08-25T09:45:00+08:00", "2026-08-25T01:45:00Z")
         artifact = self.store.append_artifact(cycle["cycle_id"], "m1", "model", "603179短线看多。", "2026-08-25T02:00:00Z")
         JudgmentLifecycle(self.store).capture(artifact, "m1", artifact["kind"] + " 603179短线看多。")
 
-        path = LearningProjectionRenderer(Path(self.temp.name), self.store).render()
-
-        text = path.read_text(encoding="utf-8")
-        self.assertIn("由确定性 renderer", text)
-        self.assertIn("603179", text)
+        self.assertTrue(any("603179" in row["snapshot_json"] for row in self.store.judgment_snapshots()))
+        self.assertEqual([], list(Path(self.temp.name).rglob("*.md")))
 
     def test_asr_lexicon_uses_current_task_context_without_copying_sentences(self):
         context = Path(self.temp.name) / "current-task.context.txt"
         context.write_text("新泉股份准备观察，机器人链相对地位需要核实。", encoding="utf-8")
 
-        words = lexicon(PROJECT_ROOT, context)
+        words = lexicon(context)
 
         self.assertIn("新泉股份准备观察", words)
         self.assertIn("机器人链相对地位需要核实", words)

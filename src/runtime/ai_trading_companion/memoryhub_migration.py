@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import re
 import sqlite3
 import time
 from typing import Any, Callable
@@ -14,6 +15,148 @@ from .memory_port import MemoryPort
 
 def _hash(body: str) -> str:
     return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+class LegacyWorkspaceImporter:
+    """One-time bridge from retired text files into MemoryHub and business facts.
+
+    Once the database marker is present, this class returns without enumerating
+    or reading the legacy directory. The files are never a production input.
+    """
+
+    def __init__(
+        self, root: Path, store: Any, memory: MemoryPort, memory_space_id: str,
+        *, migrated_at: str,
+    ) -> None:
+        self.root = Path(root)
+        self.store = store
+        self.memory = memory
+        self.memory_space_id = memory_space_id
+        self.migrated_at = migrated_at
+        root_key = hashlib.sha256(str(self.root.resolve()).casefold().encode("utf-8")).hexdigest()[:16]
+        self.marker_key = f"legacy_workspace_memoryhub_v1:{root_key}"
+
+    def run(self) -> dict[str, Any]:
+        with self.store.connection() as connection:
+            marker = connection.execute(
+                "SELECT value FROM portfolio_meta WHERE key=?", (self.marker_key,),
+            ).fetchone()
+        if marker:
+            return {"state": "already_imported", "root": str(self.root), "marker": marker[0]}
+
+        files = sorted(
+            path for path in self.root.rglob("*")
+            if path.is_file() and path.suffix.casefold() in {".md", ".csv"}
+        ) if self.root.exists() else []
+        episodes: list[dict[str, Any]] = []
+        portfolio_text: str | None = None
+        for path in files:
+            body = path.read_text(encoding="utf-8-sig", errors="replace")
+            relative = path.relative_to(self.root).as_posix()
+            digest = _hash(body)
+            episodes.append({
+                "memory_space_id": self.memory_space_id,
+                "source_system": "legacy-workspace-import",
+                "source_event_id": f"workspace:{relative}:{digest.removeprefix('sha256:')}",
+                "content_hash": digest,
+                "body": body,
+                "episode_type": "legacy_workspace_document",
+                "occurred_at": self.migrated_at,
+                "known_at": self.migrated_at,
+                "submitted_at": self.migrated_at,
+                "authority": "migrated_legacy_record",
+                "protocol_version": "memoryhub/v1",
+                "metadata": {
+                    "legacy_relative_path": relative,
+                    "legacy_format": path.suffix.casefold().lstrip("."),
+                    "time_provenance": "migration_time",
+                },
+            })
+            if relative.casefold() == "portfolio/01_current_portfolio.md":
+                portfolio_text = body
+
+        failures: list[dict[str, str]] = []
+        imported = 0
+        for offset in range(0, len(episodes), 50):
+            values = episodes[offset:offset + 50]
+            results = self.memory.append_batch(values)
+            for value, result in zip(values, results):
+                if isinstance(result, dict) and result.get("receipt"):
+                    imported += 1
+                else:
+                    failures.append({
+                        "source_event_id": str(value["source_event_id"]),
+                        "error": str(result.get("detail") or result.get("error") or "unknown append failure"),
+                    })
+        if failures:
+            raise RuntimeError("legacy workspace MemoryHub import failed: " + json.dumps(failures, ensure_ascii=False))
+
+        portfolio_rows = self._import_portfolio_baseline(portfolio_text)
+        with self.store.connection() as connection:
+            connection.execute(
+                "INSERT INTO portfolio_meta(key,value) VALUES(?,?)",
+                (self.marker_key, self.migrated_at),
+            )
+        return {
+            "state": "imported", "root": str(self.root), "files": len(files),
+            "memoryhub_episodes": imported, "portfolio_positions": portfolio_rows,
+            "legacy_files_deleted": False,
+        }
+
+    def _import_portfolio_baseline(self, text: str | None) -> int:
+        with self.store.connection() as connection:
+            has_positions = connection.execute("SELECT 1 FROM portfolio_position LIMIT 1").fetchone()
+            baseline = connection.execute("SELECT 1 FROM portfolio_meta WHERE key='baseline_imported'").fetchone()
+        if has_positions or baseline:
+            return 0
+        source = text or ""
+        section = (
+            source.split("## 当前持仓", 1)[1].split("## 最近清仓", 1)[0]
+            if "## 当前持仓" in source and "## 最近清仓" in source else ""
+        )
+        rows: list[tuple[Any, ...]] = []
+        for line in section.splitlines():
+            if not line.lstrip().startswith("|") or "---" in line or "代码" in line:
+                continue
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if len(cells) < 8 or not re.fullmatch(r"\d{6}", cells[0]):
+                continue
+            shares = int(self._number(cells[2]) or 0)
+            rows.append((
+                cells[0], cells[1], shares, self._number(cells[5]), self._number(cells[3]),
+                None, self._number(cells[4]), self._number(cells[6]),
+                (self._number(cells[7]) or 0) / 100 if self._number(cells[7]) is not None else None,
+            ))
+        updated_match = re.search(r"持仓与成交更新时间：\*\*(.+?)\*\*", source)
+        updated_at = updated_match.group(1).strip() if updated_match else self.migrated_at
+        asset_match = re.search(r"当前总资产：约\s*\*\*([\d,.]+)元\*\*", source)
+        with self.store.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for row in rows:
+                connection.execute(
+                    "INSERT OR IGNORE INTO portfolio_position VALUES(?,?,?,?,?,?,?,?,?,?,1)",
+                    (*row[:5], updated_at, *row[6:], updated_at),
+                )
+            connection.execute(
+                "INSERT INTO portfolio_meta(key,value) VALUES('baseline_imported',?)",
+                (self.migrated_at,),
+            )
+            if asset_match:
+                connection.execute(
+                    "INSERT INTO portfolio_meta(key,value) VALUES('total_assets',?)",
+                    (asset_match.group(1).replace(",", ""),),
+                )
+        return len(rows)
+
+    @staticmethod
+    def _number(value: str) -> float | None:
+        cleaned = value.replace(",", "").replace("*", "").replace("+", "").replace("%", "").strip()
+        if not cleaned or cleaned in {"-", "—", "暂无"}:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
 
 
 class MemoryHubMigrator:

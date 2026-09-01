@@ -149,7 +149,7 @@ class ManualAnalysisProfileResolverTests(TestCase):
             self.assertEqual("manual.non_trading_outlook", cycle["task_key"])
             self.assertEqual("non_trading_outlook", cycle["task_profile_id"])
             self.assertEqual("非交易日市场环境总结与下一交易日预判", packet["task_profile"]["display_name"])
-            self.assertEqual("protocols/10_NON_TRADING_OUTLOOK_PROTOCOL.md", packet["protocol"]["path"])
+            self.assertEqual("non_trading_outlook", packet["protocol"]["protocol_id"])
 
 
 class _Calendar:

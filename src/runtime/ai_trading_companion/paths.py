@@ -1,4 +1,4 @@
-"""Stable locations for the installed product and its mutable local workspace."""
+"""Stable locations for the installed product and its mutable structured state."""
 from __future__ import annotations
 
 import os
@@ -41,10 +41,6 @@ class RuntimePaths:
         return self.resources / "contracts"
 
     @property
-    def workspace(self) -> Path:
-        return self.home / "workspace"
-
-    @property
     def runtime(self) -> Path:
         return self.home / "runtime"
 
@@ -70,8 +66,7 @@ class RuntimePaths:
 
     def ensure(self) -> None:
         for directory in (
-            self.home / "data", self.workspace / "portfolio", self.workspace / "state",
-            self.workspace / "logs", self.workspace / "reports", self.runtime / "runs",
+            self.home / "data", self.runtime / "runs",
             self.runtime / "logs", self.runtime / "backups", self.exchange / "to-runtime" / "pending",
             self.exchange / "to-client" / "pending", self.home / "ui", self.home / "cache",
             self.home / "migration", self.home / "config",

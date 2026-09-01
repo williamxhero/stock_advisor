@@ -30,7 +30,8 @@ def test_export_then_confirmed_clear_is_visible_and_idempotent(tmp_path: Path) -
     )
 
     assert Path(exported["machine_export_path"]).exists()
-    assert "我的私人判断" in Path(exported["human_export_path"]).read_text(encoding="utf-8")
+    assert "我的私人判断" in Path(exported["machine_export_path"]).read_text(encoding="utf-8")
+    assert list(tmp_path.glob("*.md")) == []
     assert cancelled["cleared"] is False
     assert cleared == replay
     assert memory.timeline("private") == []

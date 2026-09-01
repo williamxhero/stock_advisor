@@ -135,7 +135,7 @@ def prepare_preview_home(product_home: Path, database: Path, preview_id: str) ->
     finally:
         destination.close()
         source.close()
-    for relative in ("config", "workspace"):
+    for relative in ("config",):
         source_path = product_home / relative
         if source_path.exists():
             shutil.copytree(source_path, work / relative, dirs_exist_ok=True)

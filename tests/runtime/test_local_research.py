@@ -294,6 +294,28 @@ print(json.dumps({'contract':'ai-trading-tool-result/v1','fact_as_of':'2026-08-2
         self.assertTrue(result.qualified)
         self.assertEqual("收盘事实", result.evidence["sources"][0]["excerpt"])
 
+    def test_production_research_keeps_replanning_past_two_repairs_until_qualified(self) -> None:
+        read = {"results": [{
+            "url": "https://example.test/2026-08-27", "title": "收盘",
+            "excerpt_text": "收盘事实", "fact_as_of": CONTRACT["as_of"], "primary": True,
+        }]}
+        rounds: list[int] = []
+
+        def planner(_packet: dict, _gaps: list[str], round_number: int) -> dict:
+            rounds.append(round_number)
+            operation = row("web_read", url="https://example.test/2026-08-27") if round_number >= 3 else row("web_search", query=f"收盘 修复 {round_number}")
+            return {"version": 1, "operations": [operation]}
+
+        result = LocalResearchChain(
+            planner,
+            ReadOnlyResearchExecutor({"gateway": lambda operation, _arguments: read if operation == "web_read" else {"results": []}}),
+            max_repairs=None,
+            deadline=lambda: 30.0,
+        ).run({"as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="continuous")
+
+        self.assertTrue(result.qualified, result.verifier["problems"])
+        self.assertEqual([0, 1, 2, 3], rounds)
+
     def test_failed_planned_read_uses_an_untried_discovery_without_new_search(self) -> None:
         search = {"results": [
             {"url": "https://blocked.test/2026-08-27", "title": "blocked", "excerpt_text": "2026-08-27", "fact_as_of": CONTRACT["as_of"]},

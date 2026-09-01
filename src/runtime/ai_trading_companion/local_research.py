@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -328,18 +329,21 @@ class ReadOnlyResearchExecutor:
 class LocalResearchChain:
     def __init__(self, planner: Callable[[dict[str, Any], list[str], int], dict[str, Any]],
                  executor: ReadOnlyResearchExecutor, *, gate: EvidenceGate | None = None,
-                 max_repairs: int = 2) -> None:
+                 max_repairs: int | None = 2,
+                 deadline: Callable[[], float] | None = None) -> None:
         self.planner = planner
         self.executor = executor
         self.gate = gate or EvidenceGate()
-        self.max_repairs = max(0, min(2, int(max_repairs)))
+        self.max_repairs = None if max_repairs is None else max(0, int(max_repairs))
+        self.deadline = deadline
 
     def run(self, packet: dict[str, Any], contract: dict[str, Any], *, attempt_id: str) -> FrozenResearchResult:
         boundary = AcquisitionBoundary(attempt_id)
         observations: list[dict[str, Any]] = []
         verifier: dict[str, Any] = {"passed": False, "problems": ["not_evaluated"], "missing_requirements": []}
         evidence: dict[str, Any] = {}
-        for round_number in range(self.max_repairs + 1):
+        round_number = 0
+        while self.deadline is None or self.deadline() > 1.0:
             round_observation_start = len(observations)
             gaps = list(verifier.get("missing_requirements") or verifier.get("problems") or [])
             planning_packet = {
@@ -403,13 +407,18 @@ class LocalResearchChain:
                 normalized = verifier.get("normalized_evidence") or evidence
                 bundle_bytes, bundle_hash = freeze_evidence_bundle(normalized)
                 return FrozenResearchResult(True, normalized, verifier, observations, bundle_bytes, bundle_hash, round_number)
+            round_number += 1
+            if self.max_repairs is not None and round_number > self.max_repairs:
+                break
         bundle_bytes, bundle_hash = freeze_evidence_bundle(evidence)
         failure = {
             "type": "stage_failure", "stage": str(packet.get("stage") or "research"),
-            "category": "evidence_insufficient", "problems": list(verifier.get("problems") or []),
+            "category": "evidence_insufficient",
+            "stop_reason": "reliability_deadline" if self.deadline is not None else "configured_test_rounds",
+            "problems": list(verifier.get("problems") or []),
         }
         return FrozenResearchResult(False, evidence, verifier, observations, bundle_bytes, bundle_hash,
-                                    self.max_repairs, [failure])
+                                    round_number, [failure])
 
 
 def freeze_evidence_bundle(evidence: dict[str, Any]) -> tuple[bytes, str]:
@@ -429,7 +438,10 @@ def _verify_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> dic
     gap_text = "\n".join(str(item) for item in packet.get("coverage_gaps") or [])
     required = {
         key for key, row in requirements.items()
-        if row.get("blocking", True) and (not gap_text or key in gap_text)
+        if row.get("blocking", True)
+        and row.get("evidence_class") != "internal_runtime"
+        and not (row.get("evidence_class") == "public_if_present" and not row.get("required_entities"))
+        and (not gap_text or key in gap_text)
     }
     planned = {
         str(row.get("requirement_key") or "")
@@ -632,7 +644,11 @@ def _compile_evidence(packet: dict[str, Any], contract: dict[str, Any], observat
         key = str(requirement.get("key") or "")
         refs = refs_by_requirement.get(key, [])
         allowed = set(requirement.get("allowed_coverage") or ["covered"])
-        if refs:
+        if requirement.get("evidence_class") == "internal_runtime":
+            status = "covered" if int(requirement.get("internal_record_count") or 0) > 0 else "checked_no_change"
+        elif requirement.get("evidence_class") == "public_if_present" and not requirement.get("required_entities"):
+            status = "checked_no_change"
+        elif refs:
             status = "covered"
         elif "checked_no_change" in allowed and _has_matching_negative_search(observations, requirement):
             status = "checked_no_change"

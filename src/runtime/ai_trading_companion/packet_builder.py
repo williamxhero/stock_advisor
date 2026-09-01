@@ -23,15 +23,16 @@ class RuntimePacketBuilder:
     def __init__(
         self,
         resources_root: Path,
-        workspace_root: Path,
-        store: Any,
+        store_or_legacy_root: Any,
+        store: Any | None = None,
         memory: MemoryPort | None = None,
         memory_space_id: str = "ai-trading-companion",
         evidence_contract_factory: EvidenceContractFactory | None = None,
     ) -> None:
         self.resources_root = Path(resources_root)
-        self.workspace_root = Path(workspace_root)
-        self.store = store
+        # The third positional argument is accepted during one release only so
+        # old callers can upgrade without making the retired directory an input.
+        self.store = store if store is not None else store_or_legacy_root
         self.memory = memory
         self.memory_space_id = memory_space_id
         self.evidence_contract_factory = evidence_contract_factory or EvidenceContractFactory()
@@ -71,13 +72,14 @@ class RuntimePacketBuilder:
                     packet["evidence_contract"] = self.evidence_contract_factory.build(
                         task_key=cycle["task_key"], stage=stage, as_of=packet_as_of,
                         task_profile=profile,
+                        internal_context=self._internal_evidence_context(cycle, packet_as_of),
                     )
             else:
                 packet["evidence_requirements"] = self._evidence_requirements(cycle, stage)
             packet["public_research_scope"] = self._public_scope(cycle, stage, evidence, context, packet_as_of, memory_cards)
         else:
             packet["protocol"] = self._protocol(cycle, stage)
-            packet["local_inputs"] = self._local_inputs(cycle, stage)
+            packet["business_context"] = self._business_context(cycle, stage)
             packet["evidence"] = evidence or {}
             packet["artifacts"] = self._stage_artifacts(cycle, stage)
             packet["memories"] = memory_cards
@@ -205,6 +207,22 @@ class RuntimePacketBuilder:
             ).fetchall()
         return [{"code": row["code"], "name": row["name"], "purpose": "核验持仓相关公开收盘量价，不包含账户身份或认证信息"} for row in rows]
 
+    def _internal_evidence_context(self, cycle: dict[str, Any], packet_as_of: str) -> dict[str, Any]:
+        if cycle["task_key"] != "daily.review.1520":
+            return {}
+        judgments = self.store.frozen_judgments_before(
+            cycle["scheduled_for"][:10], packet_as_of,
+            ("daily.execution.0945", "daily.execution.1030", "daily.execution.1430"),
+        )
+        with self.store.connection() as connection:
+            rows = connection.execute(
+                "SELECT code,name FROM portfolio_position WHERE shares>0 ORDER BY code"
+            ).fetchall()
+        return {
+            "prior_judgment_count": len(judgments),
+            "portfolio_entities": [row["code"] for row in rows],
+        }
+
     def _evidence_requirements(self, cycle: dict[str, Any], stage: str) -> list[dict[str, Any]]:
         if cycle["task_key"] != "daily.review.1520" or stage not in {"m0_research", "m1_research"}:
             return [
@@ -261,11 +279,11 @@ class RuntimePacketBuilder:
             "category": item.get("category"), "proposal": json.loads(item["changeset_json"]),
         }
 
-    def _protocol(self, cycle: dict[str, Any], stage: str) -> dict[str, str]:
-        relative = TASK_POLICIES[cycle["task_key"]].protocol_path
+    def _protocol(self, cycle: dict[str, Any], stage: str) -> dict[str, Any]:
+        protocol_id = TASK_POLICIES[cycle["task_key"]].protocol_id
         if stage == "m0_compose":
             return {
-                "path": relative,
+                "protocol_id": protocol_id,
                 "stage_scope": "m0_objective_observation_only",
                 "text": (
                     "本阶段只形成 M0 客观观察，不执行完整协议中的操作决策章节。"
@@ -274,26 +292,37 @@ class RuntimePacketBuilder:
                     "完整执行协议将在独立 M1 阶段使用。"
                 ),
             }
-        path = self.resources_root / relative
-        text = path.read_text(encoding="utf-8") if path.exists() else "Protocol unavailable. State the material impact naturally."
-        return {"path": relative, "text": text[:50000]}
+        definitions = json.loads(
+            (self.resources_root / "protocols" / "protocols.json").read_text(encoding="utf-8")
+        )
+        protocol = dict(definitions["protocols"][protocol_id])
+        return {"protocol_id": protocol_id, "version": definitions["version"], **protocol}
 
-    def _local_inputs(self, cycle: dict[str, Any], stage: str) -> list[dict[str, str]]:
-        inputs: list[dict[str, str]] = []
-        relatives = [
-            "state/11_STOCK_STATE.csv",
-            "state/10_THEME_STATE.csv",
-            "logs/12_OPPORTUNITY_LOG.csv",
-        ]
-        if stage != "m1_judgment":
-            relatives.insert(0, "portfolio/01_CURRENT_PORTFOLIO.md")
-        for relative in relatives:
-            path = self.workspace_root / relative
-            if path.exists():
-                inputs.append({"path": relative, "text": path.read_text(encoding="utf-8")[:30000]})
-        if stage == "m1_judgment" and cycle.get("private_context_json"):
-            inputs.insert(0, {"path": "runtime://private-context-before-h0", "text": cycle["private_context_json"]})
-        return inputs
+    def _business_context(self, cycle: dict[str, Any], stage: str) -> dict[str, Any]:
+        """Select current facts from the authoritative runtime database only."""
+        if stage == "m1_judgment":
+            return {
+                "fact_source": "runtime_database",
+                "portfolio": None,
+                "private_context_before_h0": json.loads(cycle["private_context_json"])
+                if cycle.get("private_context_json") else None,
+            }
+        with self.store.connection() as connection:
+            positions = [dict(row) for row in connection.execute(
+                "SELECT code,name,shares,average_cost,last_price,price_as_of,market_value,unrealized_pnl,updated_at "
+                "FROM portfolio_position WHERE shares>0 ORDER BY market_value DESC,code"
+            )]
+            total_assets = connection.execute(
+                "SELECT value FROM portfolio_meta WHERE key='total_assets'"
+            ).fetchone()
+        return {
+            "fact_source": "runtime_database",
+            "portfolio": {
+                "positions": positions,
+                "total_assets": float(total_assets[0]) if total_assets else None,
+            },
+            "historical_context_source": "memoryhub",
+        }
 
     def _stage_artifacts(self, cycle: dict[str, Any], stage: str) -> list[dict[str, Any]]:
         allowed = {

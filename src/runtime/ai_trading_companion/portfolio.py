@@ -1,41 +1,16 @@
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
-import os
 import re
-import tempfile
 import uuid
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .store import now
 
 
-PORTFOLIO_RELATIVE = Path("portfolio/01_CURRENT_PORTFOLIO.md")
-DECISION_LOG_RELATIVE = Path("logs/05_DECISION_LOG.csv")
-# Internal instrument resolution only. It must not be projected as an "AI 状态"
-# in the holdings window.
-STATE_RELATIVE = Path("state/11_STOCK_STATE.csv")
 STATE_TERMS = re.compile(r"买入|卖出|成交|加仓|减仓|清仓|持仓|成本|仓位|总资产|股票资产")
 FUTURE_TERMS = re.compile(r"计划|准备|打算|考虑|建议|如果|若|明天|等到|满足.*后")
-
-
-def sha256(path: Path) -> str | None:
-    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
-
-
-def _number(value: str) -> float | None:
-    cleaned = value.replace(",", "").replace("*", "").replace("+", "").strip()
-    if not cleaned or cleaned in {"-", "—", "暂无"}:
-        return None
-    cleaned = cleaned.replace("%", "")
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
 
 
 def is_portfolio_statement(text: str) -> bool:
@@ -50,51 +25,11 @@ def is_future_action_statement(text: str) -> bool:
 class PortfolioService:
     """Owns factual portfolio events. Model output is treated only as an untrusted proposal."""
 
-    def __init__(self, workspace_root: Path, store: Any) -> None:
-        self.root = Path(workspace_root)
-        self.store = store
+    def __init__(self, store_or_legacy_root: Any, store: Any | None = None) -> None:
+        # A second argument is tolerated for upgrade compatibility; the first
+        # value is never inspected and cannot become a factual input.
+        self.store = store if store is not None else store_or_legacy_root
         self.store.initialize()
-        self.portfolio_path = self.root / PORTFOLIO_RELATIVE
-        self.decision_log_path = self.root / DECISION_LOG_RELATIVE
-        self.state_path = self.root / STATE_RELATIVE
-        self._import_baseline_once()
-
-    def _import_baseline_once(self) -> None:
-        with self.store.connection() as connection:
-            if connection.execute("SELECT 1 FROM portfolio_meta WHERE key='baseline_imported'").fetchone():
-                return
-        # A new local installation has no user projection yet.  Treat that as
-        # an explicit empty factual baseline rather than preventing runtime
-        # startup (and therefore every future schedule) from working.
-        text = self.portfolio_path.read_text(encoding="utf-8-sig") if self.portfolio_path.exists() else ""
-        section = text.split("## 当前持仓", 1)[1].split("## 最近清仓", 1)[0] if "## 当前持仓" in text and "## 最近清仓" in text else ""
-        rows = []
-        for line in section.splitlines():
-            if not line.lstrip().startswith("|") or "---" in line or "代码" in line:
-                continue
-            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-            if len(cells) < 8 or not re.fullmatch(r"\d{6}", cells[0]):
-                continue
-            shares = int(_number(cells[2]) or 0)
-            rows.append((
-                cells[0], cells[1], shares, _number(cells[5]), _number(cells[3]),
-                None, _number(cells[4]), _number(cells[6]),
-                (_number(cells[7]) or 0) / 100 if _number(cells[7]) is not None else None,
-            ))
-        updated_match = re.search(r"持仓与成交更新时间：\*\*(.+?)\*\*", text)
-        updated_at = updated_match.group(1).strip() if updated_match else now()
-        asset_match = re.search(r"当前总资产：约\s*\*\*([\d,\.]+)元\*\*", text)
-        with self.store.connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            for row in rows:
-                connection.execute(
-                    "INSERT OR IGNORE INTO portfolio_position VALUES(?,?,?,?,?,?,?,?,?,?,1)",
-                    (*row[:5], updated_at, *row[6:], updated_at),
-                )
-            connection.execute("INSERT INTO portfolio_meta VALUES('baseline_imported',?)", (now(),))
-            connection.execute("INSERT INTO portfolio_meta VALUES('portfolio_sha256',?)", (sha256(self.portfolio_path) or "",))
-            if asset_match:
-                connection.execute("INSERT INTO portfolio_meta VALUES('total_assets',?)", (asset_match.group(1).replace(",", ""),))
 
     def snapshot(self) -> dict[str, Any]:
         with self.store.connection() as connection:
@@ -342,16 +277,6 @@ class PortfolioService:
 
     def _instrument_map(self) -> dict[str, list[tuple[str, str]]]:
         result: dict[str, list[tuple[str, str]]] = {}
-        if self.state_path.exists():
-            with self.state_path.open("r", encoding="utf-8-sig", newline="") as handle:
-                for row in csv.DictReader(handle):
-                    code, name = row.get("code", "").strip(), row.get("name", "").strip()
-                    if code and name:
-                        pair = (code, name)
-                        for key in (code, name):
-                            result.setdefault(key, [])
-                            if pair not in result[key]:
-                                result[key].append(pair)
         for row in self.snapshot()["positions"]:
             pair = (row["code"], row["name"])
             for key in pair:
@@ -383,7 +308,6 @@ class PortfolioService:
         return proposal_id
 
     def _commit_transactions(self, text: str, changes: list[dict[str, Any]], cycle_id: str | None, artifact_id: str | None) -> dict[str, Any]:
-        expected_hash = sha256(self.portfolio_path)
         group_seed = artifact_id or f"{cycle_id or ''}:{hashlib.sha256(text.encode()).hexdigest()}"
         action_group_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"portfolio-action:{group_seed}"))
         transaction_ids: list[str] = []
@@ -413,8 +337,6 @@ class PortfolioService:
                          json.dumps({"total_assets": change["total_assets"]}, ensure_ascii=False), transaction_id),
                     )
                     connection.execute("INSERT INTO portfolio_meta(key,value) VALUES('total_assets',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(change["total_assets"]),))
-                    intent_id = str(uuid.uuid4())
-                    connection.execute("INSERT INTO portfolio_render_intent VALUES(?,?,?, 'pending',?,NULL,NULL)", (intent_id, transaction_id, expected_hash, now()))
                     transaction_ids.append(transaction_id)
                     summaries.append(f"总资产修正为 {change['total_assets']:,.2f}元")
                     continue
@@ -465,148 +387,31 @@ class PortfolioService:
                     (action_group_id, json.dumps({"position": old if old_shares or change["code"] in positions else None}, ensure_ascii=False, sort_keys=True),
                      json.dumps({"position": after_position}, ensure_ascii=False, sort_keys=True), transaction_id),
                 )
-                intent_id = str(uuid.uuid4())
-                connection.execute(
-                    "INSERT INTO portfolio_render_intent VALUES(?,?,?, 'pending',?,NULL,NULL)",
-                    (intent_id, transaction_id, expected_hash, now()),
-                )
                 positions[change["code"]] = {**old, "shares": new_shares, "average_cost": new_cost}
                 transaction_ids.append(transaction_id)
                 if change["action"] == "position_correction":
                     summaries.append(f"{change['name']} 当前持仓修正为 {new_shares}股")
                 else:
                     summaries.append(f"{change['name']} {'+' if signed > 0 else ''}{signed}股 @ {change['price']:g}")
-        render_errors = self.reconcile()
         payload = {
             "source_artifact_id": artifact_id,
             "transaction_ids": transaction_ids,
             "summary": "；".join(summaries) or "持仓已更新",
-            "projection_pending": bool(render_errors),
+            "projection_pending": False,
             "snapshot": self.snapshot(),
         }
         self.store.queue_portfolio_event("portfolio.change.applied", payload)
         return {"state": "applied", **payload}
 
     def reconcile(self) -> list[str]:
-        errors: list[str] = []
+        """Retire projection intents left by pre-cutover builds without touching files."""
         with self.store.connection() as connection:
-            intents = [dict(row) for row in connection.execute(
-                "SELECT * FROM portfolio_render_intent WHERE state='pending' ORDER BY created_at"
-            )]
-        for intent in intents:
-            try:
-                current_hash = sha256(self.portfolio_path)
-                expected = intent["expected_portfolio_sha256"]
-                with self.store.connection() as connection:
-                    recorded = connection.execute("SELECT value FROM portfolio_meta WHERE key='portfolio_sha256'").fetchone()
-                if expected and current_hash != expected and (not recorded or current_hash != recorded[0]):
-                    raise RuntimeError("Portfolio Markdown revision conflict; refusing to overwrite")
-                self._render_portfolio()
-                self._append_decision_log(intent["transaction_id"])
-                with self.store.connection() as connection:
-                    connection.execute(
-                        "UPDATE portfolio_render_intent SET state='applied',completed_at=?,error=NULL WHERE intent_id=?",
-                        (now(), intent["intent_id"]),
-                    )
-                    connection.execute(
-                        "INSERT INTO portfolio_meta(key,value) VALUES('portfolio_sha256',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                        (sha256(self.portfolio_path) or "",),
-                    )
-            except Exception as exception:
-                errors.append(str(exception))
-                with self.store.connection() as connection:
-                    connection.execute(
-                        "UPDATE portfolio_render_intent SET error=? WHERE intent_id=?",
-                        (str(exception)[-2000:], intent["intent_id"]),
-                    )
-        return errors
-
-    def _render_portfolio(self) -> None:
-        text = self.portfolio_path.read_text(encoding="utf-8-sig")
-        snapshot = self.snapshot()
-        positions = snapshot["positions"]
-        table = [
-            "| 代码 | 名称 | 股数 | 参考价 | 市值 | 成本价 | 浮动盈亏 | 仓位占总资产约 |",
-            "|---|---|---:|---:|---:|---:|---:|---:|",
-        ]
-        total_assets = snapshot["total_assets"]
-        for row in positions:
-            weight = (row["market_value"] / total_assets * 100) if total_assets and row["market_value"] is not None else None
-            table.append(
-                f"| {row['code']} | {row['name']} | {row['shares']} | {_fmt(row['last_price'])} | "
-                f"{_fmt(row['market_value'])} | {_fmt(row['average_cost'], 3)} | {_fmt_signed(row['unrealized_pnl'])} | "
-                f"{_fmt(weight, 2, '%')} |"
+            connection.execute(
+                "UPDATE portfolio_render_intent SET state='retired',completed_at=?,"
+                "error='file projections retired after MemoryHub cutover' WHERE state='pending'",
+                (now(),),
             )
-        current_section = text.split("## 当前持仓", 1)[1].split("## 最近清仓", 1)[0]
-        lines = current_section.splitlines()
-        first = next(i for i, line in enumerate(lines) if line.lstrip().startswith("|"))
-        last = first
-        while last < len(lines) and lines[last].lstrip().startswith("|"):
-            last += 1
-        updated_section = "\n".join(lines[:first] + table + lines[last:])
-        text = text.split("## 当前持仓", 1)[0] + "## 当前持仓" + updated_section + "\n\n## 最近清仓" + text.split("## 最近清仓", 1)[1]
-        text = re.sub(r"持仓与成交更新时间：\*\*(.+?)\*\*", f"持仓与成交更新时间：**{snapshot['updated_at']}**", text, count=1)
-        total_value = sum(float(row["market_value"] or 0) for row in positions)
-        total_weight = total_value / total_assets * 100 if total_assets else None
-        text = re.sub(r"- 股票总市值：.*", f"- 股票总市值：按表内价格口径约 **{total_value:,.2f}元**", text, count=1)
-        if total_weight is not None:
-            text = re.sub(r"- 股票总仓位：.*", f"- 股票总仓位：按当前总资产基准估算约 **{total_weight:.2f}%**", text, count=1)
-            text = re.sub(r"- 现金及其他资产比例：.*", f"- 现金及其他资产比例：按同一基准估算约 **{100-total_weight:.2f}%**", text, count=1)
-        marker = "## AI交易伙伴成交记录"
-        generated = self._transaction_markdown()
-        if marker in text:
-            prefix, suffix = text.split(marker, 1)
-            suffix_tail = suffix.split("## 更新规则", 1)[1] if "## 更新规则" in suffix else ""
-            text = prefix.rstrip() + "\n\n" + generated + "\n\n## 更新规则" + suffix_tail
-        else:
-            text = text.replace("## 更新规则", generated + "\n\n## 更新规则")
-        self._atomic_write(self.portfolio_path, text.rstrip() + "\n")
-
-    def _transaction_markdown(self) -> str:
-        with self.store.connection() as connection:
-            rows = [dict(row) for row in connection.execute(
-                "SELECT * FROM portfolio_transaction ORDER BY created_at DESC LIMIT 30"
-            )]
-        lines = ["## AI交易伙伴成交记录", "", "> 以下记录由用户明确成交陈述生成；撤销以反向事件保留历史。", ""]
-        if not rows:
-            return "\n".join(lines + ["- 暂无新增成交。"])
-        for row in rows:
-            action = {"buy": "买入", "sell": "卖出", "position_correction": "持仓修正", "asset_correction": "资产修正"}.get(row["action"], row["action"])
-            reversal = "（撤销事件）" if row["reversal_of"] else ""
-            if row["action"] == "asset_correction":
-                lines.append(f"- {row['occurred_at']}：总资产修正为{row['price']:,.2f}元；transaction_id={row['transaction_id']}")
-            elif row["action"] == "position_correction":
-                lines.append(f"- {row['occurred_at']}：{row['name']}（{row['code']}）当前持仓修正为{row['position_after']}股，成本/参考价按已确认状态保留；transaction_id={row['transaction_id']}")
-            else:
-                lines.append(f"- {row['occurred_at']}：{action}{row['name']}（{row['code']}）{row['shares']}股 @ {row['price']:g}{reversal}；transaction_id={row['transaction_id']}")
-        return "\n".join(lines)
-
-    def _append_decision_log(self, transaction_id: str) -> None:
-        with self.store.connection() as connection:
-            row = dict(connection.execute(
-                "SELECT * FROM portfolio_transaction WHERE transaction_id=?", (transaction_id,)
-            ).fetchone())
-        if row["action"] == "asset_correction":
-            return
-        marker = f"portfolio_transaction_id={transaction_id}"
-        if marker in self.decision_log_path.read_text(encoding="utf-8-sig"):
-            return
-        with self.decision_log_path.open("r", encoding="utf-8-sig", newline="") as handle:
-            fields = next(csv.reader(handle))
-        values = {field: "" for field in fields}
-        occurred = datetime.fromisoformat(row["occurred_at"].replace("Z", "+00:00")).astimezone()
-        values.update({
-            "date": occurred.strftime("%Y-%m-%d"), "time": occurred.strftime("%H:%M"),
-            "protocol_version": "UserReportedExecution-v1", "code": row["code"], "name": row["name"],
-            "price_at_decision": row["price"], "actual_action": {"buy": "买入", "sell": "卖出", "position_correction": "持仓修正"}.get(row["action"], row["action"]),
-            "shares_actual": row["shares"], "position_before": row["position_before"], "position_after": row["position_after"],
-            "notes": marker + "; source=companion_user_judgment" + ("; reversal=true" if row["source_text"].startswith("撤销 ") else ""),
-        })
-        with self.decision_log_path.open("a", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fields, quoting=csv.QUOTE_ALL, lineterminator="\n")
-            writer.writerow(values)
-            handle.flush()
-            os.fsync(handle.fileno())
+        return []
 
     def revert_latest(self) -> dict[str, Any]:
         with self.store.connection() as connection:
@@ -636,13 +441,11 @@ class PortfolioService:
         with self.store.connection() as connection:
             connection.execute("UPDATE portfolio_transaction SET reverted_by=? WHERE transaction_id=?", (reversal_id, original["transaction_id"]))
             connection.execute("UPDATE portfolio_transaction SET reversal_of=? WHERE transaction_id=?", (original["transaction_id"], reversal_id))
-        self._render_portfolio()
         payload = {"transaction_id": original["transaction_id"], "reversal_transaction_id": reversal_id, "snapshot": self.snapshot()}
         self.store.queue_portfolio_event("portfolio.change.reverted", payload)
         return payload
 
     def _revert_action_group(self, action_group_id: str) -> dict[str, Any]:
-        expected_hash = sha256(self.portfolio_path)
         reversal_group_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"portfolio-reversal:{action_group_id}"))
         reversal_ids: list[str] = []
         with self.store.connection() as connection:
@@ -700,17 +503,12 @@ class PortfolioService:
                     ),
                 )
                 connection.execute("UPDATE portfolio_transaction SET reverted_by=? WHERE transaction_id=?", (reversal_id, original["transaction_id"]))
-                connection.execute(
-                    "INSERT OR IGNORE INTO portfolio_render_intent VALUES(?,?,?, 'pending',?,NULL,NULL)",
-                    (str(uuid.uuid4()), reversal_id, expected_hash, now()),
-                )
                 reversal_ids.append(reversal_id)
-        render_errors = self.reconcile()
         payload = {
             "transaction_id": originals[-1]["transaction_id"],
             "transaction_ids": [item["transaction_id"] for item in originals],
             "reversal_transaction_id": reversal_ids[-1], "reversal_transaction_ids": reversal_ids,
-            "projection_pending": bool(render_errors), "snapshot": self.snapshot(),
+            "projection_pending": False, "snapshot": self.snapshot(),
         }
         self.store.queue_portfolio_event("portfolio.change.reverted", payload)
         return payload
@@ -722,33 +520,6 @@ class PortfolioService:
                 (now(), proposal_id),
             )
         self.emit_snapshot()
-
-    @staticmethod
-    def _atomic_write(path: Path, text: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
-                handle.write(text)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_name, path)
-        finally:
-            if os.path.exists(temporary_name):
-                os.unlink(temporary_name)
-
-
-def _fmt(value: Any, decimals: int = 2, suffix: str = "") -> str:
-    if value is None:
-        return "暂无"
-    return f"{float(value):,.{decimals}f}{suffix}"
-
-
-def _fmt_signed(value: Any) -> str:
-    if value is None:
-        return "暂无"
-    return f"{float(value):+,.2f}"
-
 
 def explicit_fixture_extraction(text: str) -> dict[str, Any]:
     """Offline fixture parser used only when the runtime is deliberately not executing Codex."""

@@ -1693,7 +1693,7 @@ class CompanionStore:
                 "exact_sizing_requires_portfolio_freshness_trading_days": 1,
             },
             "boundary": "用户实际交易具有事实权威；本立场只决定 AI 是否认可为合格执行建议。",
-        }, evidence={"source": "APP_DEVELOPMENT_PRINCIPLES.md", "revision": 1})
+        }, evidence={"source": "APP_DEVELOPMENT_PRINCIPLES", "revision": 1})
 
     def save_market_regime(self, cycle_id: str, as_of: str, regime: str, metrics: dict[str, Any], data_quality: str) -> None:
         if regime not in {"trend_expansion", "divergence", "risk_contraction", "unknown"}:

@@ -4,7 +4,8 @@ import sqlite3
 from pathlib import Path
 
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
-from ai_trading_companion.memoryhub_migration import MemoryHubMigrator, run_shadow_comparison
+from ai_trading_companion.memoryhub_migration import LegacyWorkspaceImporter, MemoryHubMigrator, run_shadow_comparison
+from ai_trading_companion.store import CompanionStore
 
 
 def _source(path: Path) -> None:
@@ -50,3 +51,40 @@ def test_read_only_idempotent_migration_and_shadow_gate(tmp_path: Path) -> None:
     assert report["candidate_used_by_production"] is False
     assert set(report["metrics"]) == {"recall", "recall_misses", "false_associations", "major_counterevidence", "similar_failures", "future_leakage", "latency_ms", "faults"}
     assert report["switchable"] is True
+
+
+def test_legacy_workspace_is_imported_once_then_never_read_as_runtime_input(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    portfolio = root / "portfolio" / "01_CURRENT_PORTFOLIO.md"
+    portfolio.parent.mkdir(parents=True)
+    portfolio.write_text(
+        "# 当前持仓\n\n当前总资产：约 **100,000元**\n\n"
+        "## 当前持仓\n\n| 代码 | 名称 | 股数 | 参考价 | 市值 | 成本价 | 浮动盈亏 | 仓位占总资产约 |\n"
+        "|---|---|---:|---:|---:|---:|---:|---:|\n"
+        "| 600000 | 浦发银行 | 100 | 10 | 1000 | 9 | +100 | 1% |\n\n"
+        "## 最近清仓\n\n暂无\n",
+        encoding="utf-8",
+    )
+    state = root / "state" / "10_THEME_STATE.csv"
+    state.parent.mkdir(parents=True)
+    state.write_text("theme,state\n机器人,active\n", encoding="utf-8")
+    store = CompanionStore(tmp_path / "runtime.sqlite3")
+    store.initialize()
+    memory = InMemoryMemoryAdapter()
+    importer = LegacyWorkspaceImporter(
+        root, store, memory, "private", migrated_at="2026-09-01T08:00:00Z",
+    )
+
+    first = importer.run()
+    portfolio.write_text("this must never be read after the marker", encoding="utf-8")
+    second = importer.run()
+
+    assert first["memoryhub_episodes"] == 2
+    assert first["portfolio_positions"] == 1
+    assert second["state"] == "already_imported"
+    with store.connection() as connection:
+        position = dict(connection.execute("SELECT * FROM portfolio_position").fetchone())
+    assert position["code"] == "600000"
+    assert position["shares"] == 100
+    snapshot = memory.begin_snapshot({"memory_space_id": "private", "as_of": "2026-09-01T08:00:00Z", "stage": "chat", "cycle_id": "test"})
+    assert memory.search(snapshot["snapshot_id"], "机器人")

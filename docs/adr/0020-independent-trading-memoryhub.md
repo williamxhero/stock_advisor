@@ -10,4 +10,6 @@ MarketHub 与 8815 的历史内容按产品保证视为永久只读，MemoryHub 
 
 迁移采用 expand-contract：先发布协议、Ledger 与 adapter，再影子迁移和恢复演练，最后删除本地生产记忆旁路。切换后 MemoryHub 核心不可用时应用诚实不可用，不回退到旧 SQLite 记忆。旧数据库仅作为只读迁移/恢复来源保留，不自动删除。
 
+旧工作区中的 Markdown/CSV 在切换时一次性导入 MemoryHub；其中可确认的持仓基线同时导入 Runtime 业务数据库。迁移完成标记写入数据库，此后正式运行不得枚举、读取、写入或从数据库重建这些文件，安装包也不得包含旧业务文本资源。
+
 本 ADR supersede ADR 0002 对“本地 Runtime 数据库拥有长期事实”的决定，并补充 ADR 0016；桌面与 Runtime 的 Exchange interface 保持不变。

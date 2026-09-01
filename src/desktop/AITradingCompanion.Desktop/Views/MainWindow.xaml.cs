@@ -375,11 +375,11 @@ public partial class MainWindow : Window, IDisposable
             if (state == "exported" && commandId == _pendingMemoryExportCommandId)
             {
                 _pendingMemoryExportCommandId = null;
-                var humanPath = result.GetProperty("human_export_path").GetString();
+                var exportPath = result.GetProperty("machine_export_path").GetString();
                 var token = result.GetProperty("confirmation_token").GetString();
                 var answer = MessageBox.Show(
                     this,
-                    $"私人记忆已成功导出到：\n{humanPath}\n\n是否彻底清空整个私人记忆空间？这会删除正式消息、摘要、索引和派生关系，且不可撤销；持仓、成交、日程和任务不会被删除。",
+                    $"私人记忆已成功导出到：\n{exportPath}\n\n是否彻底清空整个私人记忆空间？这会删除正式消息、摘要、索引和派生关系，且不可撤销；持仓、成交、日程和任务不会被删除。",
                     "二次确认：清空私人记忆", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
                 await _companionExchange.SendAsync(new
                 {
@@ -850,7 +850,7 @@ public partial class MainWindow : Window, IDisposable
         var contextArgument = string.IsNullOrWhiteSpace(contextFile) ? string.Empty : $" --context-file \"{contextFile}\"";
         var runtimePython = Path.Combine(_paths.DataDirectory, "runtime", "python", "Scripts", "python.exe");
         var python = File.Exists(runtimePython) ? runtimePython : "py";
-        var info = new ProcessStartInfo(python, $"-m ai_trading_companion.asr --audio \"{audio}\" --output \"{output}\" --workspace-root \"{Path.Combine(_paths.DataDirectory, "workspace")}\"{contextArgument}")
+        var info = new ProcessStartInfo(python, $"-m ai_trading_companion.asr --audio \"{audio}\" --output \"{output}\"{contextArgument}")
         {
             UseShellExecute = false,
             RedirectStandardError = true,

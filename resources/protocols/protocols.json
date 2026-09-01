@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "fact_authority": {
+    "portfolio_and_transactions": "runtime_database",
+    "schedules_and_workflow": "runtime_database",
+    "historical_ai_context": "memoryhub",
+    "public_market_facts": "qualified_current_tool_evidence"
+  },
+  "protocols": {
+    "opportunity_discovery": {
+      "purpose": "发现并验证盘前机会、风险与反证，不推定用户真实成交。",
+      "requirements": [
+        "先取得完整的市场、事件、题材和反证覆盖，再形成判断。",
+        "机会必须给出触发条件、失效条件和证据来源。",
+        "用户观点只影响核验重点，不能替代独立判断。"
+      ]
+    },
+    "daily_execution": {
+      "purpose": "根据冻结时点的市场事实形成盘中独立判断。",
+      "requirements": [
+        "严格使用当前任务时点及以前的证据。",
+        "持仓和成交只接受 runtime_database 的当前事实。",
+        "判断必须包含主结论、适用周期、触发条件、失效点和最强反证。"
+      ]
+    },
+    "daily_close_review": {
+      "purpose": "核验收盘市场、持仓、题材生命周期和日内判断结果。",
+      "requirements": [
+        "七项收盘覆盖全部合格前不得发布正式 M0。",
+        "缺口出现时继续改写查询、切换工具和交叉核验，直到覆盖合格或可靠性截止时间到达。",
+        "持仓事实来自 runtime_database；历史题材和经验只通过 MemoryHub 获取。"
+      ]
+    },
+    "non_trading_outlook": {
+      "purpose": "在非交易日总结已知市场环境并形成下一交易日条件式预判。",
+      "requirements": [
+        "明确区分已完成交易日事实、休市期间新增事件与尚未发生的信息。",
+        "不得把未来价格、成交量或市场表现表述为当前缺失数据。",
+        "预判必须给出触发条件、失效条件和不确定性。"
+      ]
+    },
+    "periodic_review": {
+      "purpose": "基于数据库事实、MemoryHub 历史和可验证结果进行周期复盘。",
+      "requirements": [
+        "保留原判断、反证、失败和修正链，不事后改写。",
+        "区分过程质量、结果、运气和市场状态。",
+        "只有跨样本验证后才能提出工作流晋升。"
+      ]
+    }
+  }
+}

@@ -19,13 +19,11 @@ def handle_memory_command(
         export_directory.mkdir(parents=True, exist_ok=True)
         stem = export_directory / f"memory-export-{command_id}"
         machine_path = stem.with_suffix(".json")
-        human_path = stem.with_suffix(".md")
         _atomic_write(machine_path, json.dumps(exported, ensure_ascii=False, indent=2, sort_keys=True))
-        _atomic_write(human_path, exported["human_markdown"])
         confirmation = memory.prepare_clear(memory_space_id, exported["export_sha256"])
         return {
             "command_id": command_id, "state": "exported", "export_sha256": exported["export_sha256"],
-            "machine_export_path": str(machine_path), "human_export_path": str(human_path),
+            "machine_export_path": str(machine_path),
             "confirmation_token": confirmation["confirmation_token"],
             "confirmation_required": True,
         }

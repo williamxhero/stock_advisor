@@ -182,3 +182,33 @@ def test_external_source_is_hydrated_only_on_explicit_admin_request(tmp_path: Pa
     assert integrity_status == 409
     assert detail_after_failure["result"]["episode"]["episode_id"] == receipt.episode_id
     assert MemoryHub(database).health()["ledger"]["episodes"] == 1
+
+
+def test_retrieval_audit_has_a_separate_read_only_workspace(tmp_path: Path) -> None:
+    database = tmp_path / "ledger.sqlite3"
+    hub = MemoryHub(database)
+    hub.append({**episode("evidence"), "episode_type": "evidence", "body": "机器人订单增长证据"})
+    snapshot = hub.begin_snapshot("partner-main", as_of="2026-08-31T02:00:00Z", stage="chat")
+    bundle = hub.retrieve_bundle(snapshot.snapshot_id, "机器人", limit=10)
+
+    server = make_server("127.0.0.1", 0, database, source_adapters={})
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        snapshots = get_json(base_url, "/v1/admin/snapshots?memory_space_id=partner-main")
+        audits = get_json(base_url, "/v1/admin/retrieval-audits?memory_space_id=partner-main")
+        replay = get_json(base_url, f"/v1/admin/retrieval-bundles/{bundle['bundle_id']}")
+        episodes = get_json(base_url, "/v1/admin/episodes?memory_space_id=partner-main")
+        timeline = get_json(base_url, "/v1/admin/timeline?memory_space_id=partner-main")
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+    assert snapshots["result"]["items"][0]["watermark"] == 1
+    assert audits["result"]["items"][0]["query"] == "机器人"
+    assert audits["result"]["items"][0]["versions"]["policy"] == "memory-policy/v1"
+    assert replay["result"]["bundle_id"] == bundle["bundle_id"]
+    assert [item["episode_type"] for item in episodes["result"]["items"]] == ["evidence"]
+    assert timeline["result"] == []

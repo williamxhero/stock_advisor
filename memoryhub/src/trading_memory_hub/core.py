@@ -747,6 +747,27 @@ class MemoryHub:
         return {**hydrated, "source_reference": reference, "retrieval": "on_demand",
                 "content_hash": row["content_hash"], "protocol_version": PROTOCOL_VERSION}
 
+    def admin_snapshots(self, memory_space_id: str, *, limit: int = 100) -> dict[str, Any]:
+        with self._connection() as connection:
+            rows = list(connection.execute(
+                """SELECT * FROM memory_snapshot WHERE memory_space_id=?
+                   ORDER BY rowid DESC LIMIT ?""",
+                (memory_space_id, max(1, min(int(limit), 200))),
+            ))
+        return {"items": [dict(row) for row in rows], "protocol_version": PROTOCOL_VERSION}
+
+    def admin_retrieval_audits(self, memory_space_id: str, *, limit: int = 100) -> dict[str, Any]:
+        with self._connection() as connection:
+            rows = list(connection.execute(
+                """SELECT a.value_json FROM retrieval_audit a
+                   JOIN retrieval_bundle b ON b.audit_id=a.audit_id
+                   JOIN memory_snapshot s ON s.snapshot_id=b.snapshot_id
+                   WHERE s.memory_space_id=? ORDER BY a.rowid DESC LIMIT ?""",
+                (memory_space_id, max(1, min(int(limit), 200))),
+            ))
+        return {"items": [_loads(row["value_json"]) for row in rows],
+                "protocol_version": PROTOCOL_VERSION}
+
     def export_space(self, memory_space_id: str) -> dict[str, Any]:
         if not memory_space_id:
             raise MemoryHubError("export requires memory_space_id")

@@ -63,6 +63,17 @@ def make_server(host: str, port: int, database: Path | str, *, source_adapters: 
             elif request.path == "/v1/admin/timeline":
                 query = parse_qs(request.query)
                 self._reply(HTTPStatus.OK, {"result": hub.timeline(_first(query, "memory_space_id") or "")})
+            elif request.path == "/v1/admin/snapshots":
+                query = parse_qs(request.query)
+                self._reply(HTTPStatus.OK, {"result": hub.admin_snapshots(
+                    _first(query, "memory_space_id") or "", limit=int(_first(query, "limit") or "100"))})
+            elif request.path == "/v1/admin/retrieval-audits":
+                query = parse_qs(request.query)
+                self._reply(HTTPStatus.OK, {"result": hub.admin_retrieval_audits(
+                    _first(query, "memory_space_id") or "", limit=int(_first(query, "limit") or "100"))})
+            elif request.path.startswith("/v1/admin/retrieval-bundles/"):
+                bundle_id = unquote(request.path.removeprefix("/v1/admin/retrieval-bundles/"))
+                self._reply(HTTPStatus.OK, {"result": hub.replay_bundle(bundle_id)})
             elif request.path == "/v1/admin/episodes/export":
                 query = parse_qs(request.query)
                 result = hub.admin_episodes(_first(query, "memory_space_id") or "", limit=10000,

@@ -785,7 +785,7 @@ class CompanionEngine:
     def _diagnostic_code(reason: str) -> str:
         lowered = reason.lower()
         if "invalid_json_schema" in lowered: return "output_schema_invalid"
-        if "broker_unavailable" in lowered: return "broker_unavailable"
+        if "broker_unavailable" in lowered or "broker http 503" in lowered: return "broker_unavailable"
         if "broker_timeout" in lowered: return "broker_timeout"
         if "broker_stream_incomplete" in lowered: return "broker_stream_incomplete"
         if "timed out" in lowered or "timeout" in lowered: return "timeout"

@@ -373,6 +373,19 @@ def run_gateway(execute: bool = False) -> None:
             run_m1(engine, store, portfolio, cycle_id, execute)
             process_h0_cognition(engine, store, portfolio, cycle_id, execute)
         consume(engine, store, exchange, portfolio, execute)
+        retry_before = iso(datetime.now(timezone.utc) - timedelta(minutes=1))
+        for retry in store.recoverable_conversation_jobs(before=retry_before):
+            try:
+                run_chat(
+                    engine, store, portfolio, retry["cycle_id"], retry["batch_id"], execute,
+                    source_kind=retry["source_kind"],
+                    reply_kind="premarket_chat" if retry["source_kind"] == "pre_m0_submission" else "ai_chat",
+                    on_progress=lambda: flush(store, exchange),
+                )
+            except Exception:
+                # run_unified_cognition records the durable failure and the next
+                # gateway tick observes the retry cooldown/attempt ceiling.
+                pass
         run_background(engine, store, execute)
         flush(store, exchange)
     import asyncio
@@ -686,11 +699,7 @@ def _reuse_m0_evidence_attempt(
     preserves the existing publication/checkpoint contract while copying the
     original acquisition trace so EvidenceGate can re-verify provenance.
     """
-    source_attempt = next((
-        item for item in reversed(store.attempts(cycle["cycle_id"]))
-        if item.get("stage") == "m0_research" and item.get("status") == "succeeded"
-        and json.loads(item.get("output_json") or "null") == evidence
-    ), None)
+    source_attempt = _frozen_m0_source_attempt(store, cycle, evidence)
     if source_attempt is None:
         raise EvidenceInsufficient({
             "passed": False, "problems": ["frozen_m0_evidence_attempt_missing"],
@@ -728,6 +737,26 @@ def _reuse_m0_evidence_attempt(
         output=evidence, verifier=verifier, tool_trace=tool_trace,
     )
     return str(attempt["attempt_id"])
+
+
+def _frozen_m0_source_attempt(
+    store: CompanionStore, cycle: dict[str, Any], evidence: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Resolve the immutable M0 acquisition attempt for normal and diagnostic cycles."""
+    cycle_ids = [str(cycle["cycle_id"])]
+    snapshot = json.loads(cycle.get("schedule_snapshot_json") or "{}")
+    diagnostic_source = snapshot.get("diagnostic_rerun_of")
+    if snapshot.get("diagnostic_rerun") and diagnostic_source:
+        cycle_ids.append(str(diagnostic_source))
+    for cycle_id in cycle_ids:
+        source_attempt = next((
+            item for item in reversed(store.attempts(cycle_id))
+            if item.get("stage") == "m0_research" and item.get("status") == "succeeded"
+            and json.loads(item.get("output_json") or "null") == evidence
+        ), None)
+        if source_attempt is not None:
+            return source_attempt
+    return None
 
 
 def run_research(
@@ -1409,6 +1438,11 @@ def _receipt_safe_stream_prefix(text: str) -> str:
     return text[:min(indexes)].rstrip() if indexes else text
 
 
+def _conversation_retry_intellect(intellect: str, attempt_count: int) -> str:
+    """Escalate a retried conversation when the standard provider tier is unavailable."""
+    return "smart" if intellect == "standard" and attempt_count >= 2 else intellect
+
+
 def run_unified_cognition(
     engine: CompanionEngine,
     store: CompanionStore,
@@ -1467,7 +1501,9 @@ def run_unified_cognition(
             ).route("chat", {**request_packet, "task_key": cycle["task_key"]}, timeout_seconds, False)
             outcome = broker_client().invoke(BrokerRequest(
                 stage="chat", packet=request_packet, packet_sha256=canonical_packet_hash(request_packet),
-                intellect=chat_decision.intellect, effort=chat_decision.reasoning_effort,
+                intellect=_conversation_retry_intellect(chat_decision.intellect, int(job["attempt_count"])),
+                effort=chat_decision.reasoning_effort,
+                output_token_limit=6_000,
                 schema=json.loads((SCHEMAS / "companion-cognition-result-v1.schema.json").read_text(encoding="utf-8")),
                 visible_stream=stream is not None,
                 on_delta=on_delta if stream else None,

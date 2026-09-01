@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -10,6 +9,22 @@ from .effort_policy import CognitiveEffortPolicy, EffortPolicyFacts
 RESEARCH_STAGES = frozenset({"m0_research", "m1_research", "outcome_research", "chat_research"})
 JUDGMENT_STAGES = frozenset({"m1_judgment", "m2", "reflection", "workflow_feedback"})
 MAJOR_TASKS = frozenset({"daily.execution.1430", "daily.review.1520", "manual.non_trading_outlook", "periodic.monthly", "periodic.quarterly", "periodic.annual"})
+
+
+def _contains_human_input(value: Any) -> bool:
+    """Detect human channels structurally without matching ordinary text such as sh000001."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).strip().lower()
+            if normalized in {"human_messages", "h0", "chat_human", "我的消息"}:
+                return True
+            if normalized == "kind" and str(item).strip().lower() in {"h0", "chat_human"}:
+                return True
+            if _contains_human_input(item):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_human_input(item) for item in value)
+    return False
 
 
 @dataclass(frozen=True)
@@ -67,9 +82,7 @@ class CognitiveRouter:
         gaps = len(evidence.get("critical_gaps") or [])
         sources, conflicts, events = evidence.get("sources") or [], evidence.get("conflicts") or [], evidence.get("high_impact_events") or []
         blocked = any("网络" in str(gap) or "不可用" in str(gap) or "缺失" in str(gap) for gap in evidence.get("critical_gaps") or [])
-        serialized = json.dumps(packet, ensure_ascii=False, sort_keys=True)
-        human_keys = ("human_messages", "h0", "chat_human", "我的消息")
-        m1_blind = stage != "m1_judgment" or not any(key in serialized for key in human_keys)
+        m1_blind = stage != "m1_judgment" or not _contains_human_input(packet)
         family = "research" if stage in RESEARCH_STAGES else "judgment" if stage in JUDGMENT_STAGES else "expression"
         dependency = packet.get("dependency_health")
         dependency_health = str(dependency.get("status") or "unknown") if isinstance(dependency, dict) else str(dependency or "unknown")

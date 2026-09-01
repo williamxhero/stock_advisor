@@ -377,6 +377,12 @@ class CompanionEngineTests(unittest.TestCase):
         self.assertEqual("broker_unavailable", payload["diagnostic_code"])
         self.assertIn("LLM 服务当前没有可用上游", payload["reason"])
 
+    def test_plain_broker_http_503_has_explicit_user_category(self):
+        self.assertEqual(
+            "broker_unavailable",
+            self.engine._diagnostic_code("Broker HTTP 503"),
+        )
+
     def test_chat_batch_is_separate_from_frozen_h0(self):
         self.ready()
         self.stage("h0", "H0内容")
@@ -516,6 +522,23 @@ class CompanionEngineTests(unittest.TestCase):
         self.assertNotEqual(manual["receipt"]["cycle_id"], scheduled["cycle_id"])
         self.assertEqual("manual_chat", manual["projection"]["cycle"]["trigger"])
         self.assertEqual("scheduled", scheduled["trigger"])
+
+    def test_today_projection_keeps_the_started_scheduled_cycle_over_repair_copies(self):
+        scheduled = self.store.create_cycle(
+            "daily.review.1520", "2026-08-29T15:20:00+08:00", "2026-08-29T15:20:00+08:00",
+            work_start_at="2026-08-29T15:20:00+08:00",
+        )
+        self.store.stage_message(scheduled["cycle_id"], "我的收盘复盘", "h0")
+        repair = self.store.create_cycle(
+            "daily.review.1520", "2026-08-29T08:53:35.624Z", "2026-08-29T08:53:35.624Z",
+        )
+        self.store.append_artifact(
+            repair["cycle_id"], "m1", "model", "较新的修复结果", "2026-08-29T08:54:00Z", {},
+        )
+
+        cycles = self.store.latest_cycles_for_date("2026-08-29")
+
+        self.assertEqual([scheduled["cycle_id"]], [item["cycle_id"] for item in cycles])
 
     def test_manual_cycle_survives_store_restart_and_keeps_schedule_claims_separate(self):
         manual = self.engine.command({

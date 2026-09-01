@@ -8,6 +8,7 @@ namespace AITradingCompanion.Desktop.ViewModels;
 
 public sealed class MainViewModel : ObservableObject
 {
+    private const string TradingDayUnavailablePrefix = "交易日状态暂不可用：";
     private readonly ITaskMessageStore _store;
     private readonly LocalInboxService _inbox;
     private readonly DesktopNotificationService _notifications;
@@ -16,6 +17,7 @@ public sealed class MainViewModel : ObservableObject
     private readonly ICompanionGateway _gateway;
     private readonly List<TaskMessage> _allHistory = [];
     private readonly HashSet<string> _dismissedGatewayCycleIds = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _todayCycleIdsByTaskKey = new(StringComparer.Ordinal);
     private TaskRowViewModel? _selectedTask;
     private HistoryRecordViewModel? _selectedHistory;
     private int _selectedSectionIndex;
@@ -400,13 +402,26 @@ public sealed class MainViewModel : ObservableObject
                 ["date"] = today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
             }).ConfigureAwait(true);
             _isTradingDay = snapshot["is_trading_day"]?.GetValue<bool>() ?? false;
+            _todayCycleIdsByTaskKey.Clear();
+            if (snapshot["projections"] is System.Text.Json.Nodes.JsonArray projections)
+            {
+                foreach (var node in projections.OfType<System.Text.Json.Nodes.JsonObject>())
+                {
+                    var cycle = node["cycle"] as System.Text.Json.Nodes.JsonObject;
+                    var taskKey = cycle?["task_key"]?.GetValue<string>();
+                    var cycleId = cycle?["cycle_id"]?.GetValue<string>();
+                    if (!string.IsNullOrWhiteSpace(taskKey) && !string.IsNullOrWhiteSpace(cycleId))
+                        _todayCycleIdsByTaskKey[taskKey] = cycleId;
+                }
+            }
             _todayBoardDate = today;
+            StatusText = TradingDayStatusAfterSuccess(StatusText);
         }
         catch (Exception exception)
         {
             _isTradingDay = false;
             _todayBoardDate = null;
-            StatusText = $"交易日状态暂不可用：{exception.Message}";
+            StatusText = $"{TradingDayUnavailablePrefix}{exception.Message}";
         }
         finally
         {
@@ -415,6 +430,11 @@ public sealed class MainViewModel : ObservableObject
 
         await RefreshAsync().ConfigureAwait(true);
     }
+
+    internal static string TradingDayStatusAfterSuccess(string currentStatus) =>
+        currentStatus.StartsWith(TradingDayUnavailablePrefix, StringComparison.Ordinal)
+            ? string.Empty
+            : currentStatus;
 
     public bool IsCurrentTradingDate(DateTimeOffset value) =>
         DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(value, ShanghaiTimeZone).DateTime) == _currentTradingDate;
@@ -528,7 +548,8 @@ public sealed class MainViewModel : ObservableObject
             Tasks.Add(new TaskRowViewModel(
                 expected,
                 message,
-                TimeSpan.FromMinutes(Math.Max(1, _settings.Display.NodeTimeoutMinutes))));
+                TimeSpan.FromMinutes(Math.Max(1, _settings.Display.NodeTimeoutMinutes)),
+                _todayCycleIdsByTaskKey.GetValueOrDefault(expected.TaskKey)));
         }
         var currentSlot = TimeOnly.FromDateTime(DateTime.Now);
         SelectedTask = Tasks.FirstOrDefault(task => task.Expected.TaskKey == previousTaskKey)

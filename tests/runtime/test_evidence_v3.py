@@ -10,6 +10,7 @@ from ai_trading_companion.__main__ import (
     M1_MAX_JUDGMENT_ATTEMPTS,
     _call_stage,
     _evidence_read_cutoff,
+    _frozen_m0_source_attempt,
     _m1_research_as_of,
     _m1_retry_feedback,
     _m1_should_retry,
@@ -22,6 +23,24 @@ from ai_trading_companion.store import CompanionStore
 
 
 class EvidenceV3Tests(TestCase):
+    def test_diagnostic_rerun_resolves_frozen_m0_attempt_from_source_cycle(self):
+        evidence = {"as_of": "2026-08-31T07:20:00Z", "sources": []}
+        source_attempt = {
+            "attempt_id": "source-m0", "stage": "m0_research", "status": "succeeded",
+            "output_json": json.dumps(evidence),
+        }
+        store = Mock()
+        store.attempts.side_effect = lambda cycle_id: [] if cycle_id == "rerun" else [source_attempt]
+        cycle = {
+            "cycle_id": "rerun",
+            "schedule_snapshot_json": json.dumps({
+                "diagnostic_rerun": True, "diagnostic_rerun_of": "source",
+            }),
+        }
+
+        self.assertEqual(source_attempt, _frozen_m0_source_attempt(store, cycle, evidence))
+        self.assertEqual(["rerun", "source"], [call.args[0] for call in store.attempts.call_args_list])
+
     def test_gateway_reads_are_frozen_to_contract_not_later_stage_start(self):
         packet = {"as_of": "2026-08-31T05:22:27Z"}
         contract = {"as_of": "2026-08-31T05:21:50Z"}

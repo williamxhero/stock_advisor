@@ -179,6 +179,11 @@ class CompanionLearningTests(unittest.TestCase):
         leak = router.plan("m1_judgment", {"task_key": "daily.execution.1430", "h0": "看多", "evidence": {"sources": [{}]}}, 300, False)
         self.assertFalse(leak.profile.m1_blind)
         self.assertIsNone(leak.candidate)
+        market_code = router.plan("m1_judgment", {
+            "task_key": "daily.review.1520",
+            "evidence": {"sources": [{"url": "https://example.test/q=sh000001"}]},
+        }, 300, False)
+        self.assertTrue(market_code.profile.m1_blind)
         blocked = router.plan("m1_judgment", {"task_key": "daily.execution.1430", "evidence": {"sources": [{}], "critical_gaps": ["网络不可用"]}}, 300, False)
         self.assertTrue(blocked.profile.data_blocked)
         self.assertIsNone(blocked.candidate)

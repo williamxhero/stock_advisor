@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from ai_trading_companion.__main__ import run_unified_cognition
+from ai_trading_companion.__main__ import _conversation_retry_intellect, run_unified_cognition
 from ai_trading_companion.broker_client import BrokerError, BrokerResponse
 from ai_trading_companion.cognition import ReplyMarkdownStream, UnifiedCognition
 from ai_trading_companion.engine import CompanionEngine
@@ -75,6 +75,28 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.assertEqual("running", second["state"])
         self.assertTrue(retry["claimed"])
         self.assertEqual(2, retry["attempt_count"])
+
+    def test_retried_standard_conversation_escalates_to_smart(self) -> None:
+        self.assertEqual("standard", _conversation_retry_intellect("standard", 1))
+        self.assertEqual("smart", _conversation_retry_intellect("standard", 2))
+        self.assertEqual("expert", _conversation_retry_intellect("expert", 2))
+
+    def test_cognition_schema_declares_types_for_enum_and_const_properties(self) -> None:
+        schema = json.loads((PROJECT_ROOT / "resources" / "contracts" / "companion-cognition-result-v1.schema.json").read_text(encoding="utf-8"))
+        missing: list[str] = []
+
+        def visit(node: object, path: str = "$") -> None:
+            if isinstance(node, dict):
+                if ("enum" in node or "const" in node) and "type" not in node:
+                    missing.append(path)
+                for key, value in node.items():
+                    visit(value, f"{path}.{key}")
+            elif isinstance(node, list):
+                for index, value in enumerate(node):
+                    visit(value, f"{path}[{index}]")
+
+        visit(schema)
+        self.assertEqual([], missing)
 
     def test_h0_analysis_request_creates_a_separate_cycle_without_entering_current_m1_packet(self) -> None:
         cycle = self.engine.start_cycle("daily.execution.0945", "2026-08-27T09:45:00+08:00", "2026-08-27T01:45:00Z")
@@ -189,6 +211,7 @@ class UnifiedCognitionTests(unittest.TestCase):
         request = broker.invoke.call_args.args[0]
         self.assertTrue(request.visible_stream)
         self.assertEqual("standard", request.intellect)
+        self.assertEqual(6_000, request.output_token_limit)
         self.assertNotIn("tools", json.dumps(request.packet, ensure_ascii=False))
         self.assertEqual("记住了", output["reply_markdown"])
         with self.store.connection() as connection:

@@ -764,6 +764,7 @@ class CompanionStore:
                                ROW_NUMBER() OVER (
                                   PARTITION BY CASE WHEN c.trigger='manual_chat' THEN c.cycle_id ELSE c.task_key END
                                   ORDER BY
+                                      CASE WHEN c.work_start_at IS NOT NULL THEN 1 ELSE 0 END DESC,
                                       CASE WHEN c.state IN (
                                           'queued','researching_m0','awaiting_h0','voice_grace',
                                           'h0_locked','researching_m1','judging_m1','m1_retry_wait',
@@ -1252,6 +1253,23 @@ class CompanionStore:
             return [dict(row) for row in c.execute(
                 "SELECT * FROM companion_message_batch WHERE cycle_id=? AND phase=? AND state='pending' ORDER BY submitted_at,batch_id",
                 (cycle_id, phase),
+            )]
+
+    def recoverable_conversation_jobs(self, *, before: str, max_attempts: int = 9, limit: int = 2) -> list[dict[str, Any]]:
+        """Return failed conversations whose original submitted batch still needs a reply."""
+        with self.connection() as c:
+            return [dict(row) for row in c.execute(
+                """SELECT j.job_id,j.cycle_id,a.kind AS source_kind,b.batch_id
+                     FROM companion_cognition_job j
+                     JOIN narrative_artifact a ON a.artifact_id=j.source_artifact_id
+                     JOIN companion_message_batch b ON b.cycle_id=j.cycle_id AND b.state='pending'
+                     WHERE j.mode='conversation' AND j.state='failed'
+                       AND j.attempt_count<? AND j.completed_at<=?
+                       AND (j.error LIKE '%broker_unavailable%' OR j.error LIKE '%Broker HTTP 503%'
+                            OR j.error LIKE '%connection%' OR j.error LIKE '%timed out%')
+                     ORDER BY j.completed_at,j.job_id,b.submitted_at,b.batch_id
+                     LIMIT ?""",
+                (max_attempts, before, limit),
             )]
 
     def messages_for_batches(self, batch_ids: list[str]) -> list[dict[str, Any]]:

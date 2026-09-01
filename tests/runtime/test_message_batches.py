@@ -1,6 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from datetime import datetime, timedelta, timezone
 
 from ai_trading_companion.store import CompanionStore
 
@@ -27,3 +28,81 @@ class MessageBatchTests(TestCase):
         self.assertEqual(1, len(self.store.pending_message_batches(self.cycle["cycle_id"])))
         self.store.mark_batches_responded([batch_id], "artifact")
         self.assertEqual([], self.store.pending_message_batches(self.cycle["cycle_id"]))
+
+    def test_transiently_failed_conversation_is_recoverable_after_cooldown(self):
+        message = self.store.stage_message(self.cycle["cycle_id"], "外围消息？", "chat", message_id="message")
+        batch_id, _ = self.store.commit_staged_messages(self.cycle["cycle_id"], "chat")
+        artifact = self.store.append_artifact(
+            self.cycle["cycle_id"], "chat_human", "human", message["body_text"],
+            "2026-08-26T01:45:00Z",
+        )
+        job = self.store.start_cognition_job(
+            self.cycle["cycle_id"], artifact["artifact_id"], "conversation", message["body_text"],
+        )
+        self.store.claim_cognition_job(job["job_id"])
+        self.store.finish_cognition_job(job["job_id"], error="Broker HTTP 503")
+
+        future = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
+        recoverable = self.store.recoverable_conversation_jobs(before=future)
+
+        self.assertEqual(1, len(recoverable))
+        self.assertEqual(batch_id, recoverable[0]["batch_id"])
+        self.assertEqual("chat_human", recoverable[0]["source_kind"])
+
+    def test_non_transient_failed_conversation_is_not_automatically_retried(self):
+        message = self.store.stage_message(self.cycle["cycle_id"], "外围消息？", "chat", message_id="message")
+        self.store.commit_staged_messages(self.cycle["cycle_id"], "chat")
+        artifact = self.store.append_artifact(
+            self.cycle["cycle_id"], "chat_human", "human", message["body_text"],
+            "2026-08-26T01:45:00Z",
+        )
+        job = self.store.start_cognition_job(
+            self.cycle["cycle_id"], artifact["artifact_id"], "conversation", message["body_text"],
+        )
+        self.store.claim_cognition_job(job["job_id"])
+        self.store.finish_cognition_job(job["job_id"], error="invalid_json_schema")
+        future = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
+
+        self.assertEqual([], self.store.recoverable_conversation_jobs(before=future))
+
+    def test_transient_conversation_has_a_bounded_smart_fallback_attempt(self):
+        message = self.store.stage_message(self.cycle["cycle_id"], "外围消息？", "chat", message_id="message")
+        self.store.commit_staged_messages(self.cycle["cycle_id"], "chat")
+        artifact = self.store.append_artifact(
+            self.cycle["cycle_id"], "chat_human", "human", message["body_text"],
+            "2026-08-26T01:45:00Z",
+        )
+        job = self.store.start_cognition_job(
+            self.cycle["cycle_id"], artifact["artifact_id"], "conversation", message["body_text"],
+        )
+        for _ in range(3):
+            claimed = self.store.claim_cognition_job(job["job_id"])
+            self.assertTrue(claimed["claimed"])
+            self.store.finish_cognition_job(job["job_id"], error="Broker HTTP 503")
+        future = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
+
+        self.assertEqual(1, len(self.store.recoverable_conversation_jobs(before=future)))
+        claimed = self.store.claim_cognition_job(job["job_id"])
+        self.assertEqual(4, claimed["attempt_count"])
+        self.store.finish_cognition_job(job["job_id"], error="Broker HTTP 503")
+        self.assertEqual(1, len(self.store.recoverable_conversation_jobs(before=future)))
+        claimed = self.store.claim_cognition_job(job["job_id"])
+        self.assertEqual(5, claimed["attempt_count"])
+        self.store.finish_cognition_job(job["job_id"], error="Broker HTTP 503")
+        self.assertEqual(1, len(self.store.recoverable_conversation_jobs(before=future)))
+        claimed = self.store.claim_cognition_job(job["job_id"])
+        self.assertEqual(6, claimed["attempt_count"])
+        self.store.finish_cognition_job(job["job_id"], error="Broker HTTP 503")
+        self.assertEqual(1, len(self.store.recoverable_conversation_jobs(before=future)))
+        claimed = self.store.claim_cognition_job(job["job_id"])
+        self.assertEqual(7, claimed["attempt_count"])
+        self.store.finish_cognition_job(job["job_id"], error="Broker HTTP 503")
+        self.assertEqual(1, len(self.store.recoverable_conversation_jobs(before=future)))
+        claimed = self.store.claim_cognition_job(job["job_id"])
+        self.assertEqual(8, claimed["attempt_count"])
+        self.store.finish_cognition_job(job["job_id"], error="Broker HTTP 503")
+        self.assertEqual(1, len(self.store.recoverable_conversation_jobs(before=future)))
+        claimed = self.store.claim_cognition_job(job["job_id"])
+        self.assertEqual(9, claimed["attempt_count"])
+        self.store.finish_cognition_job(job["job_id"], error="Broker HTTP 503")
+        self.assertEqual([], self.store.recoverable_conversation_jobs(before=future))

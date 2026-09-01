@@ -281,11 +281,25 @@ public partial class MainWindow : Window, IDisposable
         _portfolioWindow?.UpdateProjection(_portfolioProjection);
         if (_viewModel.SelectedSectionIndex != 0)
         {
-            _companionProjection = null;
+            var historicalCycleId = _viewModel.SelectedMessage is { Source: "gateway", SourceRunId.Length: > 0 } historical
+                ? historical.SourceRunId
+                : null;
+            _companionProjection = historicalCycleId is null
+                ? null
+                : CompanionEventProjection.ProjectForCycle(events, historicalCycleId);
             SwitchDraft(null);
-            RenderHistoricalMessage();
+            if (_companionProjection is { } historicalProjection)
+            {
+                ResolveLocalAiNotice(historicalProjection.CycleId, historicalProjection.AiMessages);
+                RenderAiMessages(WithLocalAiNotice(historicalProjection.CycleId, historicalProjection.AiMessages));
+            }
+            else
+            {
+                RenderHistoricalMessage();
+            }
             RenderUserMessages();
             UpdateInputState();
+            if (historicalCycleId is not null) RequestCompanionProjectionAsync(historicalCycleId);
             return;
         }
 
@@ -512,7 +526,7 @@ public partial class MainWindow : Window, IDisposable
     {
         var document = MarkdownDocumentBuilder.Build(markdown);
         document.ColumnWidth = double.PositiveInfinity;
-        return new FlowDocumentScrollViewer
+        var viewer = new FlowDocumentScrollViewer
         {
             Document = document,
             IsToolBarVisible = false,
@@ -524,6 +538,8 @@ public partial class MainWindow : Window, IDisposable
             Margin = margin,
             IsSelectionEnabled = true,
         };
+        NestedScrollWheelForwarder.Attach(viewer);
+        return viewer;
     }
 
     private Button CreateCopyButton(string text)

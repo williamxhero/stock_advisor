@@ -157,6 +157,33 @@ public sealed class UiContractTests
     }
 
     [Fact]
+    public void GatewayHistorySelectionLoadsItsAuthoritativeCycleProjection()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln"))) root = root.Parent;
+        Assert.NotNull(root);
+        var code = File.ReadAllText(Path.Combine(root.FullName!,
+            "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml.cs"));
+
+        Assert.Contains("CompanionEventProjection.ProjectForCycle(events, historicalCycleId)", code, StringComparison.Ordinal);
+        Assert.Contains("RequestCompanionProjectionAsync(historicalCycleId)", code, StringComparison.Ordinal);
+        Assert.Contains("RenderUserMessages();", code, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TodayTaskRowsUseTheCycleIdentityReturnedByTheRuntimeSnapshot()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln"))) root = root.Parent;
+        Assert.NotNull(root);
+        var code = File.ReadAllText(Path.Combine(root.FullName!,
+            "src", "desktop", "AITradingCompanion.Desktop", "ViewModels", "MainViewModel.cs"));
+
+        Assert.Contains("_todayCycleIdsByTaskKey[taskKey] = cycleId", code, StringComparison.Ordinal);
+        Assert.Contains("_todayCycleIdsByTaskKey.GetValueOrDefault(expected.TaskKey)", code, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void EveryRenderedAiAndUserMessageGetsAnOriginalTextCopyButton()
     {
         var root = new DirectoryInfo(AppContext.BaseDirectory);

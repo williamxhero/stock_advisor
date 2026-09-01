@@ -762,14 +762,19 @@ class CompanionEngine:
             "m0", "m1", "m2", "ai_chat", "premarket_chat", "judgment_revision", "system_fault",
             "outcome", "reflection", "legacy_message",
         }
-        ai_messages = [
-            {
+        ai_messages = []
+        for artifact in artifacts:
+            if artifact["kind"] not in ai_kinds:
+                continue
+            metadata = json.loads(artifact["metadata_json"] or "{}")
+            item = {
                 "artifact_id": artifact["artifact_id"], "kind": artifact["kind"],
                 "at": artifact["sealed_at"], "as_of": artifact["as_of"],
                 "text": artifact["body_markdown"], "metadata": artifact["metadata_json"],
             }
-            for artifact in artifacts if artifact["kind"] in ai_kinds
-        ]
+            if isinstance(metadata.get("published_message"), dict):
+                item["message"] = metadata["published_message"]
+            ai_messages.append(item)
         user_messages = [
             {
                 "message_id": message["message_id"], "state": message["state"], "phase": message["phase"],

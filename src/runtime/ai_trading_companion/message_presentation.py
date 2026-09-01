@@ -32,14 +32,24 @@ class PresentedMessage:
 
     markdown: str
     parts: tuple[dict[str, Any], ...]
-    contract_version: int = 1
+    kind: str = "ai_chat"
+    contract_version: int = 2
+
+    def message(self) -> dict[str, Any]:
+        return {
+            "contract": "companion-published-message/v2",
+            "kind": self.kind,
+            "parts": list(self.parts),
+            "text_projection": self.markdown,
+        }
 
     def metadata(self) -> dict[str, Any]:
         return {
             "presentation": {
                 "version": self.contract_version,
                 "parts": list(self.parts),
-            }
+            },
+            "published_message": self.message(),
         }
 
 
@@ -56,7 +66,6 @@ def present_message(
     report scaffolding that has no investment meaning, keeps emphasis and
     links, and keeps externally attributable quotations in Markdown blocks.
     """
-    del kind  # kept in the public contract so future kinds cannot bypass it.
     source = str(text or "").replace("\r\n", "\n").strip()
     if not source:
         source = "我这次没有形成可发布的内容。"
@@ -67,7 +76,7 @@ def present_message(
         natural = _naturalize_speech(speech, as_of, allow_structured_format)
         if natural:
             rendered.append(natural)
-            parts.append({"kind": "speech", "markdown": natural})
+            parts.append({"kind": "speech", "text": natural})
     for material in materials:
         excerpt = _bound_material(material)
         rendered.append(excerpt)
@@ -76,8 +85,8 @@ def present_message(
     if not rendered:
         natural = _naturalize_speech(source, as_of, allow_structured_format)
         rendered.append(natural)
-        parts.append({"kind": "speech", "markdown": natural})
-    return PresentedMessage("\n\n".join(rendered), tuple(parts))
+        parts.append({"kind": "speech", "text": natural})
+    return PresentedMessage("\n\n".join(rendered), tuple(parts), kind=kind)
 
 
 def explicit_format_requested(text: str) -> bool:

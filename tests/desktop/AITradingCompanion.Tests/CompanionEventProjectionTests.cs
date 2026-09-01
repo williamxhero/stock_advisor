@@ -6,6 +6,19 @@ namespace AITradingCompanion.Tests;
 public sealed class CompanionEventProjectionTests
 {
     [Fact]
+    public void ProjectionPrefersTheVersionedPublishedMessageOverLegacyText()
+    {
+        var events = new[]
+        {
+            """{"contract":"companion-client-event/v1","event_id":"projection","cycle_id":"c1","type":"projection.ready","created_at":"2026-09-01T01:02:00Z","payload":{"cycle":{"task_key":"conversation.daily","state":"open"},"ai_messages":[{"artifact_id":"a1","kind":"ai_chat","at":"2026-09-01T01:00:00Z","text":"raw internal report","message":{"contract":"companion-published-message/v2","kind":"ai_chat","parts":[{"kind":"speech","text":"我倾向于先等承接确认。"}],"text_projection":"我倾向于先等承接确认。"}}]}}"""
+        };
+
+        var projection = CompanionEventProjection.Project(events)!;
+
+        Assert.Equal("我倾向于先等承接确认。", Assert.Single(projection.AiMessages).Text);
+    }
+
+    [Fact]
     public void SelectsTheNewestValidCompanionCycleId()
     {
         var events = new[]

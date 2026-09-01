@@ -35,6 +35,19 @@ def packet_builder(store: CompanionStore) -> RuntimePacketBuilder:
 
 
 class CompanionEngineTests(unittest.TestCase):
+    def test_published_message_v2_survives_the_runtime_projection(self):
+        self.ready()
+
+        projection = self.engine._projection(self.store.get_cycle(self.cycle["cycle_id"]))
+        message = next(item for item in projection["ai_messages"] if item["kind"] == "m0")
+
+        self.assertEqual("companion-published-message/v2", message["message"]["contract"])
+        self.assertEqual("今天先看客观信息。", message["message"]["text_projection"])
+        self.assertEqual(
+            [{"kind": "speech", "text": "今天先看客观信息。"}],
+            message["message"]["parts"],
+        )
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.store = CompanionStore(Path(self.temp.name) / "companion.sqlite3")

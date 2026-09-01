@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "kind", "parts", "text_projection"],
+  "properties": {
+    "contract": {"const": "companion-published-message/v2"},
+    "kind": {"type": "string", "minLength": 1},
+    "parts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "text"],
+            "properties": {
+              "kind": {"const": "speech"},
+              "text": {"type": "string", "minLength": 1}
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "markdown", "source_url"],
+            "properties": {
+              "kind": {"const": "material"},
+              "markdown": {"type": "string", "minLength": 1},
+              "source_url": {"type": "string", "format": "uri"}
+            }
+          }
+        ]
+      }
+    },
+    "text_projection": {"type": "string", "minLength": 1}
+  }
+}

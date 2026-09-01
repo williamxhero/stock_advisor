@@ -6,6 +6,28 @@ from ai_trading_companion.message_presentation import present_message
 
 
 class MessagePresentationTests(unittest.TestCase):
+    def test_presentation_exposes_a_versioned_message_contract(self):
+        presented = present_message(
+            "我倾向于先等承接确认。",
+            as_of="2026-09-01T01:00:00Z",
+            kind="ai_chat",
+        )
+
+        self.assertEqual(2, presented.contract_version)
+        self.assertEqual(
+            {
+                "contract": "companion-published-message/v2",
+                "kind": "ai_chat",
+                "parts": [{"kind": "speech", "text": "我倾向于先等承接确认。"}],
+                "text_projection": "我倾向于先等承接确认。",
+            },
+            presented.message(),
+        )
+        self.assertEqual(
+            presented.message(),
+            presented.metadata()["published_message"],
+        )
+
     def test_own_message_is_released_as_natural_conversation(self):
         presented = present_message(
             "##盘前结论\ntime_scope: next_trading_session。 截至2026-08-31\n\n- 不预设反包\n- 不追高开",

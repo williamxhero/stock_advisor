@@ -383,7 +383,7 @@ public static class CompanionEventProjection
                 var at = ReadDate(ReadString(message, "at")) ?? DateTimeOffset.MinValue;
                 var started = kind == "m1" ? projectedM1StartedAt : kind == "m2" ? projectedM2StartedAt : at;
                 var completed = kind == "m1" ? projectedM1CompletedAt : kind == "m2" ? projectedM2CompletedAt : at;
-                UpsertAi(ai, ReadString(message, "artifact_id"), kind, at, ReadString(message, "text"), started ?? at, completed ?? at);
+                UpsertAi(ai, ReadString(message, "artifact_id"), kind, at, ReadPublishedText(message), started ?? at, completed ?? at);
             }
         }
         if (payload.TryGetProperty("user_messages", out var userMessages) && userMessages.ValueKind == JsonValueKind.Array)
@@ -488,6 +488,9 @@ public static class CompanionEventProjection
 
     private static string? ReadNestedString(JsonElement element, string parent, string property) =>
         element.TryGetProperty(parent, out var nested) && nested.ValueKind == JsonValueKind.Object ? ReadString(nested, property) : null;
+
+    private static string? ReadPublishedText(JsonElement element) =>
+        ReadNestedString(element, "message", "text_projection") ?? ReadString(element, "text");
 
     private static string? ReadCycleString(JsonElement payload, string property) =>
         ReadNestedString(payload, "cycle", property) ?? ReadString(payload, property);

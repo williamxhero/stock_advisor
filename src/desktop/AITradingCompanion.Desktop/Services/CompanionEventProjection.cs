@@ -42,7 +42,8 @@ public sealed record CompanionWorkspaceProjection(
     DateTimeOffset? RequestedAt = null,
     string? TaskProfileId = null,
     string? TaskProfileDisplayName = null,
-    bool IsDismissed = false)
+    bool IsDismissed = false,
+    bool IsCompanionThinking = false)
 {
     public bool IsH0Locked => H0LockedAt is not null;
     public bool HasStagedMessages => UserMessages.Any(message => message.State == "staged");
@@ -104,6 +105,7 @@ public static class CompanionEventProjection
         string? taskProfileId = null;
         string? taskProfileDisplayName = null;
         var isDismissed = false;
+        var isCompanionThinking = false;
         var ai = new Dictionary<string, CompanionAiTimelineEntry>(StringComparer.Ordinal);
         var users = new Dictionary<string, CompanionTimelineEntry>(StringComparer.Ordinal);
 
@@ -215,17 +217,15 @@ public static class CompanionEventProjection
                         ReadString(payload, "m2"), m2StartedAt, item.At);
                     break;
                 case "chat.ready":
+                    isCompanionThinking = false;
                     UpsertAi(ai, ReadString(payload, "stream_id") ?? ReadString(payload, "source_artifact_id"), "chat", item.At,
                         ReadString(payload, "text"), item.At, item.At);
                     break;
                 case "chat.stream.started":
-                    var startedStreamId = ReadNestedString(payload, "stream", "stream_id");
-                    if (!string.IsNullOrWhiteSpace(startedStreamId))
-                        UpsertAi(ai, startedStreamId, "chat_pending",
-                            ReadDate(ReadNestedString(payload, "stream", "created_at")) ?? item.At,
-                            "AI 正在回复中", item.At, null);
+                    isCompanionThinking = true;
                     break;
                 case "chat.stream.delta":
+                    isCompanionThinking = false;
                     var streamId = ReadString(payload, "stream_id");
                     if (!string.IsNullOrWhiteSpace(streamId))
                     {
@@ -236,6 +236,7 @@ public static class CompanionEventProjection
                     }
                     break;
                 case "chat.stream.failed":
+                    isCompanionThinking = false;
                     var failedStreamId = ReadNestedString(payload, "stream", "stream_id");
                     var failedText = ReadNestedString(payload, "stream", "text");
                     if (!string.IsNullOrWhiteSpace(failedStreamId) && !string.IsNullOrWhiteSpace(failedText))
@@ -260,7 +261,8 @@ public static class CompanionEventProjection
                     break;
                 case "projection.ready":
                     ReadProjection(payload, ai, users, ref scheduledFor, ref autoSubmit, ref m1Deadline, ref h0LockedAt,
-                        ref taskKey, ref trigger, ref requestedAt, ref taskProfileId, ref taskProfileDisplayName);
+                        ref taskKey, ref trigger, ref requestedAt, ref taskProfileId, ref taskProfileDisplayName,
+                        ref isCompanionThinking);
                     break;
                 case "research.failed":
                 case "m0.invalidated":
@@ -294,7 +296,8 @@ public static class CompanionEventProjection
             requestedAt,
             taskProfileId,
             taskProfileDisplayName,
-            isDismissed);
+            isDismissed,
+            isCompanionThinking);
     }
 
     private static CompanionAiTimelineEntry[] CollapseVisibleFaults(
@@ -362,7 +365,8 @@ public static class CompanionEventProjection
         ref string? trigger,
         ref DateTimeOffset? requestedAt,
         ref string? taskProfileId,
-        ref string? taskProfileDisplayName)
+        ref string? taskProfileDisplayName,
+        ref bool isCompanionThinking)
     {
         taskKey = ReadNestedString(payload, "cycle", "task_key") ?? taskKey;
         trigger = ReadNestedString(payload, "cycle", "trigger") ?? trigger;
@@ -409,10 +413,11 @@ public static class CompanionEventProjection
                 var at = ReadDate(ReadString(stream, "created_at")) ?? DateTimeOffset.MinValue;
                 if (state == "streaming" && string.IsNullOrWhiteSpace(text))
                 {
-                    UpsertAi(ai, id, "chat_pending", at, "AI 正在回复中", at, null);
+                    isCompanionThinking = true;
                     continue;
                 }
                 if (string.IsNullOrWhiteSpace(text)) continue;
+                isCompanionThinking = false;
                 if (state == "failed") text += "\n\n（未完成）";
                 UpsertAi(ai, id, state == "failed" ? "chat_incomplete" : "chat", at, text, at, state == "completed" ? ReadDate(ReadString(stream, "completed_at")) : null);
             }

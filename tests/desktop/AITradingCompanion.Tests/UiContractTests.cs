@@ -101,6 +101,8 @@ public sealed class UiContractTests
 
         Assert.Contains("AiTimelineScrollViewer", xaml, StringComparison.Ordinal);
         Assert.Contains("AiTimelinePanel", xaml, StringComparison.Ordinal);
+        Assert.Contains("Text=\"对话\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Text=\"AI消息\"", xaml, StringComparison.Ordinal);
         Assert.Contains("MainSendButton", xaml, StringComparison.Ordinal);
         Assert.Contains("MainCommitButton", xaml, StringComparison.Ordinal);
         Assert.Contains("Text=\"我的消息\"", xaml, StringComparison.Ordinal);
@@ -196,10 +198,26 @@ public sealed class UiContractTests
 
         Assert.Contains("CreateCopyButton(message.Text)", source, StringComparison.Ordinal);
         Assert.Contains("CreateCopyButton(entry.Text)", source, StringComparison.Ordinal);
-        Assert.Contains("CreateMarkdownViewer(message.Text", source, StringComparison.Ordinal);
+        Assert.Contains("CreatePublishedMessageViewer(message)", source, StringComparison.Ordinal);
         Assert.Contains("CreateMarkdownViewer(entry.Text", source, StringComparison.Ordinal);
         Assert.Contains("MarkdownDocumentBuilder.Build(markdown)", source, StringComparison.Ordinal);
         Assert.Contains("Clipboard.SetText(text)", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void CompanionBubblesDoNotExposeInternalStageIdentities()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln"))) root = root.Parent;
+        Assert.NotNull(root);
+        var source = File.ReadAllText(Path.Combine(root.FullName!,
+            "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml.cs"));
+
+        Assert.DoesNotContain("M0 · 客观观察", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("M1 · 独立判断", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("M2 · 伴生综合", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("AI 正在回复中", source, StringComparison.Ordinal);
+        Assert.Contains("正在想…", source, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -169,7 +169,7 @@ public partial class MainWindow : Window, IDisposable
         if (!CompanionInputPolicy.CanCommit(_companionProjection.State, h0Locked, staged)) return;
         var type = isConversation ? "commit_conversation_batch" : isPreM0 ? "commit_pre_m0" : isH0 ? "commit_h0" : "commit_chat_batch";
         if (!isH0 && staged == 0) return;
-        SetLocalAiNotice(_companionProjection.CycleId, "chat_pending", "AI 正在回复中");
+        SetLocalAiNotice(_companionProjection.CycleId, "chat_pending", "正在想…");
         if (!await SendCompanionCommandAsync(type, null, showAiError: true)) return;
         if (isH0) _locallyLockedCycles.Add(_companionProjection.CycleId);
         UpdateInputState();
@@ -353,49 +353,27 @@ public partial class MainWindow : Window, IDisposable
         _aiAnchors.Clear();
         foreach (var message in messages.OrderBy(item => item.At))
         {
-            var label = message.Kind switch
+            if (message.Kind is "chat_pending" or "action_pending")
             {
-                "chat_pending" or "action_pending" => "AI",
-                "m0" => "M0 · 客观观察",
-                "m1" => "M1 · 独立判断",
-                "m2" => "M2 · 伴生综合",
-                "premarket" or "premarket_chat" => "盘前交流",
-                "legacy_message" => "历史 AI 消息",
-                "legacy_model" => "历史独立判断",
-                "legacy_synthesis" => "历史伴生判断",
-                "fault" => "运行说明",
-                "recovery" => "运行恢复",
-                "judgment_revision" => "判断修订",
-                "outcome" => "结果验证",
-                "reflection" => "复盘",
-                "history" => "历史消息",
-                _ => "AI",
-            };
-            var labelBrush = message.Kind switch
-            {
-                "chat_pending" or "action_pending" => (Brush)FindResource("BlueBrush"),
-                "m0" or "premarket" or "premarket_chat" => (Brush)FindResource("BlueBrush"),
-                "m1" or "m2" or "reflection" => (Brush)FindResource("AccentBrush"),
-                "fault" => new SolidColorBrush(Color.FromRgb(255, 123, 139)),
-                _ => (Brush)FindResource("SecondaryTextBrush"),
-            };
-            var header = new TextBlock { Text = label, Foreground = labelBrush, FontWeight = FontWeights.SemiBold, FontSize = 13 };
+                AiTimelinePanel.Children.Add(new TextBlock
+                {
+                    Text = "正在想…", Foreground = (Brush)FindResource("SecondaryTextBrush"),
+                    FontSize = 13, Margin = new Thickness(4, 2, 0, 12),
+                });
+                continue;
+            }
             var timing = new TextBlock
             {
                 Text = FormatTiming(message), Foreground = (Brush)FindResource("SecondaryTextBrush"),
                 FontSize = 11, Margin = new Thickness(0, 3, 0, 0),
             };
-            var body = CreateMarkdownViewer(message.Text, new Thickness(0, 8, 0, 0));
+            var body = CreatePublishedMessageViewer(message);
             var headerRow = new Grid();
             headerRow.ColumnDefinitions.Add(new ColumnDefinition());
             headerRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            headerRow.Children.Add(header);
-            if (message.Kind is not ("chat_pending" or "action_pending"))
-            {
-                var copy = CreateCopyButton(message.Text);
-                Grid.SetColumn(copy, 1);
-                headerRow.Children.Add(copy);
-            }
+            var copy = CreateCopyButton(message.Text);
+            Grid.SetColumn(copy, 1);
+            headerRow.Children.Add(copy);
             var content = new StackPanel { Children = { headerRow, timing, body } };
             var card = new Border
             {
@@ -403,16 +381,7 @@ public partial class MainWindow : Window, IDisposable
                 BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(9), Padding = new Thickness(12),
                 Margin = new Thickness(0, 0, 0, 10), Child = content, Cursor = Cursors.Hand,
             };
-            if (message.Kind is "chat_pending" or "action_pending")
-            {
-                card.Cursor = Cursors.Arrow;
-                body.BeginAnimation(OpacityProperty, new DoubleAnimation
-                {
-                    From = 0.48, To = 1, Duration = TimeSpan.FromMilliseconds(760),
-                    AutoReverse = true, RepeatBehavior = RepeatBehavior.Forever,
-                });
-            }
-            else card.MouseLeftButtonDown += (_, _) =>
+            card.MouseLeftButtonDown += (_, _) =>
             {
                 _activeAiMarkdown = message.Text;
                 ReadAloudButton.IsEnabled = true;
@@ -447,7 +416,12 @@ public partial class MainWindow : Window, IDisposable
         string cycleId,
         IReadOnlyList<CompanionAiTimelineEntry> messages)
     {
-        if (!_localAiNoticesByCycle.TryGetValue(cycleId, out var notice)) return messages;
+        if (!_localAiNoticesByCycle.TryGetValue(cycleId, out var notice))
+        {
+            if (_companionProjection?.CycleId != cycleId || !_companionProjection.IsCompanionThinking) return messages;
+            notice = new CompanionAiTimelineEntry(
+                $"projection-reply-status-{cycleId}", "chat_pending", DateTimeOffset.Now, "正在想…", DateTimeOffset.Now);
+        }
         return [.. messages, notice];
     }
 
@@ -520,6 +494,35 @@ public partial class MainWindow : Window, IDisposable
         }
         if (messages.Length == 0)
             MainJudgmentTimelinePanel.Children.Add(new TextBlock { Text = "当前判断还没有你的消息。", Foreground = (Brush)FindResource("SecondaryTextBrush") });
+    }
+
+    private UIElement CreatePublishedMessageViewer(CompanionAiTimelineEntry message)
+    {
+        if (message.Parts is null || message.Parts.Count == 0)
+            return CreateMarkdownViewer(message.Text, new Thickness(0, 8, 0, 0));
+
+        var panel = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
+        foreach (var part in message.Parts)
+        {
+            if (part.Kind == "material")
+            {
+                var material = new StackPanel();
+                if (!string.IsNullOrWhiteSpace(part.SourceTitle))
+                    material.Children.Add(new TextBlock
+                    {
+                        Text = part.SourceTitle, FontWeight = FontWeights.SemiBold,
+                        Foreground = (Brush)FindResource("SecondaryTextBrush"),
+                    });
+                material.Children.Add(CreateMarkdownViewer(part.Text, new Thickness(0, 5, 0, 0)));
+                panel.Children.Add(new Border
+                {
+                    BorderBrush = (Brush)FindResource("BorderBrush"), BorderThickness = new Thickness(1, 0, 0, 0),
+                    Padding = new Thickness(10, 2, 0, 2), Margin = new Thickness(0, 7, 0, 0), Child = material,
+                });
+            }
+            else panel.Children.Add(CreateMarkdownViewer(part.Text, new Thickness(0)));
+        }
+        return panel;
     }
 
     private static FlowDocumentScrollViewer CreateMarkdownViewer(string markdown, Thickness margin)

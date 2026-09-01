@@ -175,11 +175,12 @@ public sealed class CompanionEventProjectionTests
         var replying = CompanionEventProjection.Project([started, delta]);
 
         Assert.NotNull(pending);
-        Assert.Equal("chat_pending", Assert.Single(pending.AiMessages).Kind);
-        Assert.Equal("AI 正在回复中", pending.AiMessages[0].Text);
+        Assert.Empty(pending.AiMessages);
+        Assert.True(pending.IsCompanionThinking);
         Assert.NotNull(replying);
         Assert.Equal("chat", Assert.Single(replying.AiMessages).Kind);
         Assert.Equal("我先核对一下。", replying.AiMessages[0].Text);
+        Assert.False(replying.IsCompanionThinking);
     }
 
     [Fact]
@@ -193,7 +194,8 @@ public sealed class CompanionEventProjectionTests
         var projection = CompanionEventProjection.Project(events);
 
         Assert.NotNull(projection);
-        Assert.Equal("chat_pending", Assert.Single(projection.AiMessages).Kind);
+        Assert.Empty(projection.AiMessages);
+        Assert.True(projection.IsCompanionThinking);
     }
 
     [Fact]

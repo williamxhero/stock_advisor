@@ -85,6 +85,39 @@ public sealed class CompanionEventProjectionTests
     }
 
     [Fact]
+    public void AiStageActionsUseOnePendingBubbleUntilTheFormalMessageArrives()
+    {
+        var m0Started =
+            """{"contract":"companion-client-event/v1","event_id":"m0-start","cycle_id":"cycle-1","type":"m0.started","created_at":"2026-09-01T07:20:13Z","payload":{"cycle":{"task_key":"daily.review.1520","state":"researching_m0"}}}""";
+        var retrying =
+            """{"contract":"companion-client-event/v1","event_id":"retry","cycle_id":"cycle-1","type":"research.retrying","created_at":"2026-09-01T07:25:08Z","payload":{"reason":"上游暂时不可用，正在自动重试。","cycle":{"task_key":"daily.review.1520","state":"researching_m0"}}}""";
+        var m0Ready =
+            """{"contract":"companion-client-event/v1","event_id":"m0-ready","cycle_id":"cycle-1","type":"m0.ready","created_at":"2026-09-01T07:26:00Z","payload":{"source_artifact_id":"m0","m0":"收盘复盘事实。","cycle":{"task_key":"daily.review.1520","state":"awaiting_h0"}}}""";
+        var m1Started =
+            """{"contract":"companion-client-event/v1","event_id":"m1-start","cycle_id":"cycle-1","type":"m1.started","created_at":"2026-09-01T07:27:00Z","payload":{"cycle":{"task_key":"daily.review.1520","state":"researching_m1"}}}""";
+        var m1Ready =
+            """{"contract":"companion-client-event/v1","event_id":"m1-ready","cycle_id":"cycle-1","type":"m1.ready","created_at":"2026-09-01T07:28:00Z","payload":{"source_artifact_id":"m1","m1":"独立判断。","cycle":{"task_key":"daily.review.1520","state":"synthesizing_m2"}}}""";
+        var m2Started =
+            """{"contract":"companion-client-event/v1","event_id":"m2-start","cycle_id":"cycle-1","type":"m2.started","created_at":"2026-09-01T07:28:01Z","payload":{"cycle":{"task_key":"daily.review.1520","state":"synthesizing_m2"}}}""";
+
+        var researching = CompanionEventProjection.ProjectForCycle([m0Started], "cycle-1")!;
+        Assert.Equal("action_pending", Assert.Single(researching.AiMessages).Kind);
+        Assert.Equal("AI 正在研究中", researching.AiMessages[0].Text);
+
+        var retried = CompanionEventProjection.ProjectForCycle([m0Started, retrying], "cycle-1")!;
+        Assert.Equal("上游暂时不可用，正在自动重试。", Assert.Single(retried.AiMessages).Text);
+
+        var judging = CompanionEventProjection.ProjectForCycle([m0Started, retrying, m0Ready, m1Started], "cycle-1")!;
+        Assert.Equal(["m0", "action_pending"], judging.AiMessages.Select(message => message.Kind));
+        Assert.Equal("AI 正在形成独立判断", judging.AiMessages[1].Text);
+
+        var synthesizing = CompanionEventProjection.ProjectForCycle(
+            [m0Started, retrying, m0Ready, m1Started, m1Ready, m2Started], "cycle-1")!;
+        Assert.Equal(["m0", "m1", "action_pending"], synthesizing.AiMessages.Select(message => message.Kind));
+        Assert.Equal("AI 正在综合判断", synthesizing.AiMessages[2].Text);
+    }
+
+    [Fact]
     public void ProjectsStagedThenWithdrawnMessageWithoutTreatingItAsH0()
     {
         var events = new[]

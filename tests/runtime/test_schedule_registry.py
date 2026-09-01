@@ -100,7 +100,8 @@ def test_seed_installs_all_eight_defaults_once(tmp_path):
         "daily": [{"task_key": "daily.opportunity.0900", "at": "09:00", "lead_minutes": 30}],
         "periodic": [{"task_key": "periodic.monthly", "months": "*", "day": 1, "at": "19:00"}],
     })
-    assert [item["config"]["name"] for item in schedules.list()] == ["盘前机会发现", "月度复盘"]
+    at = datetime(2026, 8, 31, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    assert [item["config"]["name"] for item in schedules.list(at)] == ["盘前机会发现", "月度复盘"]
 
 
 def test_seed_backfills_legacy_cycles_to_their_default_template(tmp_path):

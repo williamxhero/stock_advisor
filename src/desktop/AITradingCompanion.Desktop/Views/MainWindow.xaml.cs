@@ -355,7 +355,7 @@ public partial class MainWindow : Window, IDisposable
         {
             var label = message.Kind switch
             {
-                "chat_pending" => "AI",
+                "chat_pending" or "action_pending" => "AI",
                 "m0" => "M0 · 客观观察",
                 "m1" => "M1 · 独立判断",
                 "m2" => "M2 · 伴生综合",
@@ -373,7 +373,7 @@ public partial class MainWindow : Window, IDisposable
             };
             var labelBrush = message.Kind switch
             {
-                "chat_pending" => (Brush)FindResource("BlueBrush"),
+                "chat_pending" or "action_pending" => (Brush)FindResource("BlueBrush"),
                 "m0" or "premarket" or "premarket_chat" => (Brush)FindResource("BlueBrush"),
                 "m1" or "m2" or "reflection" => (Brush)FindResource("AccentBrush"),
                 "fault" => new SolidColorBrush(Color.FromRgb(255, 123, 139)),
@@ -390,7 +390,7 @@ public partial class MainWindow : Window, IDisposable
             headerRow.ColumnDefinitions.Add(new ColumnDefinition());
             headerRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             headerRow.Children.Add(header);
-            if (message.Kind != "chat_pending")
+            if (message.Kind is not ("chat_pending" or "action_pending"))
             {
                 var copy = CreateCopyButton(message.Text);
                 Grid.SetColumn(copy, 1);
@@ -403,7 +403,7 @@ public partial class MainWindow : Window, IDisposable
                 BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(9), Padding = new Thickness(12),
                 Margin = new Thickness(0, 0, 0, 10), Child = content, Cursor = Cursors.Hand,
             };
-            if (message.Kind == "chat_pending")
+            if (message.Kind is "chat_pending" or "action_pending")
             {
                 card.Cursor = Cursors.Arrow;
                 body.BeginAnimation(OpacityProperty, new DoubleAnimation
@@ -430,7 +430,7 @@ public partial class MainWindow : Window, IDisposable
             });
             _activeAiMarkdown = null;
         }
-        else _activeAiMarkdown = messages.LastOrDefault(message => message.Kind != "chat_pending")?.Text;
+        else _activeAiMarkdown = messages.LastOrDefault(message => message.Kind is not ("chat_pending" or "action_pending"))?.Text;
         ReadAloudButton.IsEnabled = !string.IsNullOrWhiteSpace(_activeAiMarkdown);
         if (wasAtBottom) Dispatcher.BeginInvoke(() => AiTimelineScrollViewer.ScrollToEnd(), DispatcherPriority.Loaded);
     }

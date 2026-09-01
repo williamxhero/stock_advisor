@@ -120,6 +120,23 @@ class WebAccessGatewayTests(unittest.TestCase):
         self.assertNotIn("3950.00", item["excerpt_text"])
         self.assertFalse(item["primary"])
 
+    def test_tencent_intraday_minute_read_uses_frozen_date_when_truncated_payload_omits_date(self) -> None:
+        url = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sh000001"
+        markdown = (
+            r'{"data":{"sh000001":{"data":{"data":\['
+            '"1429 3981.00 100 200.00","1430 3980.81 120 240.00","1431 3982.00 130 260.00"'
+            r'\]}}}}'
+        )
+        response = {"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
+            "trace_id": "trace", "url": url, "markdown": markdown,
+        })}]}}
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=_Response(response)):
+            item = self.client.read(url, not_after="2026-09-01T06:30:04Z")["results"][0]
+        self.assertEqual("2026-09-01T06:30:00Z", item["fact_as_of"])
+        self.assertIn('"price":"3980.81"', item["excerpt_text"])
+        self.assertNotIn("3982.00", item["excerpt_text"])
+        self.assertFalse(item["primary"])
+
     def test_browser_rejects_any_mutating_action_before_network(self) -> None:
         with mock.patch("ai_trading_companion.web_access_gateway.urlopen") as open_request:
             with self.assertRaisesRegex(WebAccessGatewayError, "read-only"):

@@ -277,12 +277,19 @@ def _frozen_public_intraday_minute_row(url: str, body: str, not_after: str | Non
         return None
     symbol = (parse_qs(parsed.query).get("code") or [""])[0]
     date_match = re.search(r'"date"\s*:\s*"(20\d{6})"', body)
-    if not symbol or date_match is None:
-        return None
     cutoff = _aware_utc(not_after)
+    if not symbol:
+        return None
+    trading_date = (
+        date_match.group(1) if date_match is not None
+        else cutoff.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d") if cutoff is not None
+        else None
+    )
+    if trading_date is None:
+        return None
     candidates: list[tuple[datetime, dict[str, str]]] = []
     for match in re.finditer(r'"([012]\d)([0-5]\d)\s+([^"\s]+)\s+([^"\s]+)\s+([^"\s]+)"', body):
-        compact = date_match.group(1) + match.group(1) + match.group(2)
+        compact = trading_date + match.group(1) + match.group(2)
         try:
             local_time = datetime.strptime(compact, "%Y%m%d%H%M").replace(tzinfo=ZoneInfo("Asia/Shanghai"))
         except ValueError:
@@ -291,7 +298,7 @@ def _frozen_public_intraday_minute_row(url: str, body: str, not_after: str | Non
         if cutoff is not None and quote_time > cutoff:
             continue
         candidates.append((quote_time, {
-            "symbol": symbol, "date": date_match.group(1), "time": match.group(1) + match.group(2),
+            "symbol": symbol, "date": trading_date, "time": match.group(1) + match.group(2),
             "price": match.group(3), "cumulative_volume": match.group(4),
             "cumulative_turnover": match.group(5),
         }))

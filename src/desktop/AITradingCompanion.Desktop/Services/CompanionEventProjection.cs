@@ -124,8 +124,19 @@ public static class CompanionEventProjection
                 case "m0.started":
                 case "research.started":
                     m0StartedAt ??= item.At;
+                    UpsertAi(ai, "action-pending-m0", "action_pending", item.At,
+                        "AI 正在研究中", m0StartedAt, null);
+                    break;
+                case "research.retrying":
+                    var pendingResearchId = ai.ContainsKey("action-pending-m0")
+                        ? "action-pending-m0"
+                        : ai.ContainsKey("action-pending-m1") ? "action-pending-m1" : null;
+                    if (pendingResearchId is not null)
+                        UpsertAi(ai, pendingResearchId, "action_pending", item.At,
+                            ReadString(payload, "reason") ?? "AI 正在重新尝试研究", item.At, null);
                     break;
                 case "m0.ready":
+                    ai.Remove("action-pending-m0");
                     UpsertAi(ai, ReadString(payload, "source_artifact_id"), "m0", item.At,
                         ReadString(payload, "m0"), m0StartedAt, item.At);
                     break;
@@ -158,8 +169,11 @@ public static class CompanionEventProjection
                     break;
                 case "m1.started":
                     m1StartedAt ??= item.At;
+                    UpsertAi(ai, "action-pending-m1", "action_pending", item.At,
+                        "AI 正在形成独立判断", m1StartedAt, null);
                     break;
                 case "m1.ready":
+                    ai.Remove("action-pending-m1");
                     foreach (var fault in ai.Where(pair => pair.Value.Kind == "fault").Select(pair => pair.Key).ToArray())
                         ai.Remove(fault);
                     errorText = null;
@@ -182,8 +196,11 @@ public static class CompanionEventProjection
                     break;
                 case "m2.started":
                     m2StartedAt ??= item.At;
+                    UpsertAi(ai, "action-pending-m2", "action_pending", item.At,
+                        "AI 正在综合判断", m2StartedAt, null);
                     break;
                 case "m2.ready":
+                    ai.Remove("action-pending-m2");
                     foreach (var fault in ai.Where(pair => pair.Value.Kind == "fault").Select(pair => pair.Key).ToArray())
                         ai.Remove(fault);
                     errorText = null;
@@ -244,6 +261,7 @@ public static class CompanionEventProjection
                 case "m1.failed":
                 case "outcome.failed":
                 case "chat_research.failed":
+                    RemoveActionPending(ai);
                     errorText = ReadString(payload, "reason") ?? "本次 AI 研究未完成。";
                     UpsertAi(ai, $"fault-{item.At:O}", "fault", item.At, errorText, item.At, item.At);
                     break;
@@ -317,6 +335,12 @@ public static class CompanionEventProjection
                 faultRun[0].StartedAt, latest.CompletedAt));
             faultRun.Clear();
         }
+    }
+
+    private static void RemoveActionPending(Dictionary<string, CompanionAiTimelineEntry> ai)
+    {
+        foreach (var id in ai.Where(pair => pair.Value.Kind == "action_pending").Select(pair => pair.Key).ToArray())
+            ai.Remove(id);
     }
 
     private static void ReadProjection(

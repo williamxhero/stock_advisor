@@ -35,6 +35,39 @@ def packet_builder(store: CompanionStore) -> RuntimePacketBuilder:
 
 
 class CompanionEngineTests(unittest.TestCase):
+    def test_unqualified_chat_candidate_is_not_sealed_as_an_artifact(self):
+        with self.assertRaisesRegex(ValueError, "message qualification failed"):
+            self.engine.chat_ready(
+                self.cycle["cycle_id"],
+                "internal_flag: active\n我倾向于先等承接确认。",
+            )
+
+        self.assertIsNone(self.store.latest_artifact(self.cycle["cycle_id"], "ai_chat"))
+
+    def test_machine_shaped_chat_is_qualified_before_it_reaches_the_projection(self):
+        self.engine.chat_ready(
+            self.cycle["cycle_id"],
+            """盘前研判
+time_scope: next_trading_session
+reference_at: 2026-09–01 09:00 Asia/Shanghai
+Protocol: OpportunityDiscovery-v1.3
+状态：unqualified
+
+结论
+现有证据不够。
+市场基线
+指数偏弱。
+新增事件
+昨夜有一条消息。""",
+        )
+
+        projection = self.engine._projection(self.store.get_cycle(self.cycle["cycle_id"]))
+        message = next(item for item in projection["ai_messages"] if item["kind"] == "ai_chat")
+        visible = message["message"]["text_projection"]
+        for leaked in ("time_scope", "reference_at", "Asia/Shanghai", "Protocol", "unqualified", "盘前研判", "市场基线", "新增事件"):
+            self.assertNotIn(leaked, visible)
+        self.assertIn("现有信息还不够，我先不下判断。", visible)
+
     def test_published_message_v2_survives_the_runtime_projection(self):
         self.ready()
 

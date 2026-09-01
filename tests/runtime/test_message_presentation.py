@@ -2,10 +2,47 @@ from __future__ import annotations
 
 import unittest
 
-from ai_trading_companion.message_presentation import present_message
+from ai_trading_companion.message_presentation import MessageQualificationError, present_message
 
 
 class MessagePresentationTests(unittest.TestCase):
+    def test_unicode_internal_fields_and_bare_report_labels_cannot_reach_speech(self):
+        presented = present_message(
+            """盘前研判
+time_scope: next_trading_session
+reference_at: 2026-09–01 09:00 Asia/Shanghai
+Protocol: OpportunityDiscovery-v1.3
+状态：unqualified
+
+结论
+现在还不能下结论。
+市场基线
+指数偏弱。
+新增事件
+昨夜有一条消息。""",
+            as_of="2026-09-01T01:00:00Z",
+            kind="ai_chat",
+        )
+
+        for leaked in (
+            "time_scope", "next_trading_session", "reference_at", "Asia/Shanghai",
+            "Protocol", "OpportunityDiscovery-v1.3", "unqualified", "盘前研判",
+            "市场基线", "新增事件",
+        ):
+            self.assertNotIn(leaked, presented.markdown)
+        self.assertNotRegex(presented.markdown, r"(?m)^结论\s*$")
+        self.assertIn("下一个交易日", presented.markdown)
+        self.assertIn("现有信息还不够，我先不下判断。", presented.markdown)
+        self.assertEqual("passed", presented.metadata()["qualification"]["state"])
+
+    def test_unknown_machine_field_fails_closed_instead_of_being_rewritten(self):
+        with self.assertRaises(MessageQualificationError):
+            present_message(
+                "internal_flag: active\n我倾向于先等承接确认。",
+                as_of="2026-09-01T01:00:00Z",
+                kind="ai_chat",
+            )
+
     def test_presentation_exposes_a_versioned_message_contract(self):
         presented = present_message(
             "我倾向于先等承接确认。",

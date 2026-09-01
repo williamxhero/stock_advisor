@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -9,9 +10,31 @@ from typing import Any
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s*(.+?)\s*#*\s*$")
 _LIST = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(.+)$")
 _TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
-_FIELD = re.compile(r"^\s*([a-z][a-z0-9_]{1,40})\s*:\s*(.+?)\s*$", re.I)
-_ISO_DAY = re.compile(r"(?<!\d)(20\d{2})-(\d{2})-(\d{2})(?:[T\s][0-2]\d:[0-5]\d(?::[0-5]\d)?(?:\.\d+)?(?:Z|[+-][0-2]\d:?\d\d)?)?(?!\d)")
+_FIELD = re.compile(r"^\s*([a-z\u4e00-\u9fff][a-z0-9_\u4e00-\u9fff]{0,40})\s*[:：]\s*(.+?)\s*$", re.I)
+_ISO_DAY = re.compile(r"(?<!\d)(20\d{2})[-‐‑‒–—−](\d{2})[-‐‑‒–—−](\d{2})(?:[T\s][0-2]\d:[0-5]\d(?::[0-5]\d)?(?:\.\d+)?(?:Z|[+-][0-2]\d:?\d\d)?)?(?!\d)")
 _URL = re.compile(r"https?://[^\s)>]+")
+
+_INTERNAL_FIELDS = {
+    "task_key", "stage", "protocol", "reference_at", "model", "token",
+    "状态", "status",
+}
+_REPORT_LABELS = {
+    "盘前研判", "盘前结论", "盘中结论", "执行结论", "执行回执", "盘前研究回执",
+    "结论", "市场基线", "新增事件", "题材判断", "题材状态", "市场层", "组合处理",
+    "持仓处理", "政策材料", "事件记录与证据限制", "组合相关未知项",
+}
+_INTERNAL_TOKEN = re.compile(
+    r"\b(?:time_scope|reference_at|next_trading_session|same_trading_session|"
+    r"unqualified|task_key|protocol|token)\b|\bAsia/Shanghai\b|"
+    r"\b[A-Za-z][A-Za-z0-9]+-v\d+(?:\.\d+)+\b",
+    re.I,
+)
+
+
+class MessageQualificationError(ValueError):
+    def __init__(self, problems: list[str]):
+        self.problems = tuple(problems)
+        super().__init__("message qualification failed: " + ", ".join(problems))
 
 _ENUM_WORDS = {
     "next_trading_session": "下一个交易日",
@@ -34,6 +57,7 @@ class PresentedMessage:
     parts: tuple[dict[str, Any], ...]
     kind: str = "ai_chat"
     contract_version: int = 2
+    qualification_problems: tuple[str, ...] = ()
 
     def message(self) -> dict[str, Any]:
         return {
@@ -50,6 +74,11 @@ class PresentedMessage:
                 "parts": list(self.parts),
             },
             "published_message": self.message(),
+            "qualification": {
+                "state": "passed" if not self.qualification_problems else "rejected",
+                "problems": list(self.qualification_problems),
+                "gate": "companion-message-qualification/v2",
+            },
         }
 
 
@@ -86,6 +115,9 @@ def present_message(
         natural = _naturalize_speech(source, as_of, allow_structured_format)
         rendered.append(natural)
         parts.append({"kind": "speech", "text": natural})
+    problems = _qualification_problems(parts, allow_structured_format)
+    if problems:
+        raise MessageQualificationError(problems)
     return PresentedMessage("\n\n".join(rendered), tuple(parts), kind=kind)
 
 
@@ -151,7 +183,10 @@ def _naturalize_speech(text: str, as_of: str, allow_structured_format: bool) -> 
             continue
         heading = _HEADING.match(line)
         if heading:
-            line = heading.group(1)
+            continue
+        normalized_line = _normalized(line)
+        if normalized_line in _REPORT_LABELS:
+            continue
         if _TABLE_RULE.match(line):
             continue
         if "|" in line and line.count("|") >= 2:
@@ -175,9 +210,13 @@ def _naturalize_speech(text: str, as_of: str, allow_structured_format: bool) -> 
         field = _FIELD.match(line)
         if field:
             key, value = field.groups()
-            if key.lower() in {"task_key", "stage", "protocol", "status", "model", "token"}:
+            normalized_key = _normalized(key).lower()
+            if normalized_key in {"状态", "status"} and _normalized(value).lower() == "unqualified":
+                paragraphs.append("现有信息还不够，我先不下判断。")
                 continue
-            if key.lower() == "time_scope":
+            if normalized_key in _INTERNAL_FIELDS:
+                continue
+            if normalized_key == "time_scope":
                 line = value
         paragraphs.append(_humanize(line, as_of))
     if list_items:
@@ -200,7 +239,35 @@ def _humanize(text: str, as_of: str) -> str:
     for raw, spoken in _ENUM_WORDS.items():
         result = re.sub(rf"\b{re.escape(raw)}\b", spoken, result)
     result = _ISO_DAY.sub(lambda match: _human_day(match, as_of), result)
+    result = re.sub(r"\s*Asia/Shanghai\b", "", result, flags=re.I)
     return result
+
+
+def _qualification_problems(parts: list[dict[str, Any]], allow_structured_format: bool) -> list[str]:
+    problems: list[str] = []
+    for part in parts:
+        if part.get("kind") != "speech":
+            continue
+        speech = str(part.get("text") or "")
+        normalized = _normalized(speech)
+        if _INTERNAL_TOKEN.search(normalized):
+            problems.append("internal_token")
+        if _ISO_DAY.search(normalized):
+            problems.append("machine_date")
+        for line in normalized.splitlines():
+            stripped = line.strip()
+            field = _FIELD.match(stripped)
+            if field and ("_" in field.group(1) or _normalized(field.group(1)).lower() in _INTERNAL_FIELDS):
+                problems.append("machine_field")
+            if stripped in _REPORT_LABELS:
+                problems.append("report_label")
+            if not allow_structured_format and (_HEADING.match(stripped) or _LIST.match(stripped) or _TABLE_RULE.match(stripped)):
+                problems.append("unrequested_structure")
+    return list(dict.fromkeys(problems))
+
+
+def _normalized(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).translate(str.maketrans("‐‑‒–—−", "------"))
 
 
 def _human_day(match: re.Match[str], as_of: str) -> str:

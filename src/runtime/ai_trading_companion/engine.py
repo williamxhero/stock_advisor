@@ -161,12 +161,7 @@ class CompanionEngine:
     def research_failed(self, cycle_id: str, reason: str, *, details: dict[str, Any] | None = None) -> dict[str, Any]:
         message = self._stage_failure_message("M0", reason, details)
         cycle = self.store.transition(cycle_id, "failed")
-        presented = self.present_for_publication(message, iso(utc_now()), "system_fault")
-        self.emit(cycle, "research.failed", {
-            "cycle": cycle, "reason": presented.markdown,
-            "presentation": presented.metadata()["presentation"],
-            "diagnostic_code": self._diagnostic_code(reason),
-        })
+        self._emit_failure(cycle, "research.failed", message, reason)
         return cycle
 
     def research_retrying(self, cycle_id: str, reason: str, attempt: int) -> dict[str, Any]:
@@ -190,7 +185,7 @@ class CompanionEngine:
         if cycle["state"] != "queued":
             raise ValueError(f"only queued cycle can be missed: {cycle['state']}")
         cycle = self.store.transition(cycle_id, "missed")
-        self.emit(cycle, "cycle.missed", {"cycle": cycle, "reason": reason})
+        self._emit_failure(cycle, "cycle.missed", self._user_fault_message(reason, "这次定时判断"), reason)
         return cycle
 
     def research_ready(
@@ -320,11 +315,10 @@ class CompanionEngine:
                     raise ValueError("qualification_problems required")
                 reason = str(command.get("reason") or "M0 failed deterministic qualification after publication").strip()
                 result = self.store.transition(cycle_id, "failed")
-                self.emit(result, "m0.invalidated", {
-                    "cycle": result,
-                    "reason": reason,
-                    "qualification_problems": problems,
-                })
+                self._emit_failure(
+                    result, "m0.invalidated", self._user_fault_message(reason, "刚才的客观信息"), reason,
+                    {"qualification_problems": problems},
+                )
             elif typ in {"begin_voice_capture", "begin_h0_edit"}:
                 result = self._begin_grace(cycle, typ)
             elif typ == "stage_message":
@@ -687,6 +681,7 @@ class CompanionEngine:
         event_type = "premarket.reply.ready" if kind == "premarket_chat" else "chat.ready"
         self.emit(cycle, event_type, {
             "cycle": cycle, "text": presented.markdown, "presentation": presented.metadata()["presentation"], "reply_to_batch_id": reply_to_batch_id, "stream_id": stream_id,
+            "message": presented.message(),
             "source_artifact_id": artifact["artifact_id"],
         })
         return cycle
@@ -715,6 +710,7 @@ class CompanionEngine:
         self.emit(cycle, event_type, {
             "cycle": cycle, "text": presented.markdown,
             "presentation": presented.metadata()["presentation"],
+            "message": presented.message(),
             "source_artifact_id": artifact["artifact_id"],
         })
         return artifact
@@ -736,7 +732,7 @@ class CompanionEngine:
         stream = self.store.finish_stream_message(stream_id, error=reason)
         presented = self.present_for_publication(self._user_fault_message(reason, "聊天回复"), iso(utc_now()), "system_fault")
         artifact = self.store.append_artifact(cycle_id, "system_fault", "system", presented.markdown, iso(utc_now()), self._presentation_metadata({"stream_id": stream_id, "reason_category": self._diagnostic_code(reason)}, presented))
-        self.emit(cycle, "chat.stream.failed", {"cycle": cycle, "stream": stream, "reason": presented.markdown, "presentation": presented.metadata()["presentation"], "source_artifact_id": artifact["artifact_id"]})
+        self.emit(cycle, "chat.stream.failed", {"cycle": cycle, "stream": stream, "reason": presented.markdown, "presentation": presented.metadata()["presentation"], "message": presented.message(), "source_artifact_id": artifact["artifact_id"]})
         return stream
 
     def judgment_revision_ready(self, cycle_id: str, text: str, revises_artifact_id: str) -> dict[str, Any]:
@@ -753,6 +749,7 @@ class CompanionEngine:
         self.judgments.capture(artifact, "judgment_revision", presented.markdown)
         self.emit(cycle, "judgment.revised", {
             "cycle": cycle, "text": presented.markdown, "presentation": presented.metadata()["presentation"], "revises_artifact_id": revises_artifact_id,
+            "message": presented.message(),
             "source_artifact_id": artifact["artifact_id"],
         })
         return artifact
@@ -831,6 +828,7 @@ class CompanionEngine:
         self.emit(cycle, event_type, {
             "cycle": cycle, "reason": presented.markdown,
             "presentation": presented.metadata()["presentation"], "source_artifact_id": artifact["artifact_id"],
+            "message": presented.message(),
             "diagnostic_code": self._diagnostic_code(reason), **(extra or {}),
         })
 

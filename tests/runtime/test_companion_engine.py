@@ -330,6 +330,32 @@ Protocol: OpportunityDiscovery-v1.3
             self.assertNotIn("reference_at:", visible)
             self.assertNotIn("Protocol:", visible)
 
+    def test_companion_side_paths_publish_the_same_v2_message_contract(self):
+        self.engine.chat_ready(self.cycle["cycle_id"], "我先看承接，不急着追。")
+        self.engine.publish_proactive_message(
+            self.cycle["cycle_id"], "outcome", "刚核对过，原来的担心还没有消失。", meaningful=True,
+        )
+        self.engine.publish_proactive_message(
+            self.cycle["cycle_id"], "reflection", "这次我把量能看得太轻了。", meaningful=True,
+        )
+        prior = self.store.latest_artifact(self.cycle["cycle_id"], "outcome")
+        self.engine.judgment_revision_ready(
+            self.cycle["cycle_id"], "现在的新证据足以让我改成观望。", prior["artifact_id"],
+        )
+        failed_cycle = self.engine.start_cycle(
+            "daily.execution.1030", "2026-08-25T10:30:00+08:00", iso(self.now),
+        )
+        self.engine.research_started(failed_cycle["cycle_id"])
+        self.engine.research_failed(failed_cycle["cycle_id"], "provider timeout")
+
+        visible_types = {"chat.ready", "outcome.ready", "reflection.ready", "judgment.revised", "research.failed"}
+        events = [item for item in self.store.pending_events() if item["event_type"] in visible_types]
+        self.assertEqual(visible_types, {item["event_type"] for item in events})
+        for event in events:
+            payload = json.loads(event["payload_json"])
+            self.assertEqual("companion-published-message/v2", payload["message"]["contract"])
+            self.assertTrue(payload["message"]["text_projection"].strip())
+
     def test_no_h0_skips_m2(self):
         self.ready()
         self.engine.command({"command_id": "commit", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0"})

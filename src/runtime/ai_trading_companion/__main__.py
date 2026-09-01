@@ -1121,7 +1121,7 @@ def run_outcome(
         store.defer_outcome(checkpoint["checkpoint_id"], next_check, result["summary"])
         return result
     presented = engine.present_for_publication(str(result["summary"]), str(result.get("as_of") or cycle["as_of"]), "outcome")
-    result = {**result, "summary": presented.markdown, "presentation": presented.metadata()["presentation"]}
+    result = {**result, "summary": presented.markdown, "presentation": presented.metadata()["presentation"], "published_message": presented.message()}
     artifact = JudgmentLifecycle(store).record_outcome(checkpoint, result)
     regime_metrics = result.get("market_regime") if isinstance(result.get("market_regime"), dict) else {}
     regime = classify_regime(regime_metrics)
@@ -1162,6 +1162,7 @@ def run_outcome(
     engine.emit(cycle, "outcome.ready", {
         "cycle": cycle, "text": result["summary"], "horizon": checkpoint["horizon"],
         "presentation": presented.metadata()["presentation"],
+        "message": presented.message(),
         "verification_status": result["verification_status"],
         "source_artifact_id": artifact["artifact_id"],
     })

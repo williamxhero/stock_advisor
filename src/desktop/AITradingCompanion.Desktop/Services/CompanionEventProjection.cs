@@ -219,7 +219,7 @@ public static class CompanionEventProjection
                 case "chat.ready":
                     isCompanionThinking = false;
                     UpsertAi(ai, ReadString(payload, "stream_id") ?? ReadString(payload, "source_artifact_id"), "chat", item.At,
-                        ReadString(payload, "text"), item.At, item.At);
+                        ReadPublishedText(payload), item.At, item.At, ReadPublishedParts(payload));
                     break;
                 case "chat.stream.started":
                     isCompanionThinking = true;
@@ -245,19 +245,19 @@ public static class CompanionEventProjection
                     break;
                 case "premarket.reply.ready":
                     UpsertAi(ai, ReadString(payload, "source_artifact_id"), "premarket", item.At,
-                        ReadString(payload, "text"), item.At, item.At);
+                        ReadPublishedText(payload), item.At, item.At, ReadPublishedParts(payload));
                     break;
                 case "outcome.ready":
                     UpsertAi(ai, ReadString(payload, "source_artifact_id"), "outcome", item.At,
-                        ReadString(payload, "text"), item.At, item.At);
+                        ReadPublishedText(payload), item.At, item.At, ReadPublishedParts(payload));
                     break;
                 case "reflection.ready":
                     UpsertAi(ai, ReadString(payload, "source_artifact_id"), "reflection", item.At,
-                        ReadString(payload, "text"), item.At, item.At);
+                        ReadPublishedText(payload), item.At, item.At, ReadPublishedParts(payload));
                     break;
                 case "judgment.revised":
                     UpsertAi(ai, ReadString(payload, "source_artifact_id"), "judgment_revision", item.At,
-                        ReadString(payload, "text"), item.At, item.At);
+                        ReadPublishedText(payload), item.At, item.At, ReadPublishedParts(payload));
                     break;
                 case "projection.ready":
                     ReadProjection(payload, ai, users, ref scheduledFor, ref autoSubmit, ref m1Deadline, ref h0LockedAt,
@@ -271,12 +271,16 @@ public static class CompanionEventProjection
                 case "outcome.failed":
                 case "chat_research.failed":
                     RemoveActionPending(ai);
-                    errorText = ReadString(payload, "reason") ?? "本次 AI 研究未完成。";
-                    UpsertAi(ai, $"fault-{item.At:O}", "fault", item.At, errorText, item.At, item.At);
+                    errorText = ReadNestedString(payload, "message", "text_projection")
+                        ?? ReadString(payload, "reason") ?? "这次研究没有完成。";
+                    UpsertAi(ai, ReadString(payload, "source_artifact_id") ?? $"fault-{item.At:O}", "fault", item.At,
+                        errorText, item.At, item.At, ReadPublishedParts(payload));
                     break;
                 case "m2.deferred":
-                    errorText = ReadString(payload, "reason") ?? "M2 已延后。";
-                    UpsertAi(ai, $"fault-{item.At:O}", "fault", item.At, errorText, item.At, item.At);
+                    errorText = ReadNestedString(payload, "message", "text_projection")
+                        ?? ReadString(payload, "reason") ?? "这次综合判断要晚一点。";
+                    UpsertAi(ai, ReadString(payload, "source_artifact_id") ?? $"fault-{item.At:O}", "fault", item.At,
+                        errorText, item.At, item.At, ReadPublishedParts(payload));
                     break;
             }
         }

@@ -37,6 +37,7 @@ public partial class MainWindow : Window, IDisposable
     private readonly HashSet<string> _locallyLockedCycles = new(StringComparer.Ordinal);
     private readonly HashSet<string> _editGraceRequestedCycles = new(StringComparer.Ordinal);
     private readonly Dictionary<string, CompanionAiTimelineEntry> _localAiNoticesByCycle = new(StringComparer.Ordinal);
+    private readonly List<FlowDocumentScrollViewer> _messageTextViewers = [];
     private readonly Queue<double> _waveformLevels = new();
     private CompanionWorkspaceProjection? _companionProjection;
     private PortfolioWorkspaceProjection? _portfolioProjection;
@@ -57,6 +58,7 @@ public partial class MainWindow : Window, IDisposable
     public MainWindow(MainViewModel viewModel, AppPaths paths)
     {
         InitializeComponent();
+        PreviewMouseLeftButtonDown += OnPreviewMouseLeftButtonDown;
         _viewModel = viewModel;
         _paths = paths;
         _judgmentDrafts = CompanionDraftStore.Load(paths);
@@ -86,6 +88,19 @@ public partial class MainWindow : Window, IDisposable
         RefreshCompanionWorkspace();
     }
 
+    private bool HasMessageTextSelection() => _messageTextViewers.Any(viewer => !viewer.Selection.IsEmpty);
+
+    private void ClearMessageTextSelections()
+    {
+        foreach (var viewer in _messageTextViewers)
+            viewer.Selection.Select(viewer.Document.ContentStart, viewer.Document.ContentStart);
+    }
+
+    private void OnPreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (HasMessageTextSelection()) ClearMessageTextSelections();
+    }
+
     private void OnClosed(object? sender, EventArgs e)
     {
         SaveCurrentSize();
@@ -105,6 +120,7 @@ public partial class MainWindow : Window, IDisposable
         _speech.Dispose();
         _companionRecorder.Dispose();
         _portfolioWindow?.Close();
+        PreviewMouseLeftButtonDown -= OnPreviewMouseLeftButtonDown;
         SizeChanged -= OnSizeChanged;
         LocationChanged -= OnLocationChanged;
         _viewModel.PropertyChanged -= OnViewModelPropertyChanged;
@@ -358,8 +374,10 @@ public partial class MainWindow : Window, IDisposable
 
     private void RenderAiMessages(IReadOnlyList<CompanionAiTimelineEntry> messages)
     {
+        if (HasMessageTextSelection()) return;
         var wasAtBottom = AiTimelineScrollViewer.ScrollableHeight <= 0
             || AiTimelineScrollViewer.VerticalOffset >= AiTimelineScrollViewer.ScrollableHeight - 36;
+        _messageTextViewers.RemoveAll(viewer => AiTimelinePanel.IsAncestorOf(viewer));
         AiTimelinePanel.Children.Clear();
         foreach (var message in messages.OrderBy(item => item.At))
         {
@@ -456,6 +474,8 @@ public partial class MainWindow : Window, IDisposable
 
     private void RenderUserMessages()
     {
+        if (HasMessageTextSelection()) return;
+        _messageTextViewers.RemoveAll(viewer => MainJudgmentTimelinePanel.IsAncestorOf(viewer));
         MainJudgmentTimelinePanel.Children.Clear();
         var messages = CombinedUserMessages().OrderBy(message => message.At).ToArray();
         foreach (var entry in messages)
@@ -544,7 +564,7 @@ public partial class MainWindow : Window, IDisposable
         return panel;
     }
 
-    private static FlowDocumentScrollViewer CreateMarkdownViewer(string markdown, Thickness margin)
+    private FlowDocumentScrollViewer CreateMarkdownViewer(string markdown, Thickness margin)
     {
         var document = MarkdownDocumentBuilder.Build(markdown);
         document.ColumnWidth = double.PositiveInfinity;
@@ -563,6 +583,7 @@ public partial class MainWindow : Window, IDisposable
             Cursor = Cursors.IBeam,
             ToolTip = "可鼠标框选后按 Ctrl+C 复制；复制按钮会保留整条消息的原始 Markdown",
         };
+        _messageTextViewers.Add(viewer);
         NestedScrollWheelForwarder.Attach(viewer);
         return viewer;
     }

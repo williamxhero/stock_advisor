@@ -229,6 +229,21 @@ public sealed class UiContractTests
     }
 
     [Fact]
+    public void MessageTextSelectionSurvivesAutomaticWorkspaceRefreshUntilTheNextLeftClick()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln")))
+            root = root.Parent;
+        Assert.NotNull(root);
+        var source = File.ReadAllText(Path.Combine(root.FullName!,
+            "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml.cs"));
+
+        Assert.Contains("if (HasMessageTextSelection()) return;", source, StringComparison.Ordinal);
+        Assert.Contains("PreviewMouseLeftButtonDown += OnPreviewMouseLeftButtonDown", source, StringComparison.Ordinal);
+        Assert.Contains("ClearMessageTextSelections();", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void CompanionBubblesDoNotExposeInternalStageIdentities()
     {
         var root = new DirectoryInfo(AppContext.BaseDirectory);

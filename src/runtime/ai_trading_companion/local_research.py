@@ -4,9 +4,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -298,7 +300,15 @@ class ToolCatalogMarketBackend:
 
     def _cached_breadth(self, required_at: str, window_start: str) -> dict[str, Any] | None:
         """Use only a runtime prefetch whose fact time is inside this contract."""
-        path = self.runner.catalog.root.parent / "market-breadth-snapshot.json"
+        # The prefetch is runtime state under the user's Companion home, not a
+        # release asset under the immutable tool catalog. Looking beside tools
+        # made a valid pre-freeze snapshot invisible and forced a later live
+        # read, which the frozen-time gate correctly rejected.
+        home = os.environ.get("AI_TRADING_COMPANION_HOME")
+        path = (
+            Path(home) / "runtime" / "market-breadth-snapshot.json"
+            if home else self.runner.catalog.root.parent / "market-breadth-snapshot.json"
+        )
         try:
             cached = json.loads(path.read_text(encoding="utf-8"))
             fact_as_of = str(cached["fact_as_of"])

@@ -5,13 +5,13 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ai_trading_companion.engine import CompanionEngine, iso, parse
 from ai_trading_companion.message_presentation import MessageQualificationError
 from ai_trading_companion.stage_expression import express_stage_semantics
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
-from ai_trading_companion.__main__ import run_pending_premarket_reply
+from ai_trading_companion.__main__ import run_pending_premarket_reply, run_scheduled_cycle
 from ai_trading_companion.packet_builder import RuntimePacketBuilder as _RuntimePacketBuilder
 from ai_trading_companion.publication_registry import published_event_types
 from ai_trading_companion.scheduler import conversation_auto_submit_at, load_schedules, run_daily_schedule, run_periodic_schedule
@@ -1007,6 +1007,19 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertEqual([cycle["cycle_id"]], [item["cycle_id"] for item in self.store.claim_scheduled_workers(
             at=datetime.fromisoformat("2026-08-25T08:30:00+08:00")
         )])
+
+    def test_manual_worker_warms_breadth_before_refreshing_its_frozen_contract(self):
+        events: list[str] = []
+        store = Mock()
+        store.get_cycle.return_value = {"state": "queued", "kind": "manual", "schedule_snapshot_json": "{}"}
+        with patch("ai_trading_companion.__main__._prefetch_market_breadth", side_effect=lambda: events.append("prefetch")), patch(
+            "ai_trading_companion.__main__.run_research", side_effect=lambda *args: events.append("research") or {"state": "ok"},
+        ), patch("ai_trading_companion.__main__.process_h0_cognition"):
+            result = run_scheduled_cycle(Mock(), store, Mock(), Mock(), "cycle", True)
+
+        self.assertEqual({"state": "ok"}, result)
+        self.assertEqual(["prefetch", "research"], events)
+        store.finish_scheduled_worker.assert_called_once_with("cycle")
 
     def test_premarket_cycle_is_prepared_before_0830_without_starting_research(self):
         completed: list[str] = []

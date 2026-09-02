@@ -395,13 +395,15 @@ def run_gateway(execute: bool = False) -> None:
     def snapshot(kind: str, request: Any) -> dict[str, Any]:
         return _gateway_snapshot(engine, store, portfolio, kind, dict(request.query))
     def tick() -> None:
-        _prefetch_market_breadth()
         # A manual analysis is the user's explicit foreground work.  Reserve
         # and execute it before optional schedule/conversation maintenance so
         # a maintenance exception cannot leave it indefinitely queued.
         for cycle in store.claim_scheduled_workers(limit=2):
             run_scheduled_cycle(engine, store, exchange, portfolio, cycle["cycle_id"], execute)
         run_schedules(engine, store, datetime.now(timezone.utc), execute, exchange, portfolio)
+        # This cache warm-up is useful for the next scheduled boundary, but it
+        # is never allowed to delay a queued foreground analysis.
+        _prefetch_market_breadth()
         for projection in engine.run_due():
             cycle_id = projection["cycle"]["cycle_id"]
             run_m1(engine, store, portfolio, cycle_id, execute)
@@ -1429,6 +1431,11 @@ def run_scheduled_cycle(engine: CompanionEngine, store: CompanionStore, exchange
         snapshot = json.loads(cycle.get("schedule_snapshot_json") or "{}")
         if snapshot:
             ensure_registered_policy(cycle["task_key"], snapshot, datetime.fromisoformat(cycle["scheduled_for"]))
+        if execute and cycle.get("kind") == "manual":
+            # A manual cycle refreshes its frozen contract inside run_research.
+            # Warm breadth first so that cache becomes a valid fact at that
+            # later boundary without blocking the Gateway's worker claim.
+            _prefetch_market_breadth()
         result = run_research(engine, store, cycle, execute, lambda: flush(store, exchange))
         process_h0_cognition(engine, store, portfolio, cycle_id, execute)
         return result

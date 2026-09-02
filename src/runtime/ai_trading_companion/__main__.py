@@ -70,7 +70,7 @@ _BREADTH_PREFETCH_LOCK = threading.Lock()
 @dataclass(frozen=True)
 class VerifiedStageResult:
     output: dict[str, Any]
-    broker: BrokerResponse
+    broker: BrokerResponse | None
     attempt_id: str
     packet_hash: str
     verifier: dict[str, Any]
@@ -628,7 +628,24 @@ def _call_stage(
                 verifier["passed"] = bool(verifier.get("passed")) and bool(evidence_verifier.get("passed"))
 
         if outcome is None:
-            raise BrokerError("Broker produced no auditable outcome", category="broker_protocol")
+            if not (
+                search and schema_name.startswith("companion-evidence-result-")
+                and verifier.get("passed")
+            ):
+                raise BrokerError("Broker produced no auditable outcome", category="broker_protocol")
+            stage_audit = {
+                "kind": "local_evidence_gate",
+                "attempt_id": attempt["attempt_id"],
+                "validator_version": verifier.get("validator_version"),
+                "successful_tool_results": int(verifier.get("successful_tool_results") or 0),
+                "broker_call_required": False,
+            }
+            usage: dict[str, Any] = {}
+            actual_model = None
+        else:
+            stage_audit = outcome.audit_metadata()
+            usage = outcome.usage
+            actual_model = outcome.actual_model
         status = "succeeded" if verifier.get("passed") else "rejected"
         output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(
@@ -636,9 +653,9 @@ def _call_stage(
             status,
             output_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
             output=data,
-            usage=outcome.usage, verifier=verifier,
-            broker_metadata=outcome.audit_metadata(),
-            tool_trace=[*tool_trace, outcome.audit_metadata()], actual_model=outcome.actual_model,
+            usage=usage, verifier=verifier,
+            broker_metadata=stage_audit,
+            tool_trace=[*tool_trace, stage_audit], actual_model=actual_model,
         )
         attempt_finished = True
         if not verifier.get("passed"):

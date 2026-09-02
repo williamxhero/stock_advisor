@@ -448,6 +448,44 @@ class EvidenceV3Tests(TestCase):
             self.assertEqual("failed", attempt["status"])
             self.assertEqual(trace, json.loads(attempt["tool_trace_json"]))
 
+    def test_qualified_deterministic_research_needs_no_synthetic_broker_call(self):
+        evidence = {
+            "schema_version": 3, "as_of": self.as_of, "spoken_summary": "verified",
+            "sources": [], "coverage": [], "critical_gaps": [], "conflicts": [],
+            "high_impact_events": [],
+        }
+        qualified = SimpleNamespace(
+            qualified=True, evidence=evidence,
+            verifier={"passed": True, "problems": [], "successful_tool_results": 9},
+            observations=[{"operation": "market_breadth", "status": "succeeded", "ok": True}],
+        )
+        with TemporaryDirectory() as temporary:
+            store = CompanionStore(Path(temporary) / "companion.sqlite3")
+            cycle = CompanionEngine(store).start_cycle(
+                "daily.review.1520", "2026-09-02T15:20:00+08:00", self.as_of,
+            )
+            broker = Mock()
+            settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
+            packet = {
+                "task_key": cycle["task_key"], "stage": "m0_research", "as_of": self.as_of,
+                "evidence_contract": self.planner_contract,
+            }
+
+            with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
+                "ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker,
+            ), patch("ai_trading_companion.__main__.LocalResearchChain.run", return_value=qualified):
+                result = _call_stage(
+                    store, cycle, "m0_research", packet,
+                    "companion-evidence-result-v3.schema.json", search=True, timeout=60,
+                    frozen_controls=RuntimeStrategyControls(60, 16, ("gateway", "market"), ()),
+                )
+
+            self.assertIsNone(result.broker)
+            broker.invoke.assert_not_called()
+            attempt = store.attempts(cycle["cycle_id"])[0]
+            self.assertEqual("succeeded", attempt["status"])
+            self.assertEqual("local_evidence_gate", json.loads(attempt["tool_trace_json"])[-1]["kind"])
+
     def test_failed_stage_persists_broker_verifier_for_auditable_repair(self):
         verifier = {
             "passed": False,

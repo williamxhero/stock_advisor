@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import unittest
 
-from ai_trading_companion.message_presentation import MessageQualificationError, present_message
+from ai_trading_companion.message_presentation import MessageQualificationError, present_message, repair_message_draft
 
 
 class MessagePresentationTests(unittest.TestCase):
+    def test_repair_drops_a_sentence_that_embeds_internal_scaffolding(self):
+        draft = "盘面偏强。\n正式研判还需澄清：analysis.time_scope does not match Asia/Shanghai。"
+
+        repaired = repair_message_draft(draft, ("internal_token",))
+        presented = present_message(repaired, as_of="2026-09-01T07:20:00Z", kind="ai_chat")
+
+        self.assertEqual("盘面偏强。", presented.markdown)
+
     def test_unicode_internal_fields_and_bare_report_labels_cannot_reach_speech(self):
         presented = present_message(
             """盘前研判

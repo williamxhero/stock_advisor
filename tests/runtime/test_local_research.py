@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from ai_trading_companion.broker_client import BrokerError
 from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, WebAccessGatewayBackend
 from ai_trading_companion.tooling import EvidenceResolution, FactRequest, ToolCatalog, ToolRunner
 
@@ -17,9 +18,108 @@ def row(operation: str, *, query: str | None = None, url: str | None = None) -> 
     return {"requirement_key": "market", "backend": "gateway", "operation": operation, "arguments": {"query": query, "categories": "news", "url": url, "symbol": None, "render": "auto", "session_id": None, "actions": None}, "fallback_backends": []}
 
 class LocalResearchTests(unittest.TestCase):
+    def test_invalid_broker_plan_uses_the_existing_bounded_repair_round(self) -> None:
+        calls = 0
+        received_gaps: list[list[str]] = []
+
+        def planner(_packet: dict, gaps: list[str], _round_number: int) -> dict:
+            nonlocal calls
+            calls += 1
+            received_gaps.append(list(gaps))
+            if calls == 1:
+                raise BrokerError(
+                    "invalid plan",
+                    category="broker_output_invalid",
+                    verifier={
+                        "passed": False,
+                        "business": {
+                            "passed": False,
+                            "problems": ["research_plan_missing_requirement:market"],
+                        },
+                    },
+                )
+            return {"version": 1, "operations": [row("web_read", url="https://example.test/close")]}
+
+        backend = lambda *_: {"results": [{
+            "url": "https://example.test/close", "title": "close", "excerpt_text": "close",
+            "fact_as_of": CONTRACT["as_of"], "primary": True,
+        }]}
+        result = LocalResearchChain(
+            planner, ReadOnlyResearchExecutor({"gateway": backend}), max_repairs=1,
+        ).run({"as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="repair-plan")
+
+        self.assertTrue(result.qualified)
+        self.assertEqual(2, calls)
+        self.assertEqual(
+            ["research_plan_missing_requirement:market"],
+            received_gaps[1],
+        )
+
     def test_planner_requires_an_explicit_effort_decision(self) -> None:
         with self.assertRaises(TypeError):
             BrokerResearchPlanner(mock.Mock(), deadline=lambda: 123.0)
+
+    def test_planner_repair_reads_existing_discoveries_without_another_broker_call(self) -> None:
+        broker = mock.Mock()
+        planner = BrokerResearchPlanner(
+            broker, intellect="smart", effort="medium", deadline=lambda: 123.0,
+        )
+        packet = {
+            "as_of": CONTRACT["as_of"],
+            "evidence_contract": {
+                **CONTRACT,
+                "requirements": [
+                    *CONTRACT["requirements"],
+                    {
+                        "key": "events",
+                        "blocking": True,
+                        "allowed_coverage": ["covered", "checked_no_change"],
+                        "window": {"mode": "after_start_to_end", "start": "2026-08-26T07:00:00Z", "end": CONTRACT["as_of"]},
+                    },
+                ],
+            },
+            "research_discoveries": [
+                {"requirement_key": "events", "url": f"https://example.test/event-{index}"}
+                for index in range(6)
+            ],
+        }
+
+        plan = planner(packet, ["events"], 1)
+
+        broker.invoke.assert_not_called()
+        self.assertEqual(4, len(plan["operations"]))
+        self.assertEqual({"web_read"}, {item["operation"] for item in plan["operations"]})
+        self.assertEqual({"events"}, {item["requirement_key"] for item in plan["operations"]})
+
+    def test_planner_repair_never_reads_an_attempted_candidate_url_again(self) -> None:
+        broker = mock.Mock()
+        planner = BrokerResearchPlanner(
+            broker, intellect="smart", effort="medium", deadline=lambda: 123.0,
+        )
+        attempted = "https://example.test/already-read"
+        packet = {
+            "as_of": CONTRACT["as_of"],
+            "evidence_contract": {
+                **CONTRACT,
+                "requirements": [
+                    *CONTRACT["requirements"],
+                    {"key": "events", "blocking": True},
+                ],
+            },
+            "research_discoveries": [
+                {"requirement_key": "events", "url": attempted},
+                {"requirement_key": "events", "url": "https://example.test/untried"},
+            ],
+            "attempted_research_urls": [attempted],
+        }
+
+        plan = planner(packet, ["events"], 1)
+
+        broker.invoke.assert_not_called()
+        self.assertEqual(
+            ["https://example.test/untried"],
+            [item["arguments"]["url"] for item in plan["operations"]],
+        )
 
     def test_browser_action_schema_is_strict_and_defines_array_items(self) -> None:
         actions = RESEARCH_PLAN_SCHEMA["properties"]["operations"]["items"]["properties"]["arguments"]["properties"]["actions"]

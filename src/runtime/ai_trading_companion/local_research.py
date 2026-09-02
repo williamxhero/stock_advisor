@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 from .acquisition import AcquisitionBoundary
 from .evidence_gate import EvidenceGate
-from .broker_client import BrokerRequest, ProviderBrokerClient, canonical_packet_hash
+from .broker_client import BrokerError, BrokerRequest, ProviderBrokerClient, canonical_packet_hash
 from .tooling import FactRequest, ToolRunner
 
 
@@ -90,11 +90,22 @@ class BrokerResearchPlanner:
         self.outcomes: list[Any] = []
 
     def __call__(self, packet: dict[str, Any], gaps: list[str], round_number: int) -> dict[str, Any]:
+        attempted_urls = {
+            str(url) for url in packet.get("attempted_research_urls") or [] if str(url)
+        }
         discoveries = _merge_discoveries(
             list(packet.get("research_discoveries") or []),
             _public_market_close_discoveries(packet),
             _public_intraday_market_discoveries(packet),
         )
+        discoveries = [
+            row for row in discoveries if str(row.get("url") or "") not in attempted_urls
+        ]
+        discovery_repair = _discovery_read_repair_plan(
+            packet.get("evidence_contract") or {}, discoveries, gaps, round_number,
+        )
+        if discovery_repair is not None:
+            return discovery_repair
         planning_packet = {
             "task_key": packet.get("task_key"),
             "stage": "research_plan",
@@ -349,8 +360,35 @@ class LocalResearchChain:
             planning_packet = {
                 **packet,
                 "research_discoveries": _discovery_digest(observations, contract),
+                "attempted_research_urls": sorted({
+                    str((item.get("arguments") or {}).get("url") or "")
+                    for item in observations
+                    if str((item.get("arguments") or {}).get("url") or "")
+                }),
             }
-            plan = self.planner(planning_packet, gaps, round_number)
+            try:
+                plan = self.planner(planning_packet, gaps, round_number)
+            except BrokerError as exc:
+                if exc.category != "broker_output_invalid":
+                    raise
+                broker_verifier = exc.verifier if isinstance(exc.verifier, dict) else {}
+                business_verifier = broker_verifier.get("business")
+                if isinstance(business_verifier, dict):
+                    verifier = {
+                        "passed": False,
+                        "problems": list(business_verifier.get("problems") or ["broker_output_invalid"]),
+                        "missing_requirements": list(business_verifier.get("missing_requirements") or []),
+                    }
+                else:
+                    verifier = {
+                        "passed": False,
+                        "problems": ["broker_output_invalid"],
+                        "missing_requirements": [],
+                    }
+                round_number += 1
+                if self.max_repairs is not None and round_number > self.max_repairs:
+                    raise
+                continue
             operations = self.executor.validate_plan(plan)
             for row in operations:
                 try:
@@ -608,6 +646,53 @@ def _merge_discoveries(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
             seen.add(url)
             merged.append(row)
     return merged
+
+
+def _discovery_read_repair_plan(
+    contract: dict[str, Any], discoveries: list[dict[str, Any]], gaps: list[str], round_number: int,
+) -> dict[str, Any] | None:
+    """Deterministically verify known candidate URLs instead of asking the model to rediscover them."""
+    if round_number <= 0 or not discoveries or not gaps:
+        return None
+    requirement_keys = [
+        str(row.get("key") or "")
+        for row in contract.get("requirements") or []
+        if isinstance(row, dict) and str(row.get("key") or "")
+    ]
+    targets = {
+        key for key in requirement_keys
+        if any(gap == key or key in str(gap) for gap in gaps)
+    }
+    if not targets:
+        return None
+    operations: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    seen_urls: set[str] = set()
+    for discovery in discoveries:
+        key = str(discovery.get("requirement_key") or "")
+        url = str(discovery.get("url") or "")
+        if key not in targets or not url.startswith(("http://", "https://")) or url in seen_urls:
+            continue
+        if counts.get(key, 0) >= 4 or len(operations) >= 24:
+            continue
+        seen_urls.add(url)
+        counts[key] = counts.get(key, 0) + 1
+        operations.append({
+            "requirement_key": key,
+            "backend": "gateway",
+            "operation": "web_read",
+            "arguments": {
+                "query": None,
+                "categories": None,
+                "url": url,
+                "symbol": None,
+                "render": "auto",
+                "session_id": None,
+                "actions": None,
+            },
+            "fallback_backends": [],
+        })
+    return {"version": 1, "operations": operations} if operations else None
 
 
 def _planner_research_scope(value: Any) -> dict[str, Any]:

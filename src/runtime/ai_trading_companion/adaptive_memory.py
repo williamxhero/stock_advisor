@@ -1,11 +1,13 @@
 """AI-directed, snapshot-bound MemoryHub retrieval for one chat batch."""
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from .memory_port import MemoryPort
+from .secret_guard import find_secrets
 
 
 class MemoryResearchError(RuntimeError):
@@ -33,12 +35,14 @@ class AdaptiveMemoryResearch:
         self, memory: MemoryPort, memory_space_id: str,
         decide: Callable[[dict[str, Any]], dict[str, Any]], *,
         discover_external: Callable[[dict[str, Any], dict[str, Any]], list[dict[str, Any]]] | None = None,
+        max_actions: int = 12,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.memory = memory
         self.memory_space_id = memory_space_id
         self.decide = decide
         self.discover_external = discover_external
+        self.max_actions = max(1, int(max_actions))
         self.monotonic = monotonic
 
     def collect(
@@ -80,6 +84,10 @@ class AdaptiveMemoryResearch:
         if actions and actions[-1].get("operation") == "complete":
             return MemoryResearchResult(snapshot, tuple(context), tuple(actions), tuple(bundles))
         while True:
+            if len(actions) >= self.max_actions:
+                actions.append({"operation": "complete", "state": "budget_exhausted", "reason": "adaptive research action budget reached"})
+                checkpoint()
+                return MemoryResearchResult(snapshot, tuple(context), tuple(actions), tuple(bundles))
             if self.monotonic() >= deadline:
                 raise MemoryResearchError("memory research reached its response deadline")
             if cancelled and cancelled():
@@ -90,7 +98,17 @@ class AdaptiveMemoryResearch:
                 "messages": [{"message_id": item["message_id"], "text": item["body_text"], "known_at": item["known_at"]} for item in messages],
                 "prior_actions": actions, "known_episode_ids": sorted(known_episode_ids), "last_observation": last_observation,
             })
-            action = self._validated_decision(decision)
+            try:
+                action = self._validated_decision(decision)
+            except MemoryResearchError as exc:
+                last_observation = {
+                    "operation": "decision",
+                    "state": "rejected_invalid",
+                    "detail": str(exc),
+                    "items": [],
+                }
+                checkpoint()
+                continue
             operation = action["operation"]
             if operation == "complete":
                 actions.append(action)
@@ -99,7 +117,18 @@ class AdaptiveMemoryResearch:
             if operation in {"web_search", "web_read", "markethub_quote", "archive_article"}:
                 if self.discover_external is None:
                     raise MemoryResearchError("external discovery is unavailable for this chat")
-                rows = self.discover_external(action, snapshot)
+                try:
+                    rows = self.discover_external(action, snapshot)
+                except RuntimeError as exc:
+                    actions.append({**action, "state": "failed", "error": str(exc)})
+                    last_observation = {
+                        "operation": operation,
+                        "state": "failed",
+                        "detail": str(exc),
+                        "items": [],
+                    }
+                    checkpoint()
+                    continue
                 normalized = [self._context_item(operation, item) for item in rows if isinstance(item, dict)]
                 context.extend(item for item in normalized if item not in context)
                 actions.append({**action, "state": "completed", "result_count": len(normalized)})
@@ -180,6 +209,8 @@ class AdaptiveMemoryResearch:
         if operation == "web_read" and (not isinstance(url, str) or not url.startswith(("http://", "https://"))):
             raise MemoryResearchError("web read requires an http(s) url")
         source_reference = value.get("source_reference")
+        if isinstance(source_reference, dict) and find_secrets(json.dumps(source_reference, ensure_ascii=False)):
+            raise MemoryResearchError("source reference contains credential-shaped fields")
         if operation == "markethub_quote" and (not isinstance(source_reference, dict) or source_reference.get("source_system") != "markethub"):
             raise MemoryResearchError("MarketHub discovery requires a markethub source_reference")
         if operation == "archive_article" and (not isinstance(source_reference, dict) or source_reference.get("source_system") != "8815"):

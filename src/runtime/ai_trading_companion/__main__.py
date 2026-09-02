@@ -1793,12 +1793,31 @@ def _discover_chat_external_evidence(
         url = str(row.get("url") or "")
         if not body or not url:
             continue
-        known = registrar.register_web_snapshot(
-            memory_space_id=engine.memory_space_id,
-            source_event_id=f"chat:{snapshot['snapshot_id']}:{operation}:{index}:{hashlib.sha256(url.encode('utf-8')).hexdigest()}",
-            url=url, title=str(row.get("title") or url), body=body,
-            occurred_at=str(row.get("published_at") or row.get("fact_as_of") or iso(datetime.now(timezone.utc))),
+        identity = json.dumps(
+            {
+                "url": url,
+                "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            },
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         )
+        try:
+            known = registrar.register_web_snapshot(
+                memory_space_id=engine.memory_space_id,
+                source_event_id=(
+                    f"chat:{snapshot['snapshot_id']}:wag:"
+                    + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+                ),
+                url=url, title=str(row.get("title") or url), body=body,
+                occurred_at=str(row.get("published_at") or row.get("fact_as_of") or iso(datetime.now(timezone.utc))),
+            )
+        except (RuntimeError, ValueError) as exc:
+            registered.append({
+                "_discovery_failure": True,
+                "result_index": index,
+                "source_reference": {"url": url},
+                "error": str(exc),
+            })
+            continue
         registered.append({
             **known.context, "episode_id": known.episode_id, "authority": "mutable_source_snapshot",
             "occurred_at": row.get("published_at") or row.get("fact_as_of"), "source_reference": {"url": url},
@@ -2187,6 +2206,10 @@ def consume(
         return store.chat_research_terminated(cycle_id)
 
     for path, command in exchange.receive("to-runtime"):
+        acknowledged = False
+        cycle_id = command.get("cycle_id")
+        typ = command.get("type")
+        prior_chat_stream_ids: set[str] = set()
         try:
             if command.get("contract") == "memory-user-command/v1":
                 command_id = str(command.get("command_id") or "")
@@ -2202,30 +2225,39 @@ def consume(
                     "type": command_type, "result": result,
                 })
                 exchange.acknowledge("to-runtime", path)
+                acknowledged = True
                 results.append(result)
                 continue
             if command.get("contract") == "schedule-user-command/v1":
                 result = _schedule_command(store, command)
                 exchange.acknowledge("to-runtime", path)
+                acknowledged = True
                 results.append(result)
                 continue
             if command.get("contract") == "portfolio-user-command/v1":
                 result = _portfolio_command(store, portfolio, command)
                 exchange.acknowledge("to-runtime", path)
+                acknowledged = True
                 results.append(result)
                 continue
             if command.get("contract") == "ai-trading-tool-manager-command/v1":
                 result = ToolManagerRuntime(store, PATHS.tools, exchange_root()).command(command)
                 exchange.acknowledge("to-runtime", path)
+                acknowledged = True
                 results.append(result)
                 continue
             result = engine.command(command)
+            if cycle_id and typ in {
+                "commit_chat_batch", "commit_conversation_batch", "continue_chat_research",
+            }:
+                prior_chat_stream_ids = {
+                    str(stream["stream_id"]) for stream in store.stream_messages(str(cycle_id))
+                }
             exchange.acknowledge("to-runtime", path)
+            acknowledged = True
             # Publish deterministic state changes before a potentially long LLM call.
             # This keeps the UI responsive and makes H0 locking observable immediately.
             flush(store, exchange)
-            cycle_id = command.get("cycle_id")
-            typ = command.get("type")
             if cycle_id and typ in {"commit_h0", "skip_h0", "submit_h0", "submit_voice_h0"}:
                 if store.get_cycle(cycle_id)["state"] in {"researching_m1", "m1_retry_wait"}:
                     # Both branches receive the same immutable H0.  M1 reads
@@ -2264,8 +2296,30 @@ def consume(
                 }
             results.append(result)
         except Exception as exc:
-            exchange.reject("to-runtime", path, str(exc))
-            results.append({"error": str(exc), "path": path.name})
+            failure: dict[str, Any] = {"error": str(exc), "path": path.name}
+            if not acknowledged:
+                try:
+                    exchange.reject("to-runtime", path, str(exc))
+                except Exception as reject_exc:
+                    failure["failure_record_error"] = f"exchange reject failed: {reject_exc}"
+            elif cycle_id and typ in {
+                "commit_chat_batch", "commit_conversation_batch", "continue_chat_research",
+            }:
+                try:
+                    new_streams = [
+                        stream for stream in store.stream_messages(str(cycle_id))
+                        if str(stream["stream_id"]) not in prior_chat_stream_ids
+                    ]
+                    failure_recorded = any(stream.get("state") == "failed" for stream in new_streams)
+                    for stream in new_streams:
+                        if stream.get("state") == "streaming":
+                            engine.chat_stream_failed(str(cycle_id), str(stream["stream_id"]), str(exc))
+                            failure_recorded = True
+                    if not failure_recorded:
+                        engine.background_failed(str(cycle_id), "chat_research", str(exc))
+                except Exception as record_exc:
+                    failure["failure_record_error"] = f"chat failure audit failed: {record_exc}"
+            results.append(failure)
     flush(store, exchange)
     if results:
         render_learning(store)

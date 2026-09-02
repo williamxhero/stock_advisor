@@ -36,6 +36,7 @@ class AdaptiveMemoryResearch:
         decide: Callable[[dict[str, Any]], dict[str, Any]], *,
         discover_external: Callable[[dict[str, Any], dict[str, Any]], list[dict[str, Any]]] | None = None,
         max_actions: int = 12,
+        max_invalid_decisions: int = 3,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.memory = memory
@@ -43,6 +44,7 @@ class AdaptiveMemoryResearch:
         self.decide = decide
         self.discover_external = discover_external
         self.max_actions = max(1, int(max_actions))
+        self.max_invalid_decisions = max(1, int(max_invalid_decisions))
         self.monotonic = monotonic
 
     def collect(
@@ -68,6 +70,7 @@ class AdaptiveMemoryResearch:
         known_episode_ids: set[str] = set(restored["known_episode_ids"]) if restored else set()
         executed: set[tuple[str, str]] = set(restored["executed"]) if restored else set()
         last_observation: dict[str, Any] | None = restored["last_observation"] if restored else None
+        consecutive_invalid_decisions = int(restored.get("consecutive_invalid_decisions", 0)) if restored else 0
 
         def checkpoint() -> None:
             if on_checkpoint:
@@ -78,6 +81,7 @@ class AdaptiveMemoryResearch:
                     "known_episode_ids": sorted(known_episode_ids),
                     "executed": [list(item) for item in sorted(executed)],
                     "last_observation": last_observation,
+                    "consecutive_invalid_decisions": consecutive_invalid_decisions,
                 })
 
         checkpoint()
@@ -101,14 +105,29 @@ class AdaptiveMemoryResearch:
             try:
                 action = self._validated_decision(decision)
             except MemoryResearchError as exc:
+                consecutive_invalid_decisions += 1
                 last_observation = {
                     "operation": "decision",
                     "state": "rejected_invalid",
                     "detail": str(exc),
                     "items": [],
                 }
+                actions.append({
+                    "operation": "decision",
+                    "state": "rejected_invalid",
+                    "error": str(exc),
+                })
                 checkpoint()
+                if consecutive_invalid_decisions >= self.max_invalid_decisions:
+                    actions.append({
+                        "operation": "complete",
+                        "state": "invalid_decision_budget_exhausted",
+                        "reason": "adaptive research received too many consecutive invalid decisions",
+                    })
+                    checkpoint()
+                    return MemoryResearchResult(snapshot, tuple(context), tuple(actions), tuple(bundles))
                 continue
+            consecutive_invalid_decisions = 0
             operation = action["operation"]
             if operation == "complete":
                 actions.append(action)
@@ -129,10 +148,31 @@ class AdaptiveMemoryResearch:
                     }
                     checkpoint()
                     continue
-                normalized = [self._context_item(operation, item) for item in rows if isinstance(item, dict)]
+                failures = [
+                    {
+                        "operation": operation,
+                        "state": "failed",
+                        "result_index": item.get("result_index"),
+                        "source_reference": item.get("source_reference"),
+                        "error": str(item.get("error") or "external evidence registration failed"),
+                    }
+                    for item in rows
+                    if isinstance(item, dict) and item.get("_discovery_failure") is True
+                ]
+                normalized = [
+                    self._context_item(operation, item)
+                    for item in rows
+                    if isinstance(item, dict) and item.get("_discovery_failure") is not True
+                ]
                 context.extend(item for item in normalized if item not in context)
-                actions.append({**action, "state": "completed", "result_count": len(normalized)})
-                last_observation = {"operation": operation, "state": "completed", "items": normalized}
+                state = "completed_with_failures" if normalized and failures else "failed" if failures else "completed"
+                action_result = {**action, "state": state, "result_count": len(normalized)}
+                if failures:
+                    action_result.update({"failure_count": len(failures), "failures": failures})
+                actions.append(action_result)
+                last_observation = {"operation": operation, "state": state, "items": normalized}
+                if failures:
+                    last_observation.update({"failure_count": len(failures), "failures": failures})
                 checkpoint()
                 continue
             target = str(action["query"] if operation == "search" else action["episode_id"])
@@ -186,7 +226,20 @@ class AdaptiveMemoryResearch:
             "known_episode_ids": [str(value) for value in known if isinstance(value, str)],
             "executed": {(str(value[0]), str(value[1])) for value in executed if isinstance(value, list) and len(value) == 2},
             "last_observation": resume.get("last_observation") if isinstance(resume.get("last_observation"), dict) else None,
+            "consecutive_invalid_decisions": AdaptiveMemoryResearch._restored_invalid_decision_count(resume),
         }
+
+    @staticmethod
+    def _restored_invalid_decision_count(resume: dict[str, Any]) -> int:
+        stored = resume.get("consecutive_invalid_decisions")
+        if isinstance(stored, int) and stored >= 0:
+            return stored
+        count = 0
+        for action in reversed(resume.get("actions", [])):
+            if not isinstance(action, dict) or action.get("state") != "rejected_invalid":
+                break
+            count += 1
+        return count
 
     @staticmethod
     def _validated_decision(value: dict[str, Any]) -> dict[str, Any]:

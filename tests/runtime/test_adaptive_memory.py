@@ -82,6 +82,22 @@ class AdaptiveMemoryResearchTests(unittest.TestCase):
         self.assertIn("source_reference", observations[1]["detail"])
         self.assertEqual("complete", result.actions[-1]["operation"])
 
+    def test_consecutive_invalid_decisions_exhaust_a_separate_bounded_budget(self) -> None:
+        memory = _RecordingMemory()
+        decide = Mock(return_value={"version": 1, "operation": "markethub_quote", "source_reference": {}})
+
+        result = AdaptiveMemoryResearch(
+            memory, "test-space", decide, max_actions=10, max_invalid_decisions=3,
+        ).collect(
+            "cycle-1", [{"message_id": "message-1", "body_text": "close", "known_at": "2026-09-01T07:20:00Z"}],
+            deadline=time.monotonic() + 5,
+        )
+
+        self.assertEqual(3, decide.call_count)
+        self.assertEqual(3, len([item for item in result.actions if item["state"] == "rejected_invalid"]))
+        self.assertEqual("complete", result.actions[-1]["operation"])
+        self.assertEqual("invalid_decision_budget_exhausted", result.actions[-1]["state"])
+
     def test_credential_shaped_source_reference_is_rejected_without_echoing_it(self) -> None:
         memory = _RecordingMemory()
         decisions = iter([
@@ -218,6 +234,82 @@ class AdaptiveMemoryResearchTests(unittest.TestCase):
 
         self.assertEqual("market risk rumor", seen[0]["query"])
         self.assertEqual("test-episode-1", result.context[0]["episode_id"])
+
+    def test_web_snapshot_identity_changes_with_content_instead_of_query_or_result_index(self) -> None:
+        memory = _RecordingMemory()
+        engine = type("Engine", (), {"memory": memory, "memory_space_id": "test-space"})()
+        client = Mock()
+        client.search.side_effect = [
+            {"results": [{"url": "https://example.test/story", "title": "Story", "excerpt_text": "first version"}]},
+            {"results": [{"url": "https://example.test/story", "title": "Story", "excerpt_text": "changed version"}]},
+        ]
+
+        with patch("ai_trading_companion.__main__.WebAccessGatewayClient", return_value=client):
+            first = _discover_chat_external_evidence(
+                engine, {"operation": "web_search", "query": "query one"}, {"snapshot_id": "s", "cycle_id": "cycle"},
+            )
+            second = _discover_chat_external_evidence(
+                engine, {"operation": "web_search", "query": "query two"}, {"snapshot_id": "s", "cycle_id": "cycle"},
+            )
+
+        self.assertNotEqual(first[0]["episode_id"], second[0]["episode_id"])
+        self.assertEqual(2, len(memory._episodes))
+
+    def test_identical_web_snapshot_is_idempotent_across_query_and_result_order(self) -> None:
+        memory = _RecordingMemory()
+        engine = type("Engine", (), {"memory": memory, "memory_space_id": "test-space"})()
+        target = {"url": "https://example.test/story", "title": "Story", "excerpt_text": "same immutable snapshot"}
+        client = Mock()
+        client.search.side_effect = [
+            {"results": [target]},
+            {"results": [{"title": "skipped without URL", "excerpt_text": "noise"}, target]},
+        ]
+
+        with patch("ai_trading_companion.__main__.WebAccessGatewayClient", return_value=client):
+            first = _discover_chat_external_evidence(
+                engine, {"operation": "web_search", "query": "query one"}, {"snapshot_id": "s", "cycle_id": "cycle"},
+            )
+            second = _discover_chat_external_evidence(
+                engine, {"operation": "web_search", "query": "query two"}, {"snapshot_id": "s", "cycle_id": "cycle"},
+            )
+
+        self.assertEqual(first[0]["episode_id"], second[0]["episode_id"])
+        self.assertEqual(1, len(memory._episodes))
+
+    def test_one_web_registration_failure_preserves_other_receipted_results(self) -> None:
+        class _PartiallyFailingMemory(_RecordingMemory):
+            def append(self, episode: dict[str, object]) -> dict[str, object]:
+                if episode.get("body") == "registration fails":
+                    raise MemoryUnavailable("isolated immutable conflict")
+                return super().append(episode)
+
+        memory = _PartiallyFailingMemory()
+        engine = type("Engine", (), {"memory": memory, "memory_space_id": "test-space"})()
+        client = Mock()
+        client.search.return_value = {"results": [
+            {"url": "https://example.test/one", "title": "One", "excerpt_text": "valid one"},
+            {"url": "https://example.test/bad", "title": "Bad", "excerpt_text": "registration fails"},
+            {"url": "https://example.test/two", "title": "Two", "excerpt_text": "valid two"},
+        ]}
+        decisions = iter([
+            {"operation": "web_search", "query": "market risks"},
+            {"operation": "complete", "reason": "continue with receipted evidence"},
+        ])
+
+        with patch("ai_trading_companion.__main__.WebAccessGatewayClient", return_value=client):
+            result = AdaptiveMemoryResearch(
+                memory, "test-space", lambda _state: next(decisions),
+                discover_external=lambda action, snapshot: _discover_chat_external_evidence(engine, action, snapshot),
+            ).collect(
+                "cycle", [{"message_id": "m", "body_text": "risk", "known_at": "2026-08-20T00:00:00Z"}],
+                deadline=time.monotonic() + 5,
+            )
+
+        self.assertEqual(["valid one", "valid two"], [item["text"] for item in result.context])
+        self.assertEqual("completed_with_failures", result.actions[0]["state"])
+        self.assertEqual(1, result.actions[0]["failure_count"])
+        self.assertEqual("isolated immutable conflict", result.actions[0]["failures"][0]["error"])
+        self.assertEqual(1, client.search.call_count)
 
     def test_stable_source_reference_is_receipted_then_expanded_from_a_new_snapshot(self) -> None:
         memory = _RecordingMemory()

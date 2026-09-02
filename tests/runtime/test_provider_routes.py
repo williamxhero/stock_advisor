@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ai_trading_companion.config import DEFAULT_PROVIDER, load_settings, migrate_embedded_provider_credentials
+from ai_trading_companion.config import DEFAULT_PROVIDER, migrate_embedded_provider_credentials
 from ai_trading_companion.provider_routes import normalize_provider, route_cost_index
 
 
@@ -74,22 +74,10 @@ class ProviderRouteConfigTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         template = json.loads((root / "resources" / "seeds" / "companion.settings.template.json").read_text(encoding="utf-8"))
         provider = normalize_provider(template["provider"], warn_legacy=False)
-        self.assertEqual(4, provider["schema_version"])
+        self.assertEqual(5, provider["schema_version"])
         self.assertEqual(9, len(provider["routes"]))
         self.assertFalse(provider["enabled"])
         self.assertFalse(any(route["enabled"] for route in provider["routes"]))
-        self.assertEqual(2, template["provider"]["hedge"]["max_parallel"])
-
-    def test_legacy_zero_max_parallel_is_normalized_to_two(self) -> None:
-        with TemporaryDirectory() as temporary:
-            home = Path(temporary)
-            path = home / "config" / "settings.local.json"
-            path.parent.mkdir(parents=True)
-            path.write_text(json.dumps({"provider": {"hedge": {"max_parallel": 0}}}), encoding="utf-8")
-
-            settings = load_settings(home)
-
-        self.assertEqual(2, settings.provider["hedge"]["max_parallel"])
 
     def test_route_owns_model_and_endpoint_owns_connection(self) -> None:
         provider = normalize_provider({
@@ -113,6 +101,21 @@ class ProviderRouteConfigTests(unittest.TestCase):
             }],
         })
         self.assertEqual("vendor-x", provider["routes"][0]["model_family"])
+
+    def test_model_catalog_mapping_overrides_legacy_slot_names_for_openai_and_claude(self) -> None:
+        provider = normalize_provider({
+            "endpoints": [
+                {"id": "gpt", "base_url": "https://gpt.example/v1", "api_key": "secret", "families": ["openai"]},
+                {"id": "claude", "base_url": "https://claude.example/v1", "api_key": "secret", "families": ["anthropic"]},
+            ],
+            "routes": [
+                {"id": "luna", "endpoint": "gpt", "model": "gpt-5.6-luna", "model_family": "openai", "stages": ["research"], "cost": {"tier": 0, "mode": "relative"}},
+                {"id": "sonnet", "endpoint": "claude", "model": "claude-sonnet-5", "model_family": "anthropic", "stages": ["fast"], "cost": {"tier": 0, "mode": "relative"}},
+                {"id": "opus", "endpoint": "claude", "model": "claude-opus-4-8", "model_family": "anthropic", "stages": ["research"], "cost": {"tier": 0, "mode": "relative"}},
+            ],
+        }, warn_legacy=False)
+        routes = {item["id"]: item["intellect"] for item in provider["routes"]}
+        self.assertEqual({"luna": "standard", "sonnet": "smart", "opus": "expert"}, routes)
 
     def test_endpoint_api_key_is_preserved_for_local_runtime_configuration(self) -> None:
         provider = normalize_provider({
@@ -142,7 +145,7 @@ class ProviderRouteConfigTests(unittest.TestCase):
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(0, result["migrated_endpoint_count"])
             self.assertEqual("local-secret", saved["provider"]["endpoints"][0]["api_key"])
-            self.assertEqual(4, saved["provider"]["schema_version"])
+            self.assertEqual(5, saved["provider"]["schema_version"])
             self.assertEqual(100, saved["provider"]["routes"][0]["cost"]["tier"])
             self.assertEqual(91, saved["provider"]["routes"][0]["preference"])
             self.assertEqual("http://research.test/mcp", saved["research"]["web_access_gateway"]["mcp_url"])
@@ -169,6 +172,12 @@ class ProviderRouteConfigTests(unittest.TestCase):
         }}, "endpoints": [], "routes": []}, warn_legacy=False)
         price = provider["routing"]["model_catalog"]["openai"]["gpt-x"]["price"]
         self.assertEqual(1, price["cached_input_per_million"])
+
+    def test_price_group_parallelism_is_configurable(self) -> None:
+        provider = normalize_provider({"routing": {"max_parallel_per_price_group": 5}, "endpoints": [], "routes": []}, warn_legacy=False)
+        self.assertEqual(5, provider["routing"]["max_parallel_per_price_group"])
+        with self.assertRaisesRegex(ValueError, "max_parallel_per_price_group"):
+            normalize_provider({"routing": {"max_parallel_per_price_group": 0}, "endpoints": [], "routes": []}, warn_legacy=False)
 
     def test_credential_writer_is_ignored_and_settings_are_written_locally(self) -> None:
         with TemporaryDirectory() as temporary:

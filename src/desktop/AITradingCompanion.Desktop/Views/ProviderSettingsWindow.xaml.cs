@@ -333,16 +333,7 @@ public partial class ProviderSettingsWindow : Window
         var families = SelectedFamilies();
         if (families.Count == 0) throw new InvalidOperationException("至少选择一个模型家族。");
         if ((_isNew || _requiresNewKey) && string.IsNullOrWhiteSpace(ApiKey.Password)) throw new InvalidOperationException("新建或复制 Provider 必须填写 API key。");
-        var endpoint = new JsonObject { ["id"] = id, ["base_url"] = url, ["weight"] = weight, ["enabled"] = EnabledBox.IsChecked == true, ["archived"] = false, ["families"] = new JsonArray(families.Select(family => JsonValue.Create(family)).ToArray()) };
-        PreserveInventoryMetadata(_current, endpoint);
-        return endpoint;
-    }
-
-    private static void PreserveInventoryMetadata(JsonObject source, JsonObject target)
-    {
-        target["available_models"] = source["available_models"]?.DeepClone();
-        target["model_directory_status"] = source["model_directory_status"]?.DeepClone();
-        target["models_updated_at"] = source["models_updated_at"]?.DeepClone();
+        return new JsonObject { ["id"] = id, ["base_url"] = url, ["weight"] = weight, ["enabled"] = EnabledBox.IsChecked == true, ["archived"] = false, ["families"] = new JsonArray(families.Select(family => JsonValue.Create(family)).ToArray()), ["available_models"] = _current["available_models"]?.DeepClone(), ["models_updated_at"] = Text(_current, "models_updated_at", "") };
     }
 
     private JsonArray BuildRoutes(string endpointId)

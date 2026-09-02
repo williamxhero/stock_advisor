@@ -162,8 +162,7 @@ class CompanionStore:
               estimated_cost REAL, actual_cost REAL, currency TEXT,
               multiplier REAL, base_price_calibrated INTEGER NOT NULL DEFAULT 0,
               cost_basis TEXT, effective_unit_price_json TEXT,
-              verifier_name TEXT, requested_level TEXT, actual_level TEXT,
-              upgrade_reason TEXT, runner_fingerprint TEXT);
+              verifier_name TEXT, runner_fingerprint TEXT);
             CREATE TABLE IF NOT EXISTS provider_invocation (
               invocation_id TEXT PRIMARY KEY, stage TEXT NOT NULL, mode TEXT NOT NULL,
               packet_sha256 TEXT NOT NULL, recorded_at TEXT NOT NULL, completed_recorded_at TEXT,
@@ -310,7 +309,7 @@ class CompanionStore:
               imported_artifact_id TEXT, imported_at TEXT NOT NULL,
               detail_json TEXT NOT NULL,
               PRIMARY KEY(source_name, source_id));
-            PRAGMA user_version = 16;
+            PRAGMA user_version = 15;
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
@@ -352,9 +351,6 @@ class CompanionStore:
                 "base_price_calibrated": "INTEGER NOT NULL DEFAULT 0",
                 "cost_basis": "TEXT",
                 "effective_unit_price_json": "TEXT",
-                "requested_level": "TEXT",
-                "actual_level": "TEXT",
-                "upgrade_reason": "TEXT",
             }.items():
                 if name not in provider_attempt_columns:
                     c.execute(f"ALTER TABLE provider_llm_attempt ADD COLUMN {name} {declaration}")
@@ -1903,9 +1899,8 @@ class CompanionStore:
                     """INSERT OR IGNORE INTO provider_llm_attempt(
                          attempt_id,invocation_id,packet_sha256,stage,route_id,endpoint_id,model,model_family,tier,
                          cost_mode,preference,delayed_start,recorded_at,monotonic_started,estimated_cost,multiplier,
-                         base_price_calibrated,cost_basis,effective_unit_price_json,verifier_name,requested_level,
-                         actual_level,upgrade_reason,runner_fingerprint)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         base_price_calibrated,cost_basis,effective_unit_price_json,verifier_name,runner_fingerprint)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (str(payload["attempt_id"]), str(payload["invocation_id"]), str(payload.get("packet_sha256") or ""),
                      str(payload["stage"]), str(payload["route_id"]), str(payload["endpoint_id"]), str(payload["model"]),
                      str(payload["model_family"]), int(payload["tier"]), str(payload.get("cost_mode") or "relative"),
@@ -1918,10 +1913,7 @@ class CompanionStore:
                      json.dumps(payload.get("effective_unit_price"), ensure_ascii=False, sort_keys=True)
                      if isinstance(payload.get("effective_unit_price"), dict) else None,
                      str(payload.get("verifier_name") or "none/v1"),
-                     str(payload.get("requested_level")) if payload.get("requested_level") else None,
-                     str(payload.get("actual_level")) if payload.get("actual_level") else None,
-                     str(payload.get("upgrade_reason")) if payload.get("upgrade_reason") else None,
-                     str(payload.get("runner_fingerprint") or "provider-broker/unknown-sse-v1")),
+                     str(payload.get("runner_fingerprint") or "provider-broker/chat-completions-v1")),
                 )
             return
         if kind != "llm_attempt_finished":

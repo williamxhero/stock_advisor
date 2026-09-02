@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import queue
+import random
 import re
 import threading
 import time
@@ -20,17 +21,18 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from .provider_client import ProviderClient, ProviderError, _message_content
-from .provider_capabilities import capability_level, capability_policy, upgrade_reason
 from .provider_routes import NEAR_COST_TOLERANCE, catalog_entry
 from .secret_guard import assert_safe
 
 
 @dataclass(frozen=True)
 class StageRequest:
-    stage: str
+    # ``stage`` is a one-release compatibility adapter for older business
+    # callers. New Provider-module calls use ``intellect`` exclusively.
     packet: dict[str, Any]
     packet_sha256: str
-    effort: str
+    effort: str | None
+    stage: str | None = None
     schema: dict[str, Any] | None = None
     mode: str = "race"
     required_capabilities: tuple[str, ...] = ("race",)
@@ -39,6 +41,10 @@ class StageRequest:
     absolute_deadline: float = math.inf
     route_timeout_seconds: float = 90.0
     output_token_allowance: int = 2_000
+    # The Provider facade owns the capability level selection.  It is a
+    # technical routing constraint, never a business-quality verdict.
+    target_level: str | None = None
+    intellect: str | None = None  # standard / smart / expert (canonical)
     verifier_name: str = "none/v1"
     verifier: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     h0_forbidden: bool = False
@@ -89,14 +95,9 @@ class ChatCompletionsTransport:
                               transport=str((route or {}).get("transport") or "chat_completions"))
 
     def probe(self, endpoint: dict[str, Any], timeout: float) -> dict[str, Any]:
-        try:
-            models = self._client(endpoint)._list_models_once(max(1, int(timeout)))
-        except ProviderError as exc:
-            if exc.status in {404, 405}:
-                return {"status": f"unknown_http_{exc.status}", "models": []}
-            raise
+        models = self._client(endpoint)._list_models_once(max(1, int(timeout)))
         return {
-            "status": "available" if models else "empty",
+            "status": "available" if models else "definitive_failure",
             "models": models,
         }
 
@@ -145,9 +146,6 @@ class AttemptTrace:
     preference: int
     delayed_start: bool
     started_at: float
-    requested_level: str | None = None
-    actual_level: str | None = None
-    upgrade_reason: str | None = None
     runner_fingerprint: str = "provider-broker/chat-completions-v1"
     first_token_at: float | None = None
     completed_at: float | None = None
@@ -166,7 +164,10 @@ class AttemptTrace:
     base_price_calibrated: bool = False
     cost_basis: str = "relative_multiplier_only"
     effective_unit_price: dict[str, float] = field(default_factory=dict)
+    requested_effort: str | None = None
+    effective_effort: str | None = None
     quality_score: int | None = None
+    requested_model: str | None = None
     cost_index: float | None = None
     verifier: dict[str, Any] = field(default_factory=dict)
 
@@ -182,9 +183,6 @@ class ProviderOutcome:
     model_family: str | None
     attempts: list[AttemptTrace]
     probes: list[dict[str, Any]]
-    requested_level: str | None = None
-    actual_level: str | None = None
-    upgrade_reason: str | None = None
     request_id: str | None = None
     usage: dict[str, Any] = field(default_factory=dict)
     ttft_seconds: float | None = None
@@ -226,19 +224,16 @@ class ProviderBroker:
             "packet_sha256": request.packet_sha256, "absolute_deadline": request.absolute_deadline,
             "route_timeout_seconds": request.route_timeout_seconds, "verifier_name": request.verifier_name,
         })
-        health_probes: list[dict[str, Any]] = []
         try:
-            health_probes = self._health_gate(request)
             outcome = self._invoke_core(request)
         except Exception as exc:
             self.audit("provider_invocation_finished", {
                 "invocation_id": request.invocation_id, "winner_route": None,
                 "winner_endpoint": None, "winner_model": None, "winner_family": None,
                 "product_disposition": getattr(exc, "category", "internal_error"),
-                "attempt_count": 0, "probe_count": len(getattr(exc, "tool_trace", health_probes)),
+                "attempt_count": 0, "probe_count": 0,
             })
             raise
-        outcome.probes = health_probes + outcome.probes
         self.audit("provider_invocation_finished", {
             "invocation_id": request.invocation_id, "winner_route": outcome.winner_route,
             "winner_endpoint": outcome.endpoint_id, "winner_model": outcome.model,
@@ -249,123 +244,34 @@ class ProviderBroker:
         })
         return outcome
 
-    def _health_gate(self, request: StageRequest) -> list[dict[str, Any]]:
-        """Require two consecutive failed-majority inventory rounds before outage.
-
-        HTTP 404/405 remains an unknown, unusable inventory rather than a
-        fabricated model directory or a fleet-wide failure signal.
-        """
-        endpoint_ids = sorted(self._endpoints)
-        if not endpoint_ids:
-            return []
-        all_records: list[dict[str, Any]] = []
-        failed_majority: list[bool] = []
-        for round_index in (1, 2):
-            deadline = min(request.absolute_deadline, time.monotonic() + self.probe_seconds)
-            records: list[dict[str, Any]] = []
-
-            def one(endpoint_id: str) -> dict[str, Any]:
-                started = time.monotonic()
-                try:
-                    raw = self.transport.probe(
-                        self._endpoints[endpoint_id], max(0.01, deadline - started),
-                    )
-                    status, models = _normalized_probe(raw)
-                except ProviderError as exc:
-                    status = f"unknown_http_{exc.status}" if exc.status in {404, 405} else "definitive_failure"
-                    models = set()
-                except Exception:
-                    status, models = "definitive_failure", set()
-                return {
-                    "invocation_id": request.invocation_id,
-                    "endpoint_id": endpoint_id,
-                    "status": status,
-                    "models": sorted(models),
-                    "model_count": len(models),
-                    "probe_round": round_index,
-                    "probe_scope": "health_gate",
-                    "started_at": started,
-                    "completed_at": time.monotonic(),
-                }
-
-            executor = ThreadPoolExecutor(
-                max_workers=max(1, len(endpoint_ids)), thread_name_prefix="provider-health",
-            )
-            futures = {executor.submit(one, endpoint_id): endpoint_id for endpoint_id in endpoint_ids}
-            try:
-                for future in as_completed(futures, timeout=max(0.01, deadline - time.monotonic())):
-                    records.append(future.result())
-            except TimeoutError:
-                pass
-            finally:
-                executor.shutdown(wait=False, cancel_futures=True)
-            observed = {item["endpoint_id"] for item in records}
-            for endpoint_id in endpoint_ids:
-                if endpoint_id not in observed:
-                    records.append({
-                        "invocation_id": request.invocation_id,
-                        "endpoint_id": endpoint_id,
-                        "status": "definitive_failure",
-                        "models": [], "model_count": 0,
-                        "probe_round": round_index, "probe_scope": "health_gate",
-                        "started_at": None, "completed_at": None,
-                    })
-            records.sort(key=lambda item: item["endpoint_id"])
-            for record in records:
-                self.audit("provider_probe_attempt", record)
-            all_records.extend(records)
-            failures = sum(item["status"] in {"definitive_failure", "empty"} for item in records)
-            failed_majority.append(failures > len(endpoint_ids) / 2)
-        if failed_majority == [True, True]:
-            raise ProviderError(
-                "Enabled Provider inventory failed in two consecutive majority rounds",
-                category="PROVIDER_OUTAGE", retry_attempts=2, tool_trace=all_records,
-            )
-        return all_records
-
     def _invoke_core(self, request: StageRequest) -> ProviderOutcome:
         if request.mode == "duel":
             return self._duel(request)
-        policy = capability_policy(request.stage)
         routes = self._eligible(request)
         if not routes:
             return ProviderOutcome(request.invocation_id, request.packet_sha256, None, None, None, None, None, [], [], arbitration={"failure": "provider_family_unavailable", "family_mode": self.provider.get("routing", {}).get("family_mode", "auto")})
         attempts: list[AttemptTrace] = []
         probes: list[dict[str, Any]] = []
-        attempted_requested = False
-        for level in policy.allowed_levels:
-            level_routes = [route for route in routes if capability_level(route.get("model")) == level]
-            for tier in sorted({int(route["cost"]["tier"]) for route in level_routes}):
-                if time.monotonic() >= request.absolute_deadline:
-                    break
-                members = [route for route in level_routes if int(route["cost"]["tier"]) == tier]
-                current, tier_probes = self._probe(members, request)
-                probes.extend(tier_probes)
-                if not current:
-                    continue
-                reason = upgrade_reason(policy.requested_level, level, attempted_requested=attempted_requested)
-                before = len(attempts)
-                winner = self._race_tier(
-                    current, request, attempts, requested_level=policy.requested_level,
-                    actual_level=level, level_upgrade_reason=reason,
-                )
-                if level == policy.requested_level and len(attempts) > before:
-                    attempted_requested = True
-                if winner is not None:
-                    trace, result, parsed, visible_incomplete = winner
-                    trace.winner = trace.product_success
-                    return ProviderOutcome(request.invocation_id, request.packet_sha256, parsed,
-                        trace.route_id, trace.endpoint_id, trace.model, trace.model_family,
-                        attempts, probes, requested_level=trace.requested_level,
-                        actual_level=trace.actual_level, upgrade_reason=trace.upgrade_reason,
-                        request_id=trace.request_id, usage=dict(trace.usage),
-                        ttft_seconds=(trace.first_token_at - trace.started_at) if trace.first_token_at is not None else None,
-                        estimated_cost=trace.estimated_cost, actual_cost=trace.actual_cost, currency=trace.currency,
-                        multiplier=trace.multiplier, base_price_calibrated=trace.base_price_calibrated,
-                        cost_basis=trace.cost_basis, effective_unit_price=dict(trace.effective_unit_price),
-                        verifier=dict(trace.verifier), cancellation_status=trace.cancellation_class,
-                        visible_locked=request.visible_stream and trace.first_token_at is not None,
-                        visible_incomplete=visible_incomplete)
+        if time.monotonic() < request.absolute_deadline:
+            # Once the facade has selected an intellect level, every eligible
+            # family competes in one price ladder.  Legacy cost tiers no longer
+            # partition models before official-price × provider-multiplier.
+            current, tier_probes = self._probe(routes, request)
+            probes.extend(tier_probes)
+            winner = self._race_tier(current, request, attempts) if current else None
+            if winner is not None:
+                trace, result, parsed, visible_incomplete = winner
+                trace.winner = trace.product_success
+                return ProviderOutcome(request.invocation_id, request.packet_sha256, parsed,
+                    trace.route_id, trace.endpoint_id, trace.model, trace.model_family,
+                    attempts, probes, request_id=trace.request_id, usage=dict(trace.usage),
+                    ttft_seconds=(trace.first_token_at - trace.started_at) if trace.first_token_at is not None else None,
+                    estimated_cost=trace.estimated_cost, actual_cost=trace.actual_cost, currency=trace.currency,
+                    multiplier=trace.multiplier, base_price_calibrated=trace.base_price_calibrated,
+                    cost_basis=trace.cost_basis, effective_unit_price=dict(trace.effective_unit_price),
+                    verifier=dict(trace.verifier), cancellation_status=trace.cancellation_class,
+                    visible_locked=request.visible_stream and trace.first_token_at is not None,
+                    visible_incomplete=visible_incomplete)
         return ProviderOutcome(request.invocation_id, request.packet_sha256, None, None, None, None, None, attempts, probes)
 
     def _eligible(self, request: StageRequest, *, family: str | None = None, exclude: set[str] | None = None) -> list[dict[str, Any]]:
@@ -374,11 +280,23 @@ class ProviderBroker:
         for route in self.provider.get("routes", []):
             if not route.get("enabled", True) or route["endpoint"] not in self._endpoints or route["id"] in excluded:
                 continue
-            mode = str(self.provider.get("routing", {}).get("family_mode", "auto"))
-            required_family = family or (mode if request.mode not in {"duel", "arbitration"} and mode in {"openai", "anthropic"} else None)
+            # ``family_mode`` is retained by configuration readers for one
+            # release only.  It must not alter route selection: equivalent
+            # capability across families competes by price and quality.
+            required_family = family
             if required_family and route.get("model_family") != required_family:
                 continue
-            if capability_level(route.get("model")) not in capability_policy(request.stage).allowed_levels:
+            if request.target_level and str(route.get("target_level") or _target_level(self.provider, route)) != request.target_level:
+                continue
+            observed = self._endpoints[route["endpoint"]].get("model_fulfillment", {}).get(str(route.get("model")))
+            if isinstance(observed, dict) and observed.get("fulfilled") is False:
+                continue
+            # The legacy stage field can be read, but the canonical Provider
+            # routing constraint is intellect.  It never carries M0/M1/chat.
+            if request.intellect and route.get("intellect") and route.get("intellect") != request.intellect:
+                continue
+            stages = set(route.get("stages", []))
+            if request.stage and request.stage not in stages and _stage_slot(request.stage) not in stages:
                 continue
             if not set(request.required_capabilities).issubset(set(route.get("capabilities", []))):
                 continue
@@ -395,9 +313,10 @@ class ProviderBroker:
             started = time.monotonic()
             try:
                 raw = self.transport.probe(self._endpoints[endpoint_id], max(0.01, deadline - started))
-                value, models = _normalized_probe(raw)
-            except ProviderError as exc:
-                value = f"unknown_http_{exc.status}" if exc.status in {404, 405} else "definitive_failure"
+                models = {str(item) for item in raw.get("models", []) if str(item)}
+                value = "available" if raw.get("status") == "available" and models else "definitive_failure"
+            except ProviderError:
+                value = "definitive_failure"
                 models = set()
             except Exception:
                 value = "definitive_failure"
@@ -412,8 +331,7 @@ class ProviderBroker:
                 if models:
                     model_directories[endpoint_id] = models
                 record = {"invocation_id": request.invocation_id, "endpoint_id": endpoint_id, "status": value,
-                          "models": sorted(models), "model_count": len(models), "probe_scope": "route",
-                          "started_at": started, "completed_at": completed}
+                          "model_count": len(models), "started_at": started, "completed_at": completed}
                 records.append(record); self.audit("provider_probe_attempt", record)
         except TimeoutError:
             pass
@@ -424,8 +342,7 @@ class ProviderBroker:
                 record = {"invocation_id": request.invocation_id, "endpoint_id": endpoint_id, "status": "definitive_failure",
                           "model_count": 0, "started_at": None, "completed_at": None}
                 records.append(record); self.audit("provider_probe_attempt", record)
-        probe_rank = {"available": 0, "unknown_http_404": 1, "unknown_http_405": 1,
-                      "empty": 2, "definitive_failure": 2}
+        probe_rank = {"available": 0, "definitive_failure": 1}
         usable = [
             route for route in routes
             if status[route["endpoint"]] == "available"
@@ -456,9 +373,10 @@ class ProviderBroker:
         return ordered
 
     def _sort_cost_group(self, routes: list[dict[str, Any]], request: StageRequest) -> list[dict[str, Any]]:
+        quality_slot = request.stage or {"standard": "fast", "smart": "research", "expert": "judgment"}.get(request.intellect or "", "fast")
         return sorted(routes, key=lambda row: (
-            -self._quality_score(row, request.stage), self._pre_cost(row, request),
-            -int(row.get("preference", 0)), -self.history_score(row, request.stage), row["id"],
+            self._pre_cost(row, request), -int(row.get("preference", 0)),
+            -self.history_score(row, quality_slot), row["id"],
         ))
 
     def _quality_score(self, route: dict[str, Any], stage: str) -> int:
@@ -468,8 +386,7 @@ class ProviderBroker:
         return int(value) if isinstance(value, int) else 0
 
     def _race_tier(self, routes: list[dict[str, Any]], request: StageRequest,
-                   attempts: list[AttemptTrace], *, requested_level: str,
-                   actual_level: str, level_upgrade_reason: str | None) -> tuple[AttemptTrace, TransportResult, Any, bool] | None:
+                   attempts: list[AttemptTrace]) -> tuple[AttemptTrace, TransportResult, Any, bool] | None:
         events: queue.Queue[tuple[str, str, Any]] = queue.Queue()
         active: dict[str, tuple[dict[str, Any], AttemptTrace, threading.Event]] = {}
         remaining = list(routes)
@@ -482,17 +399,14 @@ class ProviderBroker:
             trace = AttemptTrace(
                 str(uuid.uuid4()), route["id"], endpoint["id"], route["model"], route["model_family"],
                 int(route["cost"]["tier"]), str(route["cost"]["mode"]), int(route.get("preference", 0)),
-                delayed, time.monotonic(), requested_level=requested_level, actual_level=actual_level,
-                upgrade_reason=level_upgrade_reason,
-                runner_fingerprint=(
-                    "provider-broker/responses-sse-v1" if route.get("transport") == "responses"
-                    else "provider-broker/chat-completions-sse-v1"
-                ),
-                estimated_cost=estimate["amount"], currency=estimate["currency"],
+                delayed, time.monotonic(), estimated_cost=estimate["amount"], currency=estimate["currency"],
                 multiplier=estimate["multiplier"], base_price_calibrated=estimate["calibrated"],
                 cost_basis=estimate["basis"], effective_unit_price=estimate["unit_price"],
-                quality_score=self._quality_score(route, request.stage),
+                quality_score=self._quality_score(route, request.stage or {"standard": "fast", "smart": "research", "expert": "judgment"}.get(request.intellect or "", "fast")),
                 cost_index=float(route["cost_index"]) if isinstance(route.get("cost_index"), (int, float)) else None,
+                requested_effort=request.effort,
+                effective_effort=request.effort or str(route.get("effort") or "medium"),
+                requested_model=route["model"],
             )
             cancel = threading.Event(); attempts.append(trace); active[trace.attempt_id] = (route, trace, cancel)
             payload = self._payload(route, request)
@@ -534,15 +448,36 @@ class ProviderBroker:
                 self.audit("llm_attempt_finished", asdict(other))
                 active.pop(other_id, None)
 
-        launch(remaining.pop(0), False)
+        def launch_price_group() -> None:
+            """Race up to three equivalent-price providers before escalating."""
+            if not remaining:
+                return
+            anchor = self._pre_cost(remaining[0], request)
+            anchor_tier = int(remaining[0]["cost"]["tier"])
+            tolerance = float(self.provider.get("routing", {}).get("near_cost_tolerance", NEAR_COST_TOLERANCE))
+            group: list[dict[str, Any]] = []
+            max_parallel = int(self.provider.get("routing", {}).get("max_parallel_per_price_group", 3))
+            while remaining and len(group) < max_parallel:
+                candidate = remaining[0]
+                price = self._pre_cost(candidate, request)
+                # Uncalibrated legacy routes retain their manual tier as a
+                # conservative boundary until a catalog price is supplied.
+                if (not self._cost_details(candidate, request, 1, 1)["calibrated"]
+                        and int(candidate["cost"]["tier"]) != anchor_tier):
+                    break
+                if anchor and price > anchor * (1 + tolerance):
+                    break
+                group.append(remaining.pop(0))
+            # Diversity is useful only inside an equivalent price group; it
+            # must never allow a higher-price route to jump the ladder.
+            random.shuffle(group)
+            for route in group:
+                launch(route, len(group) > 1)
+
+        launch_price_group()
         first_started = time.monotonic()
         while active and time.monotonic() < request.absolute_deadline:
             no_active_first_token = all(trace.first_token_at is None for _, trace, _ in active.values())
-            if (locked_id is None and no_active_first_token and len(active) < 2 and remaining
-                    and time.monotonic() - first_started >= self.hedge_seconds):
-                first_family = next(iter(active.values()))[0]["model_family"]
-                index = next((i for i, route in enumerate(remaining) if route["model_family"] != first_family), 0)
-                launch(remaining.pop(index), True)
             try:
                 kind, attempt_id, value = events.get(timeout=min(0.05, max(0.01, request.absolute_deadline - time.monotonic())))
             except queue.Empty:
@@ -562,8 +497,8 @@ class ProviderBroker:
                 self.audit("llm_attempt_finished", asdict(trace))
                 if locked_id == attempt_id:
                     return trace, TransportResult(""), None, published
-                if len(active) < 2 and remaining:
-                    launch(remaining.pop(0), False)
+                if not active:
+                    launch_price_group()
                 continue
             result: TransportResult = value
             if result.model:
@@ -612,8 +547,8 @@ class ProviderBroker:
             if trace.product_success:
                 cancel_remaining(attempt_id, "hedge_cancelled_maybe_billed")
                 return trace, result, parsed, False
-            if len(active) < 2 and remaining:
-                launch(remaining.pop(0), False)
+            if not active:
+                launch_price_group()
         cancel_remaining(None, "deadline_cancelled_maybe_billed")
         return None
 
@@ -646,13 +581,9 @@ class ProviderBroker:
             return ProviderOutcome(request.invocation_id, request.packet_sha256, None, None, None, None, None,
                                    attempts, probes, duel={"status": "both_failed"})
         if len(passing) == 1:
-            failed = [family for family, leg in legs.items() if not leg.winner_route]
-            return ProviderOutcome(
-                request.invocation_id, request.packet_sha256, None, None, None, None, None,
-                attempts, probes,
-                duel={"status": "required_family_failed", "failed_families": failed},
-                arbitration={"status": "failed", "failure": "required_m1_family_failed"},
-            )
+            chosen = passing[0]
+            chosen.attempts = attempts; chosen.probes = probes; chosen.duel = {"status": "single_qualified"}
+            return chosen
         consistent = _materially_consistent(passing[0].result, passing[1].result)
         if consistent:
             chosen = min(passing, key=lambda item: next(
@@ -711,8 +642,8 @@ class ProviderBroker:
         if route.get("transport") == "responses":
             payload: dict[str, Any] = {
                 "model": route["model"], "input": text,
-                "reasoning": {"effort": request.effort}, "max_output_tokens": request.output_token_allowance,
-                "stream": True,
+                "reasoning": {"effort": request.effort or str(route.get("effort") or "medium")}, "max_output_tokens": request.output_token_allowance,
+                "stream": request.visible_stream,
             }
             if request.schema is not None:
                 payload["text"] = {"format": {"type": "json_schema", "name": "stage_result", "strict": True, "schema": request.schema}}
@@ -729,10 +660,10 @@ class ProviderBroker:
             messages.append({"role": "user", "content": text})
             payload = {
                 "model": route["model"], "messages": messages,
-                "reasoning_effort": request.effort, "max_completion_tokens": request.output_token_allowance,
-                "stream": True,
+                "reasoning_effort": request.effort or str(route.get("effort") or "medium"), "max_completion_tokens": request.output_token_allowance,
+                "stream": request.visible_stream,
             }
-            payload["stream_options"] = {"include_usage": True}
+            if request.visible_stream: payload["stream_options"] = {"include_usage": True}
             if request.schema is not None:
                 payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "stage_result", "strict": True, "schema": request.schema}}
         return payload
@@ -783,16 +714,11 @@ def _directory_contains(models: set[str], requested: str) -> bool:
     return requested.lower().replace("_", "-") in normalized
 
 
-def _normalized_probe(raw: dict[str, Any]) -> tuple[str, set[str]]:
-    models = {str(item) for item in raw.get("models", []) if str(item)}
-    status = str(raw.get("status") or "definitive_failure")
-    if status == "available" and models:
-        return "available", models
-    if status in {"unknown_http_404", "unknown_http_405"}:
-        return status, set()
-    if status in {"empty", "available"}:
-        return "empty", set()
-    return "definitive_failure", set()
+def _target_level(provider: dict[str, Any], route: dict[str, Any]) -> str | None:
+    entry = catalog_entry(provider, str(route.get("model_family") or ""),
+                          str(route.get("catalog_model") or route.get("model") or ""))
+    value = entry.get("target_level") if entry else None
+    return str(value) if value in {"L1", "L2", "L3"} else None
 
 
 def _parse_structured_json(text: str) -> Any:

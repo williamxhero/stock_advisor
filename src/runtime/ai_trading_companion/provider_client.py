@@ -524,10 +524,7 @@ def _local_codex_version() -> str | None:
         return None
     try:
         executable = max(candidates, key=lambda path: path.stat().st_mtime)
-        completed = subprocess.run(
-            [str(executable), "--version"], capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=5, check=False,
-        )
+        completed = subprocess.run([str(executable), "--version"], capture_output=True, text=True, timeout=5, check=False)
         return completed.stdout.strip().split()[-1] if completed.returncode == 0 and completed.stdout.strip() else None
     except (OSError, subprocess.SubprocessError):
         return None

@@ -14,6 +14,8 @@ FAMILY_MODES = frozenset({"auto", "openai", "anthropic"})
 TRANSPORTS = frozenset({"responses", "chat_completions"})
 DEFAULT_WEIGHT = 0.3
 TIER_MODES = frozenset({"auto", "manual"})
+INTELLECTS = frozenset({"standard", "smart", "expert"})
+_LEGACY_INTELLECT = {"fast": "standard", "research": "smart", "judgment": "expert"}
 AUTO_TIER_THRESHOLDS = (0.08, 0.15)
 NEAR_COST_TOLERANCE = 0.15
 REFERENCE_MODELS = {
@@ -23,14 +25,14 @@ REFERENCE_MODELS = {
 }
 INITIAL_MODEL_CATALOG = {
     "openai": {
-        "gpt-5.6-sol": {"aliases": ["gpt-5.6-sol"], "price": {"currency": "USD", "input_per_million": 4, "output_per_million": 20}, "quality": {"research": 96, "judgment": 100, "fast": 70}},
-        "gpt-5.6-terra": {"aliases": ["gpt-5.6-terra"], "price": {"currency": "USD", "input_per_million": 2, "output_per_million": 12}, "quality": {"research": 88, "judgment": 86, "fast": 84}},
-        "gpt-5.6-luna": {"aliases": ["gpt-5.6-luna"], "price": {"currency": "USD", "input_per_million": .2, "output_per_million": 1.2}, "quality": {"research": 68, "judgment": 65, "fast": 92}},
+        "gpt-5.6-sol": {"aliases": ["gpt-5.6-sol"], "target_level": "L3", "price": {"currency": "USD", "input_per_million": 4, "output_per_million": 20}, "quality": {"research": 96, "judgment": 100, "fast": 70}},
+        "gpt-5.6-terra": {"aliases": ["gpt-5.6-terra"], "target_level": "L2", "price": {"currency": "USD", "input_per_million": 2, "output_per_million": 12}, "quality": {"research": 88, "judgment": 86, "fast": 84}},
+        "gpt-5.6-luna": {"aliases": ["gpt-5.6-luna"], "target_level": "L1", "price": {"currency": "USD", "input_per_million": .2, "output_per_million": 1.2}, "quality": {"research": 68, "judgment": 65, "fast": 92}},
     },
     "anthropic": {
-        "claude-opus-5": {"aliases": ["claude-opus-5"], "price": {"currency": "USD", "input_per_million": 5, "output_per_million": 25}, "quality": {"research": 98, "judgment": 100, "fast": 68}},
-        "claude-opus-4.8": {"aliases": ["claude-opus-4.8"], "price": {"currency": "USD", "input_per_million": 5, "output_per_million": 25}, "quality": {"research": 95, "judgment": 97, "fast": 65}},
-        "claude-sonnet-5": {"aliases": ["claude-sonnet-5"], "price": {"currency": "USD", "input_per_million": 2, "output_per_million": 10}, "quality": {"research": 92, "judgment": 90, "fast": 88}},
+        "claude-opus-5": {"aliases": ["claude-opus-5"], "target_level": "L3", "price": {"currency": "USD", "input_per_million": 5, "output_per_million": 25}, "quality": {"research": 98, "judgment": 100, "fast": 68}},
+        "claude-opus-4.8": {"aliases": ["claude-opus-4.8"], "target_level": "L3", "price": {"currency": "USD", "input_per_million": 5, "output_per_million": 25}, "quality": {"research": 95, "judgment": 97, "fast": 65}},
+        "claude-sonnet-5": {"aliases": ["claude-sonnet-5"], "target_level": "L2", "price": {"currency": "USD", "input_per_million": 2, "output_per_million": 10}, "quality": {"research": 92, "judgment": 90, "fast": 88}},
     },
 }
 SLOT_STAGES = {
@@ -126,7 +128,11 @@ def _model_catalog(raw: Any, legacy_prices: dict[str, dict[str, dict[str, float 
                 if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
                     raise ValueError("provider routing.model_catalog quality must be an integer from 0 to 100")
                 quality[stage] = value
-            result[name][str(model)] = {"aliases": sorted({str(alias).strip() for alias in aliases}), "price": price, "quality": quality}
+            level = item.get("target_level")
+            if level is not None and level not in {"L1", "L2", "L3"}:
+                raise ValueError("provider routing.model_catalog target_level must be L1, L2, or L3")
+            result[name][str(model)] = {"aliases": sorted({str(alias).strip() for alias in aliases}), "price": price,
+                                        "quality": quality, **({"target_level": level} if level else {})}
         for model, price in legacy_prices.get(name, {}).items():
             result[name].setdefault(model, {"aliases": [], "price": price, "quality": {}})
     return result
@@ -208,9 +214,12 @@ def normalize_provider(provider: dict[str, Any], *, warn_legacy: bool = True) ->
         "near_cost_tolerance": float(routing_source.get("near_cost_tolerance", NEAR_COST_TOLERANCE)),
         "price_catalog": legacy_prices,
         "model_catalog": _model_catalog(routing_source.get("model_catalog"), legacy_prices),
+        "max_parallel_per_price_group": int(routing_source.get("max_parallel_per_price_group", 3)),
     }
     if not 0 <= routing["near_cost_tolerance"] <= 1:
         raise ValueError("provider routing.near_cost_tolerance must be from 0 to 1")
+    if not 1 <= routing["max_parallel_per_price_group"] <= 8:
+        raise ValueError("provider routing.max_parallel_per_price_group must be from 1 to 8")
     endpoints_raw = source.get("endpoints")
     if not isinstance(endpoints_raw, list): endpoints_raw = [{"id": "legacy-default", "enabled": bool(source.get("enabled", False)), "base_url": source.get("base_url"), "api_key": source.get("api_key"), "weight": default_weight}]
     endpoints: list[dict[str, Any]] = []; endpoint_ids: set[str] = set()
@@ -229,11 +238,36 @@ def normalize_provider(provider: dict[str, Any], *, warn_legacy: bool = True) ->
         raw_weight = raw.get("weight")
         if schema < 3 and raw_weight == 1.0:
             raw_weight = default_weight
-        endpoint = {"id": endpoint_id, "enabled": bool(raw.get("enabled", True)) and not archived, "archived": archived, "base_url": str(raw.get("base_url") or "").rstrip("/"), "weight": _positive(raw_weight, f"provider endpoint {endpoint_id} weight", default_weight), "updated_at": str(raw.get("updated_at") or utc_now())}
-        families = raw.get("families", [])
-        if families:
-            if not isinstance(families, list) or any(str(f).lower() not in KNOWN_FAMILIES for f in families): raise ValueError("provider endpoint families must be openai or anthropic")
-            endpoint["families"] = sorted({str(f).lower() for f in families})
+        kind = str(raw.get("provider_kind") or ("cpa" if endpoint_id == "cpa" else "single_family")).lower()
+        if kind not in {"single_family", "cpa"}:
+            raise ValueError("provider_kind must be single_family or cpa")
+        endpoint = {"id": endpoint_id, "enabled": bool(raw.get("enabled", True)) and not archived, "archived": archived,
+                    "provider_kind": kind, "base_url": str(raw.get("base_url") or "").rstrip("/"),
+                    "weight": _positive(raw_weight, f"provider endpoint {endpoint_id} weight", default_weight),
+                    "updated_at": str(raw.get("updated_at") or utc_now())}
+        families = raw.get("supported_families", raw.get("families", []))
+        if families and (not isinstance(families, list) or any(str(f).lower() not in KNOWN_FAMILIES for f in families)):
+            raise ValueError("provider endpoint families must be openai or anthropic")
+        normalized_families = sorted({str(f).lower() for f in families})
+        model_family = str(raw.get("model_family") or "").lower()
+        if kind == "single_family":
+            # Old one-family endpoint configurations migrate without operator
+            # action.  Ambiguous multi-family endpoints are disabled instead of
+            # guessing how credentials or routing should be split.
+            inferred = model_family or (normalized_families[0] if len(normalized_families) == 1 else "")
+            if inferred:
+                if inferred not in KNOWN_FAMILIES: raise ValueError("single_family model_family must be supported")
+                endpoint["model_family"] = inferred
+                endpoint["families"] = [inferred]
+            elif len(normalized_families) > 1:
+                endpoint["needs_provider_kind_correction"] = True
+                endpoint["enabled"] = False
+                endpoint["families"] = normalized_families
+            else:
+                endpoint["families"] = normalized_families
+        else:
+            endpoint["supported_families"] = normalized_families
+            endpoint["families"] = normalized_families
         key = str(raw.get("api_key") or "").strip()
         if key: endpoint["api_key"] = key
         raw_models = raw.get("available_models", [])
@@ -297,6 +331,31 @@ def normalize_provider(provider: dict[str, Any], *, warn_legacy: bool = True) ->
                  "enabled": bool(raw.get("enabled", True)) and endpoint_by_id[endpoint_id]["enabled"] and not endpoint_by_id[endpoint_id]["archived"],
                  "cost": cost, "tier_mode": tier_mode, "preference": preference, "stages": stages,
                  "capabilities": caps, "effort": str(raw.get("effort") or "medium")}
+        intellect = str(raw.get("intellect") or "").lower()
+        if not intellect:
+            # Prefer the canonical model directory: legacy route slots describe
+            # a former business use, not a model's intelligence.  In particular
+            # Claude Sonnet remains smart even if an old `fast` route used it.
+            entry = catalog_entry({"routing": routing}, family, catalog_model)
+            level = str(entry.get("target_level") or "") if entry else str(raw.get("target_level") or "")
+            intellect = {"L1": "standard", "L2": "smart", "L3": "expert"}.get(level, "")
+            if not intellect:
+                legacy_slot = str(raw.get("slot") or _slot_for_stages(raw.get("stages", [])))
+                intellect = _LEGACY_INTELLECT.get(legacy_slot, "")
+        if intellect not in INTELLECTS:
+            raise ValueError("provider route intellect must be standard, smart, or expert")
+        route["intellect"] = intellect
+        target_level = raw.get("target_level")
+        if target_level is not None:
+            if target_level not in {"L1", "L2", "L3"}: raise ValueError("provider route target_level must be L1, L2, or L3")
+            route["target_level"] = target_level
+        endpoint = endpoint_by_id[endpoint_id]
+        if endpoint["provider_kind"] == "single_family" and endpoint.get("model_family") and family != endpoint["model_family"]:
+            endpoint["needs_provider_kind_correction"] = True
+            endpoint["enabled"] = False
+            route["enabled"] = False
+        if endpoint["provider_kind"] == "cpa" and endpoint.get("supported_families") and family not in endpoint["supported_families"]:
+            raise ValueError("CPA route family must be listed in supported_families")
         resolution = str(raw.get("model_resolution") or "").strip()
         if resolution: route["model_resolution"] = resolution
         routes.append(route)
@@ -306,15 +365,7 @@ def normalize_provider(provider: dict[str, Any], *, warn_legacy: bool = True) ->
         if "families" not in endpoint:
             endpoint["families"] = sorted({route["model_family"] for route in routes if route["endpoint"] == endpoint["id"] and route["model_family"] in KNOWN_FAMILIES})
     result = {key: copy.deepcopy(value) for key, value in source.items() if key not in {"base_url", "credential_target", "api_key", "models", "routes", "endpoints", "routing", "schema_version"}}
-    hedge = result.get("hedge")
-    if isinstance(hedge, dict):
-        parallel = hedge.get("max_parallel", 2)
-        if isinstance(parallel, bool) or not isinstance(parallel, int):
-            raise ValueError("provider hedge.max_parallel must be an integer")
-        # The formal broker always caps live Provider requests at two.  Legacy
-        # zero meant unbounded fan-out and is migrated to the safe formal cap.
-        hedge["max_parallel"] = 2 if parallel <= 0 else min(parallel, 2)
-    result.update({"schema_version": 4, "routing": routing, "endpoints": endpoints, "routes": routes})
+    result.update({"schema_version": 5, "routing": routing, "endpoints": endpoints, "routes": routes})
     recalculate_auto_tiers(result)
     return result
 

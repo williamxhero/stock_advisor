@@ -86,8 +86,7 @@ def test_store_audit_is_metadata_only_and_export_is_redacted(tmp_path):
         "stage": "research", "route_id": "route-a", "endpoint_id": "endpoint-a",
         "model": "gpt-test", "model_family": "openai", "tier": 100, "delayed_start": False,
         "started_at": 10.0, "estimated_cost": 0.2, "cost_mode": "token", "preference": 9,
-        "requested_level": "L2", "actual_level": "L3", "upgrade_reason": "L2_CANDIDATES_EXHAUSTED",
-        "runner_fingerprint": "provider-broker/responses-sse-v1",
+        "runner_fingerprint": "provider-broker/chat-completions-v1",
         "prompt": "must never persist", "api_key": "sk-secret",
     }, recorded_at="2026-08-27T07:00:00Z")
     store.record_provider_audit("llm_attempt_finished", {
@@ -116,14 +115,12 @@ def test_store_audit_is_metadata_only_and_export_is_redacted(tmp_path):
     assert json.loads(exported)["contract"] == "provider-quality-export/v1"
     with store.connection() as connection:
         persisted = dict(connection.execute(
-            "SELECT cost_mode,preference,cached_input_tokens,reasoning_tokens,requested_level,actual_level,"
-            "upgrade_reason,runner_fingerprint "
+            "SELECT cost_mode,preference,cached_input_tokens,reasoning_tokens,runner_fingerprint "
             "FROM provider_llm_attempt WHERE attempt_id='attempt-1'",
         ).fetchone())
     assert persisted == {
         "cost_mode": "token", "preference": 9, "cached_input_tokens": 4, "reasoning_tokens": 3,
-        "requested_level": "L2", "actual_level": "L3", "upgrade_reason": "L2_CANDIDATES_EXHAUSTED",
-        "runner_fingerprint": "provider-broker/responses-sse-v1",
+        "runner_fingerprint": "provider-broker/chat-completions-v1",
     }
     for secret in (b"must never persist", b"sk-secret", b"private business response", b"do-not-store",
                    b"invocation private prompt", b"invocation private result"):
@@ -173,16 +170,15 @@ def test_history_score_is_neutral_until_sample_is_sufficient_and_is_bounded(tmp_
     assert 0 < store.provider_history_score(route, "research") <= 0.05
 
 
-def test_provider_schema_upgrade_is_idempotent_at_version_16(tmp_path):
+def test_provider_schema_upgrade_is_idempotent_at_version_15(tmp_path):
     store = CompanionStore(tmp_path / "companion.sqlite3")
     store.initialize()
     store.initialize()
 
     with store.connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         columns = {row[1] for row in connection.execute("PRAGMA table_info(provider_llm_attempt)")}
 
     assert {"provider_invocation", "provider_llm_attempt", "provider_probe_attempt", "provider_probe_daily"} <= tables
-    assert {"cost_mode", "preference", "cached_input_tokens", "reasoning_tokens", "runner_fingerprint",
-            "requested_level", "actual_level", "upgrade_reason"} <= columns
+    assert {"cost_mode", "preference", "cached_input_tokens", "reasoning_tokens", "runner_fingerprint"} <= columns

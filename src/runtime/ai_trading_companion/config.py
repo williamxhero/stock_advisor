@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import json
 from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
@@ -39,8 +40,8 @@ DEFAULT_PROVIDER = {
     "store": True,
     "hedge": {
         "enabled": True,
-        # Formal Provider requests never exceed two concurrent live requests.
-        "max_parallel": 2,
+        # Zero means run every enabled endpoint in the active cost group concurrently.
+        "max_parallel": 0,
         "availability_probe_timeout_seconds": 5,
         "per_endpoint_timeout_seconds": 45,
         "per_endpoint_max_attempts": 1,
@@ -55,7 +56,7 @@ DEFAULT_PROVIDER = {
         "probe_timeout_seconds": 180,
     },
     "efforts": {"research": "medium", "judgment": "medium", "fast": "medium"},
-    "routing": {"family_mode": "auto", "default_weight": DEFAULT_WEIGHT,
+    "routing": {"family_mode": "auto", "default_weight": DEFAULT_WEIGHT, "max_parallel_per_price_group": 3,
                 "model_catalog": INITIAL_MODEL_CATALOG, "price_catalog": {}},
     "endpoints": [
         {
@@ -371,6 +372,62 @@ def provider_management(home: Path, payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def refresh_all_provider_models(home: Path) -> dict[str, Any]:
+    """Refresh every enabled endpoint's real inventory in one atomic save.
+
+    A missing model is routing information, not an operator instruction to
+    disable a route.  The broker consults this inventory at call time and may
+    select a stronger intellect only when the requested one is absent.
+    """
+    current = load_settings(home).provider
+    candidate = json.loads(json.dumps(current))
+    refreshed: list[dict[str, str]] = []
+    for endpoint in candidate["endpoints"]:
+        if not endpoint.get("enabled") or endpoint.get("archived"):
+            continue
+        try:
+            models, state = _fetch_provider_models(endpoint)
+            endpoint["available_models"] = models
+            endpoint.pop("model_fulfillment", None)
+            endpoint["model_directory_status"] = state
+            endpoint["models_updated_at"] = utc_now()
+            _match_refreshed_models(candidate, endpoint["id"])
+            refreshed.append({"endpoint_id": endpoint["id"], "status": state})
+        except ValueError as exc:
+            # Keep the last known inventory. A transient refresh failure must
+            # not erase valid routes or turn a local error into a provider edit.
+            refreshed.append({"endpoint_id": endpoint["id"], "status": "refresh_failed"})
+    normalized = normalize_provider(candidate, warn_legacy=False)
+    save_provider_settings(home, normalized)
+    return {"contract": "provider-management/v1", "provider": redacted_provider(normalized), "refreshed": refreshed}
+
+
+def record_model_fulfillment(home: Path, endpoint_id: str, requested: str, actual: str) -> None:
+    """Persist only model identifiers; never the prompt, key, or response."""
+    settings = load_settings(home)
+    provider = json.loads(json.dumps(settings.provider))
+    endpoint = next(item for item in provider["endpoints"] if item["id"] == endpoint_id)
+    observations = endpoint.setdefault("model_fulfillment", {})
+    observations[requested] = {"actual_model": actual, "fulfilled": requested.lower().replace("_", "-") == actual.lower().replace("_", "-")}
+    save_provider_settings(home, provider, settings.research)
+
+
+def provider_model_refresh_due(home: Path, schedule: dict[str, Any], at: datetime) -> bool:
+    """Gate scheduled inventory refreshes so repeated service ticks are harmless."""
+    if at.strftime("%H:%M") not in set(schedule.get("at") or []):
+        return False
+    cutoff = at.astimezone(timezone.utc).timestamp() - int(schedule.get("max_age_minutes", 240)) * 60
+    for endpoint in load_settings(home).provider["endpoints"]:
+        if not endpoint.get("enabled") or endpoint.get("archived"):
+            continue
+        try:
+            if datetime.fromisoformat(str(endpoint.get("models_updated_at") or "").replace("Z", "+00:00")).timestamp() <= cutoff:
+                return True
+        except ValueError:
+            return True
+    return False
+
+
 def _provider_id(value: Any) -> str:
     endpoint_id = str(value or "").strip()
     if not endpoint_id or any(char.isspace() for char in endpoint_id): raise ValueError("provider ID is required and cannot contain whitespace")
@@ -404,24 +461,18 @@ def _fetch_provider_models(endpoint: dict[str, Any]) -> tuple[list[str], str]:
     )
     try:
         with urlopen(request, timeout=8) as response:
-            raw_bytes = response.read()
+            document = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
         if exc.code in {404, 405}:
-            return [], f"unknown_http_{exc.code}"
-        return [], f"error_http_{exc.code}"
-    except TimeoutError:
-        return [], "error_timeout"
-    except URLError:
-        return [], "error_network"
-    try:
-        document = json.loads(raw_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return [], "invalid_json"
+            return [], "unavailable_http"
+        raise ValueError(f"Provider model list is unavailable (HTTP {exc.code})") from exc
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise ValueError("Provider model list could not be refreshed") from exc
     rows = document.get("data") if isinstance(document, dict) else None
     if not isinstance(rows, list):
-        return [], "invalid_response"
+        raise ValueError("Provider model list response is invalid")
     models = sorted({str(row.get("id") or "").strip() for row in rows if isinstance(row, dict) and str(row.get("id") or "").strip()})
-    return models, "available" if models else "empty"
+    return models, "refreshed" if models else "empty"
 
 
 def _match_refreshed_models(provider: dict[str, Any], endpoint_id: str) -> None:
@@ -442,7 +493,6 @@ def _match_refreshed_models(provider: dict[str, Any], endpoint_id: str) -> None:
             route["catalog_model"] = entry["canonical_model"] if entry else desired
             route.pop("model_resolution", None)
         else:
-            route["enabled"] = False
             route["model_resolution"] = "needs_selection"
 
 

@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 
-from ai_trading_companion.config import load_settings, provider_management
+from ai_trading_companion.config import load_settings, provider_management, refresh_all_provider_models
 from ai_trading_companion.provider_routes import SLOT_STAGES
 
 
@@ -53,18 +53,16 @@ class ProviderManagementTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             home = self._home(directory)
             result = provider_management(home, {
-                "action": "upsert", "endpoint": endpoint("alpha", ["openai", "anthropic"], weight=0.06),
-                "routes": routes("alpha", ["openai", "anthropic"]), "api_key": "test-local-key",
-                "family_mode": "anthropic",
+                "action": "upsert", "endpoint": endpoint("alpha", ["openai"], weight=0.06),
+                "routes": routes("alpha", ["openai"]), "api_key": "test-local-key",
             })
             self.assertNotIn("test-local-key", json.dumps(result))
             self.assertEqual("tes...key", result["provider"]["endpoints"][0]["api_key_hint"])
             saved = load_settings(home).provider
-            self.assertEqual("anthropic", saved["routing"]["family_mode"])
             self.assertEqual(0.06, saved["endpoints"][0]["weight"])
             self.assertEqual("test-local-key", saved["endpoints"][0]["api_key"])
             self.assertEqual({0.06}, {row["cost"]["weight"] for row in saved["routes"]})
-            self.assertEqual({"responses", "chat_completions"}, {row["transport"] for row in saved["routes"]})
+            self.assertEqual({"responses"}, {row["transport"] for row in saved["routes"]})
 
     def test_clone_requires_new_key_and_does_not_copy_secret(self) -> None:
         with TemporaryDirectory() as directory:
@@ -145,18 +143,18 @@ class ProviderManagementTests(unittest.TestCase):
             self.assertEqual(6, len(result["draft_routes"]))
             self.assertEqual({"research", "judgment", "fast"}, {row["slot"] for row in result["draft_routes"]})
 
-    def test_refresh_404_disables_routes_without_a_model_directory(self) -> None:
+    def test_refresh_404_keeps_routes_enabled_but_marks_inventory_unknown(self) -> None:
         with TemporaryDirectory() as directory:
             home = self._home(directory)
             provider_management(home, {"action": "upsert", "endpoint": endpoint("alpha", ["openai"]),
                                        "routes": routes("alpha", ["openai"]), "api_key": "test-key"})
             with patch("ai_trading_companion.config.urlopen", side_effect=HTTPError("https://alpha.example/models", 404, "missing", {}, None)):
                 result = provider_management(home, {"action": "refresh_models", "id": "alpha"})
-            self.assertFalse(any(item["enabled"] for item in result["provider"]["routes"]))
+            self.assertTrue(any(item["enabled"] for item in result["provider"]["routes"]))
             self.assertEqual([], result["provider"]["endpoints"][0]["available_models"])
-            self.assertEqual("unknown_http_404", result["provider"]["endpoints"][0]["model_directory_status"])
+            self.assertEqual("unavailable_http", result["provider"]["endpoints"][0]["model_directory_status"])
 
-    def test_empty_model_directory_disables_configured_slots(self) -> None:
+    def test_empty_model_directory_keeps_configured_slots_for_a_later_refresh(self) -> None:
         with TemporaryDirectory() as directory:
             home = self._home(directory)
             provider_management(home, {"action": "upsert", "endpoint": endpoint("alpha", ["openai"]),
@@ -165,9 +163,21 @@ class ProviderManagementTests(unittest.TestCase):
             response.__enter__.return_value = response
             with patch("ai_trading_companion.config.urlopen", return_value=response):
                 result = provider_management(home, {"action": "refresh_models", "id": "alpha"})
-            self.assertFalse(any(item["enabled"] for item in result["provider"]["routes"]))
+            self.assertTrue(any(item["enabled"] for item in result["provider"]["routes"]))
             self.assertEqual([], result["provider"]["endpoints"][0]["available_models"])
             self.assertEqual("empty", result["provider"]["endpoints"][0]["model_directory_status"])
+
+    def test_refresh_all_updates_each_enabled_provider_without_exposing_keys(self) -> None:
+        with TemporaryDirectory() as directory:
+            home = self._home(directory)
+            provider_management(home, {"action": "upsert", "endpoint": endpoint("alpha", ["openai"]),
+                                       "routes": routes("alpha", ["openai"]), "api_key": "alpha-secret"})
+            response = MagicMock(); response.read.return_value = b'{"data":[]}'
+            response.__enter__.return_value = response
+            with patch("ai_trading_companion.config.urlopen", return_value=response):
+                result = refresh_all_provider_models(home)
+            self.assertEqual("empty", result["refreshed"][0]["status"])
+            self.assertNotIn("alpha-secret", json.dumps(result))
 
     def test_model_catalog_recalculates_auto_tier_but_not_manual_route(self) -> None:
         with TemporaryDirectory() as directory:

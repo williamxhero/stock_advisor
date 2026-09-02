@@ -16,7 +16,7 @@
     "store": true,
     "hedge": {
       "enabled": true,
-      "max_parallel": 2,
+      "max_parallel": 0,
       "availability_probe_timeout_seconds": 5,
       "per_endpoint_timeout_seconds": 45,
       "per_endpoint_max_attempts": 1

@@ -95,6 +95,11 @@ class BrokerResearchPlanner:
             _public_market_close_discoveries(packet),
             _public_intraday_market_discoveries(packet),
         )
+        discovery_repair = _discovery_read_repair_plan(
+            packet.get("evidence_contract") or {}, discoveries, gaps, round_number,
+        )
+        if discovery_repair is not None:
+            return discovery_repair
         planning_packet = {
             "task_key": packet.get("task_key"),
             "stage": "research_plan",
@@ -630,6 +635,53 @@ def _merge_discoveries(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
             seen.add(url)
             merged.append(row)
     return merged
+
+
+def _discovery_read_repair_plan(
+    contract: dict[str, Any], discoveries: list[dict[str, Any]], gaps: list[str], round_number: int,
+) -> dict[str, Any] | None:
+    """Deterministically verify known candidate URLs instead of asking the model to rediscover them."""
+    if round_number <= 0 or not discoveries or not gaps:
+        return None
+    requirement_keys = [
+        str(row.get("key") or "")
+        for row in contract.get("requirements") or []
+        if isinstance(row, dict) and str(row.get("key") or "")
+    ]
+    targets = {
+        key for key in requirement_keys
+        if any(gap == key or key in str(gap) for gap in gaps)
+    }
+    if not targets:
+        return None
+    operations: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    seen_urls: set[str] = set()
+    for discovery in discoveries:
+        key = str(discovery.get("requirement_key") or "")
+        url = str(discovery.get("url") or "")
+        if key not in targets or not url.startswith(("http://", "https://")) or url in seen_urls:
+            continue
+        if counts.get(key, 0) >= 4 or len(operations) >= 24:
+            continue
+        seen_urls.add(url)
+        counts[key] = counts.get(key, 0) + 1
+        operations.append({
+            "requirement_key": key,
+            "backend": "gateway",
+            "operation": "web_read",
+            "arguments": {
+                "query": None,
+                "categories": None,
+                "url": url,
+                "symbol": None,
+                "render": "auto",
+                "session_id": None,
+                "actions": None,
+            },
+            "fallback_backends": [],
+        })
+    return {"version": 1, "operations": operations} if operations else None
 
 
 def _planner_research_scope(value: Any) -> dict[str, Any]:

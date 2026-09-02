@@ -59,6 +59,38 @@ class LocalResearchTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             BrokerResearchPlanner(mock.Mock(), deadline=lambda: 123.0)
 
+    def test_planner_repair_reads_existing_discoveries_without_another_broker_call(self) -> None:
+        broker = mock.Mock()
+        planner = BrokerResearchPlanner(
+            broker, intellect="smart", effort="medium", deadline=lambda: 123.0,
+        )
+        packet = {
+            "as_of": CONTRACT["as_of"],
+            "evidence_contract": {
+                **CONTRACT,
+                "requirements": [
+                    *CONTRACT["requirements"],
+                    {
+                        "key": "events",
+                        "blocking": True,
+                        "allowed_coverage": ["covered", "checked_no_change"],
+                        "window": {"mode": "after_start_to_end", "start": "2026-08-26T07:00:00Z", "end": CONTRACT["as_of"]},
+                    },
+                ],
+            },
+            "research_discoveries": [
+                {"requirement_key": "events", "url": f"https://example.test/event-{index}"}
+                for index in range(6)
+            ],
+        }
+
+        plan = planner(packet, ["events"], 1)
+
+        broker.invoke.assert_not_called()
+        self.assertEqual(4, len(plan["operations"]))
+        self.assertEqual({"web_read"}, {item["operation"] for item in plan["operations"]})
+        self.assertEqual({"events"}, {item["requirement_key"] for item in plan["operations"]})
+
     def test_browser_action_schema_is_strict_and_defines_array_items(self) -> None:
         actions = RESEARCH_PLAN_SCHEMA["properties"]["operations"]["items"]["properties"]["arguments"]["properties"]["actions"]
         self.assertEqual("object", actions["items"]["type"])

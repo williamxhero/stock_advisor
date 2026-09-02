@@ -380,6 +380,40 @@ class LocalResearchChain:
         observations: list[dict[str, Any]] = []
         verifier: dict[str, Any] = {"passed": False, "problems": ["not_evaluated"], "missing_requirements": []}
         evidence: dict[str, Any] = {}
+        # Acquire every deterministic blocker before the first Broker round.
+        # These facts are time-sensitive; waiting for a planning response first
+        # can turn an otherwise valid 09:45 snapshot into future evidence.
+        preflight = _merge_mandatory_operations(
+            {"version": 1, "operations": []}, contract,
+            max_operations=self.executor.max_operations,
+        )
+        for row in self.executor.validate_plan(preflight):
+            try:
+                backend, result = self.executor.execute(row)
+                observation, _ = boundary.observe(
+                    row["operation"], {**row["arguments"], "requirement_key": row["requirement_key"]},
+                    result, bool(result.get("results") or result.get("url") or result.get("text")),
+                )
+                _normalize_exact_close_fact_time(observation, contract, row["requirement_key"])
+                observation["backend"] = backend
+                observations.append(observation)
+            except Exception as exc:
+                observations.append({
+                    "attempt_id": attempt_id, "observation_id": f"failure-{len(observations) + 1}",
+                    "tool": row["operation"], "backend": row["backend"], "operation": row["operation"],
+                    "status": "failed", "ok": False, "non_empty": False,
+                    "arguments": {**row["arguments"], "requirement_key": row["requirement_key"]},
+                    "error_category": type(exc).__name__,
+                })
+        evidence = _compile_evidence(packet, contract, observations)
+        verifier = self.gate.evaluate(
+            evidence, contract, observations, str(packet.get("as_of") or contract.get("as_of") or ""),
+            attempt_id=attempt_id,
+        )
+        if verifier.get("passed"):
+            normalized = verifier.get("normalized_evidence") or evidence
+            bundle_bytes, bundle_hash = freeze_evidence_bundle(normalized)
+            return FrozenResearchResult(True, normalized, verifier, observations, bundle_bytes, bundle_hash, 0)
         round_number = 0
         while self.deadline is None or self.deadline() > 1.0:
             round_observation_start = len(observations)

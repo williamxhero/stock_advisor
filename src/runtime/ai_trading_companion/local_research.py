@@ -904,6 +904,12 @@ def _merge_mandatory_operations(
         required.append(_operation("market_breadth", "market", "market_breadth"))
     if requirements.get("portfolio_market_state", {}).get("required_entities"):
         required.append(_operation("portfolio_market_state", "market", "holding_snapshot"))
+    material_events = requirements.get("material_events_and_counterevidence") or {}
+    if "checked_no_change" in set(material_events.get("allowed_coverage") or []):
+        required.append(_operation(
+            "material_events_and_counterevidence", "gateway", "web_search",
+            query="A股 公告 政策 风险",
+        ))
     event_requirement = requirements.get("portfolio_events_and_counterevidence") or {}
     for entity in [str(value) for value in event_requirement.get("required_entities") or [] if str(value)]:
         required.append(_operation(

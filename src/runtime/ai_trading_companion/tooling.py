@@ -658,7 +658,9 @@ def _validate_market_breadth(request: FactRequest, data: dict[str, Any], fact_as
     if not isinstance(breadth, dict):
         return "tool_market_result_invalid"
     try:
-        if any(float(breadth[field]) < 0 for field in ("up", "down", "flat", "limit_up", "limit_down")):
+        if any(float(breadth[field]) < 0 for field in ("up", "down", "flat")):
+            return "tool_market_result_invalid"
+        if any(float(breadth[field]) < 0 for field in ("limit_up", "limit_down") if field in breadth):
             return "tool_market_result_invalid"
     except (KeyError, TypeError, ValueError):
         return "tool_market_result_invalid"

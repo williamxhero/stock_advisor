@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.3"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2"}
+_VERSION = "1.1.4"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -454,6 +454,78 @@ def breadth_page_url(endpoint: str, page: int) -> str:
     )
 
 
+def markethub_breadth_payload(
+    endpoint: str, required_at: str, finality: str,
+) -> tuple[dict[str, object], str]:
+    try:
+        required = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(
+            dt.timezone(dt.timedelta(hours=8)))
+    except ValueError:
+        fail(64, "required_at must be an ISO timestamp")
+    separator = "&" if "?" in endpoint else "?"
+    source_url, body = fetch(endpoint + separator + "trade_date=" + quote_plus(required.date().isoformat()))
+    try:
+        snapshot = json.loads(body)
+        coverage = snapshot["coverage"]
+        lineage = snapshot["lineage"]
+        values = {
+            key: int(snapshot[key]) for key in (
+                "up", "down", "flat", "unpriced", "suspended", "universe_count",
+            )
+        }
+        eligible = int(coverage["eligible_count"])
+        priced = int(coverage["priced_count"])
+        suspended = int(coverage["suspended_count"])
+        missing = int(coverage["missing_count"])
+        invalid = int(coverage["invalid_price_count"])
+        accounted = int(coverage["accounted_count"])
+        ratio = float(coverage["coverage_ratio"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        fail(75, "MarketHub breadth response is invalid")
+    if (
+        snapshot.get("contract") != "markethub-cn-a-share-market-breadth-v1"
+        or snapshot.get("trade_date") != required.date().isoformat()
+        or snapshot.get("status") != "complete"
+        or snapshot.get("finality") != "final"
+        or not isinstance(snapshot.get("source"), str)
+        or not isinstance(lineage, dict) or not str(lineage.get("dataset_version") or "").strip()
+        or any(value < 0 for value in values.values())
+        or missing != 0 or invalid != 0 or values["unpriced"] != 0
+        or ratio != 1.0 or eligible != values["universe_count"]
+        or accounted != eligible or priced + suspended != eligible
+        or values["suspended"] != suspended
+        or values["up"] + values["down"] + values["flat"] != priced
+    ):
+        fail(75, "MarketHub breadth response is incomplete")
+    try:
+        observed = dt.datetime.fromisoformat(str(snapshot["fact_as_of"]).replace("Z", "+00:00"))
+    except (KeyError, ValueError):
+        fail(75, "MarketHub breadth fact time is invalid")
+    if observed.tzinfo is None:
+        fail(75, "MarketHub breadth fact time is invalid")
+    local_observed = observed.astimezone(dt.timezone(dt.timedelta(hours=8)))
+    if local_observed.date() != required.date():
+        fail(75, "MarketHub breadth trading date is invalid")
+    if finality in {"close", "official_close"} and local_observed.time() != dt.time(15, 0):
+        fail(75, "MarketHub breadth does not meet close finality")
+    fact_as_of = observed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    breadth = {**values, "coverage_ratio": ratio}
+    data = {
+        "is_trading_day": True, "trading_date": required.date().isoformat(),
+        "source": str(snapshot["source"]), "source_urls": [source_url],
+        "breadth": breadth, "finality": finality,
+        "source_finality": str(snapshot["finality"]),
+        "lineage": lineage,
+        "coverage": coverage,
+    }
+    data["source_evidence"] = [{
+        "url": source_url, "fact_as_of": fact_as_of,
+        "data": {"trading_date": data["trading_date"], "breadth": breadth, "finality": finality,
+                 "lineage": data["lineage"]},
+    }]
+    return data, fact_as_of
+
+
 def market_breadth_payload(endpoint: str, finality: str) -> tuple[dict[str, object], str]:
     first_url, first_body = fetch(breadth_page_url(endpoint, 1))
     try:
@@ -619,9 +691,16 @@ def main() -> None:
         finality = str(request.get("finality") or "observed")
         if finality not in {"intraday", "realtime", "close", "official_close"}:
             fail(64, "unsupported market finality")
-        payload, fact_as_of = market_breadth_payload(
-            safe_url(inputs.get("breadth_url") or "https://push2delay.eastmoney.com/api/qt/clist/get"), finality,
-        )
+        markethub_url = inputs.get("markethub_url")
+        if markethub_url or (finality in {"close", "official_close"} and not inputs.get("breadth_url")):
+            payload, fact_as_of = markethub_breadth_payload(
+                safe_url(markethub_url or "http://yosef-server:8803/api/stocks/market-breadth"),
+                str(request.get("required_at") or ""), finality,
+            )
+        else:
+            payload, fact_as_of = market_breadth_payload(
+                safe_url(inputs.get("breadth_url") or "https://push2delay.eastmoney.com/api/qt/clist/get"), finality,
+            )
         result(payload, fact_as_of=fact_as_of)
         return
     if mode == "cn_market_snapshot":

@@ -271,7 +271,7 @@ class ToolCatalogMarketBackend:
         else:
             inputs = {}
         if operation == "market_breadth":
-            cached = self._cached_breadth(required_at, str(window.get("start") or ""))
+            cached = self._cached_breadth(required_at, str(window.get("start") or ""), finality)
             if cached is not None:
                 return cached
         resolution = self.runner.resolve_with_fallback(FactRequest(
@@ -301,7 +301,7 @@ class ToolCatalogMarketBackend:
             "raw_artifact_ref": resolution.raw_artifact_ref, "results": results,
         }
 
-    def _cached_breadth(self, required_at: str, window_start: str) -> dict[str, Any] | None:
+    def _cached_breadth(self, required_at: str, window_start: str, finality: str) -> dict[str, Any] | None:
         """Use only a runtime prefetch whose fact time is inside this contract."""
         # The prefetch is runtime state under the user's Companion home, not a
         # release asset under the immutable tool catalog. Looking beside tools
@@ -321,6 +321,8 @@ class ToolCatalogMarketBackend:
             if (start and fact < start) or fact > end:
                 return None
             data = dict(cached["data"])
+            if str(data.get("finality") or "") != finality:
+                return None
             urls = [str(url) for url in data.get("source_urls") or [] if str(url).startswith(("http://", "https://"))]
             if not urls:
                 return None

@@ -32,7 +32,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.3", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.4", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
 
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
@@ -628,6 +628,9 @@ class ToolRunnerTests(unittest.TestCase):
                         'v_sz399001="51~深证成指~399001~12000.0~11900.0~~~~~~~~~~~~20260901150100";\n'
                     ).encode("gb18030")
                     content_type = "text/plain; charset=gb18030"
+                elif self.path.startswith("/minute"):
+                    body = json.dumps({"data": {"data": ["1500 3500.0 100 1000.0"]}}).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
                 else:
                     body = json.dumps({
                         "fact_as_of": "2026-09-01T15:01:00+08:00", "trading_date": "2026-09-01", "source": "public_snapshot",
@@ -656,7 +659,10 @@ class ToolRunnerTests(unittest.TestCase):
                 runner = ToolRunner(ToolCatalog(root))
                 indexes = runner.resolve_with_fallback(FactRequest(
                     1, "cn_market_index_batch", "2026-09-01T07:01:00Z", 2.0,
-                    {"symbols": ["000001", "399001"], "index_url": f"{base}/index?q="}, finality="official_close",
+                    {
+                        "symbols": ["000001", "399001"], "index_url": f"{base}/index?q=",
+                        "tencent_minute_url": f"{base}/minute?code=",
+                    }, finality="official_close",
                 ))
                 snapshot = runner.resolve_with_fallback(FactRequest(
                     1, "cn_market_snapshot", "2026-09-01T07:01:00Z", 2.0,
@@ -847,6 +853,54 @@ class ToolRunnerTests(unittest.TestCase):
 
             self.assertFalse(result.succeeded)
             self.assertEqual("tool_market_trading_date_mismatch", result.error_code)
+
+    def test_official_close_breadth_uses_complete_markethub_snapshot_with_lineage(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps({
+                    "contract": "markethub-cn-a-share-market-breadth-v1",
+                    "trade_date": "2026-09-01", "fact_as_of": "2026-09-01T15:00:00+08:00",
+                    "status": "complete", "finality": "final",
+                    "up": 1500, "down": 3900, "flat": 100, "unpriced": 0,
+                    "suspended": 7, "universe_count": 5507,
+                    "source": "markethub_local_canonical_daily_snapshot",
+                    "lineage": {"dataset_version": "mhd-v1-test"},
+                    "coverage": {
+                        "eligible_count": 5507, "priced_count": 5500, "suspended_count": 7,
+                        "missing_count": 0, "invalid_price_count": 0,
+                        "accounted_count": 5507, "coverage_ratio": 1.0,
+                    },
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_market_breadth", "2026-09-01T07:20:00Z", 4.0,
+                    {"markethub_url": f"http://127.0.0.1:{server.server_port}/breadth"},
+                    finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("2026-09-01T07:00:00Z", result.fact_as_of)
+                self.assertEqual(1500, result.data["breadth"]["up"])
+                self.assertEqual(7, result.data["breadth"]["suspended"])
+                self.assertEqual("mhd-v1-test", result.data["lineage"]["dataset_version"])
+                self.assertEqual("official_close", result.data["finality"])
+            finally:
+                server.shutdown()
+                server.server_close()
 
 
 if __name__ == "__main__":

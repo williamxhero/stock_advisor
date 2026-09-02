@@ -441,9 +441,21 @@ class LocalResearchTests(unittest.TestCase):
             }, "artifact:sha256:" + "e" * 64, None, (), attempts=("default:succeeded",),
         )
 
-        ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0)(
-            "market_breadth", {"_requirement_key": "market_breadth"},
-        )
+        with tempfile.TemporaryDirectory() as home:
+            runtime = Path(home) / "runtime"
+            runtime.mkdir()
+            (runtime / "market-breadth-snapshot.json").write_text(json.dumps({
+                "fact_as_of": "2026-09-01T07:15:00Z",
+                "data": {
+                    "source": "intraday_prefetch", "finality": "intraday",
+                    "source_urls": ["https://example.test/intraday"],
+                    "breadth": {"up": 9, "down": 8, "flat": 7},
+                },
+            }), encoding="utf-8")
+            with mock.patch.dict("os.environ", {"AI_TRADING_COMPANION_HOME": home}):
+                ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0)(
+                    "market_breadth", {"_requirement_key": "market_breadth"},
+                )
 
         request = runner.resolve_with_fallback.call_args.args[0]
         self.assertEqual("official_close", request.finality)

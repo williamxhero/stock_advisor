@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .learning import WorkflowEvolution
 from .memory_port import MemoryPort, MemoryUnavailable
@@ -91,7 +92,7 @@ class RuntimePacketBuilder:
                 )
                 packet["verified_fact_digest"] = self._verified_fact_digest(evidence or {})
                 packet["m0_compose_requirements"] = {
-                    "instruction": "For every portfolio entity below, state the frozen price, previous close, change, change percentage, quote time and trading status exactly as supplied by verified_fact_digest. Do not publish a claim that any listed entity is uncovered.",
+                    "instruction": "For every portfolio entity below, state the frozen price, previous close, change, change percentage, quote time and trading status exactly as supplied by verified_fact_digest. Render every quote time as `北京时间HH:MM` using quote_at_china; never interpret a UTC `Z` clock as China local time. Do not publish a claim that any listed entity is uncovered.",
                     "portfolio_entity_codes": next((
                         list(item.get("required_entities") or []) for item in packet["evidence_contract"].get("requirements") or []
                         if isinstance(item, dict) and item.get("key") == "portfolio_market_state"
@@ -249,8 +250,33 @@ class RuntimePacketBuilder:
                 continue
             excerpt = str(source.get("excerpt") or "")
             if any(marker in excerpt for marker in ('"quotes"', '"indices"', '"breadth"')):
-                rows.append({"evidence_ref": source.get("evidence_ref"), "excerpt": excerpt[:8000]})
+                rows.append({"evidence_ref": source.get("evidence_ref"), "excerpt": RuntimePacketBuilder._with_china_quote_times(excerpt)[:8000]})
         return rows
+
+    @staticmethod
+    def _with_china_quote_times(excerpt: str) -> str:
+        """Add a deterministic display clock without changing the source timestamp."""
+        try:
+            payload = json.loads(excerpt)
+        except (TypeError, ValueError):
+            return excerpt
+
+        def enrich(value: Any) -> Any:
+            if isinstance(value, list):
+                return [enrich(item) for item in value]
+            if not isinstance(value, dict):
+                return value
+            copy = {key: enrich(item) for key, item in value.items()}
+            quote_at = copy.get("quote_at")
+            if quote_at and "quote_at_china" not in copy:
+                try:
+                    local = datetime.fromisoformat(str(quote_at).replace("Z", "+00:00")).astimezone(ZoneInfo("Asia/Shanghai"))
+                    copy["quote_at_china"] = f"北京时间{local:%Y-%m-%d %H:%M}"
+                except ValueError:
+                    pass
+            return copy
+
+        return json.dumps(enrich(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     def _evidence_requirements(self, cycle: dict[str, Any], stage: str) -> list[dict[str, Any]]:
         if cycle["task_key"] != "daily.review.1520" or stage not in {"m0_research", "m1_research"}:

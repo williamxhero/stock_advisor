@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .effort_policy import CognitiveEffortPolicy, EffortPolicyFacts
 from .stage_expression import normalize_stage_output, semantic_snapshot_conflicts
@@ -190,10 +192,15 @@ class CognitiveRouter:
                 if quote is None:
                     problems.append("m0_missing_verified_portfolio_quote:" + entity)
                     continue
-                for field in ("price", "previous_close", "change_percent"):
+                for field in ("price", "previous_close", "change", "change_percent"):
                     value = quote.get(field)
                     if value is not None and _number_text(value) not in body:
                         problems.append(f"m0_portfolio_quote_conflict:{entity}:{field}")
+                if not _m0_has_status(body, str(quote.get("status") or "")):
+                    problems.append(f"m0_portfolio_quote_status_conflict:{entity}")
+                local_time = _china_quote_time(quote.get("quote_at"))
+                if local_time and f"北京时间{local_time}" not in body:
+                    problems.append(f"m0_portfolio_quote_time_conflict:{entity}")
         if stage == "m1_judgment" and not profile.m1_blind:
             problems.append("m1_packet_contains_human_input")
         snapshot = normalized.snapshot or None
@@ -237,3 +244,21 @@ def _walk_quotes(value: Any) -> list[dict[str, Any]]:
 def _number_text(value: Any) -> str:
     number = float(value)
     return (f"{number:.4f}").rstrip("0").rstrip(".")
+
+
+def _china_quote_time(value: Any) -> str | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
+    except ValueError:
+        return None
+
+
+def _m0_has_status(body: str, status: str) -> bool:
+    labels = {
+        "trading": ("交易状态", "处于交易", "交易中"),
+        "suspended": ("停牌", "暂停交易"),
+        "unavailable": ("数据不可用", "行情不可用"),
+    }
+    return not status or any(label in body for label in labels.get(status, (status,)))

@@ -19,6 +19,7 @@ from ai_trading_companion.broker_client import BrokerError
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.evidence_gate import EvidenceGate
 from ai_trading_companion.engine import CompanionEngine
+from ai_trading_companion.router import CognitiveRouter
 from ai_trading_companion.store import CompanionStore
 
 
@@ -254,6 +255,23 @@ class EvidenceV3Tests(TestCase):
         observations[0]["evidence_items"][1]["excerpt_text"] = excerpt
         failed = EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")
         self.assertIn("blocking_requirement_lacks_numeric_facts:portfolio_market_state", failed["problems"])
+
+    def test_m0_rejects_utc_clock_and_requires_local_quote_time_and_status(self):
+        packet = {
+            "calendar_context": {},
+            "evidence_contract": {"requirements": [{"key": "portfolio_market_state", "required_entities": ["600487"]}]},
+            "verified_fact_digest": [{"excerpt": json.dumps({"quotes": [{
+                "symbol": "600487", "price": 67.97, "previous_close": 67.34, "change": 0.63,
+                "change_percent": 0.9356, "quote_at": "2026-09-02T05:22:00Z", "status": "trading",
+            }]})}],
+        }
+        output = {"semantic": {"summary": "600487 价格67.97，前收67.34，变动0.63，变动幅度0.9356%，处于交易状态，截至今天早上五点二十二分。",
+                               "observations": [], "risks": [], "unknowns": []}}
+        rejected = CognitiveRouter().verify("m0_compose", packet, output)
+        self.assertIn("m0_portfolio_quote_time_conflict:600487", rejected["problems"])
+
+        output["semantic"]["summary"] = "600487 价格67.97，前收67.34，变动0.63，变动幅度0.9356%，处于交易状态，北京时间13:22。"
+        self.assertTrue(CognitiveRouter().verify("m0_compose", packet, output)["passed"])
 
     def test_rejects_foreign_reference_and_naive_runtime_time(self):
         foreign = EvidenceGate().evaluate(self._evidence("ev_other_1"), self.contract, self.observations, self.as_of, attempt_id="attempt-1")

@@ -354,14 +354,28 @@ Protocol: OpportunityDiscovery-v1.3
             "command_id": "skip-now", "cycle_id": self.cycle["cycle_id"], "type": "skip_h0",
         })
         portfolio = Mock()
+        before_deadline = parse(self.store.get_cycle(self.cycle["cycle_id"])["m1_publish_deadline"]) - timedelta(seconds=1)
 
         with patch("ai_trading_companion.__main__.run_m1", return_value={"state": "complete"}) as worker:
-            results = run_pending_m1(self.engine, self.store, portfolio, execute=True)
+            results = run_pending_m1(self.engine, self.store, portfolio, execute=True, at=before_deadline)
 
         worker.assert_called_once_with(
             self.engine, self.store, portfolio, self.cycle["cycle_id"], True,
         )
         self.assertEqual([{"state": "complete"}], results)
+
+    def test_gateway_tick_never_revives_m1_after_its_publish_deadline(self):
+        self.ready()
+        self.engine.command({
+            "command_id": "skip-stale", "cycle_id": self.cycle["cycle_id"], "type": "skip_h0",
+        })
+        after_deadline = parse(self.store.get_cycle(self.cycle["cycle_id"])["m1_publish_deadline"]) + timedelta(seconds=1)
+
+        with patch("ai_trading_companion.__main__.run_m1") as worker:
+            results = run_pending_m1(self.engine, self.store, Mock(), execute=True, at=after_deadline)
+
+        self.assertEqual([], results)
+        worker.assert_not_called()
 
     def test_gateway_tick_does_not_restart_m1_waiting_for_repair(self):
         self.ready()

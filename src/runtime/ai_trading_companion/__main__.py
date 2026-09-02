@@ -1551,7 +1551,7 @@ def run_scheduled_cycle(engine: CompanionEngine, store: CompanionStore, exchange
 
 def run_pending_m1(
     engine: CompanionEngine, store: CompanionStore, portfolio: PortfolioService,
-    execute: bool, *, limit: int = 2,
+    execute: bool, *, limit: int = 2, at: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Run M1 made ready by an immediate user H0 commit/skip.
 
@@ -1561,7 +1561,7 @@ def run_pending_m1(
     second M1 worker concurrently.
     """
     results: list[dict[str, Any]] = []
-    for cycle in store.pending_m1_cycles(limit=limit):
+    for cycle in store.pending_m1_cycles(limit=limit, at=at):
         results.append(run_m1(engine, store, portfolio, cycle["cycle_id"], execute))
     return results
 

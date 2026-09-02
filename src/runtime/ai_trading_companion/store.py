@@ -746,14 +746,23 @@ class CompanionStore:
         with self.connection() as c:
             c.execute("DELETE FROM schedule_worker_claim WHERE cycle_id=?", (cycle_id,))
 
-    def pending_m1_cycles(self, *, limit: int = 2) -> list[dict[str, Any]]:
+    def pending_m1_cycles(
+        self, *, limit: int = 2, at: datetime | None = None,
+    ) -> list[dict[str, Any]]:
         """Return M1 work made runnable by a manual H0 action or repair."""
+        cutoff = (
+            (at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+            .isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        )
         with self.connection() as c:
             return [dict(row) for row in c.execute(
                 """SELECT * FROM companion_cycle
                      WHERE state IN ('researching_m1','m1_retry_wait')
-                     ORDER BY updated_at,created_at LIMIT ?""",
-                (max(1, int(limit)),),
+                       AND m1_publish_deadline IS NOT NULL
+                       AND julianday(m1_publish_deadline) > julianday(?)
+                     ORDER BY CASE kind WHEN 'manual' THEN 0 ELSE 1 END,
+                              julianday(updated_at) DESC,julianday(created_at) DESC LIMIT ?""",
+                (cutoff, max(1, int(limit))),
             )]
 
     def recover_orphaned_scheduled_workers(self) -> list[str]:

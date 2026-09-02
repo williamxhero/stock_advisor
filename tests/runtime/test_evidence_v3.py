@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 from ai_trading_companion.__main__ import (
     M1_MAX_JUDGMENT_ATTEMPTS,
     _call_stage,
+    _anchor_m0_facts,
     _evidence_read_cutoff,
     _frozen_m0_source_attempt,
     _m1_research_as_of,
@@ -294,6 +295,19 @@ class EvidenceV3Tests(TestCase):
 
         output["semantic"]["summary"] = "600487 价格67.97，前收67.34，变动0.63，变动幅度0.9356%，处于交易状态，北京时间13:22。"
         self.assertTrue(CognitiveRouter().verify("m0_compose", packet, output)["passed"])
+
+    def test_m0_anchor_replaces_model_market_numbers_with_frozen_facts(self):
+        packet = {"stage": "m0_compose", "verified_fact_digest": [{"excerpt": json.dumps({
+            "indices": [{"name": "上证指数", "price": 3900, "previous_close": 4000, "change": -100, "change_percent": -2.5}],
+            "breadth": {"up": 1, "down": 2, "flat": 3},
+            "quotes": [{"name": "样本", "symbol": "600487", "price": 10, "previous_close": 9, "change": 1,
+                        "change_percent": 11.1, "quote_at_china": "北京时间2026-08-31 13:22", "status": "trading"}],
+        })}]}
+        result = _anchor_m0_facts({"semantic": {"summary": "错误价格99", "observations": ["错误"], "risks": [], "unknowns": []}}, packet)
+        text = " ".join([result["semantic"]["summary"], *result["semantic"]["observations"]])
+        self.assertNotIn("错误价格99", text)
+        for expected in ("上证指数：3900", "上涨1家，下跌2家，平盘3家", "样本（600487）北京时间13:22", "价格10，前收9"):
+            self.assertIn(expected, text)
 
     def test_rejects_foreign_reference_and_naive_runtime_time(self):
         foreign = EvidenceGate().evaluate(self._evidence("ev_other_1"), self.contract, self.observations, self.as_of, attempt_id="attempt-1")

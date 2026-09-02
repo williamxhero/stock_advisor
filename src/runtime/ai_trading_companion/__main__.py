@@ -471,6 +471,15 @@ def _anchor_m0_facts(output: dict[str, Any], packet: dict[str, Any]) -> dict[str
             payload = json.loads(str(row.get("excerpt") or ""))
         except (AttributeError, TypeError, ValueError):
             continue
+        for index in payload.get("indices") or []:
+            if isinstance(index, dict):
+                facts.append(
+                    f"{index.get('name') or index.get('symbol')}：{index.get('price')}，前收{index.get('previous_close')}，"
+                    f"变动{index.get('change')}，变动幅度{index.get('change_percent')}%。"
+                )
+        breadth = payload.get("breadth")
+        if isinstance(breadth, dict):
+            facts.append(f"市场广度：上涨{breadth.get('up')}家，下跌{breadth.get('down')}家，平盘{breadth.get('flat')}家。")
         for quote in payload.get("quotes") or []:
             if not isinstance(quote, dict):
                 continue

@@ -504,7 +504,10 @@ def _call_stage(
                 )
             executor = ReadOnlyResearchExecutor(backends, max_operations=controls.max_operations)
             research = LocalResearchChain(
-                planner, executor, max_repairs=None,
+                # A repair is bounded so an incomplete web discovery cannot
+                # consume the compose model's entire deadline. The gate still
+                # rejects incomplete evidence; it is never published as M0.
+                planner, executor, max_repairs=2,
                 deadline=lambda: deadline - time.monotonic(),
             ).run(
                 packet, contract, attempt_id=attempt["attempt_id"],

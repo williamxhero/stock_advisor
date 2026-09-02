@@ -417,7 +417,10 @@ class LocalResearchChain:
                 if self.max_repairs is not None and round_number > self.max_repairs:
                     raise
                 continue
-            plan = _merge_mandatory_operations(plan, contract, max_operations=self.executor.max_operations)
+            plan = _merge_mandatory_operations(
+                plan, contract, max_operations=self.executor.max_operations,
+                observations=observations, gaps=gaps,
+            )
             operations = self.executor.validate_plan(plan)
             for row in operations:
                 try:
@@ -825,6 +828,7 @@ def _operation(
 
 def _merge_mandatory_operations(
     plan: dict[str, Any], contract: dict[str, Any], *, max_operations: int,
+    observations: list[dict[str, Any]] | None = None, gaps: list[str] | None = None,
 ) -> dict[str, Any]:
     """The model may supplement research but never omit deterministic blocker reads."""
     proposed = list(plan.get("operations") or []) if isinstance(plan, dict) else []
@@ -845,10 +849,34 @@ def _merge_mandatory_operations(
             "portfolio_events_and_counterevidence", "gateway", "web_search",
             query=f"{entity} 公告 停复牌 财报 风险",
         ))
-    required_keys = {(item["requirement_key"], item["operation"]) for item in required}
+    completed = {
+        (
+            str((item.get("arguments") or {}).get("requirement_key") or ""),
+            str(item.get("operation") or ""),
+            str((item.get("arguments") or {}).get("query") or "") if item.get("operation") == "web_search" else "",
+        )
+        for item in observations or []
+        if item.get("status") == "succeeded"
+    }
+
+    def needs_retry(item: dict[str, Any]) -> bool:
+        key = str(item["requirement_key"])
+        identity = (
+            key, str(item["operation"]),
+            str((item.get("arguments") or {}).get("query") or "") if item["operation"] == "web_search" else "",
+        )
+        if identity not in completed:
+            return True
+        # A technically successful call may still have failed semantic coverage
+        # (for example an incomplete quote batch). Repeat only that named
+        # requirement, never every already-qualified mandatory fact.
+        return any(key in str(gap) for gap in (gaps or []))
+
+    mandatory_operation_keys = {(item["requirement_key"], item["operation"]) for item in required}
+    required = [item for item in required if needs_retry(item)]
     retained = [
         item for item in proposed
-        if (str(item.get("requirement_key") or ""), str(item.get("operation") or "")) not in required_keys
+        if (str(item.get("requirement_key") or ""), str(item.get("operation") or "")) not in mandatory_operation_keys
     ]
     return {"version": 1, "operations": [*required, *retained][:max_operations]}
 

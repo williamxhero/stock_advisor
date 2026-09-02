@@ -55,6 +55,46 @@ class LocalResearchTests(unittest.TestCase):
             received_gaps[1],
         )
 
+    def test_successful_mandatory_operations_are_not_repeated_on_repair(self) -> None:
+        """A repair may add missing evidence, but must not re-fetch frozen facts."""
+        contract = {
+            "version": 4, "as_of": CONTRACT["as_of"], "requirements": [
+                {"key": "current_market_state", "blocking": True},
+                {"key": "market_breadth", "blocking": True},
+                {"key": "portfolio_market_state", "blocking": True, "required_entities": ["600487"]},
+                {"key": "portfolio_events_and_counterevidence", "blocking": True,
+                 "required_entities": ["600487"], "negative_query_terms": ["公告", "停复牌", "财报", "风险"]},
+            ],
+        }
+        calls: list[tuple[str, str, str | None]] = []
+
+        def backend(operation: str, arguments: dict) -> dict:
+            calls.append((str(arguments["_requirement_key"]), operation, arguments.get("query")))
+            return {"results": [{"url": "https://example.test/fact", "title": "fact", "excerpt_text": "fact",
+                                 "fact_as_of": CONTRACT["as_of"], "primary": True}]}
+
+        class AlwaysMissing:
+            def evaluate(self, *_args, **_kwargs):
+                return {"passed": False, "problems": ["needs_repair"], "missing_requirements": ["needs_repair"]}
+
+        result = LocalResearchChain(
+            lambda *_args: {"version": 1, "operations": []},
+            ReadOnlyResearchExecutor({"market": backend, "gateway": backend}),
+            gate=AlwaysMissing(), max_repairs=1,
+        ).run({"as_of": CONTRACT["as_of"]}, contract, attempt_id="no-repeat")
+
+        self.assertFalse(result.qualified)
+        self.assertEqual(4, len(calls))
+        self.assertEqual(
+            {
+                ("current_market_state", "market_snapshot"),
+                ("market_breadth", "market_breadth"),
+                ("portfolio_market_state", "holding_snapshot"),
+                ("portfolio_events_and_counterevidence", "web_search"),
+            },
+            {(key, operation) for key, operation, _query in calls},
+        )
+
     def test_planner_requires_an_explicit_effort_decision(self) -> None:
         with self.assertRaises(TypeError):
             BrokerResearchPlanner(mock.Mock(), deadline=lambda: 123.0)

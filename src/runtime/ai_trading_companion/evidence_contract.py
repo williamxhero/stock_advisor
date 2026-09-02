@@ -100,7 +100,7 @@ class EvidenceContractFactory:
                     "key": "market_breadth", "blocking": True,
                     "allowed_coverage": ["covered"],
                     "finality": "official_close",
-                    "window": {"start": close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
+                    "window": {"start": close_text, "end": close_text, "mode": "exact"},
                     "evidence_terms": [["上涨"], ["下跌"], ["家", "只"]],
                     "minimum_numeric_facts": 2,
                 },
@@ -215,12 +215,6 @@ class EvidenceContractFactory:
             market_local = market_at.astimezone(_SHANGHAI)
             if market_local.time() == time(15, 0):
                 market_finality = "official_close"
-                event_end = datetime.fromisoformat(str(events_window["end"]).replace("Z", "+00:00"))
-                if event_end.astimezone(_SHANGHAI).date() == market_local.date() and event_end > market_at:
-                    breadth_window = {
-                        "start": str(market_window["start"]), "end": str(events_window["end"]),
-                        "mode": "after_start_to_end",
-                    }
         return [
             *requirements,
             {

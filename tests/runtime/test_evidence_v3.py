@@ -20,7 +20,9 @@ from ai_trading_companion.broker_client import BrokerError
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.evidence_gate import EvidenceGate
 from ai_trading_companion.engine import CompanionEngine
+from ai_trading_companion.local_research import BrokerResearchPlanner
 from ai_trading_companion.router import CognitiveRouter
+from ai_trading_companion.runtime_strategy_policy import RuntimeStrategyControls
 from ai_trading_companion.store import CompanionStore
 
 
@@ -84,6 +86,14 @@ class EvidenceV3Tests(TestCase):
         self.contract = EvidenceContractFactory(_WeekdayCalendar()).build(
             task_key="daily.opportunity.0900", stage="m0_research", as_of=self.as_of,
         )
+        self.planner_contract = {
+            "version": 4, "as_of": self.as_of, "requirements": [{
+                "key": "material_events_and_counterevidence", "blocking": True,
+                "allowed_coverage": ["covered", "checked_no_change"],
+                "window": {"mode": "after_start_to_end", "start": "2026-08-25T07:00:00Z", "end": self.as_of},
+                "negative_query_terms": ["公告", "政策", "风险"],
+            }],
+        }
         self.market = next(item for item in self.contract["requirements"] if item["key"] == "current_market_state")
         self.events = next(item for item in self.contract["requirements"] if item["key"] == "material_events_and_counterevidence")
         self.observations = [{
@@ -138,7 +148,7 @@ class EvidenceV3Tests(TestCase):
         self.assertEqual("2026-08-26T07:00:00Z", requirements["events_and_counterevidence"]["window"]["start"])
         self.assertEqual("2026-08-27T07:20:02.555000Z", requirements["events_and_counterevidence"]["window"]["end"])
         self.assertEqual(
-            {"start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:20:02.555000Z", "mode": "after_start_to_end"},
+            {"start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z", "mode": "exact"},
             requirements["market_breadth"]["window"],
         )
         self.assertEqual("official_close", requirements["market_breadth"]["finality"])
@@ -289,6 +299,36 @@ class EvidenceV3Tests(TestCase):
         failed = EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")
         self.assertIn("blocking_requirement_lacks_numeric_facts:market_breadth", failed["problems"])
 
+    def test_v4_official_close_breadth_at_the_frozen_close_satisfies_the_contract(self):
+        close = "2026-09-02T07:00:00Z"
+        contract = {"version": 4, "as_of": "2026-09-02T08:20:00Z", "requirements": [{
+            "key": "market_breadth", "blocking": True, "allowed_coverage": ["covered"],
+            "minimum_numeric_facts": 3,
+            "window": {"mode": "exact", "start": close, "end": close},
+        }]}
+        excerpt = json.dumps({
+            "breadth": {"universe_count": 5554, "up": 1541, "down": 3901, "flat": 105,
+                        "suspended": 7, "unpriced": 0, "coverage_ratio": 1.0},
+            "finality": "official_close",
+        }, ensure_ascii=False)
+        observations = [{
+            "attempt_id": "attempt", "backend": "market", "status": "succeeded", "non_empty": True,
+            "evidence_items": [{"evidence_ref": "breadth", "excerpt_text": excerpt,
+                                "fact_as_of": close, "published_at": None,
+                                "acquired_at": "2026-09-02T08:20:19Z"}],
+        }]
+        evidence = {
+            "schema_version": 3, "as_of": contract["as_of"],
+            "sources": [{"evidence_ref": "breadth", "excerpt": excerpt}],
+            "coverage": [{"requirement_key": "market_breadth", "status": "covered",
+                          "evidence_refs": ["breadth"]}],
+            "high_impact_events": [],
+        }
+
+        result = EvidenceGate().evaluate(evidence, contract, observations, contract["as_of"], attempt_id="attempt")
+
+        self.assertTrue(result["passed"], result["problems"])
+
     def test_m0_rejects_utc_clock_and_requires_local_quote_time_and_status(self):
         packet = {
             "calendar_context": {},
@@ -392,7 +432,7 @@ class EvidenceV3Tests(TestCase):
             settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
             packet = {
                 "task_key": "daily.opportunity.0900", "stage": "m0_research", "as_of": self.as_of,
-                "evidence_contract": self.contract,
+                "evidence_contract": self.planner_contract,
             }
             with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
                 "ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker,
@@ -400,7 +440,8 @@ class EvidenceV3Tests(TestCase):
                 with self.assertRaisesRegex(BrokerError, "research stopped"):
                     _call_stage(
                         store, cycle, "m0_research", packet,
-                        "companion-research-evidence-v2.schema.json", search=True, timeout=60,
+                        "companion-research-result-v1.schema.json", search=False, timeout=60,
+                        frozen_controls=RuntimeStrategyControls(60, 0, (), ()),
                     )
 
             attempt = store.attempts(cycle["cycle_id"])[0]
@@ -468,32 +509,25 @@ class EvidenceV3Tests(TestCase):
         )
 
     def test_research_planning_uses_broker_and_never_calls_legacy_provider_tool_loop(self):
-        with TemporaryDirectory() as temporary:
-            store = CompanionStore(Path(temporary) / "companion.sqlite3")
-            cycle = CompanionEngine(store).start_cycle(
-                "daily.opportunity.0900", "2026-08-26T09:00:00+08:00", self.as_of,
-            )
-            settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
-            packet = {
-                "task_key": "daily.opportunity.0900", "stage": "m0_research", "as_of": self.as_of,
-                "evidence_contract": self.contract,
-            }
+        broker = Mock()
+        broker.invoke.side_effect = BrokerError("stop after inspecting request", category="test")
+        planner = BrokerResearchPlanner(
+            broker, intellect="smart", effort="medium", deadline=lambda: 2_000_000_000.0,
+            market_tool_available=True,
+        )
+        packet = {
+            "task_key": "daily.opportunity.0900", "stage": "m0_research", "as_of": self.as_of,
+            "evidence_contract": self.planner_contract,
+            "allowed_research_backends": ["gateway", "market"],
+        }
 
-            broker = Mock()
-            broker.invoke.side_effect = BrokerError("stop after inspecting request", category="test")
-            with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
-                "ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker,
-            ):
-                with self.assertRaisesRegex(BrokerError, "stop after inspecting request"):
-                    _call_stage(
-                        store, cycle, "m0_research", packet,
-                        "companion-research-evidence-v2.schema.json", search=True, timeout=60,
-                    )
+        with self.assertRaisesRegex(BrokerError, "stop after inspecting request"):
+            planner(packet, ["blocking_requirement_missing:material_events_and_counterevidence"], 0)
 
-            request = broker.invoke.call_args.args[0]
-            self.assertEqual("research", request.stage)
-            self.assertFalse(request.visible_stream)
-            self.assertIsNotNone(request.schema)
+        request = broker.invoke.call_args.args[0]
+        self.assertEqual("research", request.stage)
+        self.assertFalse(request.visible_stream)
+        self.assertIsNotNone(request.schema)
 
 
 class _WeekdayCalendar:

@@ -111,7 +111,7 @@ class ManualAnalysisProfileResolverTests(TestCase):
         self.assertEqual("after_start_to_end", contract["requirements"][0]["window"]["mode"])
         self.assertEqual(contract["contract_hash"], EvidenceContractFactory.contract_hash(contract))
 
-    def test_post_close_manual_contract_uses_close_quotes_and_a_bounded_official_breadth_snapshot(self) -> None:
+    def test_post_close_manual_contract_uses_exact_official_close_quotes_and_breadth(self) -> None:
         profile = self.resolver.resolve("2026-09-02T15:20:00+08:00", self.analysis)
         contract = EvidenceContractFactory(_Calendar()).build(
             task_key=profile["task_key"], stage="m0_research",
@@ -122,8 +122,8 @@ class ManualAnalysisProfileResolverTests(TestCase):
 
         self.assertEqual("official_close", requirements["market_breadth"]["finality"])
         self.assertEqual({
-            "start": "2026-09-02T07:00:00Z", "end": "2026-09-02T07:20:00Z",
-            "mode": "after_start_to_end",
+            "start": "2026-09-02T07:00:00Z", "end": "2026-09-02T07:00:00Z",
+            "mode": "exact",
         }, requirements["market_breadth"]["window"])
         self.assertEqual("official_close", requirements["portfolio_market_state"]["finality"])
         self.assertEqual("exact", requirements["portfolio_market_state"]["window"]["mode"])

@@ -8,11 +8,26 @@ internal static class ClipboardCopyService
     private const int ClipboardCannotOpen = unchecked((int)0x800401D0);
     private static readonly TimeSpan[] RetryDelays =
     [
-        TimeSpan.FromMilliseconds(25),
         TimeSpan.FromMilliseconds(50),
         TimeSpan.FromMilliseconds(100),
         TimeSpan.FromMilliseconds(200),
         TimeSpan.FromMilliseconds(400),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(500),
     ];
 
     internal static Task CopyTextAsync(string text) =>

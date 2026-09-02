@@ -26,7 +26,25 @@ public sealed class ClipboardCopyServiceTests
             });
 
         Assert.Equal(3, attempts);
-        Assert.Equal([TimeSpan.FromMilliseconds(25), TimeSpan.FromMilliseconds(50)], delays);
+        Assert.Equal([TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100)], delays);
+    }
+
+    [Fact]
+    public async Task RecoversWhenClipboardContentionOutlastsTheOriginalRetryWindow()
+    {
+        var attempts = 0;
+
+        await ClipboardCopyService.CopyTextAsync(
+            "message",
+            _ =>
+            {
+                attempts++;
+                if (attempts <= 10)
+                    throw Marshal.GetExceptionForHR(unchecked((int)0x800401D0))!;
+            },
+            _ => Task.CompletedTask);
+
+        Assert.Equal(11, attempts);
     }
 
     [Fact]
@@ -65,7 +83,7 @@ public sealed class ClipboardCopyServiceTests
             }));
 
         Assert.Equal(unchecked((int)0x800401D0), exception.HResult);
-        Assert.Equal(6, attempts);
-        Assert.Equal(5, delays);
+        Assert.Equal(21, attempts);
+        Assert.Equal(20, delays);
     }
 }

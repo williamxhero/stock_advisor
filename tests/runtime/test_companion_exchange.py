@@ -4,8 +4,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from ai_trading_companion.__main__ import consume
+from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.exchange import LocalExchange
+from ai_trading_companion.memory_port import InMemoryMemoryAdapter
+from ai_trading_companion.portfolio import PortfolioService
+from ai_trading_companion.store import CompanionStore
 
 
 class CompanionExchangeTests(unittest.TestCase):
@@ -47,6 +53,60 @@ class CompanionExchangeTests(unittest.TestCase):
             payload = json.loads(dead_letter.read_text(encoding="utf-8"))
             self.assertEqual("cycle not found", payload["error"])
             self.assertEqual(received, payload["received"])
+
+    def test_acknowledged_chat_failure_does_not_reject_twice_or_strand_later_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = CompanionStore(root / "runtime.sqlite3")
+            memory = InMemoryMemoryAdapter()
+            engine = CompanionEngine(store, memory=memory, memory_space_id="test-space")
+            portfolio = PortfolioService(root, store)
+            exchange = LocalExchange(root / "exchange")
+            cycle = store.ensure_daily_conversation("2026-09-03")
+            store.stage_message(cycle["cycle_id"], "please analyse my holdings", "conversation", message_id="message-1")
+            commit = {
+                "contract": "companion-user-command/v1",
+                "command_id": "commit-1",
+                "cycle_id": cycle["cycle_id"],
+                "type": "commit_conversation_batch",
+            }
+            projection = {
+                "contract": "companion-user-command/v1",
+                "command_id": "projection-2",
+                "cycle_id": cycle["cycle_id"],
+                "type": "request_projection",
+            }
+            exchange.send("to-runtime", "01-commit", commit)
+            exchange.send("to-runtime", "02-projection", projection)
+
+            with (
+                patch("ai_trading_companion.__main__.run_chat", side_effect=TimeoutError("chat deadline reached")) as run_chat,
+                patch("ai_trading_companion.__main__.flush", return_value=0),
+            ):
+                results = consume(engine, store, exchange, portfolio, True)
+
+            processed = {path.name for path in (exchange.root / "to-runtime" / "processed").glob("*.json")}
+            self.assertEqual({"01-commit.json", "02-projection.json"}, processed)
+            self.assertEqual([], list((exchange.root / "to-runtime" / "processing").glob("*.json")))
+            self.assertEqual(2, len(results))
+            self.assertEqual("chat deadline reached", results[0]["error"])
+            pending = store.pending_message_batches(cycle["cycle_id"], "conversation")
+            self.assertEqual(1, len(pending))
+            self.assertEqual("pending", pending[0]["state"])
+            self.assertEqual(pending[0]["batch_id"], store.receipt("commit-1", commit)["committed_batch_id"])
+            self.assertTrue(any(event["event_type"] == "chat_research.failed" for event in store.pending_events()))
+            self.assertEqual(pending[0]["batch_id"], run_chat.call_args.args[4])
+
+            exchange.send("to-runtime", "03-retry", commit)
+            with (
+                patch("ai_trading_companion.__main__.run_chat", return_value={"state": "recovered"}) as retried_chat,
+                patch("ai_trading_companion.__main__.flush", return_value=0),
+            ):
+                retry_results = consume(engine, store, exchange, portfolio, True)
+
+            self.assertEqual([{"state": "recovered"}], retry_results)
+            self.assertEqual(pending[0]["batch_id"], retried_chat.call_args.args[4])
+            self.assertTrue((exchange.root / "to-runtime" / "processed" / "03-retry.json").exists())
 
 
 if __name__ == "__main__":

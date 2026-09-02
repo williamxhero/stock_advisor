@@ -16,6 +16,25 @@ from ai_trading_companion.tooling import FactRequest, ToolCatalog, ToolRunner
 
 
 class ToolRunnerTests(unittest.TestCase):
+    def test_builtin_upgrade_promotes_only_a_previous_builtin_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            previous = root / "generic_web_search" / "current.json"
+            previous.parent.mkdir(parents=True)
+            previous.write_text(json.dumps({
+                "contract": "ai-trading-tool-current/v1", "version": "1.1.0",
+            }), encoding="utf-8")
+            custom = root / "generic_web_read" / "current.json"
+            custom.parent.mkdir(parents=True)
+            custom.write_text(json.dumps({
+                "contract": "ai-trading-tool-current/v1", "version": "custom-1",
+            }), encoding="utf-8")
+
+            ensure_builtin_tools(root)
+
+            self.assertEqual("1.1.3", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
+
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
         version_root = root / capability / "versions" / "1.0.0"
         version_root.mkdir(parents=True)
@@ -368,6 +387,43 @@ class ToolRunnerTests(unittest.TestCase):
             self.assertFalse(result.succeeded)
             self.assertEqual("tool_access_restricted", result.error_code)
 
+    def test_builtin_web_search_uses_searxng_json_results(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps({"results": [{
+                    "url": "https://example.test/market-news",
+                    "title": "Market <b>news</b>",
+                    "content": "Policy &amp; risk update",
+                }]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "generic_web_search", "2026-09-01T01:30:00Z", 3.0,
+                    {"query": "A-share policy \udcb4 risk", "base_url": f"http://127.0.0.1:{server.server_port}"},
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("https://example.test/market-news", result.data["results"][0]["url"])
+                self.assertEqual("Market news", result.data["results"][0]["title"])
+                self.assertEqual("Policy & risk update", result.data["results"][0]["snippet"])
+                self.assertNotEqual("2026-09-01T01:30:00Z", result.fact_as_of)
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_browser_capture_executes_public_page_javascript_in_an_ephemeral_browser(self) -> None:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
@@ -662,6 +718,45 @@ class ToolRunnerTests(unittest.TestCase):
                 self.assertEqual(["000001", "399001", "399006"], [item["symbol"] for item in snapshot.data["indices"]])
                 self.assertTrue(breadth.succeeded, breadth.error_code)
                 self.assertEqual(1, breadth.data["breadth"]["down"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_intraday_equity_quote_uses_the_last_minute_not_later_than_the_freeze(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/quote"):
+                    body = b'v_sh600000="1~Test~600000~9.20~9.00~~~~~~~~~~~~20260901094800";'
+                    content_type = "text/plain; charset=utf-8"
+                else:
+                    body = json.dumps({"data": {"sh600000": {"data": {"data": ["0945 9.10", "0948 9.20"]}}}}).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_equity_quote_batch", "2026-09-01T01:45:00Z", 4.0,
+                    {"symbols": ["600000"], "tencent_quote_url": base + "/quote?q=", "tencent_minute_url": base + "/minute?code="},
+                    finality="intraday",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual(9.10, result.data["quotes"][0]["price"])
+                self.assertEqual("2026-09-01T01:45:00Z", result.data["quotes"][0]["quote_at"])
+                self.assertLessEqual(result.fact_as_of, "2026-09-01T01:45:00Z")
             finally:
                 server.shutdown()
                 server.server_close()

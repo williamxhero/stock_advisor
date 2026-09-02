@@ -163,6 +163,11 @@ def explicit_format_requested(text: str) -> bool:
 def repair_message_draft(text: str, problems: tuple[str, ...]) -> str:
     """Repair invisible scaffolding only; never invent judgment content."""
     repaired = str(text or "").replace("\u200b", "").replace("\ufeff", "")
+    if "internal_token" in problems:
+        repaired = "\n".join(
+            line for line in repaired.splitlines()
+            if not _INTERNAL_TOKEN.search(_normalized(line))
+        )
     if "unknown_machine_field" in problems or "machine_field" in problems:
         kept = []
         for line in repaired.splitlines():

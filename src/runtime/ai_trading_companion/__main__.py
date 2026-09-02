@@ -399,6 +399,8 @@ def run_gateway(execute: bool = False) -> None:
             run_m1(engine, store, portfolio, cycle_id, execute)
             process_h0_cognition(engine, store, portfolio, cycle_id, execute)
         consume(engine, store, exchange, portfolio, execute)
+        stale_before = iso(datetime.now(timezone.utc) - timedelta(minutes=10))
+        store.recover_stale_cognition_jobs(before=stale_before)
         retry_before = iso(datetime.now(timezone.utc) - timedelta(minutes=1))
         for retry in store.recoverable_conversation_jobs(before=retry_before):
             try:
@@ -490,6 +492,7 @@ def _call_stage(
                 tool_runner,
                 as_of=_evidence_read_cutoff(packet, contract),
                 deadline=lambda: deadline - time.monotonic(),
+                contract=contract,
             )
             market_facts = packet.get("deterministic_market_facts")
             backends = {"gateway": web} if "gateway" in controls.enabled_backends else {}
@@ -983,7 +986,7 @@ def run_m1(
                 judgment, judgment_attempt_id = judgment_checkpoint["output"], judgment_checkpoint["attempt_id"]
             else:
                 judgment_stage = _call_stage(
-                    store, cycle, "m1_judgment", local_packet, "companion-m1-result-v2.schema.json",
+                    store, cycle, "m1_judgment", local_packet, "companion-m1-result-v3.schema.json",
                     search=False, timeout=judgment_timeout, frozen_controls=judgment_controls,
                 )
                 judgment, judgment_attempt_id = judgment_stage.output, judgment_stage.attempt_id
@@ -1600,7 +1603,7 @@ def _frozen_expression_profile(engine: CompanionEngine, cycle: dict[str, Any], a
         return {}
     snapshot = engine.memory.begin_snapshot({
         "memory_space_id": engine.memory_space_id, "as_of": as_of or cycle["as_of"],
-        "stage": "expression", "cycle_id": cycle["cycle_id"],
+        "stage": "chat", "cycle_id": cycle["cycle_id"],
     })
     hits = engine.memory.search(snapshot["snapshot_id"], "user.expression", limit=50)
     profile: dict[str, Any] = {}
@@ -1664,12 +1667,14 @@ def run_unified_cognition(
         if not job["claimed"]:
             return {"cycle_id": cycle_id, "job_id": job["job_id"], "state": job["state"], "receipts": []}
     stream = None
-    expression_profile = _frozen_expression_profile(
-        engine, cycle, max(str(message.get("known_at") or cycle["as_of"]) for message in messages),
-    )
+    expression_profile: dict[str, Any] = {}
     try:
         if cancelled and cancelled():
             raise MemoryResearchError("memory research was terminated by the user")
+        stream = engine.chat_stream_started(cycle_id, batch_ids, reply_kind) if mode != "h0" else None
+        expression_profile = _frozen_expression_profile(
+            engine, cycle, max(str(message.get("known_at") or cycle["as_of"]) for message in messages),
+        )
         if not execute:
             data = cognition.fixture_result(messages, mode)
         elif job["state"] == "completed" and job.get("result_json"):
@@ -1686,7 +1691,6 @@ def run_unified_cognition(
             )
             if expression_profile:
                 memories.append({"kind": "expression_preference", "object": expression_profile})
-            stream = engine.chat_stream_started(cycle_id, batch_ids, reply_kind) if mode != "h0" else None
             request_packet = {
                 "mode": mode,
                 "cognition_prompt": cognition.prompt(cycle, messages, mode, memories),

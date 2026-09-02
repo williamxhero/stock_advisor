@@ -1,0 +1,11 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,
+  "required":["result_version","semantic"],"properties":{
+    "result_version":{"type":"integer","const":3},
+    "semantic":{"type":"object","additionalProperties":false,"required":["summary","direction","qualified","triggers","invalidations","risks","unknowns"],"properties":{
+      "summary":{"type":"string","minLength":1},"direction":{"type":"string","minLength":1},"qualified":{"type":"boolean"},
+      "triggers":{"type":"array","items":{"type":"string"}},"invalidations":{"type":"array","items":{"type":"string"}},
+      "risks":{"type":"array","items":{"type":"string"}},"unknowns":{"type":"array","items":{"type":"string"}}
+    }}
+  }
+}

@@ -179,6 +179,38 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.assertEqual("failed", stream["state"])
         self.assertEqual("", stream["text"])
 
+    def test_pre_stream_memory_failure_closes_job_and_publishes_failure_stream(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-08-27")
+        text = "Do a close review."
+        self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="memory-failure")
+        batch_id, messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        created = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text,
+            conversation["as_of"], {"batch_id": batch_id},
+        )
+        source = next(
+            item for item in self.store.artifacts(conversation["cycle_id"])
+            if item["artifact_id"] == created["artifact_id"]
+        )
+        self.engine.memory.begin_snapshot = Mock(side_effect=RuntimeError("MemoryHub snapshot failed"))
+
+        with self.assertRaisesRegex(RuntimeError, "MemoryHub snapshot failed"):
+            run_unified_cognition(
+                self.engine, self.store, self.portfolio, conversation["cycle_id"], source,
+                messages, [batch_id], True, mode="conversation",
+            )
+
+        with self.store.connection() as connection:
+            job = dict(connection.execute(
+                "SELECT state,completed_at,error FROM companion_cognition_job WHERE cycle_id=?",
+                (conversation["cycle_id"],),
+            ).fetchone())
+        self.assertEqual("failed", job["state"])
+        self.assertIsNotNone(job["completed_at"])
+        self.assertIn("MemoryHub snapshot failed", job["error"])
+        stream = self.store.stream_messages(conversation["cycle_id"])[0]
+        self.assertEqual("failed", stream["state"])
+
     @unittest.skip("superseded by MemoryHub adaptive retrieval contract")
     def test_relevant_memory_keeps_matching_and_necessary_facts_but_excludes_unrelated(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-08-27")
@@ -243,6 +275,9 @@ class UnifiedCognitionTests(unittest.TestCase):
             ).fetchone()[0]
             self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM companion_cycle WHERE trigger='manual_chat'").fetchone()[0])
         self.assertNotIn("reply_markdown", persisted)
+        snapshot_stages = {snapshot["stage"] for snapshot in self.memory._snapshots.values()}
+        self.assertIn("chat", snapshot_stages)
+        self.assertNotIn("expression", snapshot_stages)
         published = next(event for event in self.store.pending_events() if event["event_type"] == "chat.ready")
         payload = json.loads(published["payload_json"])
         self.assertEqual("companion-published-message/v2", payload["message"]["contract"])

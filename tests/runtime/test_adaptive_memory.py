@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -44,6 +45,86 @@ class _RecordingMemory(InMemoryMemoryAdapter):
 
 
 class AdaptiveMemoryResearchTests(unittest.TestCase):
+    def test_action_budget_returns_collected_context_without_an_unbounded_model_loop(self) -> None:
+        memory = _RecordingMemory()
+        memory.append(_episode("test-space", "prior", "close evidence", "2026-09-01T07:00:00Z"))
+
+        result = AdaptiveMemoryResearch(
+            memory, "test-space", lambda _state: {"operation": "search", "query": "close", "episode_id": None},
+            max_actions=2,
+        ).collect(
+            "cycle-1", [{"message_id": "message-1", "body_text": "close", "known_at": "2026-09-01T07:20:00Z"}],
+            deadline=time.monotonic() + 5,
+        )
+
+        self.assertEqual("budget_exhausted", result.actions[-1]["state"])
+        self.assertEqual(1, len(result.context))
+        self.assertEqual(1, memory.operations.count(("search", "close")))
+
+    def test_invalid_external_decision_is_returned_to_the_loop_for_correction(self) -> None:
+        memory = _RecordingMemory()
+        decisions = iter([
+            {"version": 1, "operation": "markethub_quote", "source_reference": {}},
+            {"version": 1, "operation": "complete", "reason": "use available evidence"},
+        ])
+        observations: list[dict | None] = []
+
+        def decide(state: dict) -> dict:
+            observations.append(state["last_observation"])
+            return next(decisions)
+
+        result = AdaptiveMemoryResearch(memory, "test-space", decide).collect(
+            "cycle-1", [{"message_id": "message-1", "body_text": "close", "known_at": "2026-09-01T07:20:00Z"}],
+            deadline=time.monotonic() + 5,
+        )
+
+        self.assertEqual("rejected_invalid", observations[1]["state"])
+        self.assertIn("source_reference", observations[1]["detail"])
+        self.assertEqual("complete", result.actions[-1]["operation"])
+
+    def test_credential_shaped_source_reference_is_rejected_without_echoing_it(self) -> None:
+        memory = _RecordingMemory()
+        decisions = iter([
+            {"version": 1, "operation": "markethub_quote", "source_reference": {
+                "source_system": "markethub", "token": "secret=abcdefghijklmnopqrstuvwx",
+            }},
+            {"version": 1, "operation": "complete", "reason": "stop"},
+        ])
+        observations: list[dict | None] = []
+
+        def decide(state: dict) -> dict:
+            observations.append(state["last_observation"])
+            return next(decisions)
+
+        AdaptiveMemoryResearch(memory, "test-space", decide).collect(
+            "cycle-1", [{"message_id": "message-1", "body_text": "close", "known_at": "2026-09-01T07:20:00Z"}],
+            deadline=time.monotonic() + 5,
+        )
+
+        self.assertEqual("rejected_invalid", observations[1]["state"])
+        self.assertEqual("source reference contains credential-shaped fields", observations[1]["detail"])
+
+    def test_external_gateway_failure_becomes_an_observation_instead_of_aborting_chat(self) -> None:
+        memory = _RecordingMemory()
+        decisions = iter([
+            {"version": 1, "operation": "web_read", "url": "https://example.test/close"},
+            {"version": 1, "operation": "complete", "reason": "continue with available evidence"},
+        ])
+
+        def unavailable(_action: dict, _snapshot: dict) -> list[dict]:
+            raise RuntimeError("gateway returned malformed tool data")
+
+        result = AdaptiveMemoryResearch(
+            memory, "test-space", lambda _state: next(decisions), discover_external=unavailable,
+        ).collect(
+            "cycle-1", [{"message_id": "message-1", "body_text": "盘后总结", "known_at": "2026-09-01T07:00:00Z"}],
+            deadline=time.monotonic() + 5,
+        )
+
+        self.assertEqual("failed", result.actions[0]["state"])
+        self.assertEqual("complete", result.actions[1]["operation"])
+        self.assertEqual((), result.context)
+
     def test_ai_can_search_expand_and_stop_on_one_frozen_snapshot_without_repeating_expand(self) -> None:
         memory = _RecordingMemory()
         memory.append(_episode("test-space", "prior", "semiconductor drawdown lesson", "2026-08-01T00:00:00Z"))

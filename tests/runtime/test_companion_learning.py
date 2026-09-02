@@ -228,6 +228,19 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertFalse(conflicting["passed"])
         self.assertIn("judgment_semantic_conflicts_with_snapshot", conflicting["problems"])
 
+    def test_v3_m1_derives_the_immutable_snapshot_from_one_semantic_payload(self):
+        semantic = {
+            "summary": "证据支持谨慎看多。", "direction": "bullish", "qualified": True,
+            "triggers": ["量价同步转强"], "invalidations": ["放量跌破"],
+            "risks": ["冲高回落"], "unknowns": ["扩散持续性"],
+        }
+
+        accepted = CognitiveRouter().verify("m1_judgment", {"task_key": "daily.review.1520"}, {
+            "result_version": 3, "semantic": semantic,
+        })
+
+        self.assertTrue(accepted["passed"], accepted["problems"])
+
     def test_packet_and_verifier_reject_a_false_non_trading_day_m0(self):
         class TradingDayCalendar:
             @staticmethod

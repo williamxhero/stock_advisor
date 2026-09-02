@@ -1180,6 +1180,20 @@ class CompanionStore:
             raise ValueError("unknown cognition job")
         return {**dict(row), "claimed": claimed.rowcount == 1}
 
+    def recover_stale_cognition_jobs(self, *, before: str) -> list[dict[str, Any]]:
+        """Expire abandoned cognition leases so their pending batches can retry."""
+        completed_at = now()
+        error = "cognition lease expired before completion"
+        with self.connection() as c:
+            rows = [dict(row) for row in c.execute(
+                """UPDATE companion_cognition_job
+                     SET state='failed',completed_at=?,error=?
+                   WHERE state='running' AND claimed_at IS NOT NULL AND claimed_at<=?
+                   RETURNING *""",
+                (completed_at, error, before),
+            )]
+        return rows
+
     def action_receipt(self, action_id: str) -> dict[str, Any] | None:
         with self.connection() as c:
             row = c.execute("SELECT * FROM companion_action_receipt WHERE action_id=?", (action_id,)).fetchone()
@@ -1284,7 +1298,8 @@ class CompanionStore:
                      WHERE j.mode='conversation' AND j.state='failed'
                        AND j.attempt_count<? AND j.completed_at<=?
                        AND (j.error LIKE '%broker_unavailable%' OR j.error LIKE '%Broker HTTP 503%'
-                            OR j.error LIKE '%connection%' OR j.error LIKE '%timed out%')
+                            OR j.error LIKE '%connection%' OR j.error LIKE '%timed out%'
+                            OR j.error LIKE '%lease expired%')
                      ORDER BY j.completed_at,j.job_id,b.submitted_at,b.batch_id
                      LIMIT ?""",
                 (max_attempts, before, limit),

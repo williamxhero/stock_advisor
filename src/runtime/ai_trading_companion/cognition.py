@@ -198,7 +198,7 @@ class UnifiedCognition:
         snapshot = self.engine.memory.begin_snapshot({
             "memory_space_id": self.engine.memory_space_id,
             "as_of": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "stage": "expression_preference_write", "cycle_id": "preference-write",
+            "stage": "chat", "cycle_id": "preference-write",
         })
         hits = self.engine.memory.search(snapshot["snapshot_id"], "user.expression", limit=50)
         rows = [self.engine.memory.expand(snapshot["snapshot_id"], hit["episode_id"]) for hit in hits]

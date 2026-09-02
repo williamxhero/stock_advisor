@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from ai_trading_companion.broker_client import BrokerError
 from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, WebAccessGatewayBackend
 from ai_trading_companion.tooling import EvidenceResolution, FactRequest, ToolCatalog, ToolRunner
 
@@ -17,9 +18,108 @@ def row(operation: str, *, query: str | None = None, url: str | None = None) -> 
     return {"requirement_key": "market", "backend": "gateway", "operation": operation, "arguments": {"query": query, "categories": "news", "url": url, "symbol": None, "render": "auto", "session_id": None, "actions": None}, "fallback_backends": []}
 
 class LocalResearchTests(unittest.TestCase):
+    def test_invalid_broker_plan_uses_the_existing_bounded_repair_round(self) -> None:
+        calls = 0
+        received_gaps: list[list[str]] = []
+
+        def planner(_packet: dict, gaps: list[str], _round_number: int) -> dict:
+            nonlocal calls
+            calls += 1
+            received_gaps.append(list(gaps))
+            if calls == 1:
+                raise BrokerError(
+                    "invalid plan",
+                    category="broker_output_invalid",
+                    verifier={
+                        "passed": False,
+                        "business": {
+                            "passed": False,
+                            "problems": ["research_plan_missing_requirement:market"],
+                        },
+                    },
+                )
+            return {"version": 1, "operations": [row("web_read", url="https://example.test/close")]}
+
+        backend = lambda *_: {"results": [{
+            "url": "https://example.test/close", "title": "close", "excerpt_text": "close",
+            "fact_as_of": CONTRACT["as_of"], "primary": True,
+        }]}
+        result = LocalResearchChain(
+            planner, ReadOnlyResearchExecutor({"gateway": backend}), max_repairs=1,
+        ).run({"as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="repair-plan")
+
+        self.assertTrue(result.qualified)
+        self.assertEqual(2, calls)
+        self.assertEqual(
+            ["research_plan_missing_requirement:market"],
+            received_gaps[1],
+        )
+
     def test_planner_requires_an_explicit_effort_decision(self) -> None:
         with self.assertRaises(TypeError):
             BrokerResearchPlanner(mock.Mock(), deadline=lambda: 123.0)
+
+    def test_planner_repair_reads_existing_discoveries_without_another_broker_call(self) -> None:
+        broker = mock.Mock()
+        planner = BrokerResearchPlanner(
+            broker, intellect="smart", effort="medium", deadline=lambda: 123.0,
+        )
+        packet = {
+            "as_of": CONTRACT["as_of"],
+            "evidence_contract": {
+                **CONTRACT,
+                "requirements": [
+                    *CONTRACT["requirements"],
+                    {
+                        "key": "events",
+                        "blocking": True,
+                        "allowed_coverage": ["covered", "checked_no_change"],
+                        "window": {"mode": "after_start_to_end", "start": "2026-08-26T07:00:00Z", "end": CONTRACT["as_of"]},
+                    },
+                ],
+            },
+            "research_discoveries": [
+                {"requirement_key": "events", "url": f"https://example.test/event-{index}"}
+                for index in range(6)
+            ],
+        }
+
+        plan = planner(packet, ["events"], 1)
+
+        broker.invoke.assert_not_called()
+        self.assertEqual(4, len(plan["operations"]))
+        self.assertEqual({"web_read"}, {item["operation"] for item in plan["operations"]})
+        self.assertEqual({"events"}, {item["requirement_key"] for item in plan["operations"]})
+
+    def test_planner_repair_never_reads_an_attempted_candidate_url_again(self) -> None:
+        broker = mock.Mock()
+        planner = BrokerResearchPlanner(
+            broker, intellect="smart", effort="medium", deadline=lambda: 123.0,
+        )
+        attempted = "https://example.test/already-read"
+        packet = {
+            "as_of": CONTRACT["as_of"],
+            "evidence_contract": {
+                **CONTRACT,
+                "requirements": [
+                    *CONTRACT["requirements"],
+                    {"key": "events", "blocking": True},
+                ],
+            },
+            "research_discoveries": [
+                {"requirement_key": "events", "url": attempted},
+                {"requirement_key": "events", "url": "https://example.test/untried"},
+            ],
+            "attempted_research_urls": [attempted],
+        }
+
+        plan = planner(packet, ["events"], 1)
+
+        broker.invoke.assert_not_called()
+        self.assertEqual(
+            ["https://example.test/untried"],
+            [item["arguments"]["url"] for item in plan["operations"]],
+        )
 
     def test_browser_action_schema_is_strict_and_defines_array_items(self) -> None:
         actions = RESEARCH_PLAN_SCHEMA["properties"]["operations"]["items"]["properties"]["arguments"]["properties"]["actions"]
@@ -112,6 +212,20 @@ class LocalResearchTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertIn("research_plan_missing_requirement:events", result["problems"])
 
+    def test_plan_verifier_rejects_operations_with_missing_required_arguments(self) -> None:
+        broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})
+        planner = BrokerResearchPlanner(broker, intellect="smart", effort="medium", deadline=lambda: 123.0)
+        planner({"as_of": CONTRACT["as_of"], "evidence_contract": CONTRACT}, [], 0)
+        request = broker.invoke.call_args.args[0]
+
+        result = request.verifier({"version": 1, "operations": [row("web_search", query="")]})
+
+        self.assertFalse(result["passed"])
+        self.assertIn(
+            "research_plan_operation_argument_missing:market:web_search:query",
+            result["problems"],
+        )
+
     def test_plan_verifier_rejects_a_backend_that_is_not_actually_available(self) -> None:
         broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})
         planner = BrokerResearchPlanner(broker, intellect="smart", effort="medium", deadline=lambda: 123.0)
@@ -149,10 +263,11 @@ class LocalResearchTests(unittest.TestCase):
                 "url": "https://example.test/story", "text": "verified source text",
             }, "artifact:sha256:" + "b" * 64, None, ("tool_result_schema_valid",)),
         ]
-        backend = ToolCatalogResearchBackend(runner, as_of=CONTRACT["as_of"], deadline=lambda: 30.0)
+        backend = ToolCatalogResearchBackend(runner, as_of="2026-08-27T08:00:00Z", deadline=lambda: 30.0,
+                                             contract=CONTRACT)
 
-        found = backend("web_search", row("web_search", query="close") ["arguments"])
-        read = backend("web_read", row("web_read", url="https://example.test/story")["arguments"])
+        found = backend("web_search", {**row("web_search", query="close")["arguments"], "_requirement_key": "market"})
+        read = backend("web_read", {**row("web_read", url="https://example.test/story")["arguments"], "_requirement_key": "market"})
 
         self.assertEqual("https://example.test/story", found["results"][0]["url"])
         self.assertEqual("verified source text", read["results"][0]["excerpt_text"])
@@ -172,15 +287,13 @@ class LocalResearchTests(unittest.TestCase):
         }
         runner = mock.Mock()
         runner.resolve_with_fallback.return_value = EvidenceResolution(
-            True, "cn_market_snapshot", "1.1.0", "2026-09-01T06:29:00Z", "2026-09-01T06:30:01Z", {
-                "source": "tencent_quote+eastmoney_breadth",
-                "source_urls": ["https://qt.gtimg.cn/q=sh000001", "https://push2delay.eastmoney.com/api/qt/clist/get"],
+            True, "cn_market_index_batch", "1.1.3", "2026-09-01T06:29:00Z", "2026-09-01T06:30:01Z", {
+                "source": "tencent_minute",
+                "source_urls": ["https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sh000001"],
                 "source_evidence": [
-                    {"url": "https://qt.gtimg.cn/q=sh000001", "fact_as_of": "2026-09-01T06:29:00Z", "data": {"indices": [{"symbol": "000001", "price": 3500}]}},
-                    {"url": "https://push2delay.eastmoney.com/api/qt/clist/get", "fact_as_of": "2026-09-01T06:29:00Z", "data": {"breadth": {"up": 2000, "down": 1000, "flat": 50}}},
+                    {"url": "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sh000001", "fact_as_of": "2026-09-01T06:29:00Z", "data": {"indices": [{"symbol": "000001", "price": 3500}]}},
                 ],
                 "indices": [{"symbol": "000001", "price": 3500}],
-                "breadth": {"up": 2000, "down": 1000, "flat": 50},
                 "finality": "intraday",
             }, "artifact:sha256:" + "c" * 64, None, ("tool_result_schema_valid",), attempts=("default:succeeded",),
         )
@@ -197,13 +310,41 @@ class LocalResearchTests(unittest.TestCase):
 
         self.assertTrue(result.qualified, result.verifier["problems"])
         request = runner.resolve_with_fallback.call_args.args[0]
-        self.assertEqual("cn_market_snapshot", request.capability)
+        self.assertEqual("cn_market_index_batch", request.capability)
         self.assertEqual("intraday", request.finality)
         self.assertEqual("2026-09-01T06:30:00Z", request.required_at)
-        self.assertEqual(2, len(result.evidence["sources"]))
+        self.assertEqual(1, len(result.evidence["sources"]))
         self.assertIn("indices", result.evidence["sources"][0]["excerpt"])
-        self.assertNotIn("breadth", result.evidence["sources"][0]["excerpt"])
-        self.assertIn("breadth", result.evidence["sources"][1]["excerpt"])
+
+    def test_holding_snapshot_uses_only_contract_frozen_symbols(self) -> None:
+        contract = {
+            "version": 4, "as_of": "2026-09-01T01:45:00Z",
+            "requirements": [{
+                "key": "portfolio_market_state", "blocking": True,
+                "allowed_coverage": ["covered"], "required_entities": ["600487", "603861"],
+                "window": {"mode": "after_start_to_end", "start": "2026-09-01T01:30:00Z", "end": "2026-09-01T01:45:00Z"},
+            }],
+        }
+        runner = mock.Mock()
+        runner.resolve_with_fallback.return_value = EvidenceResolution(
+            True, "cn_equity_quote_batch", "1.1.3", "2026-09-01T01:45:00Z", "2026-09-01T01:45:01Z", {
+                "source": "tencent_minute", "finality": "intraday",
+                "source_evidence": [{
+                    "url": "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sh600487",
+                    "fact_as_of": "2026-09-01T01:45:00Z",
+                    "data": {"quotes": [{"symbol": "600487", "price": 66.06, "previous_close": 67.34, "status": "trading"}]},
+                }],
+            }, "artifact:sha256:" + "d" * 64, None, (), attempts=("default:succeeded",),
+        )
+
+        ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0)("holding_snapshot", {
+            "_requirement_key": "portfolio_market_state", "symbol": "000001",
+        })
+
+        request = runner.resolve_with_fallback.call_args.args[0]
+        self.assertEqual("cn_equity_quote_batch", request.capability)
+        self.assertEqual(["600487", "603861"], request.inputs["symbols"])
+        self.assertEqual("2026-09-01T01:45:00Z", request.required_at)
 
     def test_post_close_research_uses_tool_fallback_then_freezes_qualified_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -349,9 +490,8 @@ print(json.dumps({'contract':'ai-trading-tool-result/v1','fact_as_of':'2026-08-2
         }]}
         plan = {"version": 1, "operations": [row("web_read", url="https://example.test/2026-08-27")]}
         result = LocalResearchChain(lambda *_: plan, ReadOnlyResearchExecutor({"gateway": lambda *_: read}), max_repairs=0).run({"as_of": contract["as_of"]}, contract, attempt_id="x")
-        self.assertTrue(result.qualified, result.verifier["problems"])
-        self.assertEqual(CONTRACT["as_of"], result.evidence["sources"][0]["fact_as_of"])
-        self.assertEqual("2026-08-27T07:18:00Z", result.evidence["sources"][0]["published_at"])
+        self.assertFalse(result.qualified)
+        self.assertIn("blocking_requirement_missing:market", result.verifier["problems"])
 
     def test_web_excerpt_with_credential_shape_is_rejected_at_acquisition_boundary(self) -> None:
         unsafe = {"results": [{

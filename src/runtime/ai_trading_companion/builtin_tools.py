@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.0"
+_VERSION = "1.1.3"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -42,10 +43,7 @@ def ensure_builtin_tools(root: Path) -> None:
             }, ensure_ascii=False, sort_keys=True), encoding="utf-8")
         current = root / capability / "current.json"
         current.parent.mkdir(parents=True, exist_ok=True)
-        if not current.exists():
-            current.write_text(json.dumps({
-                "contract": "ai-trading-tool-current/v1", "version": _VERSION,
-            }, sort_keys=True), encoding="utf-8")
+        _promote_builtin_current(current)
     for capability, adapters in _ADAPTERS.items():
         for adapter, mode in adapters.items():
             version_root = root / capability / "adapters" / adapter / "versions" / _VERSION
@@ -59,11 +57,43 @@ def ensure_builtin_tools(root: Path) -> None:
                     "command": [sys.executable, "tool.py", mode],
                 }, ensure_ascii=False, sort_keys=True), encoding="utf-8")
         routing = root / capability / "routing.json"
-        if not routing.exists():
+        if _routing_is_managed_builtin(routing, set(adapters)):
             routing.write_text(json.dumps({
                 "contract": "ai-trading-tool-routing/v1",
                 "candidates": [{"adapter": adapter, "version": _VERSION} for adapter in adapters],
             }, sort_keys=True), encoding="utf-8")
+
+
+def _promote_builtin_current(current: Path) -> None:
+    try:
+        selected = json.loads(current.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        selected = None
+    if current.exists() and not (
+        isinstance(selected, dict)
+        and selected.get("contract") == "ai-trading-tool-current/v1"
+        and selected.get("version") in _PREVIOUS_BUILTIN_VERSIONS
+    ):
+        return
+    current.write_text(json.dumps({
+        "contract": "ai-trading-tool-current/v1", "version": _VERSION,
+    }, sort_keys=True), encoding="utf-8")
+
+
+def _routing_is_managed_builtin(routing: Path, adapters: set[str]) -> bool:
+    try:
+        selected = json.loads(routing.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return True
+    except json.JSONDecodeError:
+        return False
+    candidates = selected.get("candidates") if isinstance(selected, dict) else None
+    return bool(
+        selected.get("contract") == "ai-trading-tool-routing/v1"
+        and isinstance(candidates, list)
+        and {str(row.get("adapter") or "") for row in candidates if isinstance(row, dict)} == adapters
+        and all(row.get("version") in _PREVIOUS_BUILTIN_VERSIONS for row in candidates if isinstance(row, dict))
+    )
 
 
 _CLI = r'''from __future__ import annotations
@@ -89,6 +119,10 @@ sys.stderr.reconfigure(encoding="utf-8")
 def fail(code: int, message: str) -> None:
     print(message, file=sys.stderr)
     raise SystemExit(code)
+
+
+def clean_text(value: object) -> str:
+    return str(value or "").encode("utf-8", errors="replace").decode("utf-8")
 
 
 def safe_url(value: object) -> str:
@@ -309,6 +343,80 @@ def index_payload(body: str, symbols: list[dict[str, str]], finality: str) -> tu
     return {"indices": indices, "finality": finality, "source": "tencent_quote"}, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def minute_rows(value: object) -> list[str]:
+    """Tencent nests minute rows differently for equities and indices."""
+    if isinstance(value, str):
+        return [value] if re.match(r"^\d{4}\s+[-+]?\d", value.strip()) else []
+    if isinstance(value, list):
+        return [row for item in value for row in minute_rows(item)]
+    if isinstance(value, dict):
+        return [row for item in value.values() for row in minute_rows(item)]
+    return []
+
+
+def frozen_minute(symbol: dict[str, str], required_at: str, minute_endpoint: object = None) -> tuple[float, str, str]:
+    try:
+        cutoff = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(dt.timezone(dt.timedelta(hours=8)))
+    except ValueError:
+        fail(64, "required_at must be an ISO timestamp")
+    base = str(minute_endpoint or "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=")
+    source_url, body = fetch(base.replace("{symbol}", symbol["vendor_symbol"]) if "{symbol}" in base else base + symbol["vendor_symbol"])
+    try:
+        rows = minute_rows(json.loads(body))
+    except json.JSONDecodeError:
+        fail(75, "minute response is not JSON")
+    selected: tuple[dt.datetime, float] | None = None
+    for row in rows:
+        fields = row.strip().split()
+        if len(fields) < 2 or not re.fullmatch(r"\d{4}", fields[0]):
+            continue
+        try:
+            moment = dt.datetime.combine(cutoff.date(), dt.time(int(fields[0][:2]), int(fields[0][2:])), cutoff.tzinfo)
+            price = float(fields[1])
+        except ValueError:
+            continue
+        if price > 0 and moment <= cutoff and (selected is None or moment > selected[0]):
+            selected = (moment, price)
+    if selected is None:
+        fail(75, "minute response has no quote at or before required_at")
+    return selected[1], selected[0].astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"), source_url
+
+
+def frozen_minute_payload(
+    spot: dict[str, object], symbols: list[dict[str, str]], required_at: str, kind: str, minute_endpoint: object = None,
+) -> tuple[dict[str, object], str]:
+    field = "quotes" if kind == "equity" else "indices"
+    records = {str(item.get("symbol") or ""): dict(item) for item in spot.get(field, []) if isinstance(item, dict)}
+    frozen: list[dict[str, object]] = []
+    source_evidence: list[dict[str, object]] = []
+    latest: dt.datetime | None = None
+    for symbol in symbols:
+        item = records.get(symbol["symbol"])
+        if item is None:
+            fail(75, "spot quote is missing a requested symbol")
+        price, quote_at, source_url = frozen_minute(symbol, required_at, minute_endpoint)
+        item.update({
+            "price": price, "quote_at": quote_at,
+            "trading_date": dt.datetime.fromisoformat(quote_at.replace("Z", "+00:00")).astimezone(dt.timezone(dt.timedelta(hours=8))).date().isoformat(),
+            "status": "trading", "source": "tencent_minute",
+        })
+        previous_close = float(item.get("previous_close") or 0)
+        if previous_close <= 0:
+            fail(75, "minute quote has no valid previous close")
+        item["change"] = round(price - previous_close, 4)
+        item["change_percent"] = round((price - previous_close) / previous_close * 100, 4)
+        frozen.append(item)
+        moment = dt.datetime.fromisoformat(quote_at.replace("Z", "+00:00"))
+        latest = max(latest, moment) if latest else moment
+        source_evidence.append({"url": source_url, "fact_as_of": quote_at, "data": {field: [item], "finality": "intraday"}})
+    if latest is None:
+        fail(75, "minute response has no usable quotes")
+    return {
+        field: frozen, "finality": "intraday", "source": "tencent_minute",
+        "source_urls": [str(item["url"]) for item in source_evidence], "source_evidence": source_evidence,
+    }, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def market_snapshot_payload(body: str, finality: str) -> tuple[dict[str, object], str]:
     try:
         snapshot = json.loads(body)
@@ -461,6 +569,8 @@ def main() -> None:
         separator = "" if quote_url.endswith(("=", ",")) else "&q="
         _url, body = fetch(quote_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
         payload, fact_as_of = quote_payload(body, normalized, finality)
+        if finality == "intraday":
+            payload, fact_as_of = frozen_minute_payload(payload, normalized, str(request.get("required_at") or ""), "equity", inputs.get("tencent_minute_url"))
         result(payload, fact_as_of=fact_as_of)
         return
     if mode in {"cn_market_index_batch", "cn_market_index_tencent", "cn_market_index_sina"}:
@@ -482,6 +592,8 @@ def main() -> None:
         separator = "" if index_url.endswith(("=", ",")) else "&q="
         _url, body = fetch(index_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
         payload, fact_as_of = index_payload(body, normalized, finality)
+        if finality == "intraday":
+            payload, fact_as_of = frozen_minute_payload(payload, normalized, str(request.get("required_at") or ""), "index", inputs.get("tencent_minute_url"))
         result(payload, fact_as_of=fact_as_of)
         return
     if mode == "cn_market_breadth":
@@ -529,12 +641,30 @@ def main() -> None:
         result({"url": url, **payload})
         return
     if mode == "web_search":
-        query = str(inputs.get("query") or "").strip()
+        query = clean_text(inputs.get("query")).strip()
         if not query:
             fail(64, "query is required")
-        url, page = fetch("https://html.duckduckgo.com/html/?q=" + quote_plus(query))
-        links = re.findall(r'(?is)class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page)
-        result({"url": url, "query": query, "results": [{"url": html.unescape(link), "title": strip_html(title)} for link, title in links[:10]]})
+        base = safe_url(inputs.get("base_url") or "http://yosef-server:8801").rstrip("/")
+        url, body = fetch(base + "/search?q=" + quote_plus(query) + "&format=json")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            fail(75, "search service response is not JSON")
+        rows = payload.get("results") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            fail(75, "search service results are invalid")
+        results = []
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("url"):
+                continue
+            results.append({
+                "url": safe_url(row.get("url")),
+                "title": strip_html(str(row.get("title") or "")),
+                "snippet": strip_html(str(row.get("content") or "")),
+            })
+            if len(results) >= 10:
+                break
+        result({"url": url, "query": query, "results": results})
         return
     url = safe_url(inputs.get("url"))
     if mode == "browser_capture":

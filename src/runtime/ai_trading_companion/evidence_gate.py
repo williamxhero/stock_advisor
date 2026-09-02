@@ -30,7 +30,7 @@ class EvidenceGate:
         *,
         attempt_id: str | None = None,
     ) -> dict[str, Any]:
-        if isinstance(requirements, dict) and requirements.get("version") == 3:
+        if isinstance(requirements, dict) and int(requirements.get("version") or 0) >= 3:
             return _EvidenceGateV3().evaluate(evidence, requirements, observations, expected_as_of, attempt_id)
         problems: list[str] = []
         successful = [item for item in observations if item.get("status") == "succeeded" and item.get("non_empty")]
@@ -317,6 +317,10 @@ class _EvidenceGateV3:
                     observations, key, requirement.get("negative_query_terms") or [], attempt_id,
                 ):
                     problems.append(f"checked_no_change_query_not_matched:{key}"); missing.append(key)
+                elif required_entities and not self._negative_queries_cover_entities(
+                    observations, key, required_entities, requirement.get("negative_query_terms") or [], attempt_id,
+                ):
+                    problems.append(f"checked_no_change_query_missing_entities:{key}"); missing.append(key)
                 continue
             if not refs or len(bound) != len(refs):
                 problems.append(f"blocking_requirement_untraceable:{key}"); missing.append(key); continue
@@ -406,6 +410,21 @@ class _EvidenceGateV3:
             )
             for item in observations
         )
+
+    @staticmethod
+    def _negative_queries_cover_entities(
+        observations: list[dict[str, Any]], requirement_key: str, entities: list[str], terms: list[str], attempt_id: str | None,
+    ) -> bool:
+        queries = [
+            str((item.get("arguments") or {}).get("query") or "").casefold()
+            for item in observations
+            if item.get("operation") == "web_search"
+            and item.get("status") == "succeeded"
+            and (not attempt_id or item.get("attempt_id") == attempt_id)
+            and str((item.get("arguments") or {}).get("requirement_key") or "") == requirement_key
+            and all(str(term).casefold() in str((item.get("arguments") or {}).get("query") or "").casefold() for term in terms)
+        ]
+        return all(any(entity.casefold() in query for query in queries) for entity in entities)
 
     @staticmethod
     def _normalized(evidence: dict[str, Any], sources: dict[str, dict[str, Any]]) -> dict[str, Any]:

@@ -995,6 +995,19 @@ Protocol: OpportunityDiscovery-v1.3
 
         self.assertEqual([cycle["cycle_id"]], [item["cycle_id"] for item in claimed])
 
+    def test_gateway_restart_releases_only_orphaned_worker_capacity(self):
+        cycle = self.engine.start_cycle(
+            "daily.opportunity.0900", "2026-08-25T09:00:00+08:00", "2026-08-25T00:00:00Z",
+            schedule_snapshot={"trigger": {"lead_minutes": 30}},
+        )
+        self.store.claim_scheduled_workers(at=datetime.fromisoformat("2026-08-25T08:30:00+08:00"))
+
+        self.assertEqual([cycle["cycle_id"]], self.store.recover_orphaned_scheduled_workers())
+        self.assertEqual([], self.store.recover_orphaned_scheduled_workers())
+        self.assertEqual([cycle["cycle_id"]], [item["cycle_id"] for item in self.store.claim_scheduled_workers(
+            at=datetime.fromisoformat("2026-08-25T08:30:00+08:00")
+        )])
+
     def test_premarket_cycle_is_prepared_before_0830_without_starting_research(self):
         completed: list[str] = []
         before_lead = datetime(2026, 8, 24, 23, 15, tzinfo=timezone.utc)

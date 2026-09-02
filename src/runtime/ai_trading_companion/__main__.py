@@ -376,6 +376,10 @@ def _gateway_snapshot(engine: CompanionEngine, store: CompanionStore, portfolio:
 def run_gateway(execute: bool = False) -> None:
     """Serve desktop requests without granting the desktop database access."""
     engine, store, exchange, portfolio = runtime()
+    # A hard process stop (for example, an application update) can prevent a
+    # worker's finally block from releasing its durable slot.  At this point a
+    # new Gateway owns no workers yet, so every stored claim is orphaned.
+    store.recover_orphaned_scheduled_workers()
     def command(payload: dict[str, Any]) -> dict[str, Any]:
         contract = payload.get("contract")
         if contract == "schedule-user-command/v1":
@@ -392,9 +396,12 @@ def run_gateway(execute: bool = False) -> None:
         return _gateway_snapshot(engine, store, portfolio, kind, dict(request.query))
     def tick() -> None:
         _prefetch_market_breadth()
-        run_schedules(engine, store, datetime.now(timezone.utc), execute, exchange, portfolio)
+        # A manual analysis is the user's explicit foreground work.  Reserve
+        # and execute it before optional schedule/conversation maintenance so
+        # a maintenance exception cannot leave it indefinitely queued.
         for cycle in store.claim_scheduled_workers(limit=2):
             run_scheduled_cycle(engine, store, exchange, portfolio, cycle["cycle_id"], execute)
+        run_schedules(engine, store, datetime.now(timezone.utc), execute, exchange, portfolio)
         for projection in engine.run_due():
             cycle_id = projection["cycle"]["cycle_id"]
             run_m1(engine, store, portfolio, cycle_id, execute)

@@ -736,6 +736,22 @@ class CompanionStore:
         with self.connection() as c:
             c.execute("DELETE FROM schedule_worker_claim WHERE cycle_id=?", (cycle_id,))
 
+    def recover_orphaned_scheduled_workers(self) -> list[str]:
+        """Release claims owned by a process that ended before its finally block.
+
+        This method is intentionally called only while a new Gateway is
+        starting, before it can claim any work itself.  It does not alter the
+        interrupted cycle or its artifacts; it merely frees worker capacity
+        for later queued cycles.
+        """
+        self.initialize()
+        with self.connection() as c:
+            rows = c.execute("SELECT cycle_id FROM schedule_worker_claim ORDER BY claimed_at").fetchall()
+            cycle_ids = [str(row["cycle_id"]) for row in rows]
+            if cycle_ids:
+                c.execute("DELETE FROM schedule_worker_claim")
+        return cycle_ids
+
     def create_cycle(self, task_key: str, scheduled_for: str, as_of: str, *, schedule_id: str | None = None, schedule_revision: int | None = None, schedule_snapshot: dict[str, Any] | None = None, kind: str = "scheduled", work_start_at: str | None = None) -> dict[str, Any]:
         self.initialize(); cycle_id = str(uuid.uuid4()); at = now()
         with self.connection() as c:

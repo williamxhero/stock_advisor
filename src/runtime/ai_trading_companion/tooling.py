@@ -280,7 +280,10 @@ class ToolRunner:
             )
             try:
                 stdout, stderr = process.communicate(
-                    json.dumps(wire_request, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                    # ASCII escaping keeps malformed provider surrogates inside
+                    # the JSON envelope until the capability can sanitize its
+                    # public text fields deterministically.
+                    json.dumps(wire_request, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
                     timeout=request.deadline_seconds,
                 )
             except subprocess.TimeoutExpired as exc:

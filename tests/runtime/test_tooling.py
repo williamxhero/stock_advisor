@@ -32,7 +32,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.1", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.2", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
 
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
@@ -412,13 +412,14 @@ class ToolRunnerTests(unittest.TestCase):
             try:
                 result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
                     1, "generic_web_search", "2026-09-01T01:30:00Z", 3.0,
-                    {"query": "A-share policy risk", "base_url": f"http://127.0.0.1:{server.server_port}"},
+                    {"query": "A-share policy \udcb4 risk", "base_url": f"http://127.0.0.1:{server.server_port}"},
                 ))
 
                 self.assertTrue(result.succeeded, result.error_code)
                 self.assertEqual("https://example.test/market-news", result.data["results"][0]["url"])
                 self.assertEqual("Market news", result.data["results"][0]["title"])
                 self.assertEqual("Policy & risk update", result.data["results"][0]["snippet"])
+                self.assertEqual("2026-09-01T01:30:00Z", result.fact_as_of)
             finally:
                 server.shutdown()
                 server.server_close()

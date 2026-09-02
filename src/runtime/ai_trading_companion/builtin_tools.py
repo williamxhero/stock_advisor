@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.1"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0"}
+_VERSION = "1.1.2"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -119,6 +119,10 @@ sys.stderr.reconfigure(encoding="utf-8")
 def fail(code: int, message: str) -> None:
     print(message, file=sys.stderr)
     raise SystemExit(code)
+
+
+def clean_text(value: object) -> str:
+    return str(value or "").encode("utf-8", errors="replace").decode("utf-8")
 
 
 def safe_url(value: object) -> str:
@@ -559,7 +563,7 @@ def main() -> None:
         result({"url": url, **payload})
         return
     if mode == "web_search":
-        query = str(inputs.get("query") or "").strip()
+        query = clean_text(inputs.get("query")).strip()
         if not query:
             fail(64, "query is required")
         base = safe_url(inputs.get("base_url") or "http://yosef-server:8801").rstrip("/")
@@ -582,7 +586,7 @@ def main() -> None:
             })
             if len(results) >= 10:
                 break
-        result({"url": url, "query": query, "results": results})
+        result({"url": url, "query": query, "results": results}, fact_as_of=str(request.get("required_at") or ""))
         return
     url = safe_url(inputs.get("url"))
     if mode == "browser_capture":
@@ -598,7 +602,7 @@ def main() -> None:
             fail(75, "response is not JSON")
         result({"url": url, "json": parsed})
     elif mode == "web_read":
-        result({"url": url, "text": strip_html(body)})
+        result({"url": url, "text": strip_html(body)}, fact_as_of=str(request.get("required_at") or ""))
     elif mode == "browser_capture":
         result({"url": url, "capture_mode": "static", "text": strip_html(body)})
     else:

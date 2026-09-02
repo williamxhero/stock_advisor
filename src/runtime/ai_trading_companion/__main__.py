@@ -1073,24 +1073,32 @@ def run_m1(
             },
         )
         raise
-    public_packet = finalize_stage_packet(
-        builder.build(cycle, "m1_research", evidence=prior_evidence, as_of=research_as_of, context=memory_research), research_controls,
-    )
-    checkpoint = store.stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"])
-    if checkpoint:
-        evidence = checkpoint["output"]
-        evidence_attempt_id = checkpoint["attempt_id"]
-    else:
-        evidence = prior_evidence
-        evidence_attempt_id = _reuse_m0_evidence_attempt(store, cycle, public_packet, evidence)
-        store.save_stage_checkpoint(
-            cycle_id, "m1_research", public_packet["sha256"], evidence_attempt_id, evidence,
+    try:
+        public_packet = finalize_stage_packet(
+            builder.build(cycle, "m1_research", evidence=prior_evidence, as_of=research_as_of, context=memory_research), research_controls,
         )
-        store.append_artifact(
-            cycle_id, "m1_evidence", "runtime", json.dumps(evidence, ensure_ascii=False),
-            str(evidence.get("as_of") or research_as_of),
-            {"public_only": True, "attempt_id": evidence_attempt_id, "reused_from": "m0_research"},
+        checkpoint = store.stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"])
+        if checkpoint:
+            evidence = checkpoint["output"]
+            evidence_attempt_id = checkpoint["attempt_id"]
+        else:
+            evidence = prior_evidence
+            evidence_attempt_id = _reuse_m0_evidence_attempt(store, cycle, public_packet, evidence)
+            store.save_stage_checkpoint(
+                cycle_id, "m1_research", public_packet["sha256"], evidence_attempt_id, evidence,
+            )
+            store.append_artifact(
+                cycle_id, "m1_evidence", "runtime", json.dumps(evidence, ensure_ascii=False),
+                str(evidence.get("as_of") or research_as_of),
+                {"public_only": True, "attempt_id": evidence_attempt_id, "reused_from": "m0_research"},
+            )
+    except Exception as exc:
+        details = getattr(exc, "verifier", None)
+        engine.m1_failed(
+            cycle_id, str(exc), retryable=False,
+            details=details if isinstance(details, dict) else None,
         )
+        raise
     verification_feedback: dict[str, Any] | None = None
     for number in range(1, M1_MAX_JUDGMENT_ATTEMPTS + 1):
         try:

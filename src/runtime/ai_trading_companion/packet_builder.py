@@ -65,7 +65,7 @@ class RuntimePacketBuilder:
         memory_cards = self._memory_cards(cycle, stage, packet_as_of, evidence)
         if stage in PUBLIC_STAGES:
             if stage in {"m0_research", "m1_research"}:
-                frozen_contract = cycle.get("evidence_contract_json") if stage == "m0_research" else None
+                frozen_contract = cycle.get("evidence_contract_json")
                 if frozen_contract:
                     packet["evidence_contract"] = json.loads(frozen_contract)
                 else:

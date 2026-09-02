@@ -25,6 +25,7 @@ from ai_trading_companion.publication_registry import published_event_types
 from ai_trading_companion.scheduler import conversation_auto_submit_at, load_schedules, run_daily_schedule, run_periodic_schedule
 from ai_trading_companion.store import CompanionStore
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
+from ai_trading_companion.evidence_gate import EvidenceInsufficient
 from ai_trading_companion.task_profiles import ManualAnalysisProfileResolver
 
 
@@ -410,6 +411,33 @@ Protocol: OpportunityDiscovery-v1.3
         faults = [row for row in self.store.artifacts(self.cycle["cycle_id"]) if row["kind"] == "system_fault"]
         self.assertEqual(1, len(faults))
 
+    def test_m1_evidence_preflight_failure_stops_instead_of_restarting_blindly(self):
+        self.ready()
+        self.store.append_artifact(
+            self.cycle["cycle_id"], "evidence", "runtime",
+            json.dumps({"schema_version": 4, "as_of": iso(self.now), "sources": []}), iso(self.now),
+        )
+        self.engine.command({
+            "command_id": "skip-before-evidence-fault", "cycle_id": self.cycle["cycle_id"], "type": "skip_h0",
+        })
+        verifier = {
+            "passed": False,
+            "problems": ["frozen_m0_contract_mismatch"],
+            "missing_requirements": ["portfolio_market_state"],
+        }
+
+        with patch(
+            "ai_trading_companion.__main__._formal_adaptive_research", return_value={},
+        ), patch(
+            "ai_trading_companion.__main__._reuse_m0_evidence_attempt",
+            side_effect=EvidenceInsufficient(verifier),
+        ), self.assertRaises(EvidenceInsufficient):
+            run_m1(self.engine, self.store, Mock(), self.cycle["cycle_id"], execute=True)
+
+        self.assertEqual("waiting_for_repair", self.store.get_cycle(self.cycle["cycle_id"])["state"])
+        faults = [row for row in self.store.artifacts(self.cycle["cycle_id"]) if row["kind"] == "system_fault"]
+        self.assertEqual(1, len(faults))
+
     def test_formal_memory_research_uses_a_deadline_sized_action_budget(self):
         result = Mock(snapshot={"snapshot_id": "snapshot"}, context=(), actions=())
         with patch("ai_trading_companion.__main__.AdaptiveMemoryResearch") as research:
@@ -495,6 +523,28 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertIn("当前 A 股主要指数", serialized)
         self.assertNotIn(secret_h0, serialized)
         self.assertNotIn("local_inputs", packet)
+
+    def test_m1_research_reuses_the_frozen_m0_evidence_contract(self):
+        frozen_contract = packet_builder(self.store).evidence_contract_factory.build(
+            task_key=self.cycle["task_key"],
+            stage="m0_research",
+            as_of=self.cycle["as_of"],
+        )
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE companion_cycle SET evidence_contract_json=? WHERE cycle_id=?",
+                (json.dumps(frozen_contract, ensure_ascii=False), self.cycle["cycle_id"]),
+            )
+        cycle = self.store.get_cycle(self.cycle["cycle_id"])
+
+        packet = packet_builder(self.store).build(
+            cycle,
+            "m1_research",
+            evidence={"as_of": iso(self.now), "sources": []},
+            as_of=iso(self.now + timedelta(minutes=5)),
+        )
+
+        self.assertEqual(frozen_contract, packet["evidence_contract"])
 
     def test_formal_m1_is_single_and_m2_only_exists_with_h0(self):
         self.ready()

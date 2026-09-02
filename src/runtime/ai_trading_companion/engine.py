@@ -130,7 +130,12 @@ class CompanionEngine:
             if missing:
                 raise ValueError(f"formal analysis request missing: {sorted(missing)}")
             task_key = str(request["task_key"])
-            profile = request["task_profile"]
+            profile = dict(request["task_profile"] or {})
+            # The explicit-profile API is used by trusted local clients that
+            # already selected a profile. Persist the supplied snapshot rather
+            # than dropping it; a malformed legacy profile is then terminally
+            # reported by the worker instead of remaining queued forever.
+            profile_snapshot = profile
         if task_key not in TASK_POLICIES:
             raise ValueError(f"unregistered task_key: {task_key}")
         if not isinstance(profile, dict) or not str(profile.get("profile_id") or ""):

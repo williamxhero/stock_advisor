@@ -1490,6 +1490,14 @@ def run_scheduled_cycle(engine: CompanionEngine, store: CompanionStore, exchange
         result = run_research(engine, store, cycle, execute, lambda: flush(store, exchange))
         process_h0_cognition(engine, store, portfolio, cycle_id, execute)
         return result
+    except ValueError as exc:
+        # An accepted cycle must never remain queued forever because its
+        # persisted local profile is malformed. This is terminal configuration
+        # evidence for that occurrence, not a retry loop.
+        current = store.get_cycle(cycle_id)
+        if current["state"] == "queued":
+            return engine.research_failed(cycle_id, str(exc))
+        raise
     finally:
         store.finish_scheduled_worker(cycle_id)
 

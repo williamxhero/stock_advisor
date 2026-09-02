@@ -147,10 +147,19 @@ class EvidenceGate:
                     missing.append(key)
                     continue
             minimum_numeric = int(requirement.get("minimum_numeric_facts") or 0)
-            numeric_facts = set(re.findall(
-                r"(?<![\d.])\d+(?:\.\d+)?\s*(?:%|％|万亿元|亿元|万亿|亿|万家|家|只)", support,
-            ))
-            if len(numeric_facts) < minimum_numeric:
+            if key == "portfolio_market_state":
+                # Quote tools deliberately return typed JSON rather than prose
+                # with currency suffixes. Count the four required numeric quote
+                # facts across all held symbols; do not require one source to
+                # carry the whole portfolio's 4*N fields.
+                numeric_count = len(re.findall(
+                    r'"(?:previous_close|price|change|change_percent)"\s*:\s*-?\d+(?:\.\d+)?', support,
+                ))
+            else:
+                numeric_count = len(set(re.findall(
+                    r"(?<![\d.])\d+(?:\.\d+)?\s*(?:%|％|万亿元|亿元|万亿|亿|万家|家|只)", support,
+                )))
+            if numeric_count < minimum_numeric:
                 problems.append(f"blocking_requirement_lacks_numeric_facts:{key}")
                 missing.append(key)
                 continue

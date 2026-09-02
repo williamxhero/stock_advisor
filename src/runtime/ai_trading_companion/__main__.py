@@ -410,6 +410,7 @@ def run_gateway(execute: bool = False) -> None:
             cycle_id = projection["cycle"]["cycle_id"]
             run_m1(engine, store, portfolio, cycle_id, execute)
             process_h0_cognition(engine, store, portfolio, cycle_id, execute)
+        run_pending_m1(engine, store, portfolio, execute)
         consume(engine, store, exchange, portfolio, execute)
         stale_before = iso(datetime.now(timezone.utc) - timedelta(minutes=10))
         store.recover_stale_cognition_jobs(before=stale_before)
@@ -1532,6 +1533,23 @@ def run_scheduled_cycle(engine: CompanionEngine, store: CompanionStore, exchange
         raise
     finally:
         store.finish_scheduled_worker(cycle_id)
+
+
+def run_pending_m1(
+    engine: CompanionEngine, store: CompanionStore, portfolio: PortfolioService,
+    execute: bool, *, limit: int = 2,
+) -> list[dict[str, Any]]:
+    """Run M1 made ready by an immediate user H0 commit/skip.
+
+    Deadline-driven H0 transitions are handled inline by ``run_due``. Manual
+    transitions happen in a Gateway command and therefore need this tick-owned
+    pickup path; the Gateway tick is serial, so a cycle cannot be claimed by a
+    second M1 worker concurrently.
+    """
+    results: list[dict[str, Any]] = []
+    for cycle in store.pending_m1_cycles(limit=limit):
+        results.append(run_m1(engine, store, portfolio, cycle["cycle_id"], execute))
+    return results
 
 
 def run_background(

@@ -746,6 +746,16 @@ class CompanionStore:
         with self.connection() as c:
             c.execute("DELETE FROM schedule_worker_claim WHERE cycle_id=?", (cycle_id,))
 
+    def pending_m1_cycles(self, *, limit: int = 2) -> list[dict[str, Any]]:
+        """Return M1 work made runnable by a manual H0 action or repair."""
+        with self.connection() as c:
+            return [dict(row) for row in c.execute(
+                """SELECT * FROM companion_cycle
+                     WHERE state IN ('researching_m1','m1_retry_wait','waiting_for_repair')
+                     ORDER BY updated_at,created_at LIMIT ?""",
+                (max(1, int(limit)),),
+            )]
+
     def recover_orphaned_scheduled_workers(self) -> list[str]:
         """Release claims owned by a process that ended before its finally block.
 

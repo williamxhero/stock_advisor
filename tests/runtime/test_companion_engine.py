@@ -11,7 +11,7 @@ from ai_trading_companion.engine import CompanionEngine, iso, parse
 from ai_trading_companion.message_presentation import MessageQualificationError
 from ai_trading_companion.stage_expression import express_stage_semantics
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
-from ai_trading_companion.__main__ import run_pending_premarket_reply, run_scheduled_cycle
+from ai_trading_companion.__main__ import run_pending_m1, run_pending_premarket_reply, run_scheduled_cycle
 from ai_trading_companion.packet_builder import RuntimePacketBuilder as _RuntimePacketBuilder
 from ai_trading_companion.publication_registry import published_event_types
 from ai_trading_companion.scheduler import conversation_auto_submit_at, load_schedules, run_daily_schedule, run_periodic_schedule
@@ -339,6 +339,21 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertEqual("researching_m1", result["cycle"]["state"])
         self.assertFalse(result["has_h0"])
         self.assertIsNone(self.store.latest_artifact(self.cycle["cycle_id"], "h0"))
+
+    def test_gateway_tick_resumes_m1_immediately_after_manual_h0_skip(self):
+        self.ready()
+        self.engine.command({
+            "command_id": "skip-now", "cycle_id": self.cycle["cycle_id"], "type": "skip_h0",
+        })
+        portfolio = Mock()
+
+        with patch("ai_trading_companion.__main__.run_m1", return_value={"state": "complete"}) as worker:
+            results = run_pending_m1(self.engine, self.store, portfolio, execute=True)
+
+        worker.assert_called_once_with(
+            self.engine, self.store, portfolio, self.cycle["cycle_id"], True,
+        )
+        self.assertEqual([{"state": "complete"}], results)
 
     def test_diagnostic_rerun_isolated_from_original_cycle_and_reuses_frozen_inputs(self):
         ready = self.ready()

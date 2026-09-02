@@ -257,6 +257,8 @@ def quote_payload(body: str, symbols: list[dict[str, str]], finality: str) -> tu
         quotes.append({
             "symbol": item["symbol"], "name": fields[1].strip(), "exchange": item["exchange"], "market": item["market"],
             "price": price, "previous_close": previous_close, "quote_at": quote_at, "trading_date": trading_date,
+            "change": round(price - previous_close, 4),
+            "change_percent": round((price - previous_close) / previous_close * 100, 4) if previous_close > 0 else 0.0,
             "status": "closed" if close_ready else "trading", "source": "tencent_quote",
         })
     if latest is None:
@@ -287,6 +289,8 @@ def sina_payload(body: str, symbols: list[dict[str, str]], finality: str, *, kin
         row = {
             "symbol": item["symbol"], "name": fields[0].strip(), "exchange": item["exchange"],
             "price": price, "previous_close": previous_close,
+            "change": round(price - previous_close, 4),
+            "change_percent": round((price - previous_close) / previous_close * 100, 4) if previous_close > 0 else 0.0,
             "quote_at": moment.isoformat(), "trading_date": moment.date().isoformat(),
             "status": "closed" if close_ready else "trading", "source": "sina_quote",
         }
@@ -336,6 +340,8 @@ def index_payload(body: str, symbols: list[dict[str, str]], finality: str) -> tu
         indices.append({
             "symbol": item["symbol"], "name": fields[1].strip(), "exchange": item["exchange"], "price": price,
             "previous_close": previous_close, "quote_at": quote_at, "trading_date": trading_date,
+            "change": round(price - previous_close, 4),
+            "change_percent": round((price - previous_close) / previous_close * 100, 4) if previous_close > 0 else 0.0,
             "status": "closed" if close_ready else "trading", "source": "tencent_quote",
         })
     if latest is None:
@@ -383,7 +389,8 @@ def frozen_minute(symbol: dict[str, str], required_at: str, minute_endpoint: obj
 
 
 def frozen_minute_payload(
-    spot: dict[str, object], symbols: list[dict[str, str]], required_at: str, kind: str, minute_endpoint: object = None,
+    spot: dict[str, object], symbols: list[dict[str, str]], required_at: str, kind: str,
+    minute_endpoint: object = None, *, finality: str = "intraday",
 ) -> tuple[dict[str, object], str]:
     field = "quotes" if kind == "equity" else "indices"
     records = {str(item.get("symbol") or ""): dict(item) for item in spot.get(field, []) if isinstance(item, dict)}
@@ -395,10 +402,14 @@ def frozen_minute_payload(
         if item is None:
             fail(75, "spot quote is missing a requested symbol")
         price, quote_at, source_url = frozen_minute(symbol, required_at, minute_endpoint)
+        moment = dt.datetime.fromisoformat(quote_at.replace("Z", "+00:00")).astimezone(dt.timezone(dt.timedelta(hours=8)))
+        closed = finality in {"close", "official_close"}
+        if closed and moment.time() < dt.time(15, 0):
+            fail(75, "minute response does not meet close finality")
         item.update({
             "price": price, "quote_at": quote_at,
-            "trading_date": dt.datetime.fromisoformat(quote_at.replace("Z", "+00:00")).astimezone(dt.timezone(dt.timedelta(hours=8))).date().isoformat(),
-            "status": "trading", "source": "tencent_minute",
+            "trading_date": moment.date().isoformat(),
+            "status": "closed" if closed else "trading", "source": "tencent_minute",
         })
         previous_close = float(item.get("previous_close") or 0)
         if previous_close <= 0:
@@ -408,11 +419,11 @@ def frozen_minute_payload(
         frozen.append(item)
         moment = dt.datetime.fromisoformat(quote_at.replace("Z", "+00:00"))
         latest = max(latest, moment) if latest else moment
-        source_evidence.append({"url": source_url, "fact_as_of": quote_at, "data": {field: [item], "finality": "intraday"}})
+        source_evidence.append({"url": source_url, "fact_as_of": quote_at, "data": {field: [item], "finality": finality}})
     if latest is None:
         fail(75, "minute response has no usable quotes")
     return {
-        field: frozen, "finality": "intraday", "source": "tencent_minute",
+        field: frozen, "finality": finality, "source": "tencent_minute",
         "source_urls": [str(item["url"]) for item in source_evidence], "source_evidence": source_evidence,
     }, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -568,9 +579,13 @@ def main() -> None:
         quote_url = safe_url(inputs.get("tencent_quote_url") or inputs.get("quote_url") or "https://qt.gtimg.cn/q=")
         separator = "" if quote_url.endswith(("=", ",")) else "&q="
         _url, body = fetch(quote_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
-        payload, fact_as_of = quote_payload(body, normalized, finality)
-        if finality == "intraday":
-            payload, fact_as_of = frozen_minute_payload(payload, normalized, str(request.get("required_at") or ""), "equity", inputs.get("tencent_minute_url"))
+        spot_finality = "intraday" if finality in {"close", "official_close"} else finality
+        payload, fact_as_of = quote_payload(body, normalized, spot_finality)
+        if finality in {"intraday", "close", "official_close"}:
+            payload, fact_as_of = frozen_minute_payload(
+                payload, normalized, str(request.get("required_at") or ""), "equity",
+                inputs.get("tencent_minute_url"), finality=finality,
+            )
         result(payload, fact_as_of=fact_as_of)
         return
     if mode in {"cn_market_index_batch", "cn_market_index_tencent", "cn_market_index_sina"}:
@@ -591,9 +606,13 @@ def main() -> None:
         index_url = safe_url(inputs.get("tencent_index_url") or inputs.get("index_url") or "https://qt.gtimg.cn/q=")
         separator = "" if index_url.endswith(("=", ",")) else "&q="
         _url, body = fetch(index_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
-        payload, fact_as_of = index_payload(body, normalized, finality)
-        if finality == "intraday":
-            payload, fact_as_of = frozen_minute_payload(payload, normalized, str(request.get("required_at") or ""), "index", inputs.get("tencent_minute_url"))
+        spot_finality = "intraday" if finality in {"close", "official_close"} else finality
+        payload, fact_as_of = index_payload(body, normalized, spot_finality)
+        if finality in {"intraday", "close", "official_close"}:
+            payload, fact_as_of = frozen_minute_payload(
+                payload, normalized, str(request.get("required_at") or ""), "index",
+                inputs.get("tencent_minute_url"), finality=finality,
+            )
         result(payload, fact_as_of=fact_as_of)
         return
     if mode == "cn_market_breadth":

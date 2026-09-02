@@ -137,10 +137,20 @@ class EvidenceV3Tests(TestCase):
         )
         self.assertEqual("2026-08-26T07:00:00Z", requirements["events_and_counterevidence"]["window"]["start"])
         self.assertEqual("2026-08-27T07:20:02.555000Z", requirements["events_and_counterevidence"]["window"]["end"])
+        self.assertEqual(
+            {"start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:20:02.555000Z", "mode": "after_start_to_end"},
+            requirements["market_breadth"]["window"],
+        )
+        self.assertEqual("official_close", requirements["market_breadth"]["finality"])
+        self.assertFalse(requirements["turnover_compare"]["blocking"])
+        self.assertEqual(["covered"], requirements["turnover_compare"]["allowed_coverage"])
+        self.assertFalse(requirements["themes_and_capacity_cores"]["blocking"])
+        self.assertEqual(["covered"], requirements["themes_and_capacity_cores"]["allowed_coverage"])
+        self.assertEqual(["covered"], requirements["portfolio_market_state"]["allowed_coverage"])
         blockers = [row["key"] for row in contract["requirements"] if row["blocking"]]
         self.assertEqual([
-            "indices_close", "turnover_compare", "market_breadth", "themes_and_capacity_cores",
-            "events_and_counterevidence", "prior_judgment_changes", "portfolio_market_state",
+            "indices_close", "market_breadth", "events_and_counterevidence",
+            "prior_judgment_changes", "portfolio_market_state",
             "portfolio_events_and_counterevidence",
         ], blockers)
 

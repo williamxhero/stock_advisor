@@ -257,7 +257,10 @@ class ToolCatalogMarketBackend:
         window = requirement.get("window") if isinstance(requirement.get("window"), dict) else {}
         required_at = str(window.get("end") or self.contract.get("as_of") or "")
         mode = str(window.get("mode") or "")
-        finality = "official_close" if mode == "exact" and required_at[11:16] == "07:00" else "intraday"
+        declared_finality = str(requirement.get("finality") or "")
+        finality = declared_finality or (
+            "official_close" if mode == "exact" and required_at[11:16] == "07:00" else "intraday"
+        )
         if operation == "holding_snapshot":
             symbols = [str(value) for value in requirement.get("required_entities") or [] if str(value)]
             if not symbols:
@@ -910,6 +913,8 @@ def _merge_mandatory_operations(
     required: list[dict[str, Any]] = []
     if "current_market_state" in requirements:
         required.append(_operation("current_market_state", "market", "market_snapshot"))
+    if "indices_close" in requirements:
+        required.append(_operation("indices_close", "market", "market_snapshot"))
     if "market_breadth" in requirements:
         required.append(_operation("market_breadth", "market", "market_breadth"))
     if requirements.get("portfolio_market_state", {}).get("required_entities"):
@@ -961,7 +966,8 @@ def _merge_mandatory_operations(
 def _deterministic_requirement_keys(contract: dict[str, Any]) -> list[str]:
     keys = {str(item.get("key") or "") for item in contract.get("requirements") or [] if isinstance(item, dict)}
     return sorted(keys.intersection({
-        "current_market_state", "market_breadth", "portfolio_market_state", "portfolio_events_and_counterevidence",
+        "current_market_state", "indices_close", "market_breadth", "portfolio_market_state",
+        "portfolio_events_and_counterevidence",
     }))
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import gzip
 import json
+import math
 import os
 import shutil
 import signal
@@ -535,6 +536,16 @@ def _validate_capability_result(request: FactRequest, output: dict[str, Any]) ->
         if request.finality in {"close", "official_close"}:
             if quote_time.time().hour < 15 or quote.get("status") != "closed":
                 return "tool_quote_finality_invalid"
+        try:
+            previous_close = float(quote.get("previous_close"))
+            change = float(quote.get("change"))
+            change_percent = float(quote.get("change_percent"))
+        except (TypeError, ValueError):
+            return "tool_quote_calculation_invalid"
+        expected_change = round(price - previous_close, 4)
+        expected_percent = round((price - previous_close) / previous_close * 100, 4) if previous_close > 0 else 0.0
+        if previous_close < 0 or not math.isclose(change, expected_change, abs_tol=1e-4) or not math.isclose(change_percent, expected_percent, abs_tol=1e-4):
+            return "tool_quote_calculation_invalid"
     if set(seen) != set(expected_symbols) or data.get("finality") != request.finality:
         return "tool_quote_finality_invalid" if data.get("finality") != request.finality else "tool_quote_symbol_mismatch"
     return None
@@ -569,6 +580,16 @@ def _validate_market_indices(request: FactRequest, data: dict[str, Any]) -> str 
             return "tool_market_after_required_at"
         if request.finality in {"close", "official_close"} and (moment.time().hour < 15 or index.get("status") != "closed"):
             return "tool_market_finality_invalid"
+        try:
+            previous_close = float(index.get("previous_close"))
+            change = float(index.get("change"))
+            change_percent = float(index.get("change_percent"))
+        except (TypeError, ValueError):
+            return "tool_market_calculation_invalid"
+        expected_change = round(price - previous_close, 4)
+        expected_percent = round((price - previous_close) / previous_close * 100, 4) if previous_close > 0 else 0.0
+        if previous_close < 0 or not math.isclose(change, expected_change, abs_tol=1e-4) or not math.isclose(change_percent, expected_percent, abs_tol=1e-4):
+            return "tool_market_calculation_invalid"
     if set(seen) != {str(value) for value in expected} or data.get("finality") != request.finality:
         return "tool_market_identity_invalid"
     return None

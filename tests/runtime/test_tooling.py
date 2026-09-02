@@ -491,11 +491,14 @@ class ToolRunnerTests(unittest.TestCase):
     def test_builtin_quote_tools_validate_a_share_identity_and_close_semantics(self) -> None:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
-                body = (
-                    'v_sh600000="1~浦发银行~600000~10.50~10.00~~~~~~~~~~~~20260901150100";\n'
-                    'v_sz000001="51~平安银行~000001~11.20~11.00~~~~~~~~~~~~20260901150100";\n'
-                    'v_bj830001="47~北交所样本~830001~21.00~20.00~~~~~~~~~~~~20260901150100";\n'
-                ).encode("gb18030")
+                if self.path.startswith("/minute"):
+                    body = json.dumps({"data": {"data": ["1500 10.50 100 1000.0"]}}).encode("utf-8")
+                else:
+                    body = (
+                        'v_sh600000="1~浦发银行~600000~10.50~10.00~~~~~~~~~~~~20260901150100";\n'
+                        'v_sz000001="51~平安银行~000001~11.20~11.00~~~~~~~~~~~~20260901150100";\n'
+                        'v_bj830001="47~北交所样本~830001~21.00~20.00~~~~~~~~~~~~20260901150100";\n'
+                    ).encode("gb18030")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=gb18030")
                 self.send_header("Content-Length", str(len(body)))
@@ -519,7 +522,11 @@ class ToolRunnerTests(unittest.TestCase):
                 ))
                 quotes = runner.resolve_with_fallback(FactRequest(
                     1, "cn_equity_quote_batch", "2026-09-01T07:01:00Z", 2.0,
-                    {"symbols": ["600000", "000001", "830001"], "quote_url": f"http://127.0.0.1:{server.server_port}/quotes?q="},
+                    {
+                        "symbols": ["600000", "000001", "830001"],
+                        "quote_url": f"http://127.0.0.1:{server.server_port}/quotes?q=",
+                        "tencent_minute_url": f"http://127.0.0.1:{server.server_port}/minute?code=",
+                    },
                     finality="official_close",
                 ))
 
@@ -757,6 +764,49 @@ class ToolRunnerTests(unittest.TestCase):
                 self.assertEqual(9.10, result.data["quotes"][0]["price"])
                 self.assertEqual("2026-09-01T01:45:00Z", result.data["quotes"][0]["quote_at"])
                 self.assertLessEqual(result.fact_as_of, "2026-09-01T01:45:00Z")
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_official_close_equity_quote_uses_the_1500_minute_not_the_later_spot_timestamp(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/quote"):
+                    body = b'v_sh600000="1~Test~600000~9.20~9.00~~~~~~~~~~~~~~~~~~~~~~~~~~20260901154000";'
+                    content_type = "text/plain; charset=utf-8"
+                else:
+                    body = json.dumps({"data": {"sh600000": {"data": {"data": [
+                        "1459 9.10 100 1000.0", "1500 9.15 120 1200.0",
+                    ]}}}}).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_equity_quote_batch", "2026-09-01T07:00:00Z", 4.0,
+                    {"symbols": ["600000"], "tencent_quote_url": base + "/quote?q=", "tencent_minute_url": base + "/minute?code="},
+                    finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                quote = result.data["quotes"][0]
+                self.assertEqual(9.15, quote["price"])
+                self.assertEqual("2026-09-01T07:00:00Z", quote["quote_at"])
+                self.assertEqual("closed", quote["status"])
+                self.assertEqual("official_close", result.data["finality"])
             finally:
                 server.shutdown()
                 server.server_close()

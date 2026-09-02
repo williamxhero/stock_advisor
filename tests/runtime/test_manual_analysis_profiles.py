@@ -111,6 +111,23 @@ class ManualAnalysisProfileResolverTests(TestCase):
         self.assertEqual("after_start_to_end", contract["requirements"][0]["window"]["mode"])
         self.assertEqual(contract["contract_hash"], EvidenceContractFactory.contract_hash(contract))
 
+    def test_post_close_manual_contract_uses_close_quotes_and_a_bounded_official_breadth_snapshot(self) -> None:
+        profile = self.resolver.resolve("2026-09-02T15:20:00+08:00", self.analysis)
+        contract = EvidenceContractFactory(_Calendar()).build(
+            task_key=profile["task_key"], stage="m0_research",
+            as_of="2026-09-02T15:20:00+08:00", task_profile=profile,
+            internal_context={"portfolio_entities": ["600487"]},
+        )
+        requirements = {row["key"]: row for row in contract["requirements"]}
+
+        self.assertEqual("official_close", requirements["market_breadth"]["finality"])
+        self.assertEqual({
+            "start": "2026-09-02T07:00:00Z", "end": "2026-09-02T07:20:00Z",
+            "mode": "after_start_to_end",
+        }, requirements["market_breadth"]["window"])
+        self.assertEqual("official_close", requirements["portfolio_market_state"]["finality"])
+        self.assertEqual("exact", requirements["portfolio_market_state"]["window"]["mode"])
+
     def test_lunch_contract_accepts_late_published_morning_close_and_checks_events_since_1030(self) -> None:
         profile = self.resolver.resolve("2026-08-31T12:51:12.238+08:00", {
             **self.analysis, "time_scope": "lunch_break",

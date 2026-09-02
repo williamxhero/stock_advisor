@@ -84,12 +84,13 @@ class EvidenceContractFactory:
                 {
                     "key": "indices_close", "blocking": True,
                     "allowed_coverage": ["covered"],
+                    "finality": "official_close",
                     "window": {"start": close_text, "end": close_text, "mode": "exact"},
                     "evidence_terms": [["上证", "沪指"], ["深成指", "深证成指"], ["创业板"], ["涨", "跌", "%"]],
                     "minimum_numeric_facts": 3,
                 },
                 {
-                    "key": "turnover_compare", "blocking": True,
+                    "key": "turnover_compare", "blocking": False,
                     "allowed_coverage": ["covered"],
                     "window": {"start": close_text, "end": close_text, "mode": "exact"},
                     "evidence_terms": [["成交额", "成交"], ["亿", "万亿"], ["昨日", "前一交易日", "上一交易日", "较前日", "较上日"]],
@@ -98,14 +99,15 @@ class EvidenceContractFactory:
                 {
                     "key": "market_breadth", "blocking": True,
                     "allowed_coverage": ["covered"],
-                    "window": {"start": close_text, "end": close_text, "mode": "exact"},
+                    "finality": "official_close",
+                    "window": {"start": close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
                     "evidence_terms": [["上涨"], ["下跌"], ["家", "只"]],
                     "minimum_numeric_facts": 2,
                 },
                 {
-                    "key": "themes_and_capacity_cores", "blocking": True,
+                    "key": "themes_and_capacity_cores", "blocking": False,
                     "allowed_coverage": ["covered"],
-                    "window": {"start": close_text, "end": close_text, "mode": "exact"},
+                    "window": {"start": close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
                     "evidence_terms": [["板块", "题材"], ["领涨", "涨幅居前", "强势"], ["领跌", "跌幅居前", "弱势"]],
                     "minimum_named_entities": 2,
                 },
@@ -123,7 +125,8 @@ class EvidenceContractFactory:
                 },
                 {
                     "key": "portfolio_market_state", "blocking": True,
-                    "allowed_coverage": ["covered", "checked_no_change"],
+                    "allowed_coverage": ["covered"] if holdings else ["checked_no_change"],
+                    "finality": "official_close",
                     "window": {"start": close_text, "end": close_text, "mode": "exact"},
                     "evidence_class": "public_if_present",
                     "required_entities": holdings,
@@ -205,17 +208,32 @@ class EvidenceContractFactory:
         if "portfolio_entities" not in internal_context:
             return requirements
         holdings = [str(value) for value in internal_context.get("portfolio_entities") or [] if str(value)]
+        breadth_window = dict(market_window)
+        market_finality: str | None = None
+        if market_window.get("mode") == "exact":
+            market_at = datetime.fromisoformat(str(market_window["end"]).replace("Z", "+00:00"))
+            market_local = market_at.astimezone(_SHANGHAI)
+            if market_local.time() == time(15, 0):
+                market_finality = "official_close"
+                event_end = datetime.fromisoformat(str(events_window["end"]).replace("Z", "+00:00"))
+                if event_end.astimezone(_SHANGHAI).date() == market_local.date() and event_end > market_at:
+                    breadth_window = {
+                        "start": str(market_window["start"]), "end": str(events_window["end"]),
+                        "mode": "after_start_to_end",
+                    }
         return [
             *requirements,
             {
                 "key": "market_breadth", "blocking": True,
-                "allowed_coverage": ["covered"], "window": market_window,
+                "allowed_coverage": ["covered"], "window": breadth_window,
+                **({"finality": market_finality} if market_finality else {}),
                 "minimum_numeric_facts": 3,
             },
             {
                 "key": "portfolio_market_state", "blocking": True,
                 "allowed_coverage": ["covered"] if holdings else ["checked_no_change"],
                 "window": market_window, "evidence_class": "public_if_present",
+                **({"finality": market_finality} if market_finality else {}),
                 "required_entities": holdings,
                 "minimum_numeric_facts": 4 * len(holdings) if holdings else 0,
             },

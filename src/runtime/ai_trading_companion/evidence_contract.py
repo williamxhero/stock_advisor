@@ -53,7 +53,9 @@ class EvidenceContractFactory:
         internal_context: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if task_profile is not None and stage == "m0_research":
-            return self._manual_requirements(as_of, str(task_profile["evidence_family"]))
+            return self._manual_requirements(
+                as_of, str(task_profile["evidence_family"]), internal_context or {},
+            )
         if task_key == "daily.opportunity.0900" and stage in {"m0_research", "m1_research"}:
             close = self._latest_completed_close(as_of)
             close_text = self._iso(close)
@@ -225,7 +227,9 @@ class EvidenceContractFactory:
             },
         ]
 
-    def _manual_requirements(self, as_of: datetime, evidence_family: str) -> list[dict[str, Any]]:
+    def _manual_requirements(
+        self, as_of: datetime, evidence_family: str, internal_context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
         if evidence_family == "intraday_snapshot":
             market_window = {
                 "start": self._iso(as_of - _INTRADAY_MARKET_MAX_AGE),
@@ -247,7 +251,8 @@ class EvidenceContractFactory:
             events_start = market_at
             market_text = self._iso(market_at)
             market_window = {"start": market_text, "end": market_text, "mode": "exact"}
-        return [
+        events_window = {"start": self._iso(events_start), "end": self._iso(as_of), "mode": "after_start_to_end"}
+        return self._with_portfolio_requirements([
             {
                 "key": "current_market_state", "blocking": True,
                 "allowed_coverage": ["covered"],
@@ -256,10 +261,10 @@ class EvidenceContractFactory:
             {
                 "key": "material_events_and_counterevidence", "blocking": True,
                 "allowed_coverage": ["covered", "checked_no_change"],
-                "window": {"start": self._iso(events_start), "end": self._iso(as_of), "mode": "after_start_to_end"},
+                "window": events_window,
                 "negative_query_terms": ["公告", "政策", "风险"],
             },
-        ]
+        ], market_window=market_window, events_window=events_window, internal_context=internal_context)
 
     @staticmethod
     def _manual_intraday_anchor(as_of: datetime) -> datetime:

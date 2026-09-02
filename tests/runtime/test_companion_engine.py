@@ -721,6 +721,13 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertIn(manual["receipt"]["cycle_id"], [item["cycle_id"] for item in history["items"]])
 
     def test_structured_manual_request_freezes_selected_profile_contract_and_manual_deadlines(self):
+        with self.store.connection() as connection:
+            connection.execute(
+                """INSERT INTO portfolio_position(
+                    code,name,shares,average_cost,last_price,price_as_of,market_value,unrealized_pnl,weight,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                ("600487", "亨通光电", 200, 1.0, 1.0, "2026-08-28T06:00:00Z", 200.0, 0.0, 0.1, "2026-08-28T06:00:00Z"),
+            )
         engine = CompanionEngine(
             self.store,
             task_profiles=ManualAnalysisProfileResolver(_WeekdayCalendar()),
@@ -740,6 +747,9 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertEqual("daily.execution.0945", cycle["task_key"])
         self.assertEqual("2026-08-28T14:58:00+08:00", cycle["requested_at"])
         self.assertEqual(64, len(cycle["evidence_contract_hash"]))
+        contract = json.loads(cycle["evidence_contract_json"])
+        portfolio_quotes = next(item for item in contract["requirements"] if item["key"] == "portfolio_market_state")
+        self.assertEqual(["600487"], portfolio_quotes["required_entities"])
         packet = packet_builder(self.store).build(cycle, "m0_research")
         self.assertEqual(cycle["evidence_contract_hash"], packet["evidence_contract"]["contract_hash"])
 

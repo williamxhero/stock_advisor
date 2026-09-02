@@ -113,9 +113,17 @@ class CompanionEngine:
             profile_snapshot = self.task_profiles.resolve(requested_at, request["analysis"])
             task_key = str(profile_snapshot["task_key"])
             profile = profile_snapshot
+            # The manual cycle persists its contract before packet construction,
+            # so it must freeze the same runtime-held portfolio universe that a
+            # scheduled packet builder would supply later.
+            with self.store.connection() as connection:
+                positions = connection.execute(
+                    "SELECT code FROM portfolio_position WHERE shares>0 ORDER BY code"
+                ).fetchall()
             evidence_contract = self.evidence_contract_factory.build(
                 task_key=task_key, stage="m0_research", as_of=requested_at,
                 task_profile=profile_snapshot,
+                internal_context={"portfolio_entities": [str(row["code"]) for row in positions]},
             )
         else:
             missing = {"task_key", "task_profile"} - request.keys()

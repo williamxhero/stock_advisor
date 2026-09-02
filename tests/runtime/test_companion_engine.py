@@ -1008,7 +1008,7 @@ Protocol: OpportunityDiscovery-v1.3
             at=datetime.fromisoformat("2026-08-25T08:30:00+08:00")
         )])
 
-    def test_manual_worker_warms_breadth_before_refreshing_its_frozen_contract(self):
+    def test_manual_worker_never_waits_for_breadth_prefetch(self):
         events: list[str] = []
         store = Mock()
         store.get_cycle.return_value = {"state": "queued", "kind": "manual", "schedule_snapshot_json": "{}"}
@@ -1018,7 +1018,7 @@ Protocol: OpportunityDiscovery-v1.3
             result = run_scheduled_cycle(Mock(), store, Mock(), Mock(), "cycle", True)
 
         self.assertEqual({"state": "ok"}, result)
-        self.assertEqual(["prefetch", "research"], events)
+        self.assertEqual(["research"], events)
         store.finish_scheduled_worker.assert_called_once_with("cycle")
 
     def test_premarket_cycle_is_prepared_before_0830_without_starting_research(self):

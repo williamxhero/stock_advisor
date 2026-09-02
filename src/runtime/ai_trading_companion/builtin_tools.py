@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.0"
+_VERSION = "1.1.1"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -42,10 +43,7 @@ def ensure_builtin_tools(root: Path) -> None:
             }, ensure_ascii=False, sort_keys=True), encoding="utf-8")
         current = root / capability / "current.json"
         current.parent.mkdir(parents=True, exist_ok=True)
-        if not current.exists():
-            current.write_text(json.dumps({
-                "contract": "ai-trading-tool-current/v1", "version": _VERSION,
-            }, sort_keys=True), encoding="utf-8")
+        _promote_builtin_current(current)
     for capability, adapters in _ADAPTERS.items():
         for adapter, mode in adapters.items():
             version_root = root / capability / "adapters" / adapter / "versions" / _VERSION
@@ -59,11 +57,43 @@ def ensure_builtin_tools(root: Path) -> None:
                     "command": [sys.executable, "tool.py", mode],
                 }, ensure_ascii=False, sort_keys=True), encoding="utf-8")
         routing = root / capability / "routing.json"
-        if not routing.exists():
+        if _routing_is_managed_builtin(routing, set(adapters)):
             routing.write_text(json.dumps({
                 "contract": "ai-trading-tool-routing/v1",
                 "candidates": [{"adapter": adapter, "version": _VERSION} for adapter in adapters],
             }, sort_keys=True), encoding="utf-8")
+
+
+def _promote_builtin_current(current: Path) -> None:
+    try:
+        selected = json.loads(current.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        selected = None
+    if current.exists() and not (
+        isinstance(selected, dict)
+        and selected.get("contract") == "ai-trading-tool-current/v1"
+        and selected.get("version") in _PREVIOUS_BUILTIN_VERSIONS
+    ):
+        return
+    current.write_text(json.dumps({
+        "contract": "ai-trading-tool-current/v1", "version": _VERSION,
+    }, sort_keys=True), encoding="utf-8")
+
+
+def _routing_is_managed_builtin(routing: Path, adapters: set[str]) -> bool:
+    try:
+        selected = json.loads(routing.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return True
+    except json.JSONDecodeError:
+        return False
+    candidates = selected.get("candidates") if isinstance(selected, dict) else None
+    return bool(
+        selected.get("contract") == "ai-trading-tool-routing/v1"
+        and isinstance(candidates, list)
+        and {str(row.get("adapter") or "") for row in candidates if isinstance(row, dict)} == adapters
+        and all(row.get("version") in _PREVIOUS_BUILTIN_VERSIONS for row in candidates if isinstance(row, dict))
+    )
 
 
 _CLI = r'''from __future__ import annotations
@@ -532,9 +562,27 @@ def main() -> None:
         query = str(inputs.get("query") or "").strip()
         if not query:
             fail(64, "query is required")
-        url, page = fetch("https://html.duckduckgo.com/html/?q=" + quote_plus(query))
-        links = re.findall(r'(?is)class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page)
-        result({"url": url, "query": query, "results": [{"url": html.unescape(link), "title": strip_html(title)} for link, title in links[:10]]})
+        base = safe_url(inputs.get("base_url") or "http://yosef-server:8801").rstrip("/")
+        url, body = fetch(base + "/search?q=" + quote_plus(query) + "&format=json")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            fail(75, "search service response is not JSON")
+        rows = payload.get("results") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            fail(75, "search service results are invalid")
+        results = []
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("url"):
+                continue
+            results.append({
+                "url": safe_url(row.get("url")),
+                "title": strip_html(str(row.get("title") or "")),
+                "snippet": strip_html(str(row.get("content") or "")),
+            })
+            if len(results) >= 10:
+                break
+        result({"url": url, "query": query, "results": results})
         return
     url = safe_url(inputs.get("url"))
     if mode == "browser_capture":

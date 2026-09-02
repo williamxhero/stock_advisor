@@ -492,6 +492,13 @@ def _verify_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> dic
         if not isinstance(row, dict):
             continue
         backend = str(row.get("backend") or "")
+        operation = str(row.get("operation") or "")
+        arguments = row.get("arguments") if isinstance(row.get("arguments"), dict) else {}
+        key = str(row.get("requirement_key") or "")
+        if operation == "web_search" and not str(arguments.get("query") or "").strip():
+            problems.append(f"research_plan_operation_argument_missing:{key}:web_search:query")
+        if operation in {"web_read", "web_browser"} and not str(arguments.get("url") or "").strip():
+            problems.append(f"research_plan_operation_argument_missing:{key}:{operation}:url")
         if backend and backend not in available_backends:
             problems.append(f"research_plan_backend_unavailable:{backend}")
         for fallback in row.get("fallback_backends") or []:

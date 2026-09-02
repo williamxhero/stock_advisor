@@ -212,6 +212,20 @@ class LocalResearchTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertIn("research_plan_missing_requirement:events", result["problems"])
 
+    def test_plan_verifier_rejects_operations_with_missing_required_arguments(self) -> None:
+        broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})
+        planner = BrokerResearchPlanner(broker, intellect="smart", effort="medium", deadline=lambda: 123.0)
+        planner({"as_of": CONTRACT["as_of"], "evidence_contract": CONTRACT}, [], 0)
+        request = broker.invoke.call_args.args[0]
+
+        result = request.verifier({"version": 1, "operations": [row("web_search", query="")]})
+
+        self.assertFalse(result["passed"])
+        self.assertIn(
+            "research_plan_operation_argument_missing:market:web_search:query",
+            result["problems"],
+        )
+
     def test_plan_verifier_rejects_a_backend_that_is_not_actually_available(self) -> None:
         broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})
         planner = BrokerResearchPlanner(broker, intellect="smart", effort="medium", deadline=lambda: 123.0)

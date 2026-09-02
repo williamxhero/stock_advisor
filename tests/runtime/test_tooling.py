@@ -16,6 +16,25 @@ from ai_trading_companion.tooling import FactRequest, ToolCatalog, ToolRunner
 
 
 class ToolRunnerTests(unittest.TestCase):
+    def test_builtin_upgrade_promotes_only_a_previous_builtin_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            previous = root / "generic_web_search" / "current.json"
+            previous.parent.mkdir(parents=True)
+            previous.write_text(json.dumps({
+                "contract": "ai-trading-tool-current/v1", "version": "1.1.0",
+            }), encoding="utf-8")
+            custom = root / "generic_web_read" / "current.json"
+            custom.parent.mkdir(parents=True)
+            custom.write_text(json.dumps({
+                "contract": "ai-trading-tool-current/v1", "version": "custom-1",
+            }), encoding="utf-8")
+
+            ensure_builtin_tools(root)
+
+            self.assertEqual("1.1.1", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
+
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
         version_root = root / capability / "versions" / "1.0.0"
         version_root.mkdir(parents=True)
@@ -367,6 +386,42 @@ class ToolRunnerTests(unittest.TestCase):
 
             self.assertFalse(result.succeeded)
             self.assertEqual("tool_access_restricted", result.error_code)
+
+    def test_builtin_web_search_uses_searxng_json_results(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps({"results": [{
+                    "url": "https://example.test/market-news",
+                    "title": "Market <b>news</b>",
+                    "content": "Policy &amp; risk update",
+                }]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "generic_web_search", "2026-09-01T01:30:00Z", 3.0,
+                    {"query": "A-share policy risk", "base_url": f"http://127.0.0.1:{server.server_port}"},
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("https://example.test/market-news", result.data["results"][0]["url"])
+                self.assertEqual("Market news", result.data["results"][0]["title"])
+                self.assertEqual("Policy & risk update", result.data["results"][0]["snippet"])
+            finally:
+                server.shutdown()
+                server.server_close()
 
     def test_browser_capture_executes_public_page_javascript_in_an_ephemeral_browser(self) -> None:
         class Handler(BaseHTTPRequestHandler):

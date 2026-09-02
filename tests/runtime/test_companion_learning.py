@@ -13,6 +13,7 @@ from ai_trading_companion.learning import JudgmentLifecycle, WorkflowEvolution
 from ai_trading_companion.packet_builder import RuntimePacketBuilder as _RuntimePacketBuilder
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.router import CognitiveRouter
+from ai_trading_companion.stage_expression import normalize_stage_output
 from ai_trading_companion.store import CompanionStore
 
 
@@ -240,6 +241,37 @@ class CompanionLearningTests(unittest.TestCase):
         })
 
         self.assertTrue(accepted["passed"], accepted["problems"])
+
+    def test_v3_m1_canonicalizes_a_natural_chinese_direction_without_inverting_risk_claims(self):
+        semantic = {
+            "summary": "收盘市场宽度显著偏弱。",
+            "direction": "谨慎偏空，短线风险偏好明显下降",
+            "qualified": True,
+            "triggers": ["上涨家数重新超过下跌家数"],
+            "invalidations": ["主要指数收复本次跌幅"],
+            "risks": ["下跌3901家、上涨1541家，宽度显著偏弱"],
+            "unknowns": ["缺少跨来源核验"],
+        }
+
+        normalized = normalize_stage_output("m1_judgment", {
+            "result_version": 3,
+            "semantic": semantic,
+        })
+
+        self.assertEqual("bearish", normalized.snapshot["direction"])
+        self.assertEqual("bearish", normalized.snapshot["claims"][0]["direction"])
+        self.assertEqual(semantic["summary"], normalized.snapshot["claims"][0]["original_text"])
+
+        cycle = self.cycle("daily.review.1520", "2026-09-02T15:20:00+08:00", "2026-09-02T07:00:00Z")
+        artifact = self.store.append_artifact(
+            cycle["cycle_id"], "m1", "model", normalized.text, "2026-09-02T07:00:00Z",
+        )
+        row = JudgmentLifecycle(self.store).capture(
+            artifact, "m1", normalized.text, snapshot=normalized.snapshot, qualified=True,
+        )
+        frozen = json.loads(row["snapshot_json"])
+        self.assertEqual("bearish", frozen["direction"])
+        self.assertEqual(["bearish"], [claim["direction"] for claim in frozen["claims"]])
 
     def test_packet_and_verifier_reject_a_false_non_trading_day_m0(self):
         class TradingDayCalendar:

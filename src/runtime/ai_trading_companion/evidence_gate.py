@@ -1,6 +1,7 @@
 """Deterministic qualification for current-information research outputs."""
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -30,7 +31,7 @@ class EvidenceGate:
         *,
         attempt_id: str | None = None,
     ) -> dict[str, Any]:
-        if isinstance(requirements, dict) and requirements.get("version") == 3:
+        if isinstance(requirements, dict) and int(requirements.get("version") or 0) >= 3:
             return _EvidenceGateV3().evaluate(evidence, requirements, observations, expected_as_of, attempt_id)
         problems: list[str] = []
         successful = [item for item in observations if item.get("status") == "succeeded" and item.get("non_empty")]
@@ -147,10 +148,19 @@ class EvidenceGate:
                     missing.append(key)
                     continue
             minimum_numeric = int(requirement.get("minimum_numeric_facts") or 0)
-            numeric_facts = set(re.findall(
-                r"(?<![\d.])\d+(?:\.\d+)?\s*(?:%|％|万亿元|亿元|万亿|亿|万家|家|只)", support,
-            ))
-            if len(numeric_facts) < minimum_numeric:
+            if key == "portfolio_market_state":
+                # Quote tools deliberately return typed JSON rather than prose
+                # with currency suffixes. Count the four required numeric quote
+                # facts across all held symbols; do not require one source to
+                # carry the whole portfolio's 4*N fields.
+                numeric_count = len(re.findall(
+                    r'"(?:previous_close|price|change|change_percent)"\s*:\s*-?\d+(?:\.\d+)?', support,
+                ))
+            else:
+                numeric_count = len(set(re.findall(
+                    r"(?<![\d.])\d+(?:\.\d+)?\s*(?:%|％|万亿元|亿元|万亿|亿|万家|家|只)", support,
+                )))
+            if numeric_count < minimum_numeric:
                 problems.append(f"blocking_requirement_lacks_numeric_facts:{key}")
                 missing.append(key)
                 continue
@@ -317,6 +327,10 @@ class _EvidenceGateV3:
                     observations, key, requirement.get("negative_query_terms") or [], attempt_id,
                 ):
                     problems.append(f"checked_no_change_query_not_matched:{key}"); missing.append(key)
+                elif required_entities and not self._negative_queries_cover_entities(
+                    observations, key, required_entities, requirement.get("negative_query_terms") or [], attempt_id,
+                ):
+                    problems.append(f"checked_no_change_query_missing_entities:{key}"); missing.append(key)
                 continue
             if not refs or len(bound) != len(refs):
                 problems.append(f"blocking_requirement_untraceable:{key}"); missing.append(key); continue
@@ -329,6 +343,20 @@ class _EvidenceGateV3:
             term_groups = requirement.get("evidence_terms") or []
             if any(not any(str(term) in support for term in group) for group in term_groups):
                 problems.append(f"blocking_requirement_semantically_unsupported:{key}"); missing.append(key); continue
+            if key == "portfolio_market_state":
+                quote_facts = self._portfolio_quote_facts(bound, required_entities)
+                numeric_count = sum(len(values) for values in quote_facts.values())
+                if numeric_count < int(requirement.get("minimum_numeric_facts") or 0):
+                    problems.append(f"blocking_requirement_lacks_numeric_facts:{key}"); missing.append(key); continue
+                absent_entities = [entity for entity in required_entities if entity not in quote_facts]
+                if absent_entities:
+                    problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
+                continue
+            if key == "market_breadth":
+                breadth_facts = self._market_breadth_facts(bound)
+                if len(breadth_facts) < int(requirement.get("minimum_numeric_facts") or 0):
+                    problems.append(f"blocking_requirement_lacks_numeric_facts:{key}"); missing.append(key); continue
+                continue
             numeric_facts = set(re.findall(
                 r"(?<![\d.])\d+(?:\.\d+)?\s*(?:%|％|万亿元|亿元|万亿|亿|万家|家|只|股|元)", support,
             ))
@@ -384,6 +412,47 @@ class _EvidenceGateV3:
         return any(start < value <= end for value in values)
 
     @staticmethod
+    def _portfolio_quote_facts(sources: list[dict[str, Any]], required_entities: list[str]) -> dict[str, set[str]]:
+        """Return complete deterministic quote fields for each required symbol."""
+        required = set(required_entities)
+        fields = {"previous_close", "price", "change", "change_percent"}
+        complete: dict[str, set[str]] = {}
+        for source in sources:
+            try:
+                payload = json.loads(str(source.get("excerpt") or ""))
+            except (TypeError, ValueError):
+                continue
+            for quote in payload.get("quotes") or []:
+                if not isinstance(quote, dict):
+                    continue
+                symbol = str(quote.get("symbol") or "")
+                valid = {
+                    field for field in fields
+                    if isinstance(quote.get(field), (int, float)) and not isinstance(quote.get(field), bool)
+                }
+                if symbol in required and valid == fields and quote.get("quote_at") and quote.get("trading_date") and quote.get("status"):
+                    complete[symbol] = valid
+        return complete
+
+    @staticmethod
+    def _market_breadth_facts(sources: list[dict[str, Any]]) -> set[str]:
+        """Return required typed breadth fields from the canonical tool JSON."""
+        fields = {"up", "down", "flat"}
+        found: set[str] = set()
+        for source in sources:
+            try:
+                payload = json.loads(str(source.get("excerpt") or ""))
+            except (TypeError, ValueError):
+                continue
+            candidates = [payload.get("breadth")] if isinstance(payload, dict) else []
+            while candidates:
+                value = candidates.pop()
+                if isinstance(value, dict):
+                    found.update(field for field in fields if isinstance(value.get(field), int) and not isinstance(value.get(field), bool))
+                    candidates.extend(item for item in value.values() if isinstance(item, dict))
+        return found
+
+    @staticmethod
     def _matching_negative_query(sources: list[dict[str, Any]], terms: list[str]) -> bool:
         if not terms:
             return True
@@ -406,6 +475,21 @@ class _EvidenceGateV3:
             )
             for item in observations
         )
+
+    @staticmethod
+    def _negative_queries_cover_entities(
+        observations: list[dict[str, Any]], requirement_key: str, entities: list[str], terms: list[str], attempt_id: str | None,
+    ) -> bool:
+        queries = [
+            str((item.get("arguments") or {}).get("query") or "").casefold()
+            for item in observations
+            if item.get("operation") == "web_search"
+            and item.get("status") == "succeeded"
+            and (not attempt_id or item.get("attempt_id") == attempt_id)
+            and str((item.get("arguments") or {}).get("requirement_key") or "") == requirement_key
+            and all(str(term).casefold() in str((item.get("arguments") or {}).get("query") or "").casefold() for term in terms)
+        ]
+        return all(any(entity.casefold() in query for query in queries) for entity in entities)
 
     @staticmethod
     def _normalized(evidence: dict[str, Any], sources: dict[str, dict[str, Any]]) -> dict[str, Any]:

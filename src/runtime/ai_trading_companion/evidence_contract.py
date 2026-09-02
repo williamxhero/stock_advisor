@@ -1,4 +1,4 @@
-"""Task-semantic, frozen Evidence v3 contracts."""
+"""Task-semantic, frozen Evidence v4 contracts."""
 from __future__ import annotations
 
 import hashlib
@@ -33,7 +33,7 @@ class EvidenceContractFactory:
         frozen = self._aware(as_of)
         requirements = self._requirements(task_key, stage, frozen, task_profile, internal_context or {})
         contract = {
-            "version": 3,
+            "version": 4,
             "as_of": frozen.isoformat().replace("+00:00", "Z"),
             "requirements": requirements,
         }
@@ -53,11 +53,13 @@ class EvidenceContractFactory:
         internal_context: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         if task_profile is not None and stage == "m0_research":
-            return self._manual_requirements(as_of, str(task_profile["evidence_family"]))
+            return self._manual_requirements(
+                as_of, str(task_profile["evidence_family"]), internal_context or {},
+            )
         if task_key == "daily.opportunity.0900" and stage in {"m0_research", "m1_research"}:
             close = self._latest_completed_close(as_of)
             close_text = self._iso(close)
-            return [
+            return self._with_portfolio_requirements([
                 {
                     "key": "current_market_state", "blocking": True,
                     "allowed_coverage": ["covered"],
@@ -69,7 +71,9 @@ class EvidenceContractFactory:
                     "window": {"start": close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
                     "negative_query_terms": ["公告", "政策", "风险"],
                 },
-            ]
+            ], market_window={"start": close_text, "end": close_text, "mode": "exact"},
+               events_window={"start": close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
+               internal_context=internal_context or {})
         if task_key == "daily.review.1520" and stage in {"m0_research", "m1_research"}:
             close = self._latest_completed_close(as_of)
             close_text = self._iso(close)
@@ -80,12 +84,13 @@ class EvidenceContractFactory:
                 {
                     "key": "indices_close", "blocking": True,
                     "allowed_coverage": ["covered"],
+                    "finality": "official_close",
                     "window": {"start": close_text, "end": close_text, "mode": "exact"},
                     "evidence_terms": [["上证", "沪指"], ["深成指", "深证成指"], ["创业板"], ["涨", "跌", "%"]],
                     "minimum_numeric_facts": 3,
                 },
                 {
-                    "key": "turnover_compare", "blocking": True,
+                    "key": "turnover_compare", "blocking": False,
                     "allowed_coverage": ["covered"],
                     "window": {"start": close_text, "end": close_text, "mode": "exact"},
                     "evidence_terms": [["成交额", "成交"], ["亿", "万亿"], ["昨日", "前一交易日", "上一交易日", "较前日", "较上日"]],
@@ -94,14 +99,15 @@ class EvidenceContractFactory:
                 {
                     "key": "market_breadth", "blocking": True,
                     "allowed_coverage": ["covered"],
+                    "finality": "official_close",
                     "window": {"start": close_text, "end": close_text, "mode": "exact"},
                     "evidence_terms": [["上涨"], ["下跌"], ["家", "只"]],
                     "minimum_numeric_facts": 2,
                 },
                 {
-                    "key": "themes_and_capacity_cores", "blocking": True,
+                    "key": "themes_and_capacity_cores", "blocking": False,
                     "allowed_coverage": ["covered"],
-                    "window": {"start": close_text, "end": close_text, "mode": "exact"},
+                    "window": {"start": close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
                     "evidence_terms": [["板块", "题材"], ["领涨", "涨幅居前", "强势"], ["领跌", "跌幅居前", "弱势"]],
                     "minimum_named_entities": 2,
                 },
@@ -118,12 +124,21 @@ class EvidenceContractFactory:
                     "internal_record_count": int(context.get("prior_judgment_count") or 0),
                 },
                 {
-                    "key": "portfolio_close", "blocking": True,
-                    "allowed_coverage": ["covered", "checked_no_change"],
+                    "key": "portfolio_market_state", "blocking": True,
+                    "allowed_coverage": ["covered"] if holdings else ["checked_no_change"],
+                    "finality": "official_close",
                     "window": {"start": close_text, "end": close_text, "mode": "exact"},
                     "evidence_class": "public_if_present",
                     "required_entities": holdings,
-                    "minimum_numeric_facts": 2 if holdings else 0,
+                    "minimum_numeric_facts": 4 * len(holdings) if holdings else 0,
+                },
+                {
+                    "key": "portfolio_events_and_counterevidence", "blocking": True,
+                    "allowed_coverage": ["covered", "checked_no_change"],
+                    "window": {"start": prior_close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
+                    "evidence_class": "public_if_present",
+                    "required_entities": holdings,
+                    "negative_query_terms": ["公告", "停复牌", "财报", "风险"],
                 },
                 {
                     "key": "forum_and_sentiment", "blocking": False,
@@ -132,12 +147,13 @@ class EvidenceContractFactory:
                 },
             ]
         if task_key in _INTRADAY_EVENT_ANCHORS and stage in {"m0_research", "m1_research"}:
-            return self._scheduled_intraday_requirements(task_key, as_of)
-        return [
+            return self._scheduled_intraday_requirements(task_key, as_of, internal_context or {})
+        market_window = {"start": self._iso(as_of), "end": self._iso(as_of), "mode": "exact"}
+        return self._with_portfolio_requirements([
             {
                 "key": "current_market_state", "blocking": True,
                 "allowed_coverage": ["covered"],
-                "window": {"start": self._iso(as_of), "end": self._iso(as_of), "mode": "exact"},
+                "window": market_window,
             },
             {
                 "key": "material_events_and_counterevidence", "blocking": True,
@@ -145,35 +161,87 @@ class EvidenceContractFactory:
                 "window": {"start": self._iso(as_of), "end": self._iso(as_of), "mode": "after_start_to_end"},
                 "negative_query_terms": ["公告", "政策", "风险"],
             },
-        ]
+        ], market_window=market_window,
+           events_window={"start": self._iso(as_of), "end": self._iso(as_of), "mode": "after_start_to_end"},
+           internal_context=internal_context or {})
 
-    def _scheduled_intraday_requirements(self, task_key: str, as_of: datetime) -> list[dict[str, Any]]:
+    def _scheduled_intraday_requirements(
+        self, task_key: str, as_of: datetime, internal_context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
         local = as_of.astimezone(_SHANGHAI)
         event_start = datetime.combine(
             local.date(), _INTRADAY_EVENT_ANCHORS[task_key], _SHANGHAI,
         ).astimezone(ZoneInfo("UTC"))
         market_start = as_of - _INTRADAY_MARKET_MAX_AGE
-        return [
+        market_window = {
+            "start": self._iso(market_start), "end": self._iso(as_of),
+            "mode": "after_start_to_end",
+        }
+        events_window = {
+            "start": self._iso(event_start), "end": self._iso(as_of),
+            "mode": "after_start_to_end",
+        }
+        return self._with_portfolio_requirements([
             {
                 "key": "current_market_state", "blocking": True,
                 "allowed_coverage": ["covered"],
-                "window": {
-                    "start": self._iso(market_start), "end": self._iso(as_of),
-                    "mode": "after_start_to_end",
-                },
+                "window": market_window,
             },
             {
                 "key": "material_events_and_counterevidence", "blocking": True,
                 "allowed_coverage": ["covered", "checked_no_change"],
-                "window": {
-                    "start": self._iso(event_start), "end": self._iso(as_of),
-                    "mode": "after_start_to_end",
-                },
+                "window": events_window,
                 "negative_query_terms": ["公告", "政策", "风险"],
+            },
+        ], market_window=market_window, events_window=events_window, internal_context=internal_context)
+
+    @staticmethod
+    def _with_portfolio_requirements(
+        requirements: list[dict[str, Any]], *, market_window: dict[str, Any],
+        events_window: dict[str, Any], internal_context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Attach the deterministic blocking facts every formal analysis needs."""
+        # Runtime always supplies this key from its authoritative portfolio store.
+        # Keeping direct factory callers on their original shape preserves read-only
+        # v3 artifact tests and prevents callers without a portfolio snapshot from
+        # silently claiming an empty portfolio.
+        if "portfolio_entities" not in internal_context:
+            return requirements
+        holdings = [str(value) for value in internal_context.get("portfolio_entities") or [] if str(value)]
+        breadth_window = dict(market_window)
+        market_finality: str | None = None
+        if market_window.get("mode") == "exact":
+            market_at = datetime.fromisoformat(str(market_window["end"]).replace("Z", "+00:00"))
+            market_local = market_at.astimezone(_SHANGHAI)
+            if market_local.time() == time(15, 0):
+                market_finality = "official_close"
+        return [
+            *requirements,
+            {
+                "key": "market_breadth", "blocking": True,
+                "allowed_coverage": ["covered"], "window": breadth_window,
+                **({"finality": market_finality} if market_finality else {}),
+                "minimum_numeric_facts": 3,
+            },
+            {
+                "key": "portfolio_market_state", "blocking": True,
+                "allowed_coverage": ["covered"] if holdings else ["checked_no_change"],
+                "window": market_window, "evidence_class": "public_if_present",
+                **({"finality": market_finality} if market_finality else {}),
+                "required_entities": holdings,
+                "minimum_numeric_facts": 4 * len(holdings) if holdings else 0,
+            },
+            {
+                "key": "portfolio_events_and_counterevidence", "blocking": True,
+                "allowed_coverage": ["covered", "checked_no_change"],
+                "window": events_window, "evidence_class": "public_if_present", "required_entities": holdings,
+                "negative_query_terms": ["公告", "停复牌", "财报", "风险"],
             },
         ]
 
-    def _manual_requirements(self, as_of: datetime, evidence_family: str) -> list[dict[str, Any]]:
+    def _manual_requirements(
+        self, as_of: datetime, evidence_family: str, internal_context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
         if evidence_family == "intraday_snapshot":
             market_window = {
                 "start": self._iso(as_of - _INTRADAY_MARKET_MAX_AGE),
@@ -195,7 +263,8 @@ class EvidenceContractFactory:
             events_start = market_at
             market_text = self._iso(market_at)
             market_window = {"start": market_text, "end": market_text, "mode": "exact"}
-        return [
+        events_window = {"start": self._iso(events_start), "end": self._iso(as_of), "mode": "after_start_to_end"}
+        return self._with_portfolio_requirements([
             {
                 "key": "current_market_state", "blocking": True,
                 "allowed_coverage": ["covered"],
@@ -204,10 +273,10 @@ class EvidenceContractFactory:
             {
                 "key": "material_events_and_counterevidence", "blocking": True,
                 "allowed_coverage": ["covered", "checked_no_change"],
-                "window": {"start": self._iso(events_start), "end": self._iso(as_of), "mode": "after_start_to_end"},
+                "window": events_window,
                 "negative_query_terms": ["公告", "政策", "风险"],
             },
-        ]
+        ], market_window=market_window, events_window=events_window, internal_context=internal_context)
 
     @staticmethod
     def _manual_intraday_anchor(as_of: datetime) -> datetime:

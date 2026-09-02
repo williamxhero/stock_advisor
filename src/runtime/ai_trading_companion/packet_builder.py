@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .learning import WorkflowEvolution
 from .memory_port import MemoryPort, MemoryUnavailable
@@ -64,7 +65,7 @@ class RuntimePacketBuilder:
         memory_cards = self._memory_cards(cycle, stage, packet_as_of, evidence)
         if stage in PUBLIC_STAGES:
             if stage in {"m0_research", "m1_research"}:
-                frozen_contract = cycle.get("evidence_contract_json") if stage == "m0_research" else None
+                frozen_contract = cycle.get("evidence_contract_json")
                 if frozen_contract:
                     packet["evidence_contract"] = json.loads(frozen_contract)
                 else:
@@ -81,6 +82,22 @@ class RuntimePacketBuilder:
             packet["protocol"] = self._protocol(cycle, stage)
             packet["business_context"] = self._business_context(cycle, stage)
             packet["evidence"] = evidence or {}
+            if stage == "m0_compose":
+                frozen_contract = cycle.get("evidence_contract_json")
+                packet["evidence_contract"] = (
+                    json.loads(frozen_contract) if frozen_contract else self.evidence_contract_factory.build(
+                        task_key=cycle["task_key"], stage="m0_research", as_of=packet_as_of,
+                        internal_context=self._internal_evidence_context(cycle, packet_as_of),
+                    )
+                )
+                packet["verified_fact_digest"] = self._verified_fact_digest(evidence or {})
+                packet["m0_compose_requirements"] = {
+                    "instruction": "For every portfolio entity below, state the frozen price, previous close, change, change percentage, quote time and trading status exactly as supplied by verified_fact_digest. Render every quote time as `北京时间HH:MM` using quote_at_china; never interpret a UTC `Z` clock as China local time. Do not publish a claim that any listed entity is uncovered.",
+                    "portfolio_entity_codes": next((
+                        list(item.get("required_entities") or []) for item in packet["evidence_contract"].get("requirements") or []
+                        if isinstance(item, dict) and item.get("key") == "portfolio_market_state"
+                    ), []),
+                }
             packet["artifacts"] = self._stage_artifacts(cycle, stage)
             packet["memories"] = memory_cards
             packet["active_workflow_policy"] = WorkflowEvolution(self.store).active_policy()
@@ -208,20 +225,58 @@ class RuntimePacketBuilder:
         return [{"code": row["code"], "name": row["name"], "purpose": "核验持仓相关公开收盘量价，不包含账户身份或认证信息"} for row in rows]
 
     def _internal_evidence_context(self, cycle: dict[str, Any], packet_as_of: str) -> dict[str, Any]:
-        if cycle["task_key"] != "daily.review.1520":
-            return {}
-        judgments = self.store.frozen_judgments_before(
-            cycle["scheduled_for"][:10], packet_as_of,
-            ("daily.execution.0945", "daily.execution.1030", "daily.execution.1430"),
-        )
         with self.store.connection() as connection:
             rows = connection.execute(
                 "SELECT code,name FROM portfolio_position WHERE shares>0 ORDER BY code"
             ).fetchall()
-        return {
-            "prior_judgment_count": len(judgments),
+        context = {
             "portfolio_entities": [row["code"] for row in rows],
+            "portfolio_entity_names": {row["code"]: row["name"] for row in rows},
         }
+        if cycle["task_key"] == "daily.review.1520":
+            judgments = self.store.frozen_judgments_before(
+                cycle["scheduled_for"][:10], packet_as_of,
+                ("daily.execution.0945", "daily.execution.1030", "daily.execution.1430"),
+            )
+            context["prior_judgment_count"] = len(judgments)
+        return context
+
+    @staticmethod
+    def _verified_fact_digest(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+        """Expose only frozen structured quote facts for deterministic M0 expression checks."""
+        rows: list[dict[str, Any]] = []
+        for source in evidence.get("sources") or []:
+            if not isinstance(source, dict):
+                continue
+            excerpt = str(source.get("excerpt") or "")
+            if any(marker in excerpt for marker in ('"quotes"', '"indices"', '"breadth"')):
+                rows.append({"evidence_ref": source.get("evidence_ref"), "excerpt": RuntimePacketBuilder._with_china_quote_times(excerpt)[:8000]})
+        return rows
+
+    @staticmethod
+    def _with_china_quote_times(excerpt: str) -> str:
+        """Add a deterministic display clock without changing the source timestamp."""
+        try:
+            payload = json.loads(excerpt)
+        except (TypeError, ValueError):
+            return excerpt
+
+        def enrich(value: Any) -> Any:
+            if isinstance(value, list):
+                return [enrich(item) for item in value]
+            if not isinstance(value, dict):
+                return value
+            copy = {key: enrich(item) for key, item in value.items()}
+            quote_at = copy.get("quote_at")
+            if quote_at and "quote_at_china" not in copy:
+                try:
+                    local = datetime.fromisoformat(str(quote_at).replace("Z", "+00:00")).astimezone(ZoneInfo("Asia/Shanghai"))
+                    copy["quote_at_china"] = f"北京时间{local:%Y-%m-%d %H:%M}"
+                except ValueError:
+                    pass
+            return copy
+
+        return json.dumps(enrich(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     def _evidence_requirements(self, cycle: dict[str, Any], stage: str) -> list[dict[str, Any]]:
         if cycle["task_key"] != "daily.review.1520" or stage not in {"m0_research", "m1_research"}:

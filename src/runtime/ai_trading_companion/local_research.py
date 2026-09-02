@@ -4,9 +4,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -121,8 +123,12 @@ class BrokerResearchPlanner:
                 if backend in set(packet.get("allowed_research_backends") or ("gateway", "market"))
                 and (backend != "market" or packet.get("deterministic_market_facts") or self.market_tool_available)
             ],
+            "deterministic_requirement_keys": _deterministic_requirement_keys(packet.get("evidence_contract") or {})
+            if packet.get("deterministic_injection") is True else [],
             "instruction": (
-                "Return only a version 1 research plan. Use gateway web_search only for discovery and "
+                "Return only a version 1 research plan. Deterministic index, breadth, portfolio-quote and "
+                "per-holding event searches are injected locally from the frozen contract; do not substitute "
+                "or broaden their symbols. Use gateway web_search only for discovery and "
                 "gateway web_read for source verification. Use market operations only when market appears in "
                 "available_backends; they read frozen caller-supplied facts when available, otherwise use promoted local public-market tools. "
                 "All timestamps in the evidence contract are UTC. For Chinese-market search terms, convert them to the "
@@ -166,15 +172,24 @@ class WebAccessGatewayBackend:
 class ToolCatalogResearchBackend:
     """Compatibility projection from a research plan to promoted local CLI capabilities."""
 
-    def __init__(self, runner: ToolRunner, *, as_of: str, deadline: Callable[[], float]) -> None:
+    def __init__(self, runner: ToolRunner, *, as_of: str, deadline: Callable[[], float],
+                 contract: dict[str, Any] | None = None) -> None:
         self.runner = runner
         self.as_of = as_of
         self.deadline = deadline
+        self.requirements = {
+            str(row.get("key") or ""): row
+            for row in (contract or {}).get("requirements") or [] if isinstance(row, dict)
+        }
 
     def __call__(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        requirement_key = str(arguments.pop("_requirement_key", "") or "")
+        requirement = self.requirements.get(requirement_key) or {}
+        window = requirement.get("window") if isinstance(requirement.get("window"), dict) else {}
+        required_at = str(window.get("end") or self.as_of)
         capability, inputs = self._request_for(operation, arguments)
         resolution = self.runner.resolve_with_fallback(FactRequest(
-            contract_version=1, capability=capability, required_at=self.as_of,
+            contract_version=1, capability=capability, required_at=required_at,
             deadline_seconds=max(0.1, min(15.0, float(self.deadline()))), inputs=inputs,
             context={}, freshness_seconds=0.0, finality="observed",
         ))
@@ -232,16 +247,37 @@ class ToolCatalogMarketBackend:
     def __call__(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
         requirement_key = str(arguments.pop("_requirement_key", "") or "")
         requirement = self.requirements.get(requirement_key) or {}
-        capability = {"market_snapshot": "cn_market_snapshot", "market_breadth": "cn_market_breadth"}.get(operation)
+        capability = {
+            "market_snapshot": "cn_market_index_batch",
+            "market_breadth": "cn_market_breadth",
+            "holding_snapshot": "cn_equity_quote_batch",
+        }.get(operation)
         if capability is None:
             raise ValueError(f"unsupported live market operation: {operation}")
         window = requirement.get("window") if isinstance(requirement.get("window"), dict) else {}
         required_at = str(window.get("end") or self.contract.get("as_of") or "")
         mode = str(window.get("mode") or "")
-        finality = "official_close" if mode == "exact" and required_at[11:16] == "07:00" else "intraday"
+        declared_finality = str(requirement.get("finality") or "")
+        finality = declared_finality or (
+            "official_close" if mode == "exact" and required_at[11:16] == "07:00" else "intraday"
+        )
+        if operation == "holding_snapshot":
+            symbols = [str(value) for value in requirement.get("required_entities") or [] if str(value)]
+            if not symbols:
+                raise ValueError("holding_snapshot requires frozen portfolio entities")
+            inputs = {"symbols": symbols}
+        elif operation == "market_snapshot":
+            inputs = {"symbols": ["000001", "399001", "399006"]}
+        else:
+            inputs = {}
+        if operation == "market_breadth":
+            cached = self._cached_breadth(required_at, str(window.get("start") or ""), finality)
+            if cached is not None:
+                return cached
         resolution = self.runner.resolve_with_fallback(FactRequest(
             contract_version=1, capability=capability, required_at=required_at,
-            deadline_seconds=max(0.1, min(25.0, float(self.deadline()))), inputs={}, context={},
+            deadline_seconds=max(0.1, min(25.0, float(self.deadline()))), inputs=inputs,
+            context={"window_start": str(window.get("start") or required_at)},
             freshness_seconds=900.0 if finality == "intraday" else 0.0, finality=finality,
         ))
         if not resolution.succeeded or resolution.data is None:
@@ -264,6 +300,39 @@ class ToolCatalogMarketBackend:
             "url": results[0]["url"], "text": results[0]["excerpt_text"],
             "raw_artifact_ref": resolution.raw_artifact_ref, "results": results,
         }
+
+    def _cached_breadth(self, required_at: str, window_start: str, finality: str) -> dict[str, Any] | None:
+        """Use only a runtime prefetch whose fact time is inside this contract."""
+        # The prefetch is runtime state under the user's Companion home, not a
+        # release asset under the immutable tool catalog. Looking beside tools
+        # made a valid pre-freeze snapshot invisible and forced a later live
+        # read, which the frozen-time gate correctly rejected.
+        home = os.environ.get("AI_TRADING_COMPANION_HOME")
+        path = (
+            Path(home) / "runtime" / "market-breadth-snapshot.json"
+            if home else self.runner.catalog.root.parent / "market-breadth-snapshot.json"
+        )
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            fact_as_of = str(cached["fact_as_of"])
+            fact = datetime.fromisoformat(fact_as_of.replace("Z", "+00:00"))
+            start = datetime.fromisoformat(window_start.replace("Z", "+00:00")) if window_start else None
+            end = datetime.fromisoformat(required_at.replace("Z", "+00:00"))
+            if (start and fact < start) or fact > end:
+                return None
+            data = dict(cached["data"])
+            if str(data.get("finality") or "") != finality:
+                return None
+            urls = [str(url) for url in data.get("source_urls") or [] if str(url).startswith(("http://", "https://"))]
+            if not urls:
+                return None
+            excerpt = json.dumps(data, ensure_ascii=False, sort_keys=True)[:8000]
+            results = [{"url": url, "title": str(data.get("source") or "cn_market_breadth"),
+                        "excerpt_text": excerpt, "fact_as_of": fact_as_of,
+                        "raw_artifact_ref": cached.get("raw_artifact_ref")} for url in urls]
+            return {"url": urls[0], "text": excerpt, "raw_artifact_ref": cached.get("raw_artifact_ref"), "results": results}
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
 
 
 class DeterministicMarketBackend:
@@ -353,12 +422,47 @@ class LocalResearchChain:
         observations: list[dict[str, Any]] = []
         verifier: dict[str, Any] = {"passed": False, "problems": ["not_evaluated"], "missing_requirements": []}
         evidence: dict[str, Any] = {}
+        # Acquire every deterministic blocker before the first Broker round.
+        # These facts are time-sensitive; waiting for a planning response first
+        # can turn an otherwise valid 09:45 snapshot into future evidence.
+        preflight = _merge_mandatory_operations(
+            {"version": 1, "operations": []}, contract,
+            max_operations=self.executor.max_operations,
+        )
+        for row in self.executor.validate_plan(preflight):
+            try:
+                backend, result = self.executor.execute(row)
+                observation, _ = boundary.observe(
+                    row["operation"], {**row["arguments"], "requirement_key": row["requirement_key"]},
+                    result, bool(result.get("results") or result.get("url") or result.get("text")),
+                )
+                _normalize_exact_close_fact_time(observation, contract, row["requirement_key"])
+                observation["backend"] = backend
+                observations.append(observation)
+            except Exception as exc:
+                observations.append({
+                    "attempt_id": attempt_id, "observation_id": f"failure-{len(observations) + 1}",
+                    "tool": row["operation"], "backend": row["backend"], "operation": row["operation"],
+                    "status": "failed", "ok": False, "non_empty": False,
+                    "arguments": {**row["arguments"], "requirement_key": row["requirement_key"]},
+                    "error_category": type(exc).__name__,
+                })
+        evidence = _compile_evidence(packet, contract, observations)
+        verifier = self.gate.evaluate(
+            evidence, contract, observations, str(packet.get("as_of") or contract.get("as_of") or ""),
+            attempt_id=attempt_id,
+        )
+        if verifier.get("passed"):
+            normalized = verifier.get("normalized_evidence") or evidence
+            bundle_bytes, bundle_hash = freeze_evidence_bundle(normalized)
+            return FrozenResearchResult(True, normalized, verifier, observations, bundle_bytes, bundle_hash, 0)
         round_number = 0
         while self.deadline is None or self.deadline() > 1.0:
             round_observation_start = len(observations)
             gaps = list(verifier.get("missing_requirements") or verifier.get("problems") or [])
             planning_packet = {
                 **packet,
+                "deterministic_injection": True,
                 "research_discoveries": _discovery_digest(observations, contract),
                 "attempted_research_urls": sorted({
                     str((item.get("arguments") or {}).get("url") or "")
@@ -389,6 +493,10 @@ class LocalResearchChain:
                 if self.max_repairs is not None and round_number > self.max_repairs:
                     raise
                 continue
+            plan = _merge_mandatory_operations(
+                plan, contract, max_operations=self.executor.max_operations,
+                observations=observations, gaps=gaps,
+            )
             operations = self.executor.validate_plan(plan)
             for row in operations:
                 try:
@@ -481,6 +589,7 @@ def _verify_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> dic
         and not (row.get("evidence_class") == "public_if_present" and not row.get("required_entities"))
         and (not gap_text or key in gap_text)
     }
+    required -= {str(value) for value in packet.get("deterministic_requirement_keys") or []}
     planned = {
         str(row.get("requirement_key") or "")
         for row in operations if isinstance(row, dict)
@@ -492,6 +601,13 @@ def _verify_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> dic
         if not isinstance(row, dict):
             continue
         backend = str(row.get("backend") or "")
+        operation = str(row.get("operation") or "")
+        arguments = row.get("arguments") if isinstance(row.get("arguments"), dict) else {}
+        key = str(row.get("requirement_key") or "")
+        if operation == "web_search" and not str(arguments.get("query") or "").strip():
+            problems.append(f"research_plan_operation_argument_missing:{key}:web_search:query")
+        if operation in {"web_read", "web_browser"} and not str(arguments.get("url") or "").strip():
+            problems.append(f"research_plan_operation_argument_missing:{key}:{operation}:url")
         if backend and backend not in available_backends:
             problems.append(f"research_plan_backend_unavailable:{backend}")
         for fallback in row.get("fallback_backends") or []:
@@ -753,13 +869,108 @@ def _has_matching_negative_search(observations: list[dict[str, Any]], requiremen
     terms = [str(term).casefold() for term in requirement.get("negative_query_terms") or []]
     if not terms:
         return False
-    return any(
+    queries = [
+        str((observation.get("arguments") or {}).get("query") or "").casefold()
+        for observation in observations
+        if observation.get("operation") == "web_search"
+        and observation.get("status") == "succeeded"
+        and str((observation.get("arguments") or {}).get("requirement_key") or "") == key
+        and all(term in str((observation.get("arguments") or {}).get("query") or "").casefold() for term in terms)
+    ]
+    return bool(queries) and all(
+        any(entity.casefold() in query for query in queries)
+        for entity in [str(value) for value in requirement.get("required_entities") or [] if str(value)]
+    ) and any(
         observation.get("operation") == "web_search"
         and observation.get("status") == "succeeded"
         and str((observation.get("arguments") or {}).get("requirement_key") or "") == key
         and all(term in str((observation.get("arguments") or {}).get("query") or "").casefold() for term in terms)
         for observation in observations
     )
+
+
+def _operation(
+    requirement_key: str, backend: str, operation: str, *, query: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "requirement_key": requirement_key, "backend": backend, "operation": operation,
+        "arguments": {
+            "query": query, "categories": "news" if query else None, "url": None,
+            "symbol": None, "render": None, "session_id": None, "actions": None,
+        },
+        "fallback_backends": [],
+    }
+
+
+def _merge_mandatory_operations(
+    plan: dict[str, Any], contract: dict[str, Any], *, max_operations: int,
+    observations: list[dict[str, Any]] | None = None, gaps: list[str] | None = None,
+) -> dict[str, Any]:
+    """The model may supplement research but never omit deterministic blocker reads."""
+    proposed = list(plan.get("operations") or []) if isinstance(plan, dict) else []
+    requirements = {
+        str(item.get("key") or ""): item for item in contract.get("requirements") or []
+        if isinstance(item, dict)
+    }
+    required: list[dict[str, Any]] = []
+    if "current_market_state" in requirements:
+        required.append(_operation("current_market_state", "market", "market_snapshot"))
+    if "indices_close" in requirements:
+        required.append(_operation("indices_close", "market", "market_snapshot"))
+    if "market_breadth" in requirements:
+        required.append(_operation("market_breadth", "market", "market_breadth"))
+    if requirements.get("portfolio_market_state", {}).get("required_entities"):
+        required.append(_operation("portfolio_market_state", "market", "holding_snapshot"))
+    material_events = requirements.get("material_events_and_counterevidence") or {}
+    if "checked_no_change" in set(material_events.get("allowed_coverage") or []):
+        required.append(_operation(
+            "material_events_and_counterevidence", "gateway", "web_search",
+            query="A股 公告 政策 风险",
+        ))
+    event_requirement = requirements.get("portfolio_events_and_counterevidence") or {}
+    for entity in [str(value) for value in event_requirement.get("required_entities") or [] if str(value)]:
+        required.append(_operation(
+            "portfolio_events_and_counterevidence", "gateway", "web_search",
+            query=f"{entity} 公告 停复牌 财报 风险",
+        ))
+    completed = {
+        (
+            str((item.get("arguments") or {}).get("requirement_key") or ""),
+            str(item.get("operation") or ""),
+            str((item.get("arguments") or {}).get("query") or "") if item.get("operation") == "web_search" else "",
+        )
+        for item in observations or []
+        if item.get("status") == "succeeded"
+    }
+
+    def needs_retry(item: dict[str, Any]) -> bool:
+        key = str(item["requirement_key"])
+        identity = (
+            key, str(item["operation"]),
+            str((item.get("arguments") or {}).get("query") or "") if item["operation"] == "web_search" else "",
+        )
+        if identity not in completed:
+            return True
+        # A technically successful call may still have failed semantic coverage
+        # (for example an incomplete quote batch). Repeat only that named
+        # requirement, never every already-qualified mandatory fact.
+        return any(key in str(gap) for gap in (gaps or []))
+
+    mandatory_operation_keys = {(item["requirement_key"], item["operation"]) for item in required}
+    required = [item for item in required if needs_retry(item)]
+    retained = [
+        item for item in proposed
+        if (str(item.get("requirement_key") or ""), str(item.get("operation") or "")) not in mandatory_operation_keys
+    ]
+    return {"version": 1, "operations": [*required, *retained][:max_operations]}
+
+
+def _deterministic_requirement_keys(contract: dict[str, Any]) -> list[str]:
+    keys = {str(item.get("key") or "") for item in contract.get("requirements") or [] if isinstance(item, dict)}
+    return sorted(keys.intersection({
+        "current_market_state", "indices_close", "market_breadth", "portfolio_market_state",
+        "portfolio_events_and_counterevidence",
+    }))
 
 
 def _fallback_operation(backend: str) -> str:
@@ -834,8 +1045,10 @@ def _fallback_read_rows(
 def _normalize_exact_close_fact_time(
     observation: dict[str, Any], contract: dict[str, Any], requirement_key: str,
 ) -> None:
-    if observation.get("operation") != "web_read":
-        return
+    # A fetched page may contain dynamic quotes newer than the frozen contract.
+    # Never relabel that page as an earlier market fact; only tools that return a
+    # timestamped historical observation may satisfy an exact window.
+    return
     requirement = next((
         row for row in contract.get("requirements") or []
         if str(row.get("key") or "") == str(requirement_key)

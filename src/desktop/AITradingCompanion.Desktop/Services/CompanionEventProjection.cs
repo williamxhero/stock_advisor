@@ -182,6 +182,11 @@ public static class CompanionEventProjection
                     UpsertAi(ai, "action-pending-m1", "action_pending", item.At,
                         "AI 正在形成独立判断", m1StartedAt, null);
                     break;
+                case "m1.retrying":
+                    m1StartedAt ??= item.At;
+                    UpsertAi(ai, "action-pending-m1", "action_pending", item.At,
+                        "我正在重新核对，稍等一下。", m1StartedAt, null);
+                    break;
                 case "m1.ready":
                     ai.Remove("action-pending-m1");
                     foreach (var fault in ai.Where(pair => pair.Value.Kind == "fault").Select(pair => pair.Key).ToArray())

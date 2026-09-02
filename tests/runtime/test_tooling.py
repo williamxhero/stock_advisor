@@ -16,6 +16,25 @@ from ai_trading_companion.tooling import FactRequest, ToolCatalog, ToolRunner
 
 
 class ToolRunnerTests(unittest.TestCase):
+    def test_builtin_upgrade_promotes_only_a_previous_builtin_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            previous = root / "generic_web_search" / "current.json"
+            previous.parent.mkdir(parents=True)
+            previous.write_text(json.dumps({
+                "contract": "ai-trading-tool-current/v1", "version": "1.1.0",
+            }), encoding="utf-8")
+            custom = root / "generic_web_read" / "current.json"
+            custom.parent.mkdir(parents=True)
+            custom.write_text(json.dumps({
+                "contract": "ai-trading-tool-current/v1", "version": "custom-1",
+            }), encoding="utf-8")
+
+            ensure_builtin_tools(root)
+
+            self.assertEqual("1.1.4", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
+
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
         version_root = root / capability / "versions" / "1.0.0"
         version_root.mkdir(parents=True)
@@ -368,6 +387,43 @@ class ToolRunnerTests(unittest.TestCase):
             self.assertFalse(result.succeeded)
             self.assertEqual("tool_access_restricted", result.error_code)
 
+    def test_builtin_web_search_uses_searxng_json_results(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps({"results": [{
+                    "url": "https://example.test/market-news",
+                    "title": "Market <b>news</b>",
+                    "content": "Policy &amp; risk update",
+                }]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "generic_web_search", "2026-09-01T01:30:00Z", 3.0,
+                    {"query": "A-share policy \udcb4 risk", "base_url": f"http://127.0.0.1:{server.server_port}"},
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("https://example.test/market-news", result.data["results"][0]["url"])
+                self.assertEqual("Market news", result.data["results"][0]["title"])
+                self.assertEqual("Policy & risk update", result.data["results"][0]["snippet"])
+                self.assertNotEqual("2026-09-01T01:30:00Z", result.fact_as_of)
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_browser_capture_executes_public_page_javascript_in_an_ephemeral_browser(self) -> None:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
@@ -435,11 +491,14 @@ class ToolRunnerTests(unittest.TestCase):
     def test_builtin_quote_tools_validate_a_share_identity_and_close_semantics(self) -> None:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
-                body = (
-                    'v_sh600000="1~浦发银行~600000~10.50~10.00~~~~~~~~~~~~20260901150100";\n'
-                    'v_sz000001="51~平安银行~000001~11.20~11.00~~~~~~~~~~~~20260901150100";\n'
-                    'v_bj830001="47~北交所样本~830001~21.00~20.00~~~~~~~~~~~~20260901150100";\n'
-                ).encode("gb18030")
+                if self.path.startswith("/minute"):
+                    body = json.dumps({"data": {"data": ["1500 10.50 100 1000.0"]}}).encode("utf-8")
+                else:
+                    body = (
+                        'v_sh600000="1~浦发银行~600000~10.50~10.00~~~~~~~~~~~~20260901150100";\n'
+                        'v_sz000001="51~平安银行~000001~11.20~11.00~~~~~~~~~~~~20260901150100";\n'
+                        'v_bj830001="47~北交所样本~830001~21.00~20.00~~~~~~~~~~~~20260901150100";\n'
+                    ).encode("gb18030")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=gb18030")
                 self.send_header("Content-Length", str(len(body)))
@@ -463,7 +522,11 @@ class ToolRunnerTests(unittest.TestCase):
                 ))
                 quotes = runner.resolve_with_fallback(FactRequest(
                     1, "cn_equity_quote_batch", "2026-09-01T07:01:00Z", 2.0,
-                    {"symbols": ["600000", "000001", "830001"], "quote_url": f"http://127.0.0.1:{server.server_port}/quotes?q="},
+                    {
+                        "symbols": ["600000", "000001", "830001"],
+                        "quote_url": f"http://127.0.0.1:{server.server_port}/quotes?q=",
+                        "tencent_minute_url": f"http://127.0.0.1:{server.server_port}/minute?code=",
+                    },
                     finality="official_close",
                 ))
 
@@ -565,6 +628,9 @@ class ToolRunnerTests(unittest.TestCase):
                         'v_sz399001="51~深证成指~399001~12000.0~11900.0~~~~~~~~~~~~20260901150100";\n'
                     ).encode("gb18030")
                     content_type = "text/plain; charset=gb18030"
+                elif self.path.startswith("/minute"):
+                    body = json.dumps({"data": {"data": ["1500 3500.0 100 1000.0"]}}).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
                 else:
                     body = json.dumps({
                         "fact_as_of": "2026-09-01T15:01:00+08:00", "trading_date": "2026-09-01", "source": "public_snapshot",
@@ -593,7 +659,10 @@ class ToolRunnerTests(unittest.TestCase):
                 runner = ToolRunner(ToolCatalog(root))
                 indexes = runner.resolve_with_fallback(FactRequest(
                     1, "cn_market_index_batch", "2026-09-01T07:01:00Z", 2.0,
-                    {"symbols": ["000001", "399001"], "index_url": f"{base}/index?q="}, finality="official_close",
+                    {
+                        "symbols": ["000001", "399001"], "index_url": f"{base}/index?q=",
+                        "tencent_minute_url": f"{base}/minute?code=",
+                    }, finality="official_close",
                 ))
                 snapshot = runner.resolve_with_fallback(FactRequest(
                     1, "cn_market_snapshot", "2026-09-01T07:01:00Z", 2.0,
@@ -666,6 +735,88 @@ class ToolRunnerTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_intraday_equity_quote_uses_the_last_minute_not_later_than_the_freeze(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/quote"):
+                    body = b'v_sh600000="1~Test~600000~9.20~9.00~~~~~~~~~~~~20260901094800";'
+                    content_type = "text/plain; charset=utf-8"
+                else:
+                    body = json.dumps({"data": {"sh600000": {"data": {"data": ["0945 9.10", "0948 9.20"]}}}}).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_equity_quote_batch", "2026-09-01T01:45:00Z", 4.0,
+                    {"symbols": ["600000"], "tencent_quote_url": base + "/quote?q=", "tencent_minute_url": base + "/minute?code="},
+                    finality="intraday",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual(9.10, result.data["quotes"][0]["price"])
+                self.assertEqual("2026-09-01T01:45:00Z", result.data["quotes"][0]["quote_at"])
+                self.assertLessEqual(result.fact_as_of, "2026-09-01T01:45:00Z")
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_official_close_equity_quote_uses_the_1500_minute_not_the_later_spot_timestamp(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/quote"):
+                    body = b'v_sh600000="1~Test~600000~9.20~9.00~~~~~~~~~~~~~~~~~~~~~~~~~~20260901154000";'
+                    content_type = "text/plain; charset=utf-8"
+                else:
+                    body = json.dumps({"data": {"sh600000": {"data": {"data": [
+                        "1459 9.10 100 1000.0", "1500 9.15 120 1200.0",
+                    ]}}}}).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_equity_quote_batch", "2026-09-01T07:00:00Z", 4.0,
+                    {"symbols": ["600000"], "tencent_quote_url": base + "/quote?q=", "tencent_minute_url": base + "/minute?code="},
+                    finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                quote = result.data["quotes"][0]
+                self.assertEqual(9.15, quote["price"])
+                self.assertEqual("2026-09-01T07:00:00Z", quote["quote_at"])
+                self.assertEqual("closed", quote["status"])
+                self.assertEqual("official_close", result.data["finality"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_market_snapshot_rejects_nontrading_or_stale_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "tools"
@@ -702,6 +853,54 @@ class ToolRunnerTests(unittest.TestCase):
 
             self.assertFalse(result.succeeded)
             self.assertEqual("tool_market_trading_date_mismatch", result.error_code)
+
+    def test_official_close_breadth_uses_complete_markethub_snapshot_with_lineage(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                body = json.dumps({
+                    "contract": "markethub-cn-a-share-market-breadth-v1",
+                    "trade_date": "2026-09-01", "fact_as_of": "2026-09-01T15:00:00+08:00",
+                    "status": "complete", "finality": "final",
+                    "up": 1500, "down": 3900, "flat": 100, "unpriced": 0,
+                    "suspended": 7, "universe_count": 5507,
+                    "source": "markethub_local_canonical_daily_snapshot",
+                    "lineage": {"dataset_version": "mhd-v1-test"},
+                    "coverage": {
+                        "eligible_count": 5507, "priced_count": 5500, "suspended_count": 7,
+                        "missing_count": 0, "invalid_price_count": 0,
+                        "accounted_count": 5507, "coverage_ratio": 1.0,
+                    },
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_market_breadth", "2026-09-01T07:20:00Z", 4.0,
+                    {"markethub_url": f"http://127.0.0.1:{server.server_port}/breadth"},
+                    finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("2026-09-01T07:00:00Z", result.fact_as_of)
+                self.assertEqual(1500, result.data["breadth"]["up"])
+                self.assertEqual(7, result.data["breadth"]["suspended"])
+                self.assertEqual("mhd-v1-test", result.data["lineage"]["dataset_version"])
+                self.assertEqual("official_close", result.data["finality"])
+            finally:
+                server.shutdown()
+                server.server_close()
 
 
 if __name__ == "__main__":

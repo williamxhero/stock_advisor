@@ -282,6 +282,25 @@ public sealed class CompanionEventProjectionTests
     }
 
     [Fact]
+    public void RetryableM1FailuresStayOnePendingBubbleUntilTheTerminalFailure()
+    {
+        var events = new[]
+        {
+            """{"contract":"companion-client-event/v1","event_id":"m0","cycle_id":"cycle-1","type":"m0.ready","created_at":"2026-09-02T01:45:00Z","payload":{"m0":"已核对的客观观察","cycle":{"task_key":"daily.execution.0945","state":"awaiting_h0"}}}""",
+            """{"contract":"companion-client-event/v1","event_id":"m1-start","cycle_id":"cycle-1","type":"m1.started","created_at":"2026-09-02T01:46:00Z","payload":{"cycle":{"task_key":"daily.execution.0945","state":"researching_m1"}}}""",
+            """{"contract":"companion-client-event/v1","event_id":"retry-1","cycle_id":"cycle-1","type":"m1.retrying","created_at":"2026-09-02T01:47:00Z","payload":{"cycle":{"task_key":"daily.execution.0945","state":"m1_retry_wait"}}}""",
+            """{"contract":"companion-client-event/v1","event_id":"retry-2","cycle_id":"cycle-1","type":"m1.retrying","created_at":"2026-09-02T01:48:00Z","payload":{"cycle":{"task_key":"daily.execution.0945","state":"m1_retry_wait"}}}"""
+        };
+
+        var projection = CompanionEventProjection.ProjectForTask(events, "daily.execution.0945");
+
+        Assert.NotNull(projection);
+        Assert.Equal(["m0", "action_pending"], projection.AiMessages.Select(message => message.Kind));
+        Assert.Equal("我正在重新核对，稍等一下。", projection.AiMessages[1].Text);
+        Assert.Null(projection.ErrorText);
+    }
+
+    [Fact]
     public void ConsecutiveFaultsShareOneCardAndRepeatedTextUsesLatestOccurrence()
     {
         const string repeated = "M1 遇到技术故障，未能完成。详细诊断已保留在本地审计记录中。";

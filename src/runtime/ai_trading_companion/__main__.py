@@ -10,6 +10,7 @@ import os
 import sqlite3
 import time
 import sys
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -63,12 +64,13 @@ INSTALL_ROOT = PATHS.install_root
 RUNTIME = Path(os.environ.get("AI_TRADING_COMPANION_RUNTIME", str(PATHS.runtime)))
 DB = Path(os.environ.get("AI_TRADING_COMPANION_DATABASE", str(PATHS.database)))
 SCHEMAS = PATHS.contracts
+_BREADTH_PREFETCH_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
 class VerifiedStageResult:
     output: dict[str, Any]
-    broker: BrokerResponse
+    broker: BrokerResponse | None
     attempt_id: str
     packet_hash: str
     verifier: dict[str, Any]
@@ -80,6 +82,7 @@ class VerifiedStageResult:
 
 M1_MAX_JUDGMENT_ATTEMPTS = 4
 M1_MIN_RETRY_WINDOW_SECONDS = 30
+FORMAL_MEMORY_MAX_ACTIONS = 4
 
 
 def _m1_should_retry(exc: Exception, *, attempt_number: int, remaining_seconds: int) -> bool:
@@ -376,6 +379,10 @@ def _gateway_snapshot(engine: CompanionEngine, store: CompanionStore, portfolio:
 def run_gateway(execute: bool = False) -> None:
     """Serve desktop requests without granting the desktop database access."""
     engine, store, exchange, portfolio = runtime()
+    # A hard process stop (for example, an application update) can prevent a
+    # worker's finally block from releasing its durable slot.  At this point a
+    # new Gateway owns no workers yet, so every stored claim is orphaned.
+    store.recover_orphaned_scheduled_workers()
     def command(payload: dict[str, Any]) -> dict[str, Any]:
         contract = payload.get("contract")
         if contract == "schedule-user-command/v1":
@@ -391,13 +398,20 @@ def run_gateway(execute: bool = False) -> None:
     def snapshot(kind: str, request: Any) -> dict[str, Any]:
         return _gateway_snapshot(engine, store, portfolio, kind, dict(request.query))
     def tick() -> None:
-        run_schedules(engine, store, datetime.now(timezone.utc), execute, exchange, portfolio)
+        # A manual analysis is the user's explicit foreground work.  Reserve
+        # and execute it before optional schedule/conversation maintenance so
+        # a maintenance exception cannot leave it indefinitely queued.
         for cycle in store.claim_scheduled_workers(limit=2):
             run_scheduled_cycle(engine, store, exchange, portfolio, cycle["cycle_id"], execute)
+        run_schedules(engine, store, datetime.now(timezone.utc), execute, exchange, portfolio)
+        # This cache warm-up is useful for the next scheduled boundary, but it
+        # is never allowed to occupy the sole Gateway tick worker.
+        threading.Thread(target=_prefetch_market_breadth, name="market-breadth-prefetch", daemon=True).start()
         for projection in engine.run_due():
             cycle_id = projection["cycle"]["cycle_id"]
             run_m1(engine, store, portfolio, cycle_id, execute)
             process_h0_cognition(engine, store, portfolio, cycle_id, execute)
+        run_pending_m1(engine, store, portfolio, execute)
         consume(engine, store, exchange, portfolio, execute)
         stale_before = iso(datetime.now(timezone.utc) - timedelta(minutes=10))
         store.recover_stale_cognition_jobs(before=stale_before)
@@ -418,6 +432,71 @@ def run_gateway(execute: bool = False) -> None:
         flush(store, exchange)
     import asyncio
     asyncio.run(serve_gateway(RuntimeGateway(PATHS.home, store, command, snapshot, tick)))
+
+
+def _prefetch_market_breadth() -> None:
+    """Persist a recent public breadth snapshot for the next frozen task boundary."""
+    if not _BREADTH_PREFETCH_LOCK.acquire(blocking=False):
+        return
+    target = PATHS.runtime / "market-breadth-snapshot.json"
+    try:
+        if target.exists() and (time.time() - target.stat().st_mtime) < 30:
+            return
+        requested_at = iso(datetime.now(timezone.utc) + timedelta(seconds=30))
+        resolution = ToolRunner(ToolCatalog(PATHS.tools)).resolve_with_fallback(FactRequest(
+            contract_version=1, capability="cn_market_breadth", required_at=requested_at,
+            deadline_seconds=8.0, inputs={}, context={"purpose": "runtime_prefetch"},
+            freshness_seconds=0.0, finality="intraday",
+        ))
+        if not resolution.succeeded or resolution.data is None or not resolution.fact_as_of:
+            return
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"fact_as_of": resolution.fact_as_of, "data": resolution.data,
+                                         "raw_artifact_ref": resolution.raw_artifact_ref}, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(target)
+    except Exception:
+        # A prefetch never changes a formal task's outcome except by making a
+        # already-observed snapshot available; failures remain non-authoritative.
+        return
+    finally:
+        _BREADTH_PREFETCH_LOCK.release()
+
+
+def _anchor_m0_facts(output: dict[str, Any], packet: dict[str, Any]) -> dict[str, Any]:
+    """Keep immutable market facts out of free-form model generation."""
+    if packet.get("stage") != "m0_compose" or not isinstance(output.get("semantic"), dict):
+        return output
+    anchored = json.loads(json.dumps(output, ensure_ascii=False))
+    facts: list[str] = []
+    for row in packet.get("verified_fact_digest") or []:
+        try:
+            payload = json.loads(str(row.get("excerpt") or ""))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        for index in payload.get("indices") or []:
+            if isinstance(index, dict):
+                facts.append(
+                    f"{index.get('name') or index.get('symbol')}：{index.get('price')}，前收{index.get('previous_close')}，"
+                    f"变动{index.get('change')}，变动幅度{index.get('change_percent')}%。"
+                )
+        breadth = payload.get("breadth")
+        if isinstance(breadth, dict):
+            facts.append(f"市场广度：上涨{breadth.get('up')}家，下跌{breadth.get('down')}家，平盘{breadth.get('flat')}家。")
+        for quote in payload.get("quotes") or []:
+            if not isinstance(quote, dict):
+                continue
+            local = str(quote.get("quote_at_china") or quote.get("quote_at") or "")
+            clock = local[-5:] if len(local) >= 5 else local
+            status = "交易状态" if quote.get("status") == "trading" else str(quote.get("status") or "状态未知")
+            facts.append(
+                f"{quote.get('name') or quote.get('symbol')}（{quote.get('symbol')}）北京时间{clock}："
+                f"价格{quote.get('price')}，前收{quote.get('previous_close')}，变动{quote.get('change')}，"
+                f"变动幅度{quote.get('change_percent')}%，{status}。"
+            )
+    if facts:
+        anchored["semantic"]["summary"] = "本阶段为 M0 客观观察；以下行情字段由冻结工具结果确定性投影。"
+        anchored["semantic"]["observations"] = facts
+    return anchored
 
 
 def _call_stage(
@@ -492,6 +571,7 @@ def _call_stage(
                 tool_runner,
                 as_of=_evidence_read_cutoff(packet, contract),
                 deadline=lambda: deadline - time.monotonic(),
+                contract=contract,
             )
             market_facts = packet.get("deterministic_market_facts")
             backends = {"gateway": web} if "gateway" in controls.enabled_backends else {}
@@ -503,7 +583,10 @@ def _call_stage(
                 )
             executor = ReadOnlyResearchExecutor(backends, max_operations=controls.max_operations)
             research = LocalResearchChain(
-                planner, executor, max_repairs=None,
+                # A repair is bounded so an incomplete web discovery cannot
+                # consume the compose model's entire deadline. The gate still
+                # rejects incomplete evidence; it is never published as M0.
+                planner, executor, max_repairs=2,
                 deadline=lambda: deadline - time.monotonic(),
             ).run(
                 packet, contract, attempt_id=attempt["attempt_id"],
@@ -526,26 +609,45 @@ def _call_stage(
 
         if not search or not schema_name.startswith("companion-evidence-result-"):
             schema = json.loads((SCHEMAS / schema_name).read_text(encoding="utf-8"))
+            def verified_output(output: dict[str, Any]) -> dict[str, Any]:
+                return router.verify(stage, packet, _anchor_m0_facts(output, packet))
             request = BrokerRequest(
                 stage=stage, packet=request_packet, packet_sha256=request_hash,
                 intellect=decision.intellect, effort=decision.reasoning_effort, schema=schema,
                 visible_stream=False, absolute_deadline=deadline,
                 output_token_limit=6_000 if stage == "m1_judgment" else 4_000 if stage == "m2" else 2_000,
                 verifier_name=f"cognitive-router/{stage}",
-                verifier=lambda output: router.verify(stage, packet, output),
+                verifier=verified_output,
                 h0_forbidden=stage == "m1_judgment",
             )
             outcome = broker.invoke(request)
             if not isinstance(outcome.result, dict):
                 raise BrokerError(f"Broker produced no qualified result for {stage}", category="broker_output_invalid")
-            data = outcome.result
+            data = _anchor_m0_facts(outcome.result, packet)
             verifier = router.verify(stage, packet, data)
             if evidence_verifier is not None:
                 verifier["evidence_gate"] = evidence_verifier
                 verifier["passed"] = bool(verifier.get("passed")) and bool(evidence_verifier.get("passed"))
 
         if outcome is None:
-            raise BrokerError("Broker produced no auditable outcome", category="broker_protocol")
+            if not (
+                search and schema_name.startswith("companion-evidence-result-")
+                and verifier.get("passed")
+            ):
+                raise BrokerError("Broker produced no auditable outcome", category="broker_protocol")
+            stage_audit = {
+                "kind": "local_evidence_gate",
+                "attempt_id": attempt["attempt_id"],
+                "validator_version": verifier.get("validator_version"),
+                "successful_tool_results": int(verifier.get("successful_tool_results") or 0),
+                "broker_call_required": False,
+            }
+            usage: dict[str, Any] = {}
+            actual_model = None
+        else:
+            stage_audit = outcome.audit_metadata()
+            usage = outcome.usage
+            actual_model = outcome.actual_model
         status = "succeeded" if verifier.get("passed") else "rejected"
         output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(
@@ -553,9 +655,9 @@ def _call_stage(
             status,
             output_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
             output=data,
-            usage=outcome.usage, verifier=verifier,
-            broker_metadata=outcome.audit_metadata(),
-            tool_trace=[*tool_trace, outcome.audit_metadata()], actual_model=outcome.actual_model,
+            usage=usage, verifier=verifier,
+            broker_metadata=stage_audit,
+            tool_trace=[*tool_trace, stage_audit], actual_model=actual_model,
         )
         attempt_finished = True
         if not verifier.get("passed"):
@@ -806,12 +908,11 @@ def run_research(
     on_progress: Any = None,
     frozen_as_of: str | None = None,
 ) -> dict[str, Any]:
-    cycle = engine.research_started(cycle["cycle_id"], as_of=frozen_as_of)
-    publish_observatory_forecast(store, cycle["cycle_id"], trigger="stage:m0_started")
-    if on_progress:
-        on_progress()
-    builder = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
     if not execute:
+        cycle = engine.research_started(cycle["cycle_id"], as_of=frozen_as_of)
+        publish_observatory_forecast(store, cycle["cycle_id"], trigger="stage:m0_started")
+        if on_progress:
+            on_progress()
         evidence = {"as_of": cycle["as_of"], "spoken_summary": "Fixture 模式：等待真实公开信息搜索。", "sources": [], "critical_gaps": []}
         store.append_artifact(cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False), cycle["as_of"])
         evidence_hash = "fixture-m0-research"
@@ -830,7 +931,28 @@ def run_research(
     research_controls = resolve_stage_controls(
         store, "m0_research", timeout=research_timeout, search=True,
     )
-    memory_research = _formal_adaptive_research(engine, store, cycle, "m0_research", cycle["as_of"], research_timeout)
+    # M0's public market/portfolio evidence is a deterministic acquisition
+    # obligation.  Do not put an optional model-directed MemoryHub exploration
+    # in front of it: a slow provider would otherwise leave an accepted manual
+    # analysis visibly queued without even beginning its frozen evidence work.
+    # RuntimePacketBuilder still supplies the policy-filtered MemoryHub cards;
+    # this merely keeps speculative adaptive exploration out of the critical
+    # evidence path.
+    memory_research = {
+        "adaptive_memory": [],
+        "adaptive_actions": [],
+        "mode": "deterministic_m0_evidence_first",
+    }
+    if cycle.get("kind") == "manual":
+        # A manual request may wait in the shared worker queue. Freeze it at
+        # the actual collection start, not at its earlier queue timestamp.
+        cycle = engine.refresh_manual_analysis_contract(cycle["cycle_id"], iso(datetime.now(timezone.utc)))
+        frozen_as_of = cycle["as_of"]
+    cycle = engine.research_started(cycle["cycle_id"], as_of=frozen_as_of)
+    publish_observatory_forecast(store, cycle["cycle_id"], trigger="stage:m0_started")
+    if on_progress:
+        on_progress()
+    builder = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
     public_packet = finalize_stage_packet(builder.build(cycle, "m0_research", context=memory_research), research_controls)
     compose_timeout = int(policy.m1_timeout.total_seconds())
     compose_controls = resolve_stage_controls(
@@ -937,25 +1059,46 @@ def run_m1(
     research_controls = resolve_stage_controls(
         store, "m1_research", timeout=research_timeout, search=True,
     )
-    memory_research = _formal_adaptive_research(engine, store, cycle, "m1_research", research_as_of, research_timeout)
-    public_packet = finalize_stage_packet(
-        builder.build(cycle, "m1_research", evidence=prior_evidence, as_of=research_as_of, context=memory_research), research_controls,
-    )
-    checkpoint = store.stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"])
-    if checkpoint:
-        evidence = checkpoint["output"]
-        evidence_attempt_id = checkpoint["attempt_id"]
-    else:
-        evidence = prior_evidence
-        evidence_attempt_id = _reuse_m0_evidence_attempt(store, cycle, public_packet, evidence)
-        store.save_stage_checkpoint(
-            cycle_id, "m1_research", public_packet["sha256"], evidence_attempt_id, evidence,
+    try:
+        memory_research = _formal_adaptive_research(
+            engine, store, cycle, "m1_research", research_as_of, research_timeout,
         )
-        store.append_artifact(
-            cycle_id, "m1_evidence", "runtime", json.dumps(evidence, ensure_ascii=False),
-            str(evidence.get("as_of") or research_as_of),
-            {"public_only": True, "attempt_id": evidence_attempt_id, "reused_from": "m0_research"},
+    except MemoryResearchError as exc:
+        engine.m1_failed(
+            cycle_id, str(exc), retryable=False,
+            details={
+                "passed": False,
+                "problems": ["memory_research_deadline"],
+                "missing_requirements": ["private_memory_context"],
+            },
         )
+        raise
+    try:
+        public_packet = finalize_stage_packet(
+            builder.build(cycle, "m1_research", evidence=prior_evidence, as_of=research_as_of, context=memory_research), research_controls,
+        )
+        checkpoint = store.stage_checkpoint(cycle_id, "m1_research", public_packet["sha256"])
+        if checkpoint:
+            evidence = checkpoint["output"]
+            evidence_attempt_id = checkpoint["attempt_id"]
+        else:
+            evidence = prior_evidence
+            evidence_attempt_id = _reuse_m0_evidence_attempt(store, cycle, public_packet, evidence)
+            store.save_stage_checkpoint(
+                cycle_id, "m1_research", public_packet["sha256"], evidence_attempt_id, evidence,
+            )
+            store.append_artifact(
+                cycle_id, "m1_evidence", "runtime", json.dumps(evidence, ensure_ascii=False),
+                str(evidence.get("as_of") or research_as_of),
+                {"public_only": True, "attempt_id": evidence_attempt_id, "reused_from": "m0_research"},
+            )
+    except Exception as exc:
+        details = getattr(exc, "verifier", None)
+        engine.m1_failed(
+            cycle_id, str(exc), retryable=False,
+            details=details if isinstance(details, dict) else None,
+        )
+        raise
     verification_feedback: dict[str, Any] | None = None
     for number in range(1, M1_MAX_JUDGMENT_ATTEMPTS + 1):
         try:
@@ -985,7 +1128,7 @@ def run_m1(
                 judgment, judgment_attempt_id = judgment_checkpoint["output"], judgment_checkpoint["attempt_id"]
             else:
                 judgment_stage = _call_stage(
-                    store, cycle, "m1_judgment", local_packet, "companion-m1-result-v2.schema.json",
+                    store, cycle, "m1_judgment", local_packet, "companion-m1-result-v3.schema.json",
                     search=False, timeout=judgment_timeout, frozen_controls=judgment_controls,
                 )
                 judgment, judgment_attempt_id = judgment_stage.output, judgment_stage.attempt_id
@@ -1364,14 +1507,29 @@ def run_schedules(engine: CompanionEngine, store: CompanionStore, at: datetime, 
         if not submitted:
             continue
         flush(store, exchange)
-        reply = run_chat(
-            engine, store, portfolio, conversation["cycle_id"], submitted["committed_batch_id"], execute,
-            on_progress=lambda: flush(store, exchange),
-        )
+        # A conversation reply can legitimately take a full model deadline.
+        # It is not allowed to monopolise the Gateway ticker and delay a
+        # foreground manual M0 from even beginning its deterministic market
+        # and portfolio acquisition.
+        def reply_in_background(
+            conversation_cycle_id: str = conversation["cycle_id"],
+            batch_id: str = submitted["committed_batch_id"],
+        ) -> None:
+            try:
+                run_chat(
+                    engine, store, portfolio, conversation_cycle_id, batch_id, execute,
+                    on_progress=lambda: flush(store, exchange),
+                )
+            except Exception as exc:
+                engine.background_failed(conversation_cycle_id, "scheduled_conversation", str(exc))
+                flush(store, exchange)
+        threading.Thread(
+            target=reply_in_background, name="scheduled-conversation", daemon=True,
+        ).start()
         results.append({
             "task_key": row["task_key"], "scheduled_for": target.isoformat(timespec="seconds"),
             "action": "conversation_auto_submitted", "conversation_cycle_id": conversation["cycle_id"],
-            "cognition_job_id": reply.get("job_id"),
+            "cognition_job_id": None,
         })
     return results
 
@@ -1387,8 +1545,33 @@ def run_scheduled_cycle(engine: CompanionEngine, store: CompanionStore, exchange
         result = run_research(engine, store, cycle, execute, lambda: flush(store, exchange))
         process_h0_cognition(engine, store, portfolio, cycle_id, execute)
         return result
+    except ValueError as exc:
+        # An accepted cycle must never remain queued forever because its
+        # persisted local profile is malformed. This is terminal configuration
+        # evidence for that occurrence, not a retry loop.
+        current = store.get_cycle(cycle_id)
+        if current["state"] == "queued":
+            return engine.research_failed(cycle_id, str(exc))
+        raise
     finally:
         store.finish_scheduled_worker(cycle_id)
+
+
+def run_pending_m1(
+    engine: CompanionEngine, store: CompanionStore, portfolio: PortfolioService,
+    execute: bool, *, limit: int = 2, at: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Run M1 made ready by an immediate user H0 commit/skip.
+
+    Deadline-driven H0 transitions are handled inline by ``run_due``. Manual
+    transitions happen in a Gateway command and therefore need this tick-owned
+    pickup path; the Gateway tick is serial, so a cycle cannot be claimed by a
+    second M1 worker concurrently.
+    """
+    results: list[dict[str, Any]] = []
+    for cycle in store.pending_m1_cycles(limit=limit, at=at):
+        results.append(run_m1(engine, store, portfolio, cycle["cycle_id"], execute))
+    return results
 
 
 def run_background(
@@ -1535,6 +1718,7 @@ def _formal_adaptive_research(engine: CompanionEngine, store: CompanionStore, cy
         engine.memory, engine.memory_space_id,
         lambda state: _next_memory_research_action(store, cycle, state, deadline),
         discover_external=lambda action, snapshot: _discover_chat_external_evidence(engine, action, snapshot),
+        max_actions=FORMAL_MEMORY_MAX_ACTIONS,
     ).collect(cycle["cycle_id"], [{"message_id": stage, "body_text": f"Formal {stage} evidence gaps", "known_at": as_of}], deadline=deadline, stage=stage)
     return {"memoryhub_snapshot": result.snapshot, "adaptive_memory": list(result.context), "adaptive_actions": list(result.actions)}
 

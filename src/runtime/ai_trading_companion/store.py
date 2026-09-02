@@ -14,6 +14,16 @@ from zoneinfo import ZoneInfo
 from .secret_guard import assert_safe
 
 
+_USER_VISIBLE_CYCLE_SQL = """NOT (
+  c.kind='manual'
+  AND CASE
+      WHEN json_valid(COALESCE(c.request_source_json, '{}'))
+      THEN COALESCE(json_extract(c.request_source_json, '$.kind'), '')
+      ELSE ''
+  END IN ('manual_acceptance','manual_validation','codex_local_verification')
+)"""
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -566,7 +576,7 @@ class CompanionStore:
         """Authoritative compact history, deduplicated by task and scheduled time."""
         self.initialize(); limit = max(1, min(limit, 90))
         with self.connection() as c:
-            clauses, values = ["1=1"], []
+            clauses, values = ["1=1", _USER_VISIBLE_CYCLE_SQL], []
             if before: clauses.append("substr(c.scheduled_for,1,10)<?"); values.append(before)
             if search:
                 clauses.append("(c.task_key LIKE ? OR EXISTS(SELECT 1 FROM narrative_artifact a WHERE a.cycle_id=c.cycle_id AND a.body_markdown LIKE ?))")
@@ -736,6 +746,41 @@ class CompanionStore:
         with self.connection() as c:
             c.execute("DELETE FROM schedule_worker_claim WHERE cycle_id=?", (cycle_id,))
 
+    def pending_m1_cycles(
+        self, *, limit: int = 2, at: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return M1 work made runnable by a manual H0 action or repair."""
+        cutoff = (
+            (at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+            .isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        )
+        with self.connection() as c:
+            return [dict(row) for row in c.execute(
+                """SELECT * FROM companion_cycle
+                     WHERE state IN ('researching_m1','m1_retry_wait')
+                       AND m1_publish_deadline IS NOT NULL
+                       AND julianday(m1_publish_deadline) > julianday(?)
+                     ORDER BY CASE kind WHEN 'manual' THEN 0 ELSE 1 END,
+                              julianday(updated_at) DESC,julianday(created_at) DESC LIMIT ?""",
+                (cutoff, max(1, int(limit))),
+            )]
+
+    def recover_orphaned_scheduled_workers(self) -> list[str]:
+        """Release claims owned by a process that ended before its finally block.
+
+        This method is intentionally called only while a new Gateway is
+        starting, before it can claim any work itself.  It does not alter the
+        interrupted cycle or its artifacts; it merely frees worker capacity
+        for later queued cycles.
+        """
+        self.initialize()
+        with self.connection() as c:
+            rows = c.execute("SELECT cycle_id FROM schedule_worker_claim ORDER BY claimed_at").fetchall()
+            cycle_ids = [str(row["cycle_id"]) for row in rows]
+            if cycle_ids:
+                c.execute("DELETE FROM schedule_worker_claim")
+        return cycle_ids
+
     def create_cycle(self, task_key: str, scheduled_for: str, as_of: str, *, schedule_id: str | None = None, schedule_revision: int | None = None, schedule_snapshot: dict[str, Any] | None = None, kind: str = "scheduled", work_start_at: str | None = None) -> dict[str, Any]:
         self.initialize(); cycle_id = str(uuid.uuid4()); at = now()
         with self.connection() as c:
@@ -833,6 +878,23 @@ class CompanionStore:
             )
             return self.get_cycle(cycle_id, connection=c), True
 
+    def refresh_manual_analysis_contract(self, cycle_id: str, as_of: str, contract: dict[str, Any]) -> dict[str, Any]:
+        """Freeze a manual request at the instant its research worker actually starts."""
+        self.initialize()
+        raw = json.dumps(contract, ensure_ascii=False, sort_keys=True)
+        with self.connection() as c:
+            row = c.execute("SELECT kind,state FROM companion_cycle WHERE cycle_id=?", (cycle_id,)).fetchone()
+            if row is None:
+                raise ValueError("unknown manual analysis cycle")
+            if row["kind"] != "manual" or row["state"] != "queued":
+                raise ValueError("manual analysis contract can only refresh while queued")
+            c.execute(
+                """UPDATE companion_cycle SET as_of=?,evidence_contract_version=?,evidence_contract_hash=?,
+                   evidence_contract_json=?,updated_at=?,revision=revision+1 WHERE cycle_id=?""",
+                (as_of, int(contract["version"]), str(contract["contract_hash"]), raw, now(), cycle_id),
+            )
+        return self.get_cycle(cycle_id)
+
     def find_cycle(self, task_key: str, scheduled_for: str) -> dict[str, Any] | None:
         self.initialize()
         with self.connection() as c:
@@ -849,7 +911,7 @@ class CompanionStore:
         self.initialize()
         with self.connection() as c:
             rows = c.execute(
-                """SELECT * FROM (
+                f"""SELECT * FROM (
                        SELECT c.*,
                               COALESCE(a.artifact_count, 0) AS artifact_count,
                               COALESCE(m.message_count, 0) AS message_count,
@@ -879,6 +941,7 @@ class CompanionStore:
                          GROUP BY cycle_id
                     ) m ON m.cycle_id=c.cycle_id
                         WHERE substr(scheduled_for, 1, 10)=?
+                          AND {_USER_VISIBLE_CYCLE_SQL}
                           AND NOT EXISTS (
                               SELECT 1 FROM companion_cycle_visibility v
                                WHERE v.cycle_id=c.cycle_id AND v.dismissed_at IS NOT NULL
@@ -901,6 +964,30 @@ class CompanionStore:
                     ORDER BY created_at""",
                 (task_profile_id,),
             )]
+            for cycle in cycles:
+                c.execute(
+                    """INSERT INTO companion_cycle_visibility(cycle_id,dismissed_at,reason)
+                       VALUES(?,?,?) ON CONFLICT(cycle_id) DO UPDATE SET
+                       dismissed_at=excluded.dismissed_at,reason=excluded.reason""",
+                    (cycle["cycle_id"], dismissed_at, reason),
+                )
+        return cycles
+
+    def dismiss_cycles(self, cycle_ids: list[str], reason: str) -> list[dict[str, Any]]:
+        """Hide an explicit bounded set from projections while preserving its audit records."""
+        self.initialize()
+        unique_ids = list(dict.fromkeys(str(value).strip() for value in cycle_ids if str(value).strip()))
+        if not unique_ids or len(unique_ids) > 100:
+            raise ValueError("cycle_ids must contain between 1 and 100 explicit cycle ids")
+        placeholders = ",".join("?" for _ in unique_ids)
+        dismissed_at = now()
+        with self.connection() as c:
+            cycles = [dict(row) for row in c.execute(
+                f"SELECT * FROM companion_cycle WHERE cycle_id IN ({placeholders}) ORDER BY created_at",
+                unique_ids,
+            )]
+            if len(cycles) != len(unique_ids):
+                raise ValueError("one or more cycle_ids are unknown")
             for cycle in cycles:
                 c.execute(
                     """INSERT INTO companion_cycle_visibility(cycle_id,dismissed_at,reason)

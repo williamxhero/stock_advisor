@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 from ai_trading_companion.__main__ import (
     M1_MAX_JUDGMENT_ATTEMPTS,
     _call_stage,
+    _anchor_m0_facts,
     _evidence_read_cutoff,
     _frozen_m0_source_attempt,
     _m1_research_as_of,
@@ -19,6 +20,9 @@ from ai_trading_companion.broker_client import BrokerError
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.evidence_gate import EvidenceGate
 from ai_trading_companion.engine import CompanionEngine
+from ai_trading_companion.local_research import BrokerResearchPlanner
+from ai_trading_companion.router import CognitiveRouter
+from ai_trading_companion.runtime_strategy_policy import RuntimeStrategyControls
 from ai_trading_companion.store import CompanionStore
 
 
@@ -82,6 +86,14 @@ class EvidenceV3Tests(TestCase):
         self.contract = EvidenceContractFactory(_WeekdayCalendar()).build(
             task_key="daily.opportunity.0900", stage="m0_research", as_of=self.as_of,
         )
+        self.planner_contract = {
+            "version": 4, "as_of": self.as_of, "requirements": [{
+                "key": "material_events_and_counterevidence", "blocking": True,
+                "allowed_coverage": ["covered", "checked_no_change"],
+                "window": {"mode": "after_start_to_end", "start": "2026-08-25T07:00:00Z", "end": self.as_of},
+                "negative_query_terms": ["公告", "政策", "风险"],
+            }],
+        }
         self.market = next(item for item in self.contract["requirements"] if item["key"] == "current_market_state")
         self.events = next(item for item in self.contract["requirements"] if item["key"] == "material_events_and_counterevidence")
         self.observations = [{
@@ -135,10 +147,21 @@ class EvidenceV3Tests(TestCase):
         )
         self.assertEqual("2026-08-26T07:00:00Z", requirements["events_and_counterevidence"]["window"]["start"])
         self.assertEqual("2026-08-27T07:20:02.555000Z", requirements["events_and_counterevidence"]["window"]["end"])
+        self.assertEqual(
+            {"start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z", "mode": "exact"},
+            requirements["market_breadth"]["window"],
+        )
+        self.assertEqual("official_close", requirements["market_breadth"]["finality"])
+        self.assertFalse(requirements["turnover_compare"]["blocking"])
+        self.assertEqual(["covered"], requirements["turnover_compare"]["allowed_coverage"])
+        self.assertFalse(requirements["themes_and_capacity_cores"]["blocking"])
+        self.assertEqual(["covered"], requirements["themes_and_capacity_cores"]["allowed_coverage"])
+        self.assertEqual(["covered"], requirements["portfolio_market_state"]["allowed_coverage"])
         blockers = [row["key"] for row in contract["requirements"] if row["blocking"]]
         self.assertEqual([
-            "indices_close", "turnover_compare", "market_breadth", "themes_and_capacity_cores",
-            "events_and_counterevidence", "prior_judgment_changes", "portfolio_close",
+            "indices_close", "market_breadth", "events_and_counterevidence",
+            "prior_judgment_changes", "portfolio_market_state",
+            "portfolio_events_and_counterevidence",
         ], blockers)
 
         rejected = EvidenceGate().evaluate(
@@ -204,6 +227,137 @@ class EvidenceV3Tests(TestCase):
         result = EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="intraday-attempt")
 
         self.assertTrue(result["passed"], result["problems"])
+
+    def test_intraday_contract_v4_blocks_publication_without_market_breadth_and_all_holdings(self):
+        contract = EvidenceContractFactory(_WeekdayCalendar()).build(
+            task_key="daily.execution.0945", stage="m0_research",
+            as_of="2026-08-31T01:45:00Z",
+            internal_context={"portfolio_entities": ["600487", "603861", "300421"]},
+        )
+
+        requirements = {item["key"]: item for item in contract["requirements"]}
+
+        self.assertEqual(4, contract["version"])
+        self.assertEqual(["600487", "603861", "300421"], requirements["portfolio_market_state"]["required_entities"])
+        self.assertEqual(["covered"], requirements["portfolio_market_state"]["allowed_coverage"])
+        self.assertEqual(["covered", "checked_no_change"], requirements["portfolio_events_and_counterevidence"]["allowed_coverage"])
+        self.assertTrue(requirements["market_breadth"]["blocking"])
+
+    def test_v4_portfolio_quotes_are_qualified_from_structured_tool_json(self):
+        as_of = "2026-08-31T01:45:00Z"
+        contract = {"version": 4, "as_of": as_of, "requirements": [{
+            "key": "portfolio_market_state", "blocking": True, "allowed_coverage": ["covered"],
+            "required_entities": ["600487", "603861"], "minimum_numeric_facts": 8,
+            "window": {"mode": "after_start_to_end", "start": "2026-08-31T01:30:00Z", "end": as_of},
+        }]}
+        quotes = [
+            {"symbol": "600487", "previous_close": 1.0, "price": 1.1, "change": 0.1, "change_percent": 10.0,
+             "quote_at": "2026-08-31T01:44:00Z", "trading_date": "2026-08-31", "status": "trading"},
+            {"symbol": "603861", "previous_close": 2.0, "price": 1.9, "change": -0.1, "change_percent": -5.0,
+             "quote_at": "2026-08-31T01:44:00Z", "trading_date": "2026-08-31", "status": "trading"},
+        ]
+        sources, evidence_items = [], []
+        for index, quote in enumerate(quotes, 1):
+            ref = f"quote-{index}"
+            excerpt = json.dumps({"quotes": [quote]}, ensure_ascii=False, sort_keys=True)
+            sources.append({"evidence_ref": ref, "excerpt": excerpt})
+            evidence_items.append({"evidence_ref": ref, "excerpt_text": excerpt, "fact_as_of": quote["quote_at"],
+                                   "published_at": None, "acquired_at": as_of})
+        observations = [{"attempt_id": "attempt", "backend": "market", "status": "succeeded", "non_empty": True,
+                         "evidence_items": evidence_items}]
+        evidence = {"schema_version": 3, "as_of": as_of, "sources": sources,
+                    "coverage": [{"requirement_key": "portfolio_market_state", "status": "covered",
+                                  "evidence_refs": ["quote-1", "quote-2"]}], "high_impact_events": []}
+
+        self.assertTrue(EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")["passed"])
+        quotes[1].pop("change_percent")
+        excerpt = json.dumps({"quotes": [quotes[1]]}, ensure_ascii=False, sort_keys=True)
+        evidence["sources"][1]["excerpt"] = excerpt
+        observations[0]["evidence_items"][1]["excerpt_text"] = excerpt
+        failed = EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")
+        self.assertIn("blocking_requirement_lacks_numeric_facts:portfolio_market_state", failed["problems"])
+
+    def test_v4_market_breadth_is_qualified_from_structured_tool_json(self):
+        as_of = "2026-08-31T01:45:00Z"
+        contract = {"version": 4, "as_of": as_of, "requirements": [{
+            "key": "market_breadth", "blocking": True, "allowed_coverage": ["covered"],
+            "minimum_numeric_facts": 3,
+            "window": {"mode": "after_start_to_end", "start": "2026-08-31T01:30:00Z", "end": as_of},
+        }]}
+        excerpt = json.dumps({"breadth": {"up": 632, "down": 2203, "flat": 57}}, ensure_ascii=False)
+        observations = [{"attempt_id": "attempt", "backend": "market", "status": "succeeded", "non_empty": True,
+                         "evidence_items": [{"evidence_ref": "breadth", "excerpt_text": excerpt,
+                                             "fact_as_of": "2026-08-31T01:44:00Z", "published_at": None, "acquired_at": as_of}]}]
+        evidence = {"schema_version": 3, "as_of": as_of, "sources": [{"evidence_ref": "breadth", "excerpt": excerpt}],
+                    "coverage": [{"requirement_key": "market_breadth", "status": "covered", "evidence_refs": ["breadth"]}],
+                    "high_impact_events": []}
+
+        self.assertTrue(EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")["passed"])
+        excerpt = json.dumps({"breadth": {"up": 632, "down": 2203}}, ensure_ascii=False)
+        evidence["sources"][0]["excerpt"] = excerpt
+        observations[0]["evidence_items"][0]["excerpt_text"] = excerpt
+        failed = EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")
+        self.assertIn("blocking_requirement_lacks_numeric_facts:market_breadth", failed["problems"])
+
+    def test_v4_official_close_breadth_at_the_frozen_close_satisfies_the_contract(self):
+        close = "2026-09-02T07:00:00Z"
+        contract = {"version": 4, "as_of": "2026-09-02T08:20:00Z", "requirements": [{
+            "key": "market_breadth", "blocking": True, "allowed_coverage": ["covered"],
+            "minimum_numeric_facts": 3,
+            "window": {"mode": "exact", "start": close, "end": close},
+        }]}
+        excerpt = json.dumps({
+            "breadth": {"universe_count": 5554, "up": 1541, "down": 3901, "flat": 105,
+                        "suspended": 7, "unpriced": 0, "coverage_ratio": 1.0},
+            "finality": "official_close",
+        }, ensure_ascii=False)
+        observations = [{
+            "attempt_id": "attempt", "backend": "market", "status": "succeeded", "non_empty": True,
+            "evidence_items": [{"evidence_ref": "breadth", "excerpt_text": excerpt,
+                                "fact_as_of": close, "published_at": None,
+                                "acquired_at": "2026-09-02T08:20:19Z"}],
+        }]
+        evidence = {
+            "schema_version": 3, "as_of": contract["as_of"],
+            "sources": [{"evidence_ref": "breadth", "excerpt": excerpt}],
+            "coverage": [{"requirement_key": "market_breadth", "status": "covered",
+                          "evidence_refs": ["breadth"]}],
+            "high_impact_events": [],
+        }
+
+        result = EvidenceGate().evaluate(evidence, contract, observations, contract["as_of"], attempt_id="attempt")
+
+        self.assertTrue(result["passed"], result["problems"])
+
+    def test_m0_rejects_utc_clock_and_requires_local_quote_time_and_status(self):
+        packet = {
+            "calendar_context": {},
+            "evidence_contract": {"requirements": [{"key": "portfolio_market_state", "required_entities": ["600487"]}]},
+            "verified_fact_digest": [{"excerpt": json.dumps({"quotes": [{
+                "symbol": "600487", "price": 67.97, "previous_close": 67.34, "change": 0.63,
+                "change_percent": 0.9356, "quote_at": "2026-09-02T05:22:00Z", "status": "trading",
+            }]})}],
+        }
+        output = {"semantic": {"summary": "600487 价格67.97，前收67.34，变动0.63，变动幅度0.9356%，处于交易状态，截至今天早上五点二十二分。",
+                               "observations": [], "risks": [], "unknowns": []}}
+        rejected = CognitiveRouter().verify("m0_compose", packet, output)
+        self.assertIn("m0_portfolio_quote_time_conflict:600487", rejected["problems"])
+
+        output["semantic"]["summary"] = "600487 价格67.97，前收67.34，变动0.63，变动幅度0.9356%，处于交易状态，北京时间13:22。"
+        self.assertTrue(CognitiveRouter().verify("m0_compose", packet, output)["passed"])
+
+    def test_m0_anchor_replaces_model_market_numbers_with_frozen_facts(self):
+        packet = {"stage": "m0_compose", "verified_fact_digest": [{"excerpt": json.dumps({
+            "indices": [{"name": "上证指数", "price": 3900, "previous_close": 4000, "change": -100, "change_percent": -2.5}],
+            "breadth": {"up": 1, "down": 2, "flat": 3},
+            "quotes": [{"name": "样本", "symbol": "600487", "price": 10, "previous_close": 9, "change": 1,
+                        "change_percent": 11.1, "quote_at_china": "北京时间2026-08-31 13:22", "status": "trading"}],
+        })}]}
+        result = _anchor_m0_facts({"semantic": {"summary": "错误价格99", "observations": ["错误"], "risks": [], "unknowns": []}}, packet)
+        text = " ".join([result["semantic"]["summary"], *result["semantic"]["observations"]])
+        self.assertNotIn("错误价格99", text)
+        for expected in ("上证指数：3900", "上涨1家，下跌2家，平盘3家", "样本（600487）北京时间13:22", "价格10，前收9"):
+            self.assertIn(expected, text)
 
     def test_rejects_foreign_reference_and_naive_runtime_time(self):
         foreign = EvidenceGate().evaluate(self._evidence("ev_other_1"), self.contract, self.observations, self.as_of, attempt_id="attempt-1")
@@ -278,7 +432,7 @@ class EvidenceV3Tests(TestCase):
             settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
             packet = {
                 "task_key": "daily.opportunity.0900", "stage": "m0_research", "as_of": self.as_of,
-                "evidence_contract": self.contract,
+                "evidence_contract": self.planner_contract,
             }
             with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
                 "ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker,
@@ -286,12 +440,51 @@ class EvidenceV3Tests(TestCase):
                 with self.assertRaisesRegex(BrokerError, "research stopped"):
                     _call_stage(
                         store, cycle, "m0_research", packet,
-                        "companion-research-evidence-v2.schema.json", search=True, timeout=60,
+                        "companion-research-result-v1.schema.json", search=False, timeout=60,
+                        frozen_controls=RuntimeStrategyControls(60, 0, (), ()),
                     )
 
             attempt = store.attempts(cycle["cycle_id"])[0]
             self.assertEqual("failed", attempt["status"])
             self.assertEqual(trace, json.loads(attempt["tool_trace_json"]))
+
+    def test_qualified_deterministic_research_needs_no_synthetic_broker_call(self):
+        evidence = {
+            "schema_version": 3, "as_of": self.as_of, "spoken_summary": "verified",
+            "sources": [], "coverage": [], "critical_gaps": [], "conflicts": [],
+            "high_impact_events": [],
+        }
+        qualified = SimpleNamespace(
+            qualified=True, evidence=evidence,
+            verifier={"passed": True, "problems": [], "successful_tool_results": 9},
+            observations=[{"operation": "market_breadth", "status": "succeeded", "ok": True}],
+        )
+        with TemporaryDirectory() as temporary:
+            store = CompanionStore(Path(temporary) / "companion.sqlite3")
+            cycle = CompanionEngine(store).start_cycle(
+                "daily.review.1520", "2026-09-02T15:20:00+08:00", self.as_of,
+            )
+            broker = Mock()
+            settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
+            packet = {
+                "task_key": cycle["task_key"], "stage": "m0_research", "as_of": self.as_of,
+                "evidence_contract": self.planner_contract,
+            }
+
+            with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
+                "ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker,
+            ), patch("ai_trading_companion.__main__.LocalResearchChain.run", return_value=qualified):
+                result = _call_stage(
+                    store, cycle, "m0_research", packet,
+                    "companion-evidence-result-v3.schema.json", search=True, timeout=60,
+                    frozen_controls=RuntimeStrategyControls(60, 16, ("gateway", "market"), ()),
+                )
+
+            self.assertIsNone(result.broker)
+            broker.invoke.assert_not_called()
+            attempt = store.attempts(cycle["cycle_id"])[0]
+            self.assertEqual("succeeded", attempt["status"])
+            self.assertEqual("local_evidence_gate", json.loads(attempt["tool_trace_json"])[-1]["kind"])
 
     def test_failed_stage_persists_broker_verifier_for_auditable_repair(self):
         verifier = {
@@ -354,32 +547,25 @@ class EvidenceV3Tests(TestCase):
         )
 
     def test_research_planning_uses_broker_and_never_calls_legacy_provider_tool_loop(self):
-        with TemporaryDirectory() as temporary:
-            store = CompanionStore(Path(temporary) / "companion.sqlite3")
-            cycle = CompanionEngine(store).start_cycle(
-                "daily.opportunity.0900", "2026-08-26T09:00:00+08:00", self.as_of,
-            )
-            settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
-            packet = {
-                "task_key": "daily.opportunity.0900", "stage": "m0_research", "as_of": self.as_of,
-                "evidence_contract": self.contract,
-            }
+        broker = Mock()
+        broker.invoke.side_effect = BrokerError("stop after inspecting request", category="test")
+        planner = BrokerResearchPlanner(
+            broker, intellect="smart", effort="medium", deadline=lambda: 2_000_000_000.0,
+            market_tool_available=True,
+        )
+        packet = {
+            "task_key": "daily.opportunity.0900", "stage": "m0_research", "as_of": self.as_of,
+            "evidence_contract": self.planner_contract,
+            "allowed_research_backends": ["gateway", "market"],
+        }
 
-            broker = Mock()
-            broker.invoke.side_effect = BrokerError("stop after inspecting request", category="test")
-            with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
-                "ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker,
-            ):
-                with self.assertRaisesRegex(BrokerError, "stop after inspecting request"):
-                    _call_stage(
-                        store, cycle, "m0_research", packet,
-                        "companion-research-evidence-v2.schema.json", search=True, timeout=60,
-                    )
+        with self.assertRaisesRegex(BrokerError, "stop after inspecting request"):
+            planner(packet, ["blocking_requirement_missing:material_events_and_counterevidence"], 0)
 
-            request = broker.invoke.call_args.args[0]
-            self.assertEqual("research", request.stage)
-            self.assertFalse(request.visible_stream)
-            self.assertIsNotNone(request.schema)
+        request = broker.invoke.call_args.args[0]
+        self.assertEqual("research", request.stage)
+        self.assertFalse(request.visible_stream)
+        self.assertIsNotNone(request.schema)
 
 
 class _WeekdayCalendar:

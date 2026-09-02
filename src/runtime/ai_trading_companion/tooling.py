@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import gzip
 import json
+import math
 import os
 import shutil
 import signal
@@ -280,7 +281,10 @@ class ToolRunner:
             )
             try:
                 stdout, stderr = process.communicate(
-                    json.dumps(wire_request, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                    # ASCII escaping keeps malformed provider surrogates inside
+                    # the JSON envelope until the capability can sanitize its
+                    # public text fields deterministically.
+                    json.dumps(wire_request, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
                     timeout=request.deadline_seconds,
                 )
             except subprocess.TimeoutExpired as exc:
@@ -527,9 +531,21 @@ def _validate_capability_result(request: FactRequest, output: dict[str, Any]) ->
             return "tool_quote_result_invalid"
         if quote_time.date().isoformat() != expected_date or price <= 0:
             return "tool_quote_trading_date_mismatch" if quote_time.date().isoformat() != expected_date else "tool_quote_result_invalid"
+        if quote_time.astimezone(timezone.utc) > _parse_timestamp(request.required_at):
+            return "tool_quote_after_required_at"
         if request.finality in {"close", "official_close"}:
             if quote_time.time().hour < 15 or quote.get("status") != "closed":
                 return "tool_quote_finality_invalid"
+        try:
+            previous_close = float(quote.get("previous_close"))
+            change = float(quote.get("change"))
+            change_percent = float(quote.get("change_percent"))
+        except (TypeError, ValueError):
+            return "tool_quote_calculation_invalid"
+        expected_change = round(price - previous_close, 4)
+        expected_percent = round((price - previous_close) / previous_close * 100, 4) if previous_close > 0 else 0.0
+        if previous_close < 0 or not math.isclose(change, expected_change, abs_tol=1e-4) or not math.isclose(change_percent, expected_percent, abs_tol=1e-4):
+            return "tool_quote_calculation_invalid"
     if set(seen) != set(expected_symbols) or data.get("finality") != request.finality:
         return "tool_quote_finality_invalid" if data.get("finality") != request.finality else "tool_quote_symbol_mismatch"
     return None
@@ -560,8 +576,20 @@ def _validate_market_indices(request: FactRequest, data: dict[str, Any]) -> str 
             return "tool_market_result_invalid"
         if moment.date().isoformat() != expected_date or price <= 0:
             return "tool_market_trading_date_mismatch"
+        if moment.astimezone(timezone.utc) > _parse_timestamp(request.required_at):
+            return "tool_market_after_required_at"
         if request.finality in {"close", "official_close"} and (moment.time().hour < 15 or index.get("status") != "closed"):
             return "tool_market_finality_invalid"
+        try:
+            previous_close = float(index.get("previous_close"))
+            change = float(index.get("change"))
+            change_percent = float(index.get("change_percent"))
+        except (TypeError, ValueError):
+            return "tool_market_calculation_invalid"
+        expected_change = round(price - previous_close, 4)
+        expected_percent = round((price - previous_close) / previous_close * 100, 4) if previous_close > 0 else 0.0
+        if previous_close < 0 or not math.isclose(change, expected_change, abs_tol=1e-4) or not math.isclose(change_percent, expected_percent, abs_tol=1e-4):
+            return "tool_market_calculation_invalid"
     if set(seen) != {str(value) for value in expected} or data.get("finality") != request.finality:
         return "tool_market_identity_invalid"
     return None
@@ -579,6 +607,8 @@ def _validate_market_snapshot(request: FactRequest, data: dict[str, Any], fact_a
         return "tool_market_result_invalid"
     if observed.date().isoformat() != expected_date:
         return "tool_market_trading_date_mismatch"
+    if observed.astimezone(timezone.utc) > _parse_timestamp(request.required_at):
+        return "tool_market_after_required_at"
     if request.finality in {"close", "official_close"} and observed.time().hour < 15:
         return "tool_market_finality_invalid"
     if not isinstance(data.get("source"), str) or not data["source"].strip():
@@ -618,6 +648,8 @@ def _validate_market_breadth(request: FactRequest, data: dict[str, Any], fact_as
         return "tool_market_result_invalid"
     if observed.date().isoformat() != expected_date:
         return "tool_market_trading_date_mismatch"
+    if observed.astimezone(timezone.utc) > _parse_timestamp(request.required_at):
+        return "tool_market_after_required_at"
     if request.finality in {"close", "official_close"} and observed.time().hour < 15:
         return "tool_market_finality_invalid"
     if not isinstance(data.get("source"), str) or not data["source"].strip():
@@ -626,7 +658,9 @@ def _validate_market_breadth(request: FactRequest, data: dict[str, Any], fact_as
     if not isinstance(breadth, dict):
         return "tool_market_result_invalid"
     try:
-        if any(float(breadth[field]) < 0 for field in ("up", "down", "flat", "limit_up", "limit_down")):
+        if any(float(breadth[field]) < 0 for field in ("up", "down", "flat")):
+            return "tool_market_result_invalid"
+        if any(float(breadth[field]) < 0 for field in ("limit_up", "limit_down") if field in breadth):
             return "tool_market_result_invalid"
     except (KeyError, TypeError, ValueError):
         return "tool_market_result_invalid"

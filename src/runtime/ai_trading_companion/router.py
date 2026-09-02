@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .effort_policy import CognitiveEffortPolicy, EffortPolicyFacts
 from .stage_expression import normalize_stage_output, semantic_snapshot_conflicts
@@ -170,6 +173,34 @@ class CognitiveRouter:
                 wrong_labels = {f"星期{suffix}" for suffix in "一二三四五六日"} | {f"周{suffix}" for suffix in "一二三四五六日"}
                 if any(f"{expected_date}为{label}" in body for label in wrong_labels - expected_labels):
                     problems.append("m0_calendar_weekday_conflict")
+        if stage == "m0_compose":
+            contract = packet.get("evidence_contract") if isinstance(packet.get("evidence_contract"), dict) else {}
+            portfolio_requirement = next((
+                item for item in contract.get("requirements") or []
+                if isinstance(item, dict) and item.get("key") == "portfolio_market_state"
+            ), {})
+            entities = [str(value).lower() for value in portfolio_requirement.get("required_entities") or [] if str(value)]
+            body = "".join(normalized.text.split()).lower()
+            missing_entities = [entity for entity in entities if entity not in body]
+            if missing_entities:
+                problems.append("m0_missing_portfolio_market_coverage:" + ",".join(missing_entities))
+            if entities and any(marker in body for marker in ("未覆盖", "未被覆盖", "没有持仓行情", "持仓行情未知")):
+                problems.append("m0_claims_portfolio_quote_gap_despite_qualified_evidence")
+            quotes = _frozen_portfolio_quotes(packet.get("verified_fact_digest"))
+            for entity in entities:
+                quote = quotes.get(entity)
+                if quote is None:
+                    problems.append("m0_missing_verified_portfolio_quote:" + entity)
+                    continue
+                for field in ("price", "previous_close", "change", "change_percent"):
+                    value = quote.get(field)
+                    if value is not None and _number_text(value) not in body:
+                        problems.append(f"m0_portfolio_quote_conflict:{entity}:{field}")
+                if not _m0_has_status(body, str(quote.get("status") or "")):
+                    problems.append(f"m0_portfolio_quote_status_conflict:{entity}")
+                local_time = _china_quote_time(quote.get("quote_at"))
+                if local_time and f"北京时间{local_time}" not in body:
+                    problems.append(f"m0_portfolio_quote_time_conflict:{entity}")
         if stage == "m1_judgment" and not profile.m1_blind:
             problems.append("m1_packet_contains_human_input")
         snapshot = normalized.snapshot or None
@@ -183,3 +214,51 @@ class CognitiveRouter:
             if snapshot.get("qualified") and (not snapshot.get("triggers") or not snapshot.get("invalidations")):
                 problems.append("qualified_snapshot_lacks_execution_boundary")
         return {"passed": not problems, "problems": problems, "profile": profile.as_json()}
+
+
+def _frozen_portfolio_quotes(value: Any) -> dict[str, dict[str, Any]]:
+    quotes: dict[str, dict[str, Any]] = {}
+    for row in value or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            parsed = json.loads(str(row.get("excerpt") or ""))
+        except json.JSONDecodeError:
+            continue
+        for item in _walk_quotes(parsed):
+            symbol = str(item.get("symbol") or "").lower()
+            if symbol:
+                quotes[symbol] = item
+    return quotes
+
+
+def _walk_quotes(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        rows = [item for item in value.get("quotes") or [] if isinstance(item, dict)]
+        return rows + [quote for item in value.values() for quote in _walk_quotes(item)]
+    if isinstance(value, list):
+        return [quote for item in value for quote in _walk_quotes(item)]
+    return []
+
+
+def _number_text(value: Any) -> str:
+    number = float(value)
+    return (f"{number:.4f}").rstrip("0").rstrip(".")
+
+
+def _china_quote_time(value: Any) -> str | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
+    except ValueError:
+        return None
+
+
+def _m0_has_status(body: str, status: str) -> bool:
+    labels = {
+        "trading": ("交易状态", "处于交易", "交易中"),
+        "suspended": ("停牌", "暂停交易"),
+        "unavailable": ("数据不可用", "行情不可用"),
+    }
+    return not status or any(label in body for label in labels.get(status, (status,)))

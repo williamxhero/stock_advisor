@@ -113,16 +113,29 @@ class CompanionEngine:
             profile_snapshot = self.task_profiles.resolve(requested_at, request["analysis"])
             task_key = str(profile_snapshot["task_key"])
             profile = profile_snapshot
+            # The manual cycle persists its contract before packet construction,
+            # so it must freeze the same runtime-held portfolio universe that a
+            # scheduled packet builder would supply later.
+            with self.store.connection() as connection:
+                positions = connection.execute(
+                    "SELECT code FROM portfolio_position WHERE shares>0 ORDER BY code"
+                ).fetchall()
             evidence_contract = self.evidence_contract_factory.build(
                 task_key=task_key, stage="m0_research", as_of=requested_at,
                 task_profile=profile_snapshot,
+                internal_context={"portfolio_entities": [str(row["code"]) for row in positions]},
             )
         else:
             missing = {"task_key", "task_profile"} - request.keys()
             if missing:
                 raise ValueError(f"formal analysis request missing: {sorted(missing)}")
             task_key = str(request["task_key"])
-            profile = request["task_profile"]
+            profile = dict(request["task_profile"] or {})
+            # The explicit-profile API is used by trusted local clients that
+            # already selected a profile. Persist the supplied snapshot rather
+            # than dropping it; a malformed legacy profile is then terminally
+            # reported by the worker instead of remaining queued forever.
+            profile_snapshot = profile
         if task_key not in TASK_POLICIES:
             raise ValueError(f"unregistered task_key: {task_key}")
         if not isinstance(profile, dict) or not str(profile.get("profile_id") or ""):
@@ -152,6 +165,25 @@ class CompanionEngine:
         }
         self.emit(cycle, f"analysis.request.{receipt['state']}", {"cycle": cycle, "receipt": receipt})
         return {"receipt": receipt, "projection": self._projection(cycle)}
+
+    def refresh_manual_analysis_contract(self, cycle_id: str, as_of: str) -> dict[str, Any]:
+        """Bind a manual contract to the real acquisition start, not queue time."""
+        cycle = self.store.get_cycle(cycle_id)
+        if cycle.get("kind") != "manual":
+            return cycle
+        profile = json.loads(cycle.get("task_profile_json") or "{}")
+        if not profile:
+            raise ValueError("manual analysis task profile is missing")
+        with self.store.connection() as connection:
+            positions = connection.execute(
+                "SELECT code FROM portfolio_position WHERE shares>0 ORDER BY code"
+            ).fetchall()
+        contract = self.evidence_contract_factory.build(
+            task_key=str(cycle["task_key"]), stage="m0_research", as_of=as_of,
+            task_profile=profile,
+            internal_context={"portfolio_entities": [str(row["code"]) for row in positions]},
+        )
+        return self.store.refresh_manual_analysis_contract(cycle_id, as_of, contract)
 
     def start_diagnostic_rerun(self, source_cycle_id: str) -> dict[str, Any]:
         cycle = self.store.create_diagnostic_cycle(source_cycle_id)
@@ -337,6 +369,21 @@ class CompanionEngine:
                 })
             result = {
                 "task_profile_id": task_profile_id,
+                "dismissed_count": len(cycles),
+                "cycle_ids": [cycle["cycle_id"] for cycle in cycles],
+            }
+        elif typ == "dismiss_cycles":
+            cycle_ids = command.get("cycle_ids")
+            if not isinstance(cycle_ids, list):
+                raise ValueError("cycle_ids required")
+            reason = str(command.get("reason") or "user_requested_cleanup").strip()
+            cycles = self.store.dismiss_cycles(cycle_ids, reason)
+            for dismissed_cycle in cycles:
+                self.emit(dismissed_cycle, "analysis.dismissed", {
+                    "cycle": dismissed_cycle,
+                    "reason": reason,
+                })
+            result = {
                 "dismissed_count": len(cycles),
                 "cycle_ids": [cycle["cycle_id"] for cycle in cycles],
             }
@@ -659,10 +706,16 @@ class CompanionEngine:
         return cycle
 
     def m1_failed(self, cycle_id: str, reason: str, *, retryable: bool, details: dict[str, Any] | None = None) -> dict[str, Any]:
-        message = self._stage_failure_message("M1", str(reason), details)
         diagnostic_code = self._verifier_diagnostic_code(details) or self._diagnostic_code(str(reason))
         cycle = self.store.transition(cycle_id, "m1_retry_wait" if retryable else "waiting_for_repair")
-        self._emit_failure(cycle, "m1.failed", message, reason, {"diagnostic_code": diagnostic_code, "retryable": retryable})
+        if retryable:
+            message = self._stage_failure_message("M1", str(reason), details)
+            self._queue_event(cycle_id, "m1.retrying", {
+                "cycle": cycle, "reason": message, "diagnostic_code": diagnostic_code, "retryable": True,
+            })
+            return cycle
+        message = self._stage_failure_message("M1", str(reason), details)
+        self._emit_failure(cycle, "m1.failed", message, reason, {"diagnostic_code": diagnostic_code, "retryable": False})
         return cycle
 
     @classmethod
@@ -878,17 +931,27 @@ class CompanionEngine:
             "outcome", "reflection", "recovery", "legacy_message",
         }
         ai_messages = []
+        local_message_ids: set[str] = set()
         for artifact in artifacts:
             if artifact["kind"] not in ai_kinds:
                 continue
             metadata = json.loads(artifact["metadata_json"] or "{}")
+            published_message = metadata.get("published_message")
+            if (
+                artifact["kind"] not in {"ai_chat", "premarket_chat"}
+                and isinstance(published_message, dict)
+                and published_message.get("message_id")
+            ):
+                local_message_ids.add(str(published_message["message_id"]))
+            if artifact["kind"] == "system_fault" and metadata.get("retryable") is True:
+                continue
             item = {
                 "artifact_id": artifact["artifact_id"], "kind": artifact["kind"],
                 "at": artifact["sealed_at"], "as_of": artifact["as_of"],
                 "text": artifact["body_markdown"], "metadata": artifact["metadata_json"],
             }
-            if isinstance(metadata.get("published_message"), dict):
-                item["message"] = metadata["published_message"]
+            if isinstance(published_message, dict):
+                item["message"] = published_message
             ai_messages.append(item)
         user_messages = [
             {
@@ -929,7 +992,9 @@ class CompanionEngine:
                     "text": item.get("body"), "metadata": json.dumps(item.get("metadata") or {}, ensure_ascii=False),
                 } | ({"message": (item.get("metadata") or {}).get("published_message")}
                      if isinstance((item.get("metadata") or {}).get("published_message"), dict) else {}))
-                for item in timeline if item.get("episode_type") == "ai_message"
+                for item in timeline
+                if item.get("episode_type") == "ai_message"
+                and str((item.get("metadata") or {}).get("message_id") or "") not in local_message_ids
             ]
             ai_messages = local_non_chat + memory_ai
         latest = {kind: next((item for item in reversed(ai_messages) if item["kind"] == kind), None) for kind in ("m0", "m1", "m2")}

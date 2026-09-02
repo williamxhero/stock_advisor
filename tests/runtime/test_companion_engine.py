@@ -5,18 +5,27 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ai_trading_companion.engine import CompanionEngine, iso, parse
 from ai_trading_companion.message_presentation import MessageQualificationError
 from ai_trading_companion.stage_expression import express_stage_semantics
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
-from ai_trading_companion.__main__ import run_pending_premarket_reply
+from ai_trading_companion.__main__ import (
+    FORMAL_MEMORY_MAX_ACTIONS,
+    _formal_adaptive_research,
+    run_m1,
+    run_pending_m1,
+    run_pending_premarket_reply,
+    run_scheduled_cycle,
+)
+from ai_trading_companion.adaptive_memory import MemoryResearchError
 from ai_trading_companion.packet_builder import RuntimePacketBuilder as _RuntimePacketBuilder
 from ai_trading_companion.publication_registry import published_event_types
 from ai_trading_companion.scheduler import conversation_auto_submit_at, load_schedules, run_daily_schedule, run_periodic_schedule
 from ai_trading_companion.store import CompanionStore
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
+from ai_trading_companion.evidence_gate import EvidenceInsufficient
 from ai_trading_companion.task_profiles import ManualAnalysisProfileResolver
 
 
@@ -121,6 +130,53 @@ Protocol: OpportunityDiscovery-v1.3
         memory_message = next(row for row in memory._episodes if row["episode_type"] == "ai_message")
         self.assertEqual(message["message"]["message_id"], memory_message["metadata"]["message_id"])
         self.assertEqual(message["message"], memory_message["metadata"]["published_message"])
+
+    def test_historical_retryable_fault_is_not_reintroduced_from_memoryhub(self):
+        memory = InMemoryMemoryAdapter()
+        self.engine.memory = memory
+        message_id = "retryable-fault-message"
+        published_message = {
+            "contract": "companion-published-message/v2",
+            "message_id": message_id,
+            "kind": "system_fault",
+            "sealed_at": "2026-09-02T01:47:00Z",
+            "text_projection": "正在重新核对。",
+            "parts": [{"kind": "speech", "text": "正在重新核对。"}],
+        }
+        self.store.append_artifact(
+            self.cycle["cycle_id"],
+            "system_fault",
+            "system",
+            "正在重新核对。",
+            "2026-09-02T01:47:00Z",
+            {"retryable": True, "published_message": published_message},
+        )
+        memory.append({
+            "memory_space_id": self.engine.memory_space_id,
+            "source_system": "stock-advisor",
+            "source_event_id": message_id,
+            "content_hash": "retryable-fault-hash",
+            "episode_type": "ai_message",
+            "body": "正在重新核对。",
+            "occurred_at": "2026-09-02T01:47:00Z",
+            "known_at": "2026-09-02T01:47:00Z",
+            "submitted_at": "2026-09-02T01:47:00Z",
+            "authority": "published_ai_message",
+            "protocol_version": "memoryhub/v1",
+            "metadata": {
+                "message_id": message_id,
+                "cycle_id": self.cycle["cycle_id"],
+                "kind": "system_fault",
+                "state": "published",
+                "actor": "ai",
+                "published_message": published_message,
+            },
+        })
+
+        projection = self.engine._projection(self.store.get_cycle(self.cycle["cycle_id"]))
+
+        self.assertNotIn(message_id, {item.get("artifact_id") for item in projection["ai_messages"]})
+        self.assertFalse(any(item["kind"] == "system_fault" for item in projection["ai_messages"]))
 
     def test_new_m0_result_publishes_from_structured_semantics_not_markdown(self):
         self.engine.research_started(self.cycle["cycle_id"])
@@ -293,6 +349,106 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertFalse(result["has_h0"])
         self.assertIsNone(self.store.latest_artifact(self.cycle["cycle_id"], "h0"))
 
+    def test_gateway_tick_resumes_m1_immediately_after_manual_h0_skip(self):
+        self.ready()
+        self.engine.command({
+            "command_id": "skip-now", "cycle_id": self.cycle["cycle_id"], "type": "skip_h0",
+        })
+        portfolio = Mock()
+        before_deadline = parse(self.store.get_cycle(self.cycle["cycle_id"])["m1_publish_deadline"]) - timedelta(seconds=1)
+
+        with patch("ai_trading_companion.__main__.run_m1", return_value={"state": "complete"}) as worker:
+            results = run_pending_m1(self.engine, self.store, portfolio, execute=True, at=before_deadline)
+
+        worker.assert_called_once_with(
+            self.engine, self.store, portfolio, self.cycle["cycle_id"], True,
+        )
+        self.assertEqual([{"state": "complete"}], results)
+
+    def test_gateway_tick_never_revives_m1_after_its_publish_deadline(self):
+        self.ready()
+        self.engine.command({
+            "command_id": "skip-stale", "cycle_id": self.cycle["cycle_id"], "type": "skip_h0",
+        })
+        after_deadline = parse(self.store.get_cycle(self.cycle["cycle_id"])["m1_publish_deadline"]) + timedelta(seconds=1)
+
+        with patch("ai_trading_companion.__main__.run_m1") as worker:
+            results = run_pending_m1(self.engine, self.store, Mock(), execute=True, at=after_deadline)
+
+        self.assertEqual([], results)
+        worker.assert_not_called()
+
+    def test_gateway_tick_does_not_restart_m1_waiting_for_repair(self):
+        self.ready()
+        self.engine.command({
+            "command_id": "skip-before-fault", "cycle_id": self.cycle["cycle_id"], "type": "skip_h0",
+        })
+        self.engine.m1_failed(self.cycle["cycle_id"], "memory deadline", retryable=False)
+
+        with patch("ai_trading_companion.__main__.run_m1") as worker:
+            results = run_pending_m1(self.engine, self.store, Mock(), execute=True)
+
+        self.assertEqual([], results)
+        worker.assert_not_called()
+
+    def test_m1_memory_deadline_records_one_fault_and_waits_for_explicit_repair(self):
+        self.ready()
+        self.store.append_artifact(
+            self.cycle["cycle_id"], "evidence", "runtime",
+            json.dumps({"schema_version": 3, "as_of": iso(self.now), "sources": []}), iso(self.now),
+        )
+        self.engine.command({
+            "command_id": "skip-before-memory-timeout", "cycle_id": self.cycle["cycle_id"], "type": "skip_h0",
+        })
+
+        with patch(
+            "ai_trading_companion.__main__._formal_adaptive_research",
+            side_effect=MemoryResearchError("memory research reached its response deadline"),
+        ), self.assertRaisesRegex(MemoryResearchError, "response deadline"):
+            run_m1(self.engine, self.store, Mock(), self.cycle["cycle_id"], execute=True)
+
+        self.assertEqual("waiting_for_repair", self.store.get_cycle(self.cycle["cycle_id"])["state"])
+        faults = [row for row in self.store.artifacts(self.cycle["cycle_id"]) if row["kind"] == "system_fault"]
+        self.assertEqual(1, len(faults))
+
+    def test_m1_evidence_preflight_failure_stops_instead_of_restarting_blindly(self):
+        self.ready()
+        self.store.append_artifact(
+            self.cycle["cycle_id"], "evidence", "runtime",
+            json.dumps({"schema_version": 4, "as_of": iso(self.now), "sources": []}), iso(self.now),
+        )
+        self.engine.command({
+            "command_id": "skip-before-evidence-fault", "cycle_id": self.cycle["cycle_id"], "type": "skip_h0",
+        })
+        verifier = {
+            "passed": False,
+            "problems": ["frozen_m0_contract_mismatch"],
+            "missing_requirements": ["portfolio_market_state"],
+        }
+
+        with patch(
+            "ai_trading_companion.__main__._formal_adaptive_research", return_value={},
+        ), patch(
+            "ai_trading_companion.__main__._reuse_m0_evidence_attempt",
+            side_effect=EvidenceInsufficient(verifier),
+        ), self.assertRaises(EvidenceInsufficient):
+            run_m1(self.engine, self.store, Mock(), self.cycle["cycle_id"], execute=True)
+
+        self.assertEqual("waiting_for_repair", self.store.get_cycle(self.cycle["cycle_id"])["state"])
+        faults = [row for row in self.store.artifacts(self.cycle["cycle_id"]) if row["kind"] == "system_fault"]
+        self.assertEqual(1, len(faults))
+
+    def test_formal_memory_research_uses_a_deadline_sized_action_budget(self):
+        result = Mock(snapshot={"snapshot_id": "snapshot"}, context=(), actions=())
+        with patch("ai_trading_companion.__main__.AdaptiveMemoryResearch") as research:
+            research.return_value.collect.return_value = result
+            _formal_adaptive_research(
+                self.engine, self.store, self.cycle, "m1_research", iso(self.now), timeout=300,
+            )
+
+        self.assertEqual(4, FORMAL_MEMORY_MAX_ACTIONS)
+        self.assertEqual(FORMAL_MEMORY_MAX_ACTIONS, research.call_args.kwargs["max_actions"])
+
     def test_diagnostic_rerun_isolated_from_original_cycle_and_reuses_frozen_inputs(self):
         ready = self.ready()
         self.stage("rerun-h0", "保留原来的独立判断边界")
@@ -367,6 +523,28 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertIn("当前 A 股主要指数", serialized)
         self.assertNotIn(secret_h0, serialized)
         self.assertNotIn("local_inputs", packet)
+
+    def test_m1_research_reuses_the_frozen_m0_evidence_contract(self):
+        frozen_contract = packet_builder(self.store).evidence_contract_factory.build(
+            task_key=self.cycle["task_key"],
+            stage="m0_research",
+            as_of=self.cycle["as_of"],
+        )
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE companion_cycle SET evidence_contract_json=? WHERE cycle_id=?",
+                (json.dumps(frozen_contract, ensure_ascii=False), self.cycle["cycle_id"]),
+            )
+        cycle = self.store.get_cycle(self.cycle["cycle_id"])
+
+        packet = packet_builder(self.store).build(
+            cycle,
+            "m1_research",
+            evidence={"as_of": iso(self.now), "sources": []},
+            as_of=iso(self.now + timedelta(minutes=5)),
+        )
+
+        self.assertEqual(frozen_contract, packet["evidence_contract"])
 
     def test_formal_m1_is_single_and_m2_only_exists_with_h0(self):
         self.ready()
@@ -487,7 +665,7 @@ Protocol: OpportunityDiscovery-v1.3
             retryable=True,
         )
 
-        events = [event for event in self.store.pending_events() if event["event_type"] == "m1.failed"]
+        events = [event for event in self.store.pending_events() if event["event_type"] == "m1.retrying"]
         payload = json.loads(events[-1]["payload_json"])
         self.assertEqual("output_schema_invalid", payload["diagnostic_code"])
         self.assertIn("输出格式配置错误", payload["reason"])
@@ -508,7 +686,7 @@ Protocol: OpportunityDiscovery-v1.3
             },
         )
 
-        event = [item for item in self.store.pending_events() if item["event_type"] == "m1.failed"][-1]
+        event = [item for item in self.store.pending_events() if item["event_type"] == "m1.retrying"][-1]
         payload = json.loads(event["payload_json"])
         self.assertEqual("output_schema_invalid", payload["diagnostic_code"])
         self.assertIn("本地输出格式校验", payload["reason"])
@@ -657,6 +835,28 @@ Protocol: OpportunityDiscovery-v1.3
                 "SELECT COUNT(*) FROM companion_cycle_visibility WHERE dismissed_at IS NOT NULL"
             ).fetchone()[0])
 
+    def test_dismiss_cycles_hides_only_explicit_test_or_error_cycles_without_deleting_audit_history(self):
+        hidden = self.store.create_cycle(
+            "daily.execution.1030", "2026-08-29T10:30:00+08:00", "2026-08-29T02:30:00Z",
+        )
+        preserved = self.store.create_cycle(
+            "daily.review.1520", "2026-08-29T15:20:00+08:00", "2026-08-29T07:00:00Z",
+        )
+
+        dismissed = self.engine.command({
+            "command_id": "dismiss-explicit-cycles",
+            "type": "dismiss_cycles",
+            "cycle_ids": [hidden["cycle_id"]],
+            "reason": "verification_cleanup",
+        })
+
+        self.assertEqual([hidden["cycle_id"]], dismissed["cycle_ids"])
+        self.assertEqual(
+            [preserved["cycle_id"]],
+            [item["cycle_id"] for item in self.store.latest_cycles_for_date("2026-08-29")],
+        )
+        self.assertEqual(hidden["cycle_id"], self.store.get_cycle(hidden["cycle_id"])["cycle_id"])
+
     def test_manual_analysis_request_never_consumes_a_scheduled_occurrence(self):
         manual = self.engine.command({
             "command_id": "manual-at-scheduled-time",
@@ -721,6 +921,13 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertIn(manual["receipt"]["cycle_id"], [item["cycle_id"] for item in history["items"]])
 
     def test_structured_manual_request_freezes_selected_profile_contract_and_manual_deadlines(self):
+        with self.store.connection() as connection:
+            connection.execute(
+                """INSERT INTO portfolio_position(
+                    code,name,shares,average_cost,last_price,price_as_of,market_value,unrealized_pnl,weight,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                ("600487", "亨通光电", 200, 1.0, 1.0, "2026-08-28T06:00:00Z", 200.0, 0.0, 0.1, "2026-08-28T06:00:00Z"),
+            )
         engine = CompanionEngine(
             self.store,
             task_profiles=ManualAnalysisProfileResolver(_WeekdayCalendar()),
@@ -740,6 +947,9 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertEqual("daily.execution.0945", cycle["task_key"])
         self.assertEqual("2026-08-28T14:58:00+08:00", cycle["requested_at"])
         self.assertEqual(64, len(cycle["evidence_contract_hash"]))
+        contract = json.loads(cycle["evidence_contract_json"])
+        portfolio_quotes = next(item for item in contract["requirements"] if item["key"] == "portfolio_market_state")
+        self.assertEqual(["600487"], portfolio_quotes["required_entities"])
         packet = packet_builder(self.store).build(cycle, "m0_research")
         self.assertEqual(cycle["evidence_contract_hash"], packet["evidence_contract"]["contract_hash"])
 
@@ -984,6 +1194,32 @@ Protocol: OpportunityDiscovery-v1.3
         )
 
         self.assertEqual([cycle["cycle_id"]], [item["cycle_id"] for item in claimed])
+
+    def test_gateway_restart_releases_only_orphaned_worker_capacity(self):
+        cycle = self.engine.start_cycle(
+            "daily.opportunity.0900", "2026-08-25T09:00:00+08:00", "2026-08-25T00:00:00Z",
+            schedule_snapshot={"trigger": {"lead_minutes": 30}},
+        )
+        self.store.claim_scheduled_workers(at=datetime.fromisoformat("2026-08-25T08:30:00+08:00"))
+
+        self.assertEqual([cycle["cycle_id"]], self.store.recover_orphaned_scheduled_workers())
+        self.assertEqual([], self.store.recover_orphaned_scheduled_workers())
+        self.assertEqual([cycle["cycle_id"]], [item["cycle_id"] for item in self.store.claim_scheduled_workers(
+            at=datetime.fromisoformat("2026-08-25T08:30:00+08:00")
+        )])
+
+    def test_manual_worker_never_waits_for_breadth_prefetch(self):
+        events: list[str] = []
+        store = Mock()
+        store.get_cycle.return_value = {"state": "queued", "kind": "manual", "schedule_snapshot_json": "{}"}
+        with patch("ai_trading_companion.__main__._prefetch_market_breadth", side_effect=lambda: events.append("prefetch")), patch(
+            "ai_trading_companion.__main__.run_research", side_effect=lambda *args: events.append("research") or {"state": "ok"},
+        ), patch("ai_trading_companion.__main__.process_h0_cognition"):
+            result = run_scheduled_cycle(Mock(), store, Mock(), Mock(), "cycle", True)
+
+        self.assertEqual({"state": "ok"}, result)
+        self.assertEqual(["research"], events)
+        store.finish_scheduled_worker.assert_called_once_with("cycle")
 
     def test_premarket_cycle_is_prepared_before_0830_without_starting_research(self):
         completed: list[str] = []

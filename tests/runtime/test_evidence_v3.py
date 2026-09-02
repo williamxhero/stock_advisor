@@ -221,6 +221,40 @@ class EvidenceV3Tests(TestCase):
         self.assertEqual(["covered", "checked_no_change"], requirements["portfolio_events_and_counterevidence"]["allowed_coverage"])
         self.assertTrue(requirements["market_breadth"]["blocking"])
 
+    def test_v4_portfolio_quotes_are_qualified_from_structured_tool_json(self):
+        as_of = "2026-08-31T01:45:00Z"
+        contract = {"version": 4, "as_of": as_of, "requirements": [{
+            "key": "portfolio_market_state", "blocking": True, "allowed_coverage": ["covered"],
+            "required_entities": ["600487", "603861"], "minimum_numeric_facts": 8,
+            "window": {"mode": "after_start_to_end", "start": "2026-08-31T01:30:00Z", "end": as_of},
+        }]}
+        quotes = [
+            {"symbol": "600487", "previous_close": 1.0, "price": 1.1, "change": 0.1, "change_percent": 10.0,
+             "quote_at": "2026-08-31T01:44:00Z", "trading_date": "2026-08-31", "status": "trading"},
+            {"symbol": "603861", "previous_close": 2.0, "price": 1.9, "change": -0.1, "change_percent": -5.0,
+             "quote_at": "2026-08-31T01:44:00Z", "trading_date": "2026-08-31", "status": "trading"},
+        ]
+        sources, evidence_items = [], []
+        for index, quote in enumerate(quotes, 1):
+            ref = f"quote-{index}"
+            excerpt = json.dumps({"quotes": [quote]}, ensure_ascii=False, sort_keys=True)
+            sources.append({"evidence_ref": ref, "excerpt": excerpt})
+            evidence_items.append({"evidence_ref": ref, "excerpt_text": excerpt, "fact_as_of": quote["quote_at"],
+                                   "published_at": None, "acquired_at": as_of})
+        observations = [{"attempt_id": "attempt", "backend": "market", "status": "succeeded", "non_empty": True,
+                         "evidence_items": evidence_items}]
+        evidence = {"schema_version": 3, "as_of": as_of, "sources": sources,
+                    "coverage": [{"requirement_key": "portfolio_market_state", "status": "covered",
+                                  "evidence_refs": ["quote-1", "quote-2"]}], "high_impact_events": []}
+
+        self.assertTrue(EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")["passed"])
+        quotes[1].pop("change_percent")
+        excerpt = json.dumps({"quotes": [quotes[1]]}, ensure_ascii=False, sort_keys=True)
+        evidence["sources"][1]["excerpt"] = excerpt
+        observations[0]["evidence_items"][1]["excerpt_text"] = excerpt
+        failed = EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")
+        self.assertIn("blocking_requirement_lacks_numeric_facts:portfolio_market_state", failed["problems"])
+
     def test_rejects_foreign_reference_and_naive_runtime_time(self):
         foreign = EvidenceGate().evaluate(self._evidence("ev_other_1"), self.contract, self.observations, self.as_of, attempt_id="attempt-1")
         self.assertIn("source_ref_not_in_current_attempt", foreign["problems"])

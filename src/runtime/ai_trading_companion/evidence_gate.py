@@ -1,6 +1,7 @@
 """Deterministic qualification for current-information research outputs."""
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -342,6 +343,15 @@ class _EvidenceGateV3:
             term_groups = requirement.get("evidence_terms") or []
             if any(not any(str(term) in support for term in group) for group in term_groups):
                 problems.append(f"blocking_requirement_semantically_unsupported:{key}"); missing.append(key); continue
+            if key == "portfolio_market_state":
+                quote_facts = self._portfolio_quote_facts(bound, required_entities)
+                numeric_count = sum(len(values) for values in quote_facts.values())
+                if numeric_count < int(requirement.get("minimum_numeric_facts") or 0):
+                    problems.append(f"blocking_requirement_lacks_numeric_facts:{key}"); missing.append(key); continue
+                absent_entities = [entity for entity in required_entities if entity not in quote_facts]
+                if absent_entities:
+                    problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
+                continue
             numeric_facts = set(re.findall(
                 r"(?<![\d.])\d+(?:\.\d+)?\s*(?:%|％|万亿元|亿元|万亿|亿|万家|家|只|股|元)", support,
             ))
@@ -395,6 +405,29 @@ class _EvidenceGateV3:
         if window.get("mode") == "exact":
             return any(value == start == end for value in values)
         return any(start < value <= end for value in values)
+
+    @staticmethod
+    def _portfolio_quote_facts(sources: list[dict[str, Any]], required_entities: list[str]) -> dict[str, set[str]]:
+        """Return complete deterministic quote fields for each required symbol."""
+        required = set(required_entities)
+        fields = {"previous_close", "price", "change", "change_percent"}
+        complete: dict[str, set[str]] = {}
+        for source in sources:
+            try:
+                payload = json.loads(str(source.get("excerpt") or ""))
+            except (TypeError, ValueError):
+                continue
+            for quote in payload.get("quotes") or []:
+                if not isinstance(quote, dict):
+                    continue
+                symbol = str(quote.get("symbol") or "")
+                valid = {
+                    field for field in fields
+                    if isinstance(quote.get(field), (int, float)) and not isinstance(quote.get(field), bool)
+                }
+                if symbol in required and valid == fields and quote.get("quote_at") and quote.get("trading_date") and quote.get("status"):
+                    complete[symbol] = valid
+        return complete
 
     @staticmethod
     def _matching_negative_query(sources: list[dict[str, Any]], terms: list[str]) -> bool:

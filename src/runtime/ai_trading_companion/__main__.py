@@ -1467,14 +1467,29 @@ def run_schedules(engine: CompanionEngine, store: CompanionStore, at: datetime, 
         if not submitted:
             continue
         flush(store, exchange)
-        reply = run_chat(
-            engine, store, portfolio, conversation["cycle_id"], submitted["committed_batch_id"], execute,
-            on_progress=lambda: flush(store, exchange),
-        )
+        # A conversation reply can legitimately take a full model deadline.
+        # It is not allowed to monopolise the Gateway ticker and delay a
+        # foreground manual M0 from even beginning its deterministic market
+        # and portfolio acquisition.
+        def reply_in_background(
+            conversation_cycle_id: str = conversation["cycle_id"],
+            batch_id: str = submitted["committed_batch_id"],
+        ) -> None:
+            try:
+                run_chat(
+                    engine, store, portfolio, conversation_cycle_id, batch_id, execute,
+                    on_progress=lambda: flush(store, exchange),
+                )
+            except Exception as exc:
+                engine.background_failed(conversation_cycle_id, "scheduled_conversation", str(exc))
+                flush(store, exchange)
+        threading.Thread(
+            target=reply_in_background, name="scheduled-conversation", daemon=True,
+        ).start()
         results.append({
             "task_key": row["task_key"], "scheduled_for": target.isoformat(timespec="seconds"),
             "action": "conversation_auto_submitted", "conversation_cycle_id": conversation["cycle_id"],
-            "cognition_job_id": reply.get("job_id"),
+            "cognition_job_id": None,
         })
     return results
 

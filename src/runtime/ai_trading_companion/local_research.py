@@ -265,6 +265,10 @@ class ToolCatalogMarketBackend:
             inputs = {"symbols": ["000001", "399001", "399006"]}
         else:
             inputs = {}
+        if operation == "market_breadth":
+            cached = self._cached_breadth(required_at, str(window.get("start") or ""))
+            if cached is not None:
+                return cached
         resolution = self.runner.resolve_with_fallback(FactRequest(
             contract_version=1, capability=capability, required_at=required_at,
             deadline_seconds=max(0.1, min(25.0, float(self.deadline()))), inputs=inputs,
@@ -291,6 +295,29 @@ class ToolCatalogMarketBackend:
             "url": results[0]["url"], "text": results[0]["excerpt_text"],
             "raw_artifact_ref": resolution.raw_artifact_ref, "results": results,
         }
+
+    def _cached_breadth(self, required_at: str, window_start: str) -> dict[str, Any] | None:
+        """Use only a runtime prefetch whose fact time is inside this contract."""
+        path = self.runner.catalog.root.parent / "market-breadth-snapshot.json"
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            fact_as_of = str(cached["fact_as_of"])
+            fact = datetime.fromisoformat(fact_as_of.replace("Z", "+00:00"))
+            start = datetime.fromisoformat(window_start.replace("Z", "+00:00")) if window_start else None
+            end = datetime.fromisoformat(required_at.replace("Z", "+00:00"))
+            if (start and fact < start) or fact > end:
+                return None
+            data = dict(cached["data"])
+            urls = [str(url) for url in data.get("source_urls") or [] if str(url).startswith(("http://", "https://"))]
+            if not urls:
+                return None
+            excerpt = json.dumps(data, ensure_ascii=False, sort_keys=True)[:8000]
+            results = [{"url": url, "title": str(data.get("source") or "cn_market_breadth"),
+                        "excerpt_text": excerpt, "fact_as_of": fact_as_of,
+                        "raw_artifact_ref": cached.get("raw_artifact_ref")} for url in urls]
+            return {"url": urls[0], "text": excerpt, "raw_artifact_ref": cached.get("raw_artifact_ref"), "results": results}
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
 
 
 class DeterministicMarketBackend:

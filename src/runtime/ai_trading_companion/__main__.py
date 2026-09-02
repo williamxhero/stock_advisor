@@ -391,6 +391,7 @@ def run_gateway(execute: bool = False) -> None:
     def snapshot(kind: str, request: Any) -> dict[str, Any]:
         return _gateway_snapshot(engine, store, portfolio, kind, dict(request.query))
     def tick() -> None:
+        _prefetch_market_breadth()
         run_schedules(engine, store, datetime.now(timezone.utc), execute, exchange, portfolio)
         for cycle in store.claim_scheduled_workers(limit=2):
             run_scheduled_cycle(engine, store, exchange, portfolio, cycle["cycle_id"], execute)
@@ -418,6 +419,30 @@ def run_gateway(execute: bool = False) -> None:
         flush(store, exchange)
     import asyncio
     asyncio.run(serve_gateway(RuntimeGateway(PATHS.home, store, command, snapshot, tick)))
+
+
+def _prefetch_market_breadth() -> None:
+    """Persist a recent public breadth snapshot for the next frozen task boundary."""
+    target = PATHS.runtime / "market-breadth-snapshot.json"
+    try:
+        if target.exists() and (time.time() - target.stat().st_mtime) < 30:
+            return
+        requested_at = iso(datetime.now(timezone.utc) + timedelta(seconds=30))
+        resolution = ToolRunner(ToolCatalog(PATHS.tools)).resolve_with_fallback(FactRequest(
+            contract_version=1, capability="cn_market_breadth", required_at=requested_at,
+            deadline_seconds=8.0, inputs={}, context={"purpose": "runtime_prefetch"},
+            freshness_seconds=0.0, finality="intraday",
+        ))
+        if not resolution.succeeded or resolution.data is None or not resolution.fact_as_of:
+            return
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"fact_as_of": resolution.fact_as_of, "data": resolution.data,
+                                         "raw_artifact_ref": resolution.raw_artifact_ref}, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(target)
+    except Exception:
+        # A prefetch never changes a formal task's outcome except by making a
+        # already-observed snapshot available; failures remain non-authoritative.
+        return
 
 
 def _call_stage(

@@ -355,6 +355,20 @@ class LocalResearchChain:
             except BrokerError as exc:
                 if exc.category != "broker_output_invalid":
                     raise
+                broker_verifier = exc.verifier if isinstance(exc.verifier, dict) else {}
+                business_verifier = broker_verifier.get("business")
+                if isinstance(business_verifier, dict):
+                    verifier = {
+                        "passed": False,
+                        "problems": list(business_verifier.get("problems") or ["broker_output_invalid"]),
+                        "missing_requirements": list(business_verifier.get("missing_requirements") or []),
+                    }
+                else:
+                    verifier = {
+                        "passed": False,
+                        "problems": ["broker_output_invalid"],
+                        "missing_requirements": [],
+                    }
                 round_number += 1
                 if self.max_repairs is not None and round_number > self.max_repairs:
                     raise

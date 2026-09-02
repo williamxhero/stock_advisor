@@ -20,12 +20,24 @@ def row(operation: str, *, query: str | None = None, url: str | None = None) -> 
 class LocalResearchTests(unittest.TestCase):
     def test_invalid_broker_plan_uses_the_existing_bounded_repair_round(self) -> None:
         calls = 0
+        received_gaps: list[list[str]] = []
 
-        def planner(*_args: object) -> dict:
+        def planner(_packet: dict, gaps: list[str], _round_number: int) -> dict:
             nonlocal calls
             calls += 1
+            received_gaps.append(list(gaps))
             if calls == 1:
-                raise BrokerError("invalid plan", category="broker_output_invalid")
+                raise BrokerError(
+                    "invalid plan",
+                    category="broker_output_invalid",
+                    verifier={
+                        "passed": False,
+                        "business": {
+                            "passed": False,
+                            "problems": ["research_plan_missing_requirement:market"],
+                        },
+                    },
+                )
             return {"version": 1, "operations": [row("web_read", url="https://example.test/close")]}
 
         backend = lambda *_: {"results": [{
@@ -38,6 +50,10 @@ class LocalResearchTests(unittest.TestCase):
 
         self.assertTrue(result.qualified)
         self.assertEqual(2, calls)
+        self.assertEqual(
+            ["research_plan_missing_requirement:market"],
+            received_gaps[1],
+        )
 
     def test_planner_requires_an_explicit_effort_decision(self) -> None:
         with self.assertRaises(TypeError):

@@ -88,12 +88,15 @@ public partial class MainWindow : Window, IDisposable
         RefreshCompanionWorkspace();
     }
 
-    private bool HasMessageTextSelection() => _messageTextViewers.Any(viewer => !viewer.Selection.IsEmpty);
+    private bool HasMessageTextSelection() => _messageTextViewers.Any(viewer => viewer.Selection is { IsEmpty: false });
 
     private void ClearMessageTextSelections()
     {
         foreach (var viewer in _messageTextViewers)
-            viewer.Selection.Select(viewer.Document.ContentStart, viewer.Document.ContentStart);
+        {
+            if (viewer.Selection is { } selection)
+                selection.Select(viewer.Document.ContentStart, viewer.Document.ContentStart);
+        }
     }
 
     private void OnPreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)

@@ -238,6 +238,7 @@ public sealed class UiContractTests
         var source = File.ReadAllText(Path.Combine(root.FullName!,
             "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml.cs"));
 
+        Assert.Contains("viewer.Selection is { IsEmpty: false }", source, StringComparison.Ordinal);
         Assert.Contains("if (HasMessageTextSelection()) return;", source, StringComparison.Ordinal);
         Assert.Contains("PreviewMouseLeftButtonDown += OnPreviewMouseLeftButtonDown", source, StringComparison.Ordinal);
         Assert.Contains("ClearMessageTextSelections();", source, StringComparison.Ordinal);

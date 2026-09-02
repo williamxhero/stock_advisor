@@ -273,6 +273,26 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertEqual("bearish", frozen["direction"])
         self.assertEqual(["bearish"], [claim["direction"] for claim in frozen["claims"]])
 
+    def test_v3_m1_contract_requires_a_canonical_direction_and_expression_localizes_it(self):
+        schema = json.loads((
+            PROJECT_ROOT / "resources" / "contracts" / "companion-m1-result-v3.schema.json"
+        ).read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            ["bullish", "bearish", "neutral", "avoid", "unqualified", "unknown"],
+            schema["properties"]["semantic"]["properties"]["direction"]["enum"],
+        )
+        normalized = normalize_stage_output("m1_judgment", {
+            "result_version": 3,
+            "semantic": {
+                "summary": "市场宽度偏弱。", "direction": "bearish", "qualified": True,
+                "triggers": ["宽度修复"], "invalidations": ["指数收复跌幅"],
+                "risks": [], "unknowns": [],
+            },
+        })
+        self.assertIn("偏空", normalized.text)
+        self.assertNotIn("bearish", normalized.text)
+
     def test_packet_and_verifier_reject_a_false_non_trading_day_m0(self):
         class TradingDayCalendar:
             @staticmethod

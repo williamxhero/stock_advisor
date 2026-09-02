@@ -71,7 +71,11 @@ def express_stage_semantics(stage: str, semantic: dict[str, Any]) -> str:
     if stage in {"m1", "m2"}:
         direction = str(semantic.get("direction") or "").strip()
         if direction:
-            paragraphs.append(f"我现在更倾向于{direction}。")
+            direction_label = {
+                "bullish": "偏多", "bearish": "偏空", "neutral": "中性",
+                "avoid": "回避交易", "unqualified": "尚未形成合格方向", "unknown": "方向未知",
+            }.get(direction, direction)
+            paragraphs.append(f"我现在更倾向于{direction_label}。")
         if semantic.get("qualified") is False:
             paragraphs.append("不过证据还不够，我不会把它当成可以直接执行的判断。")
     for key, lead in (

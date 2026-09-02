@@ -161,6 +161,25 @@ class CompanionEngine:
         self.emit(cycle, f"analysis.request.{receipt['state']}", {"cycle": cycle, "receipt": receipt})
         return {"receipt": receipt, "projection": self._projection(cycle)}
 
+    def refresh_manual_analysis_contract(self, cycle_id: str, as_of: str) -> dict[str, Any]:
+        """Bind a manual contract to the real acquisition start, not queue time."""
+        cycle = self.store.get_cycle(cycle_id)
+        if cycle.get("kind") != "manual":
+            return cycle
+        profile = json.loads(cycle.get("task_profile_json") or "{}")
+        if not profile:
+            raise ValueError("manual analysis task profile is missing")
+        with self.store.connection() as connection:
+            positions = connection.execute(
+                "SELECT code FROM portfolio_position WHERE shares>0 ORDER BY code"
+            ).fetchall()
+        contract = self.evidence_contract_factory.build(
+            task_key=str(cycle["task_key"]), stage="m0_research", as_of=as_of,
+            task_profile=profile,
+            internal_context={"portfolio_entities": [str(row["code"]) for row in positions]},
+        )
+        return self.store.refresh_manual_analysis_contract(cycle_id, as_of, contract)
+
     def start_diagnostic_rerun(self, source_cycle_id: str) -> dict[str, Any]:
         cycle = self.store.create_diagnostic_cycle(source_cycle_id)
         self.emit(cycle, "cycle.diagnostic_rerun.created", {

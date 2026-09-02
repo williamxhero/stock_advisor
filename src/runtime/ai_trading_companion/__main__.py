@@ -810,12 +810,11 @@ def run_research(
     on_progress: Any = None,
     frozen_as_of: str | None = None,
 ) -> dict[str, Any]:
-    cycle = engine.research_started(cycle["cycle_id"], as_of=frozen_as_of)
-    publish_observatory_forecast(store, cycle["cycle_id"], trigger="stage:m0_started")
-    if on_progress:
-        on_progress()
-    builder = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
     if not execute:
+        cycle = engine.research_started(cycle["cycle_id"], as_of=frozen_as_of)
+        publish_observatory_forecast(store, cycle["cycle_id"], trigger="stage:m0_started")
+        if on_progress:
+            on_progress()
         evidence = {"as_of": cycle["as_of"], "spoken_summary": "Fixture 模式：等待真实公开信息搜索。", "sources": [], "critical_gaps": []}
         store.append_artifact(cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False), cycle["as_of"])
         evidence_hash = "fixture-m0-research"
@@ -835,6 +834,16 @@ def run_research(
         store, "m0_research", timeout=research_timeout, search=True,
     )
     memory_research = _formal_adaptive_research(engine, store, cycle, "m0_research", cycle["as_of"], research_timeout)
+    if cycle.get("kind") == "manual":
+        # A manual request may wait in the shared worker queue. Freeze it at
+        # the actual collection start, not at its earlier queue timestamp.
+        cycle = engine.refresh_manual_analysis_contract(cycle["cycle_id"], iso(datetime.now(timezone.utc)))
+        frozen_as_of = cycle["as_of"]
+    cycle = engine.research_started(cycle["cycle_id"], as_of=frozen_as_of)
+    publish_observatory_forecast(store, cycle["cycle_id"], trigger="stage:m0_started")
+    if on_progress:
+        on_progress()
+    builder = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
     public_packet = finalize_stage_packet(builder.build(cycle, "m0_research", context=memory_research), research_controls)
     compose_timeout = int(policy.m1_timeout.total_seconds())
     compose_controls = resolve_stage_controls(

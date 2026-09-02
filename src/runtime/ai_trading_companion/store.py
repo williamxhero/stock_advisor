@@ -833,6 +833,23 @@ class CompanionStore:
             )
             return self.get_cycle(cycle_id, connection=c), True
 
+    def refresh_manual_analysis_contract(self, cycle_id: str, as_of: str, contract: dict[str, Any]) -> dict[str, Any]:
+        """Freeze a manual request at the instant its research worker actually starts."""
+        self.initialize()
+        raw = json.dumps(contract, ensure_ascii=False, sort_keys=True)
+        with self.connection() as c:
+            row = c.execute("SELECT kind,state FROM companion_cycle WHERE cycle_id=?", (cycle_id,)).fetchone()
+            if row is None:
+                raise ValueError("unknown manual analysis cycle")
+            if row["kind"] != "manual" or row["state"] != "queued":
+                raise ValueError("manual analysis contract can only refresh while queued")
+            c.execute(
+                """UPDATE companion_cycle SET as_of=?,evidence_contract_version=?,evidence_contract_hash=?,
+                   evidence_contract_json=?,updated_at=?,revision=revision+1 WHERE cycle_id=?""",
+                (as_of, int(contract["version"]), str(contract["contract_hash"]), raw, now(), cycle_id),
+            )
+        return self.get_cycle(cycle_id)
+
     def find_cycle(self, task_key: str, scheduled_for: str) -> dict[str, Any] | None:
         self.initialize()
         with self.connection() as c:

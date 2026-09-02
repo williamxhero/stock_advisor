@@ -91,6 +91,36 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual({"web_read"}, {item["operation"] for item in plan["operations"]})
         self.assertEqual({"events"}, {item["requirement_key"] for item in plan["operations"]})
 
+    def test_planner_repair_never_reads_an_attempted_candidate_url_again(self) -> None:
+        broker = mock.Mock()
+        planner = BrokerResearchPlanner(
+            broker, intellect="smart", effort="medium", deadline=lambda: 123.0,
+        )
+        attempted = "https://example.test/already-read"
+        packet = {
+            "as_of": CONTRACT["as_of"],
+            "evidence_contract": {
+                **CONTRACT,
+                "requirements": [
+                    *CONTRACT["requirements"],
+                    {"key": "events", "blocking": True},
+                ],
+            },
+            "research_discoveries": [
+                {"requirement_key": "events", "url": attempted},
+                {"requirement_key": "events", "url": "https://example.test/untried"},
+            ],
+            "attempted_research_urls": [attempted],
+        }
+
+        plan = planner(packet, ["events"], 1)
+
+        broker.invoke.assert_not_called()
+        self.assertEqual(
+            ["https://example.test/untried"],
+            [item["arguments"]["url"] for item in plan["operations"]],
+        )
+
     def test_browser_action_schema_is_strict_and_defines_array_items(self) -> None:
         actions = RESEARCH_PLAN_SCHEMA["properties"]["operations"]["items"]["properties"]["arguments"]["properties"]["actions"]
         self.assertEqual("object", actions["items"]["type"])

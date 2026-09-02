@@ -90,11 +90,17 @@ class BrokerResearchPlanner:
         self.outcomes: list[Any] = []
 
     def __call__(self, packet: dict[str, Any], gaps: list[str], round_number: int) -> dict[str, Any]:
+        attempted_urls = {
+            str(url) for url in packet.get("attempted_research_urls") or [] if str(url)
+        }
         discoveries = _merge_discoveries(
             list(packet.get("research_discoveries") or []),
             _public_market_close_discoveries(packet),
             _public_intraday_market_discoveries(packet),
         )
+        discoveries = [
+            row for row in discoveries if str(row.get("url") or "") not in attempted_urls
+        ]
         discovery_repair = _discovery_read_repair_plan(
             packet.get("evidence_contract") or {}, discoveries, gaps, round_number,
         )
@@ -354,6 +360,11 @@ class LocalResearchChain:
             planning_packet = {
                 **packet,
                 "research_discoveries": _discovery_digest(observations, contract),
+                "attempted_research_urls": sorted({
+                    str((item.get("arguments") or {}).get("url") or "")
+                    for item in observations
+                    if str((item.get("arguments") or {}).get("url") or "")
+                }),
             }
             try:
                 plan = self.planner(planning_packet, gaps, round_number)

@@ -256,6 +256,28 @@ class EvidenceV3Tests(TestCase):
         failed = EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")
         self.assertIn("blocking_requirement_lacks_numeric_facts:portfolio_market_state", failed["problems"])
 
+    def test_v4_market_breadth_is_qualified_from_structured_tool_json(self):
+        as_of = "2026-08-31T01:45:00Z"
+        contract = {"version": 4, "as_of": as_of, "requirements": [{
+            "key": "market_breadth", "blocking": True, "allowed_coverage": ["covered"],
+            "minimum_numeric_facts": 3,
+            "window": {"mode": "after_start_to_end", "start": "2026-08-31T01:30:00Z", "end": as_of},
+        }]}
+        excerpt = json.dumps({"breadth": {"up": 632, "down": 2203, "flat": 57}}, ensure_ascii=False)
+        observations = [{"attempt_id": "attempt", "backend": "market", "status": "succeeded", "non_empty": True,
+                         "evidence_items": [{"evidence_ref": "breadth", "excerpt_text": excerpt,
+                                             "fact_as_of": "2026-08-31T01:44:00Z", "published_at": None, "acquired_at": as_of}]}]
+        evidence = {"schema_version": 3, "as_of": as_of, "sources": [{"evidence_ref": "breadth", "excerpt": excerpt}],
+                    "coverage": [{"requirement_key": "market_breadth", "status": "covered", "evidence_refs": ["breadth"]}],
+                    "high_impact_events": []}
+
+        self.assertTrue(EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")["passed"])
+        excerpt = json.dumps({"breadth": {"up": 632, "down": 2203}}, ensure_ascii=False)
+        evidence["sources"][0]["excerpt"] = excerpt
+        observations[0]["evidence_items"][0]["excerpt_text"] = excerpt
+        failed = EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")
+        self.assertIn("blocking_requirement_lacks_numeric_facts:market_breadth", failed["problems"])
+
     def test_m0_rejects_utc_clock_and_requires_local_quote_time_and_status(self):
         packet = {
             "calendar_context": {},

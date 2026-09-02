@@ -352,6 +352,11 @@ class _EvidenceGateV3:
                 if absent_entities:
                     problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
                 continue
+            if key == "market_breadth":
+                breadth_facts = self._market_breadth_facts(bound)
+                if len(breadth_facts) < int(requirement.get("minimum_numeric_facts") or 0):
+                    problems.append(f"blocking_requirement_lacks_numeric_facts:{key}"); missing.append(key); continue
+                continue
             numeric_facts = set(re.findall(
                 r"(?<![\d.])\d+(?:\.\d+)?\s*(?:%|％|万亿元|亿元|万亿|亿|万家|家|只|股|元)", support,
             ))
@@ -428,6 +433,24 @@ class _EvidenceGateV3:
                 if symbol in required and valid == fields and quote.get("quote_at") and quote.get("trading_date") and quote.get("status"):
                     complete[symbol] = valid
         return complete
+
+    @staticmethod
+    def _market_breadth_facts(sources: list[dict[str, Any]]) -> set[str]:
+        """Return required typed breadth fields from the canonical tool JSON."""
+        fields = {"up", "down", "flat"}
+        found: set[str] = set()
+        for source in sources:
+            try:
+                payload = json.loads(str(source.get("excerpt") or ""))
+            except (TypeError, ValueError):
+                continue
+            candidates = [payload.get("breadth")] if isinstance(payload, dict) else []
+            while candidates:
+                value = candidates.pop()
+                if isinstance(value, dict):
+                    found.update(field for field in fields if isinstance(value.get(field), int) and not isinstance(value.get(field), bool))
+                    candidates.extend(item for item in value.values() if isinstance(item, dict))
+        return found
 
     @staticmethod
     def _matching_negative_query(sources: list[dict[str, Any]], terms: list[str]) -> bool:

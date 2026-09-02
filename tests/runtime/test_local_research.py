@@ -263,10 +263,11 @@ class LocalResearchTests(unittest.TestCase):
                 "url": "https://example.test/story", "text": "verified source text",
             }, "artifact:sha256:" + "b" * 64, None, ("tool_result_schema_valid",)),
         ]
-        backend = ToolCatalogResearchBackend(runner, as_of=CONTRACT["as_of"], deadline=lambda: 30.0)
+        backend = ToolCatalogResearchBackend(runner, as_of="2026-08-27T08:00:00Z", deadline=lambda: 30.0,
+                                             contract=CONTRACT)
 
-        found = backend("web_search", row("web_search", query="close") ["arguments"])
-        read = backend("web_read", row("web_read", url="https://example.test/story")["arguments"])
+        found = backend("web_search", {**row("web_search", query="close")["arguments"], "_requirement_key": "market"})
+        read = backend("web_read", {**row("web_read", url="https://example.test/story")["arguments"], "_requirement_key": "market"})
 
         self.assertEqual("https://example.test/story", found["results"][0]["url"])
         self.assertEqual("verified source text", read["results"][0]["excerpt_text"])

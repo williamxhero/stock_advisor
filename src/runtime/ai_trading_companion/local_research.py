@@ -166,15 +166,24 @@ class WebAccessGatewayBackend:
 class ToolCatalogResearchBackend:
     """Compatibility projection from a research plan to promoted local CLI capabilities."""
 
-    def __init__(self, runner: ToolRunner, *, as_of: str, deadline: Callable[[], float]) -> None:
+    def __init__(self, runner: ToolRunner, *, as_of: str, deadline: Callable[[], float],
+                 contract: dict[str, Any] | None = None) -> None:
         self.runner = runner
         self.as_of = as_of
         self.deadline = deadline
+        self.requirements = {
+            str(row.get("key") or ""): row
+            for row in (contract or {}).get("requirements") or [] if isinstance(row, dict)
+        }
 
     def __call__(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        requirement_key = str(arguments.pop("_requirement_key", "") or "")
+        requirement = self.requirements.get(requirement_key) or {}
+        window = requirement.get("window") if isinstance(requirement.get("window"), dict) else {}
+        required_at = str(window.get("end") or self.as_of)
         capability, inputs = self._request_for(operation, arguments)
         resolution = self.runner.resolve_with_fallback(FactRequest(
-            contract_version=1, capability=capability, required_at=self.as_of,
+            contract_version=1, capability=capability, required_at=required_at,
             deadline_seconds=max(0.1, min(15.0, float(self.deadline()))), inputs=inputs,
             context={}, freshness_seconds=0.0, finality="observed",
         ))

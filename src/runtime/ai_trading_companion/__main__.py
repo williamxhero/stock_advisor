@@ -912,7 +912,18 @@ def run_research(
     research_controls = resolve_stage_controls(
         store, "m0_research", timeout=research_timeout, search=True,
     )
-    memory_research = _formal_adaptive_research(engine, store, cycle, "m0_research", cycle["as_of"], research_timeout)
+    # M0's public market/portfolio evidence is a deterministic acquisition
+    # obligation.  Do not put an optional model-directed MemoryHub exploration
+    # in front of it: a slow provider would otherwise leave an accepted manual
+    # analysis visibly queued without even beginning its frozen evidence work.
+    # RuntimePacketBuilder still supplies the policy-filtered MemoryHub cards;
+    # this merely keeps speculative adaptive exploration out of the critical
+    # evidence path.
+    memory_research = {
+        "adaptive_memory": [],
+        "adaptive_actions": [],
+        "mode": "deterministic_m0_evidence_first",
+    }
     if cycle.get("kind") == "manual":
         # A manual request may wait in the shared worker queue. Freeze it at
         # the actual collection start, not at its earlier queue timestamp.

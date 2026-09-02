@@ -37,7 +37,6 @@ public partial class MainWindow : Window, IDisposable
     private readonly HashSet<string> _locallyWithdrawnMessageIds = new(StringComparer.Ordinal);
     private readonly HashSet<string> _locallyLockedCycles = new(StringComparer.Ordinal);
     private readonly HashSet<string> _editGraceRequestedCycles = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, FrameworkElement> _aiAnchors = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, CompanionAiTimelineEntry> _localAiNoticesByCycle = new(StringComparer.Ordinal);
     private readonly Queue<double> _waveformLevels = new();
     private CompanionWorkspaceProjection? _companionProjection;
@@ -55,8 +54,6 @@ public partial class MainWindow : Window, IDisposable
     private string? _voiceContextFile;
     private bool _suppressDraftUpdate;
     private bool _disposed;
-    private string? _pendingMemoryExportCommandId;
-    private readonly HashSet<string> _handledMemoryResults = new(StringComparer.Ordinal);
 
     public MainWindow(MainViewModel viewModel, AppPaths paths)
     {
@@ -276,7 +273,6 @@ public partial class MainWindow : Window, IDisposable
             catch (Exception exception) { _viewModel.ReportInboxFailure(exception); }
         }
         var events = _companionExchange.ReadLatestEvents(1000);
-        HandleMemoryResults(events);
         _taskManagementWindow?.UpdateEvents(events);
         RequestTodayProjectionsAsync();
         _viewModel.SynchronizeManualCycles(CompanionEventProjection.ProjectAll(events));
@@ -341,56 +337,16 @@ public partial class MainWindow : Window, IDisposable
         RequestCompanionProjectionAsync(projection.CycleId);
     }
 
-    private async void MemoryButton_Click(object sender, RoutedEventArgs e)
+    private void MemoryButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_pendingMemoryExportCommandId is not null) return;
-        var commandId = Guid.NewGuid().ToString();
-        _pendingMemoryExportCommandId = commandId;
         try
         {
-            await _companionExchange.SendAsync(new
-            {
-                contract = "memory-user-command/v1", command_id = commandId, type = "memory.export",
-            });
-            MessageBox.Show(this, "正在导出全部私人记忆。导出成功后会再次询问是否清空；此操作不会修改 MarketHub 或 8815 的公共历史。", "AI交易伙伴", MessageBoxButton.OK, MessageBoxImage.Information);
+            Process.Start(new ProcessStartInfo("http://yosef-server:8820/admin/") { UseShellExecute = true });
         }
         catch (Exception exception)
         {
-            _pendingMemoryExportCommandId = null;
-            _viewModel.ReportInboxFailure(exception);
-        }
-    }
-
-    private async void HandleMemoryResults(IReadOnlyList<string> events)
-    {
-        foreach (var raw in events)
-        {
-            using var document = JsonDocument.Parse(raw);
-            var root = document.RootElement;
-            if (!root.TryGetProperty("contract", out var contract) || contract.GetString() != "memory-command-result/v1") continue;
-            var commandId = root.GetProperty("command_id").GetString();
-            if (string.IsNullOrWhiteSpace(commandId) || !_handledMemoryResults.Add(commandId)) continue;
-            var result = root.GetProperty("result");
-            var state = result.TryGetProperty("state", out var stateValue) ? stateValue.GetString() : null;
-            if (state == "exported" && commandId == _pendingMemoryExportCommandId)
-            {
-                _pendingMemoryExportCommandId = null;
-                var exportPath = result.GetProperty("machine_export_path").GetString();
-                var token = result.GetProperty("confirmation_token").GetString();
-                var answer = MessageBox.Show(
-                    this,
-                    $"私人记忆已成功导出到：\n{exportPath}\n\n是否彻底清空整个私人记忆空间？这会删除正式消息、摘要、索引和派生关系，且不可撤销；持仓、成交、日程和任务不会被删除。",
-                    "二次确认：清空私人记忆", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
-                await _companionExchange.SendAsync(new
-                {
-                    contract = "memory-user-command/v1", command_id = Guid.NewGuid().ToString(), type = "memory.clear",
-                    confirmed = answer == MessageBoxResult.Yes, confirmation_token = token,
-                });
-            }
-            else if (state == "cleared")
-            {
-                MessageBox.Show(this, "私人记忆空间已清空。MarketHub、8815、持仓、成交、日程和任务未受影响。", "AI交易伙伴", MessageBoxButton.OK, MessageBoxImage.Information);
-            }
+            MessageBox.Show(this, $"无法打开记忆页：\n{exception.Message}", "AI交易伙伴",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
 
@@ -406,12 +362,11 @@ public partial class MainWindow : Window, IDisposable
         var wasAtBottom = AiTimelineScrollViewer.ScrollableHeight <= 0
             || AiTimelineScrollViewer.VerticalOffset >= AiTimelineScrollViewer.ScrollableHeight - 36;
         AiTimelinePanel.Children.Clear();
-        _aiAnchors.Clear();
         foreach (var message in messages.OrderBy(item => item.At))
         {
             if (message.Kind is "chat_pending" or "action_pending")
             {
-                var pending = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, Margin = new Thickness(4, 2, 0, 12) };
+                var pending = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal };
                 pending.Children.Add(new TextBlock
                 {
                     Text = "正在想…", Foreground = (Brush)FindResource("SecondaryTextBrush"), FontSize = 13,
@@ -422,13 +377,18 @@ public partial class MainWindow : Window, IDisposable
                     stop.Click += async (_, _) => await SendCompanionCommandAsync("terminate_chat_research", null, showAiError: true);
                     pending.Children.Add(stop);
                 }
-                AiTimelinePanel.Children.Add(pending);
+                AiTimelinePanel.Children.Add(new Border
+                {
+                    Background = (Brush)FindResource("CardBrush"), BorderBrush = (Brush)FindResource("BorderBrush"),
+                    BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(9), Padding = new Thickness(10, 7, 10, 7),
+                    Margin = new Thickness(0, 0, 0, 10), Child = pending,
+                });
                 continue;
             }
             var timing = new TextBlock
             {
                 Text = FormatTiming(message), Foreground = (Brush)FindResource("SecondaryTextBrush"),
-                FontSize = 11, Margin = new Thickness(0, 3, 0, 0),
+                FontSize = 11,
             };
             var body = CreatePublishedMessageViewer(message);
             var headerRow = new Grid();
@@ -436,6 +396,7 @@ public partial class MainWindow : Window, IDisposable
             headerRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             var copy = CreateCopyButton(message.Text);
             Grid.SetColumn(copy, 1);
+            headerRow.Children.Add(timing);
             headerRow.Children.Add(copy);
             if (message.Kind == "chat_terminated" && _companionProjection is not null)
             {
@@ -443,21 +404,14 @@ public partial class MainWindow : Window, IDisposable
                 resume.Click += async (_, _) => await SendCompanionCommandAsync("continue_chat_research", null, showAiError: true);
                 Grid.SetColumn(resume, 1); headerRow.Children.Add(resume);
             }
-            var content = new StackPanel { Children = { headerRow, timing, body } };
+            var content = new StackPanel { Children = { headerRow, body } };
             var card = new Border
             {
                 Background = (Brush)FindResource("CardBrush"), BorderBrush = (Brush)FindResource("BorderBrush"),
-                BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(9), Padding = new Thickness(12),
-                Margin = new Thickness(0, 0, 0, 10), Child = content, Cursor = Cursors.Hand,
-            };
-            card.MouseLeftButtonDown += (_, _) =>
-            {
-                _activeAiMarkdown = message.Text;
-                ReadAloudButton.IsEnabled = true;
+                BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(9), Padding = new Thickness(10, 7, 10, 9),
+                Margin = new Thickness(0, 0, 0, 10), Child = content,
             };
             AiTimelinePanel.Children.Add(card);
-            if (message.Kind is "premarket" or "premarket_chat" or "m0" or "m1" or "m2")
-                _aiAnchors[message.Kind == "premarket_chat" ? "premarket" : message.Kind] = card;
         }
         if (messages.Count == 0)
         {
@@ -508,10 +462,7 @@ public partial class MainWindow : Window, IDisposable
         foreach (var entry in messages)
         {
             var isStaged = entry.State == "staged";
-            var headerText = isStaged ? $"待提交 · {entry.At.ToLocalTime():HH:mm}"
-                : entry.Phase == "h0" ? $"H0 · {entry.At.ToLocalTime():HH:mm}"
-                : entry.Phase == "pre_m0" ? $"盘前交流 · {entry.At.ToLocalTime():HH:mm}"
-                : $"我 · {entry.At.ToLocalTime():HH:mm}";
+            var headerText = entry.At.ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture);
             var header = new TextBlock
             {
                 Text = headerText, FontSize = 11,
@@ -557,7 +508,7 @@ public partial class MainWindow : Window, IDisposable
             {
                 Background = isStaged ? new SolidColorBrush(Color.FromRgb(21, 42, 66)) : Brushes.Transparent,
                 BorderBrush = (Brush)FindResource("BorderBrush"), BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(8), Padding = new Thickness(10, 8, 10, 8),
+                CornerRadius = new CornerRadius(8), Padding = new Thickness(10, 6, 10, 8),
                 Margin = new Thickness(0, 0, 0, 8), Child = content,
             });
         }
@@ -609,6 +560,9 @@ public partial class MainWindow : Window, IDisposable
             Padding = new Thickness(0),
             Margin = margin,
             IsSelectionEnabled = true,
+            Focusable = true,
+            Cursor = Cursors.IBeam,
+            ToolTip = "可鼠标框选后按 Ctrl+C 复制；复制按钮会保留整条消息的原始 Markdown",
         };
         NestedScrollWheelForwarder.Attach(viewer);
         return viewer;
@@ -661,13 +615,6 @@ public partial class MainWindow : Window, IDisposable
 
     private bool IsH0LockedForUi() => _companionProjection is not null
         && (_companionProjection.IsH0Locked || _locallyLockedCycles.Contains(_companionProjection.CycleId));
-
-    private void AiAnchor_Click(object sender, RoutedEventArgs e)
-    {
-        if (sender is not Button { Tag: string tag }) return;
-        if (tag == "latest") AiTimelineScrollViewer.ScrollToEnd();
-        else if (_aiAnchors.TryGetValue(tag, out var target)) target.BringIntoView();
-    }
 
     private async void RequestCompanionProjectionAsync(string cycleId)
     {
@@ -832,9 +779,10 @@ public partial class MainWindow : Window, IDisposable
 
     private static string FormatTiming(CompanionAiTimelineEntry message)
     {
-        var started = (message.StartedAt ?? message.At).ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture);
-        var completed = (message.CompletedAt ?? message.At).ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture);
-        return $"开始 {started} · 完成 {completed}";
+        var started = (message.StartedAt ?? message.At).ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture);
+        return message.CompletedAt is { } completedAt
+            ? $"{started} -> {completedAt.ToLocalTime():HH:mm}"
+            : $"{started} -> ";
     }
 
     private string BuildAsrContext()

@@ -101,15 +101,36 @@ public sealed class UiContractTests
 
         Assert.Contains("AiTimelineScrollViewer", xaml, StringComparison.Ordinal);
         Assert.Contains("AiTimelinePanel", xaml, StringComparison.Ordinal);
-        Assert.Contains("Text=\"对话\"", xaml, StringComparison.Ordinal);
-        Assert.DoesNotContain("Text=\"AI消息\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("Text=\"AI的消息\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Text=\"对话\"", xaml, StringComparison.Ordinal);
         Assert.Contains("MainSendButton", xaml, StringComparison.Ordinal);
         Assert.Contains("MainCommitButton", xaml, StringComparison.Ordinal);
         Assert.Contains("Text=\"我的消息\"", xaml, StringComparison.Ordinal);
-        Assert.Contains("Content=\"盘前\" Tag=\"premarket\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Content=\"盘前\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Content=\"M0\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Content=\"M1\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Content=\"M2\"", xaml, StringComparison.Ordinal);
+        Assert.DoesNotContain("Content=\"最新\"", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("M0Viewer", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("M1Viewer", xaml, StringComparison.Ordinal);
         Assert.Contains("BasedOn=\"{StaticResource ThinScrollBarStyle}\"", xaml, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void MemoryButtonOpensTheYosefServerMemoryHubAdminPage()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln")))
+            root = root.Parent;
+        Assert.NotNull(root);
+        var source = File.ReadAllText(Path.Combine(root.FullName!,
+            "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml.cs"));
+
+        Assert.Contains("MemoryButton_Click", source, StringComparison.Ordinal);
+        Assert.Contains("http://yosef-server:8820/admin/", source, StringComparison.Ordinal);
+        Assert.Contains("UseShellExecute = true", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("memory-user-command/v1", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("memory-command-result/v1", source, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -202,6 +223,9 @@ public sealed class UiContractTests
         Assert.Contains("CreateMarkdownViewer(entry.Text", source, StringComparison.Ordinal);
         Assert.Contains("MarkdownDocumentBuilder.Build(markdown)", source, StringComparison.Ordinal);
         Assert.Contains("Clipboard.SetText(text)", source, StringComparison.Ordinal);
+        Assert.Contains("IsSelectionEnabled = true", source, StringComparison.Ordinal);
+        Assert.Contains("Focusable = true", source, StringComparison.Ordinal);
+        Assert.Contains("Cursor = Cursors.IBeam", source, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -218,6 +242,9 @@ public sealed class UiContractTests
         Assert.DoesNotContain("M2 · 伴生综合", source, StringComparison.Ordinal);
         Assert.DoesNotContain("AI 正在回复中", source, StringComparison.Ordinal);
         Assert.Contains("正在想…", source, StringComparison.Ordinal);
+        Assert.Contains("Child = pending", source, StringComparison.Ordinal);
+        Assert.Contains("$\"{started} -> {completedAt.ToLocalTime():HH:mm}\"", source, StringComparison.Ordinal);
+        Assert.Contains("$\"{started} -> \"", source, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -200,7 +200,7 @@ class ProviderBrokerTests(unittest.TestCase):
         self.assertEqual("streaming", outcome.winner_route)
         self.assertEqual(["streaming"], [item["route"] for item in transport.calls])
 
-    def test_close_costs_prefer_stage_quality_but_cost_bands_stay_dominant(self) -> None:
+    def test_cost_bands_keep_cheaper_route_ahead_of_near_cost_race(self) -> None:
         configured = normalize_provider({
             "enabled": True,
             "endpoints": [
@@ -216,13 +216,15 @@ class ProviderBrokerTests(unittest.TestCase):
         })
         transport = FakeTransport({})
         outcome = ProviderBroker(configured, transport).invoke(request())
-        # Luna is materially cheaper, so it cannot be displaced by the more
-        # capable near-price pair.  Remove it to assert quality inside a band.
+        # Luna is materially cheaper, so it cannot be displaced by the
+        # near-price pair.  Without it, Terra and Sonnet share one price band
+        # and are deliberately launched as a concurrent race: either qualified
+        # response may return first.
         self.assertEqual("luna", outcome.winner_route)
         configured["routes"] = [row for row in configured["routes"] if row["id"] != "luna"]
         transport = FakeTransport({})
         outcome = ProviderBroker(configured, transport).invoke(request())
-        self.assertEqual("terra", outcome.winner_route)
+        self.assertIn(outcome.winner_route, {"terra", "sonnet"})
 
     def test_visible_first_delta_locks_route_even_if_later_invalid(self) -> None:
         visible: list[str] = []

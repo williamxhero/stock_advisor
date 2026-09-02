@@ -916,10 +916,18 @@ class CompanionEngine:
             "outcome", "reflection", "recovery", "legacy_message",
         }
         ai_messages = []
+        local_message_ids: set[str] = set()
         for artifact in artifacts:
             if artifact["kind"] not in ai_kinds:
                 continue
             metadata = json.loads(artifact["metadata_json"] or "{}")
+            published_message = metadata.get("published_message")
+            if (
+                artifact["kind"] not in {"ai_chat", "premarket_chat"}
+                and isinstance(published_message, dict)
+                and published_message.get("message_id")
+            ):
+                local_message_ids.add(str(published_message["message_id"]))
             if artifact["kind"] == "system_fault" and metadata.get("retryable") is True:
                 continue
             item = {
@@ -927,8 +935,8 @@ class CompanionEngine:
                 "at": artifact["sealed_at"], "as_of": artifact["as_of"],
                 "text": artifact["body_markdown"], "metadata": artifact["metadata_json"],
             }
-            if isinstance(metadata.get("published_message"), dict):
-                item["message"] = metadata["published_message"]
+            if isinstance(published_message, dict):
+                item["message"] = published_message
             ai_messages.append(item)
         user_messages = [
             {
@@ -969,7 +977,9 @@ class CompanionEngine:
                     "text": item.get("body"), "metadata": json.dumps(item.get("metadata") or {}, ensure_ascii=False),
                 } | ({"message": (item.get("metadata") or {}).get("published_message")}
                      if isinstance((item.get("metadata") or {}).get("published_message"), dict) else {}))
-                for item in timeline if item.get("episode_type") == "ai_message"
+                for item in timeline
+                if item.get("episode_type") == "ai_message"
+                and str((item.get("metadata") or {}).get("message_id") or "") not in local_message_ids
             ]
             ai_messages = local_non_chat + memory_ai
         latest = {kind: next((item for item in reversed(ai_messages) if item["kind"] == kind), None) for kind in ("m0", "m1", "m2")}

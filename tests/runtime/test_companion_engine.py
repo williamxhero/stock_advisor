@@ -122,6 +122,53 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertEqual(message["message"]["message_id"], memory_message["metadata"]["message_id"])
         self.assertEqual(message["message"], memory_message["metadata"]["published_message"])
 
+    def test_historical_retryable_fault_is_not_reintroduced_from_memoryhub(self):
+        memory = InMemoryMemoryAdapter()
+        self.engine.memory = memory
+        message_id = "retryable-fault-message"
+        published_message = {
+            "contract": "companion-published-message/v2",
+            "message_id": message_id,
+            "kind": "system_fault",
+            "sealed_at": "2026-09-02T01:47:00Z",
+            "text_projection": "正在重新核对。",
+            "parts": [{"kind": "speech", "text": "正在重新核对。"}],
+        }
+        self.store.append_artifact(
+            self.cycle["cycle_id"],
+            "system_fault",
+            "system",
+            "正在重新核对。",
+            "2026-09-02T01:47:00Z",
+            {"retryable": True, "published_message": published_message},
+        )
+        memory.append({
+            "memory_space_id": self.engine.memory_space_id,
+            "source_system": "stock-advisor",
+            "source_event_id": message_id,
+            "content_hash": "retryable-fault-hash",
+            "episode_type": "ai_message",
+            "body": "正在重新核对。",
+            "occurred_at": "2026-09-02T01:47:00Z",
+            "known_at": "2026-09-02T01:47:00Z",
+            "submitted_at": "2026-09-02T01:47:00Z",
+            "authority": "published_ai_message",
+            "protocol_version": "memoryhub/v1",
+            "metadata": {
+                "message_id": message_id,
+                "cycle_id": self.cycle["cycle_id"],
+                "kind": "system_fault",
+                "state": "published",
+                "actor": "ai",
+                "published_message": published_message,
+            },
+        })
+
+        projection = self.engine._projection(self.store.get_cycle(self.cycle["cycle_id"]))
+
+        self.assertNotIn(message_id, {item.get("artifact_id") for item in projection["ai_messages"]})
+        self.assertFalse(any(item["kind"] == "system_fault" for item in projection["ai_messages"]))
+
     def test_new_m0_result_publishes_from_structured_semantics_not_markdown(self):
         self.engine.research_started(self.cycle["cycle_id"])
         semantic = {

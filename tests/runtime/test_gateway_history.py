@@ -47,3 +47,46 @@ def test_today_snapshot_exposes_the_runtime_xshg_trading_day_decision(tmp_path, 
 
     assert snapshot["scheduled_date"] == "2026-08-29"
     assert snapshot["is_trading_day"] is False
+
+
+def test_internal_acceptance_cycles_are_absent_from_today_and_history(tmp_path, monkeypatch):
+    class TradingCalendar:
+        def is_trading_day(self, value):
+            return True
+
+    class Registry:
+        calendar = TradingCalendar()
+
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    store.initialize()
+    hidden, _ = store.create_manual_analysis_cycle(
+        request_id="acceptance-run",
+        task_key="daily.execution.0945",
+        requested_at="2026-09-02T06:42:59Z",
+        source={"kind": "manual_acceptance", "note": "formal intraday analysis validation"},
+        task_profile_id="intraday_market_and_portfolio",
+        task_profile_version=1,
+    )
+    visible, _ = store.create_manual_analysis_cycle(
+        request_id="user-run",
+        task_key="daily.execution.0945",
+        requested_at="2026-09-02T06:43:59Z",
+        source={"kind": "user_request", "message_id": "analysis"},
+        task_profile_id="intraday_market_and_portfolio",
+        task_profile_version=1,
+    )
+    monkeypatch.setattr(runtime, "_schedule_registry", lambda _: Registry())
+
+    today = runtime._gateway_snapshot(
+        CompanionEngine(store), store, None, "today", {"date": "2026-09-02"}
+    )
+    history = runtime._gateway_snapshot(
+        CompanionEngine(store), store, None, "history", {"limit": "31"}
+    )
+
+    today_ids = {item["cycle"]["cycle_id"] for item in today["projections"]}
+    history_ids = {item["cycle_id"] for item in history["items"]}
+    assert visible["cycle_id"] in today_ids
+    assert visible["cycle_id"] in history_ids
+    assert hidden["cycle_id"] not in today_ids
+    assert hidden["cycle_id"] not in history_ids

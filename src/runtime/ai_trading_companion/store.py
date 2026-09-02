@@ -14,6 +14,16 @@ from zoneinfo import ZoneInfo
 from .secret_guard import assert_safe
 
 
+_USER_VISIBLE_CYCLE_SQL = """NOT (
+  c.kind='manual'
+  AND CASE
+      WHEN json_valid(COALESCE(c.request_source_json, '{}'))
+      THEN COALESCE(json_extract(c.request_source_json, '$.kind'), '')
+      ELSE ''
+  END IN ('manual_acceptance','manual_validation','codex_local_verification')
+)"""
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -566,7 +576,7 @@ class CompanionStore:
         """Authoritative compact history, deduplicated by task and scheduled time."""
         self.initialize(); limit = max(1, min(limit, 90))
         with self.connection() as c:
-            clauses, values = ["1=1"], []
+            clauses, values = ["1=1", _USER_VISIBLE_CYCLE_SQL], []
             if before: clauses.append("substr(c.scheduled_for,1,10)<?"); values.append(before)
             if search:
                 clauses.append("(c.task_key LIKE ? OR EXISTS(SELECT 1 FROM narrative_artifact a WHERE a.cycle_id=c.cycle_id AND a.body_markdown LIKE ?))")
@@ -882,7 +892,7 @@ class CompanionStore:
         self.initialize()
         with self.connection() as c:
             rows = c.execute(
-                """SELECT * FROM (
+                f"""SELECT * FROM (
                        SELECT c.*,
                               COALESCE(a.artifact_count, 0) AS artifact_count,
                               COALESCE(m.message_count, 0) AS message_count,
@@ -912,6 +922,7 @@ class CompanionStore:
                          GROUP BY cycle_id
                     ) m ON m.cycle_id=c.cycle_id
                         WHERE substr(scheduled_for, 1, 10)=?
+                          AND {_USER_VISIBLE_CYCLE_SQL}
                           AND NOT EXISTS (
                               SELECT 1 FROM companion_cycle_visibility v
                                WHERE v.cycle_id=c.cycle_id AND v.dismissed_at IS NOT NULL

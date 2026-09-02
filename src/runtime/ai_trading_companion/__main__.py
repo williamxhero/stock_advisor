@@ -10,6 +10,7 @@ import os
 import sqlite3
 import time
 import sys
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -63,6 +64,7 @@ INSTALL_ROOT = PATHS.install_root
 RUNTIME = Path(os.environ.get("AI_TRADING_COMPANION_RUNTIME", str(PATHS.runtime)))
 DB = Path(os.environ.get("AI_TRADING_COMPANION_DATABASE", str(PATHS.database)))
 SCHEMAS = PATHS.contracts
+_BREADTH_PREFETCH_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -402,8 +404,8 @@ def run_gateway(execute: bool = False) -> None:
             run_scheduled_cycle(engine, store, exchange, portfolio, cycle["cycle_id"], execute)
         run_schedules(engine, store, datetime.now(timezone.utc), execute, exchange, portfolio)
         # This cache warm-up is useful for the next scheduled boundary, but it
-        # is never allowed to delay a queued foreground analysis.
-        _prefetch_market_breadth()
+        # is never allowed to occupy the sole Gateway tick worker.
+        threading.Thread(target=_prefetch_market_breadth, name="market-breadth-prefetch", daemon=True).start()
         for projection in engine.run_due():
             cycle_id = projection["cycle"]["cycle_id"]
             run_m1(engine, store, portfolio, cycle_id, execute)
@@ -432,6 +434,8 @@ def run_gateway(execute: bool = False) -> None:
 
 def _prefetch_market_breadth() -> None:
     """Persist a recent public breadth snapshot for the next frozen task boundary."""
+    if not _BREADTH_PREFETCH_LOCK.acquire(blocking=False):
+        return
     target = PATHS.runtime / "market-breadth-snapshot.json"
     try:
         if target.exists() and (time.time() - target.stat().st_mtime) < 30:
@@ -452,6 +456,8 @@ def _prefetch_market_breadth() -> None:
         # A prefetch never changes a formal task's outcome except by making a
         # already-observed snapshot available; failures remain non-authoritative.
         return
+    finally:
+        _BREADTH_PREFETCH_LOCK.release()
 
 
 def _call_stage(

@@ -95,6 +95,49 @@ class LocalResearchTests(unittest.TestCase):
             {(key, operation) for key, operation, _query in calls},
         )
 
+    def test_transient_broker_failure_reuses_qualified_mandatory_facts(self) -> None:
+        """A retry must not re-read a fact whose frozen observation is valid."""
+        contract = {
+            "version": 4, "as_of": CONTRACT["as_of"], "requirements": [
+                {"key": "market_breadth", "blocking": True},
+            ],
+        }
+        calls = 0
+        breadth_reads = 0
+
+        def planner(_packet: dict, _gaps: list[str], _round: int) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise BrokerError("route has no outcome", category="broker_protocol")
+            return {"version": 1, "operations": []}
+
+        def market(operation: str, _arguments: dict) -> dict:
+            nonlocal breadth_reads
+            self.assertEqual("market_breadth", operation)
+            breadth_reads += 1
+            return {"results": [{
+                "url": "https://example.test/breadth", "title": "breadth", "excerpt_text": "breadth",
+                "fact_as_of": CONTRACT["as_of"], "primary": True,
+            }]}
+
+        class Gate:
+            calls = 0
+
+            def evaluate(self, *_args, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return {"passed": False, "problems": ["needs_planner"], "missing_requirements": ["needs_planner"]}
+                return {"passed": True, "problems": [], "missing_requirements": []}
+
+        result = LocalResearchChain(
+            planner, ReadOnlyResearchExecutor({"market": market}), gate=Gate(), max_repairs=1,
+        ).run({"as_of": CONTRACT["as_of"]}, contract, attempt_id="broker-retry")
+
+        self.assertTrue(result.qualified)
+        self.assertEqual(2, calls)
+        self.assertEqual(1, breadth_reads)
+
     def test_mandatory_operations_finish_before_broker_planning(self) -> None:
         contract = {
             "version": 4, "as_of": CONTRACT["as_of"], "requirements": [

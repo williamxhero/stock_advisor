@@ -383,6 +383,14 @@ def run_gateway(execute: bool = False) -> None:
     # worker's finally block from releasing its durable slot.  At this point a
     # new Gateway owns no workers yet, so every stored claim is orphaned.
     store.recover_orphaned_scheduled_workers()
+    breadth_prefetch_stop = threading.Event()
+    breadth_prefetcher = threading.Thread(
+        target=_market_breadth_prefetch_loop,
+        args=(breadth_prefetch_stop,),
+        name="market-breadth-prefetch",
+        daemon=True,
+    )
+    breadth_prefetcher.start()
     def command(payload: dict[str, Any]) -> dict[str, Any]:
         contract = payload.get("contract")
         if contract == "schedule-user-command/v1":
@@ -404,9 +412,6 @@ def run_gateway(execute: bool = False) -> None:
         for cycle in store.claim_scheduled_workers(limit=2):
             run_scheduled_cycle(engine, store, exchange, portfolio, cycle["cycle_id"], execute)
         run_schedules(engine, store, datetime.now(timezone.utc), execute, exchange, portfolio)
-        # This cache warm-up is useful for the next scheduled boundary, but it
-        # is never allowed to occupy the sole Gateway tick worker.
-        threading.Thread(target=_prefetch_market_breadth, name="market-breadth-prefetch", daemon=True).start()
         for projection in engine.run_due():
             cycle_id = projection["cycle"]["cycle_id"]
             run_m1(engine, store, portfolio, cycle_id, execute)
@@ -431,7 +436,27 @@ def run_gateway(execute: bool = False) -> None:
         run_background(engine, store, execute)
         flush(store, exchange)
     import asyncio
-    asyncio.run(serve_gateway(RuntimeGateway(PATHS.home, store, command, snapshot, tick)))
+    try:
+        asyncio.run(serve_gateway(RuntimeGateway(PATHS.home, store, command, snapshot, tick)))
+    finally:
+        breadth_prefetch_stop.set()
+        breadth_prefetcher.join(timeout=1.0)
+
+
+def _market_breadth_prefetch_loop(
+    stop: threading.Event, *, interval_seconds: float = 5.0,
+    run_once: Callable[[], None] | None = None,
+) -> None:
+    """Refresh breadth independently of serial Gateway task execution."""
+    refresh = run_once or _prefetch_market_breadth
+    while not stop.is_set():
+        try:
+            refresh()
+        except Exception:
+            # A cache warm-up never changes a formal task result by itself.
+            pass
+        if stop.wait(max(0.0, interval_seconds)):
+            return
 
 
 def _prefetch_market_breadth() -> None:

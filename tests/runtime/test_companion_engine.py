@@ -14,6 +14,7 @@ from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.__main__ import (
     FORMAL_MEMORY_MAX_ACTIONS,
     _formal_adaptive_research,
+    _market_breadth_prefetch_loop,
     run_m1,
     run_pending_m1,
     run_pending_premarket_reply,
@@ -53,6 +54,23 @@ def packet_builder(store: CompanionStore) -> RuntimePacketBuilder:
 
 
 class CompanionEngineTests(unittest.TestCase):
+    def test_breadth_prefetch_loop_runs_without_waiting_for_gateway_tick(self):
+        calls: list[str] = []
+
+        class StopAfterTwoWaits:
+            waits = 0
+
+            def is_set(self) -> bool:
+                return False
+
+            def wait(self, _seconds: float) -> bool:
+                self.waits += 1
+                return self.waits > 1
+
+        _market_breadth_prefetch_loop(StopAfterTwoWaits(), interval_seconds=0, run_once=lambda: calls.append("prefetch"))
+
+        self.assertEqual(["prefetch", "prefetch"], calls)
+
     def test_user_visible_event_cannot_bypass_the_v2_publication_contract(self):
         for event_type in published_event_types():
             with self.subTest(event_type=event_type):

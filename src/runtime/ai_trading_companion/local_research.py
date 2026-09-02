@@ -473,22 +473,38 @@ class LocalResearchChain:
             try:
                 plan = self.planner(planning_packet, gaps, round_number)
             except BrokerError as exc:
-                if exc.category != "broker_output_invalid":
+                # Keep the deterministic observations from this frozen attempt
+                # alive while a transient Planner/Broker fault is retried.
+                # Re-entering the outer M0 stage would otherwise require a new
+                # live breadth read, which can only be later than the frozen
+                # time and must correctly be rejected by the tool gate.
+                if exc.category in {
+                    "broker_effort_unsupported", "broker_authentication", "broker_forbidden",
+                    "broker_secret_rejected",
+                }:
                     raise
-                broker_verifier = exc.verifier if isinstance(exc.verifier, dict) else {}
-                business_verifier = broker_verifier.get("business")
-                if isinstance(business_verifier, dict):
-                    verifier = {
-                        "passed": False,
-                        "problems": list(business_verifier.get("problems") or ["broker_output_invalid"]),
-                        "missing_requirements": list(business_verifier.get("missing_requirements") or []),
-                    }
-                else:
-                    verifier = {
-                        "passed": False,
-                        "problems": ["broker_output_invalid"],
-                        "missing_requirements": [],
-                    }
+                if exc.category == "broker_output_invalid":
+                    broker_verifier = exc.verifier if isinstance(exc.verifier, dict) else {}
+                    business_verifier = broker_verifier.get("business")
+                    if isinstance(business_verifier, dict):
+                        verifier = {
+                            "passed": False,
+                            "problems": list(business_verifier.get("problems") or ["broker_output_invalid"]),
+                            "missing_requirements": list(business_verifier.get("missing_requirements") or []),
+                        }
+                    else:
+                        verifier = {
+                            "passed": False,
+                            "problems": ["broker_output_invalid"],
+                            "missing_requirements": [],
+                        }
+                observations.append({
+                    "attempt_id": attempt_id, "observation_id": f"failure-{len(observations) + 1}",
+                    "tool": "research_plan", "backend": "broker", "operation": "research_plan",
+                    "status": "failed", "ok": False, "non_empty": False,
+                    "arguments": {}, "error_category": exc.category,
+                    "broker_request_id": exc.request_id,
+                })
                 round_number += 1
                 if self.max_repairs is not None and round_number > self.max_repairs:
                     raise

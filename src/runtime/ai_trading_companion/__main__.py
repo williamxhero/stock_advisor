@@ -82,6 +82,7 @@ class VerifiedStageResult:
 
 M1_MAX_JUDGMENT_ATTEMPTS = 4
 M1_MIN_RETRY_WINDOW_SECONDS = 30
+FORMAL_MEMORY_MAX_ACTIONS = 4
 
 
 def _m1_should_retry(exc: Exception, *, attempt_number: int, remaining_seconds: int) -> bool:
@@ -1058,7 +1059,20 @@ def run_m1(
     research_controls = resolve_stage_controls(
         store, "m1_research", timeout=research_timeout, search=True,
     )
-    memory_research = _formal_adaptive_research(engine, store, cycle, "m1_research", research_as_of, research_timeout)
+    try:
+        memory_research = _formal_adaptive_research(
+            engine, store, cycle, "m1_research", research_as_of, research_timeout,
+        )
+    except MemoryResearchError as exc:
+        engine.m1_failed(
+            cycle_id, str(exc), retryable=False,
+            details={
+                "passed": False,
+                "problems": ["memory_research_deadline"],
+                "missing_requirements": ["private_memory_context"],
+            },
+        )
+        raise
     public_packet = finalize_stage_packet(
         builder.build(cycle, "m1_research", evidence=prior_evidence, as_of=research_as_of, context=memory_research), research_controls,
     )
@@ -1696,6 +1710,7 @@ def _formal_adaptive_research(engine: CompanionEngine, store: CompanionStore, cy
         engine.memory, engine.memory_space_id,
         lambda state: _next_memory_research_action(store, cycle, state, deadline),
         discover_external=lambda action, snapshot: _discover_chat_external_evidence(engine, action, snapshot),
+        max_actions=FORMAL_MEMORY_MAX_ACTIONS,
     ).collect(cycle["cycle_id"], [{"message_id": stage, "body_text": f"Formal {stage} evidence gaps", "known_at": as_of}], deadline=deadline, stage=stage)
     return {"memoryhub_snapshot": result.snapshot, "adaptive_memory": list(result.context), "adaptive_actions": list(result.actions)}
 

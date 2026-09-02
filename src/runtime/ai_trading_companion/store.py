@@ -751,7 +751,7 @@ class CompanionStore:
         with self.connection() as c:
             return [dict(row) for row in c.execute(
                 """SELECT * FROM companion_cycle
-                     WHERE state IN ('researching_m1','m1_retry_wait','waiting_for_repair')
+                     WHERE state IN ('researching_m1','m1_retry_wait')
                      ORDER BY updated_at,created_at LIMIT ?""",
                 (max(1, int(limit)),),
             )]

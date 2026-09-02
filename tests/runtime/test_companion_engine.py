@@ -11,7 +11,15 @@ from ai_trading_companion.engine import CompanionEngine, iso, parse
 from ai_trading_companion.message_presentation import MessageQualificationError
 from ai_trading_companion.stage_expression import express_stage_semantics
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
-from ai_trading_companion.__main__ import run_pending_m1, run_pending_premarket_reply, run_scheduled_cycle
+from ai_trading_companion.__main__ import (
+    FORMAL_MEMORY_MAX_ACTIONS,
+    _formal_adaptive_research,
+    run_m1,
+    run_pending_m1,
+    run_pending_premarket_reply,
+    run_scheduled_cycle,
+)
+from ai_trading_companion.adaptive_memory import MemoryResearchError
 from ai_trading_companion.packet_builder import RuntimePacketBuilder as _RuntimePacketBuilder
 from ai_trading_companion.publication_registry import published_event_types
 from ai_trading_companion.scheduler import conversation_auto_submit_at, load_schedules, run_daily_schedule, run_periodic_schedule
@@ -354,6 +362,50 @@ Protocol: OpportunityDiscovery-v1.3
             self.engine, self.store, portfolio, self.cycle["cycle_id"], True,
         )
         self.assertEqual([{"state": "complete"}], results)
+
+    def test_gateway_tick_does_not_restart_m1_waiting_for_repair(self):
+        self.ready()
+        self.engine.command({
+            "command_id": "skip-before-fault", "cycle_id": self.cycle["cycle_id"], "type": "skip_h0",
+        })
+        self.engine.m1_failed(self.cycle["cycle_id"], "memory deadline", retryable=False)
+
+        with patch("ai_trading_companion.__main__.run_m1") as worker:
+            results = run_pending_m1(self.engine, self.store, Mock(), execute=True)
+
+        self.assertEqual([], results)
+        worker.assert_not_called()
+
+    def test_m1_memory_deadline_records_one_fault_and_waits_for_explicit_repair(self):
+        self.ready()
+        self.store.append_artifact(
+            self.cycle["cycle_id"], "evidence", "runtime",
+            json.dumps({"schema_version": 3, "as_of": iso(self.now), "sources": []}), iso(self.now),
+        )
+        self.engine.command({
+            "command_id": "skip-before-memory-timeout", "cycle_id": self.cycle["cycle_id"], "type": "skip_h0",
+        })
+
+        with patch(
+            "ai_trading_companion.__main__._formal_adaptive_research",
+            side_effect=MemoryResearchError("memory research reached its response deadline"),
+        ), self.assertRaisesRegex(MemoryResearchError, "response deadline"):
+            run_m1(self.engine, self.store, Mock(), self.cycle["cycle_id"], execute=True)
+
+        self.assertEqual("waiting_for_repair", self.store.get_cycle(self.cycle["cycle_id"])["state"])
+        faults = [row for row in self.store.artifacts(self.cycle["cycle_id"]) if row["kind"] == "system_fault"]
+        self.assertEqual(1, len(faults))
+
+    def test_formal_memory_research_uses_a_deadline_sized_action_budget(self):
+        result = Mock(snapshot={"snapshot_id": "snapshot"}, context=(), actions=())
+        with patch("ai_trading_companion.__main__.AdaptiveMemoryResearch") as research:
+            research.return_value.collect.return_value = result
+            _formal_adaptive_research(
+                self.engine, self.store, self.cycle, "m1_research", iso(self.now), timeout=300,
+            )
+
+        self.assertEqual(4, FORMAL_MEMORY_MAX_ACTIONS)
+        self.assertEqual(FORMAL_MEMORY_MAX_ACTIONS, research.call_args.kwargs["max_actions"])
 
     def test_diagnostic_rerun_isolated_from_original_cycle_and_reuses_frozen_inputs(self):
         ready = self.ready()

@@ -372,6 +372,21 @@ class CompanionEngine:
                 "dismissed_count": len(cycles),
                 "cycle_ids": [cycle["cycle_id"] for cycle in cycles],
             }
+        elif typ == "dismiss_cycles":
+            cycle_ids = command.get("cycle_ids")
+            if not isinstance(cycle_ids, list):
+                raise ValueError("cycle_ids required")
+            reason = str(command.get("reason") or "user_requested_cleanup").strip()
+            cycles = self.store.dismiss_cycles(cycle_ids, reason)
+            for dismissed_cycle in cycles:
+                self.emit(dismissed_cycle, "analysis.dismissed", {
+                    "cycle": dismissed_cycle,
+                    "reason": reason,
+                })
+            result = {
+                "dismissed_count": len(cycles),
+                "cycle_ids": [cycle["cycle_id"] for cycle in cycles],
+            }
         else:
             if not cycle_id:
                 raise ValueError("cycle_id required")

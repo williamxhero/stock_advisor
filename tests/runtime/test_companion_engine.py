@@ -835,6 +835,28 @@ Protocol: OpportunityDiscovery-v1.3
                 "SELECT COUNT(*) FROM companion_cycle_visibility WHERE dismissed_at IS NOT NULL"
             ).fetchone()[0])
 
+    def test_dismiss_cycles_hides_only_explicit_test_or_error_cycles_without_deleting_audit_history(self):
+        hidden = self.store.create_cycle(
+            "daily.execution.1030", "2026-08-29T10:30:00+08:00", "2026-08-29T02:30:00Z",
+        )
+        preserved = self.store.create_cycle(
+            "daily.review.1520", "2026-08-29T15:20:00+08:00", "2026-08-29T07:00:00Z",
+        )
+
+        dismissed = self.engine.command({
+            "command_id": "dismiss-explicit-cycles",
+            "type": "dismiss_cycles",
+            "cycle_ids": [hidden["cycle_id"]],
+            "reason": "verification_cleanup",
+        })
+
+        self.assertEqual([hidden["cycle_id"]], dismissed["cycle_ids"])
+        self.assertEqual(
+            [preserved["cycle_id"]],
+            [item["cycle_id"] for item in self.store.latest_cycles_for_date("2026-08-29")],
+        )
+        self.assertEqual(hidden["cycle_id"], self.store.get_cycle(hidden["cycle_id"])["cycle_id"])
+
     def test_manual_analysis_request_never_consumes_a_scheduled_occurrence(self):
         manual = self.engine.command({
             "command_id": "manual-at-scheduled-time",

@@ -973,6 +973,30 @@ class CompanionStore:
                 )
         return cycles
 
+    def dismiss_cycles(self, cycle_ids: list[str], reason: str) -> list[dict[str, Any]]:
+        """Hide an explicit bounded set from projections while preserving its audit records."""
+        self.initialize()
+        unique_ids = list(dict.fromkeys(str(value).strip() for value in cycle_ids if str(value).strip()))
+        if not unique_ids or len(unique_ids) > 100:
+            raise ValueError("cycle_ids must contain between 1 and 100 explicit cycle ids")
+        placeholders = ",".join("?" for _ in unique_ids)
+        dismissed_at = now()
+        with self.connection() as c:
+            cycles = [dict(row) for row in c.execute(
+                f"SELECT * FROM companion_cycle WHERE cycle_id IN ({placeholders}) ORDER BY created_at",
+                unique_ids,
+            )]
+            if len(cycles) != len(unique_ids):
+                raise ValueError("one or more cycle_ids are unknown")
+            for cycle in cycles:
+                c.execute(
+                    """INSERT INTO companion_cycle_visibility(cycle_id,dismissed_at,reason)
+                       VALUES(?,?,?) ON CONFLICT(cycle_id) DO UPDATE SET
+                       dismissed_at=excluded.dismissed_at,reason=excluded.reason""",
+                    (cycle["cycle_id"], dismissed_at, reason),
+                )
+        return cycles
+
     def get_cycle(self, cycle_id: str, *, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
         if connection is not None:
             row = connection.execute("SELECT * FROM companion_cycle WHERE cycle_id=?", (cycle_id,)).fetchone()

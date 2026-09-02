@@ -14,7 +14,6 @@ using AITradingCompanion.Desktop.ViewModels;
 using Brush = System.Windows.Media.Brush;
 using Brushes = System.Windows.Media.Brushes;
 using Button = System.Windows.Controls.Button;
-using Clipboard = System.Windows.Clipboard;
 using Color = System.Windows.Media.Color;
 using Cursors = System.Windows.Input.Cursors;
 using HorizontalAlignment = System.Windows.HorizontalAlignment;
@@ -627,10 +626,10 @@ public partial class MainWindow : Window, IDisposable
         return button;
     }
 
-    private void CopyMessage_Click(object sender, RoutedEventArgs e)
+    private async void CopyMessage_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not Button { Tag: string text }) return;
-        try { Clipboard.SetText(text); }
+        try { await ClipboardCopyService.CopyTextAsync(text); }
         catch (Exception exception)
         {
             MessageBox.Show(this, $"复制失败：{exception.Message}", "AI交易伙伴",

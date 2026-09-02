@@ -287,15 +287,13 @@ class LocalResearchTests(unittest.TestCase):
         }
         runner = mock.Mock()
         runner.resolve_with_fallback.return_value = EvidenceResolution(
-            True, "cn_market_snapshot", "1.1.0", "2026-09-01T06:29:00Z", "2026-09-01T06:30:01Z", {
-                "source": "tencent_quote+eastmoney_breadth",
-                "source_urls": ["https://qt.gtimg.cn/q=sh000001", "https://push2delay.eastmoney.com/api/qt/clist/get"],
+            True, "cn_market_index_batch", "1.1.3", "2026-09-01T06:29:00Z", "2026-09-01T06:30:01Z", {
+                "source": "tencent_minute",
+                "source_urls": ["https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sh000001"],
                 "source_evidence": [
-                    {"url": "https://qt.gtimg.cn/q=sh000001", "fact_as_of": "2026-09-01T06:29:00Z", "data": {"indices": [{"symbol": "000001", "price": 3500}]}},
-                    {"url": "https://push2delay.eastmoney.com/api/qt/clist/get", "fact_as_of": "2026-09-01T06:29:00Z", "data": {"breadth": {"up": 2000, "down": 1000, "flat": 50}}},
+                    {"url": "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sh000001", "fact_as_of": "2026-09-01T06:29:00Z", "data": {"indices": [{"symbol": "000001", "price": 3500}]}},
                 ],
                 "indices": [{"symbol": "000001", "price": 3500}],
-                "breadth": {"up": 2000, "down": 1000, "flat": 50},
                 "finality": "intraday",
             }, "artifact:sha256:" + "c" * 64, None, ("tool_result_schema_valid",), attempts=("default:succeeded",),
         )
@@ -312,13 +310,41 @@ class LocalResearchTests(unittest.TestCase):
 
         self.assertTrue(result.qualified, result.verifier["problems"])
         request = runner.resolve_with_fallback.call_args.args[0]
-        self.assertEqual("cn_market_snapshot", request.capability)
+        self.assertEqual("cn_market_index_batch", request.capability)
         self.assertEqual("intraday", request.finality)
         self.assertEqual("2026-09-01T06:30:00Z", request.required_at)
-        self.assertEqual(2, len(result.evidence["sources"]))
+        self.assertEqual(1, len(result.evidence["sources"]))
         self.assertIn("indices", result.evidence["sources"][0]["excerpt"])
-        self.assertNotIn("breadth", result.evidence["sources"][0]["excerpt"])
-        self.assertIn("breadth", result.evidence["sources"][1]["excerpt"])
+
+    def test_holding_snapshot_uses_only_contract_frozen_symbols(self) -> None:
+        contract = {
+            "version": 4, "as_of": "2026-09-01T01:45:00Z",
+            "requirements": [{
+                "key": "portfolio_market_state", "blocking": True,
+                "allowed_coverage": ["covered"], "required_entities": ["600487", "603861"],
+                "window": {"mode": "after_start_to_end", "start": "2026-09-01T01:30:00Z", "end": "2026-09-01T01:45:00Z"},
+            }],
+        }
+        runner = mock.Mock()
+        runner.resolve_with_fallback.return_value = EvidenceResolution(
+            True, "cn_equity_quote_batch", "1.1.3", "2026-09-01T01:45:00Z", "2026-09-01T01:45:01Z", {
+                "source": "tencent_minute", "finality": "intraday",
+                "source_evidence": [{
+                    "url": "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sh600487",
+                    "fact_as_of": "2026-09-01T01:45:00Z",
+                    "data": {"quotes": [{"symbol": "600487", "price": 66.06, "previous_close": 67.34, "status": "trading"}]},
+                }],
+            }, "artifact:sha256:" + "d" * 64, None, (), attempts=("default:succeeded",),
+        )
+
+        ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0)("holding_snapshot", {
+            "_requirement_key": "portfolio_market_state", "symbol": "000001",
+        })
+
+        request = runner.resolve_with_fallback.call_args.args[0]
+        self.assertEqual("cn_equity_quote_batch", request.capability)
+        self.assertEqual(["600487", "603861"], request.inputs["symbols"])
+        self.assertEqual("2026-09-01T01:45:00Z", request.required_at)
 
     def test_post_close_research_uses_tool_fallback_then_freezes_qualified_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -464,9 +490,8 @@ print(json.dumps({'contract':'ai-trading-tool-result/v1','fact_as_of':'2026-08-2
         }]}
         plan = {"version": 1, "operations": [row("web_read", url="https://example.test/2026-08-27")]}
         result = LocalResearchChain(lambda *_: plan, ReadOnlyResearchExecutor({"gateway": lambda *_: read}), max_repairs=0).run({"as_of": contract["as_of"]}, contract, attempt_id="x")
-        self.assertTrue(result.qualified, result.verifier["problems"])
-        self.assertEqual(CONTRACT["as_of"], result.evidence["sources"][0]["fact_as_of"])
-        self.assertEqual("2026-08-27T07:18:00Z", result.evidence["sources"][0]["published_at"])
+        self.assertFalse(result.qualified)
+        self.assertIn("blocking_requirement_missing:market", result.verifier["problems"])
 
     def test_web_excerpt_with_credential_shape_is_rejected_at_acquisition_boundary(self) -> None:
         unsafe = {"results": [{

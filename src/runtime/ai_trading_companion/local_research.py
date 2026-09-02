@@ -121,8 +121,12 @@ class BrokerResearchPlanner:
                 if backend in set(packet.get("allowed_research_backends") or ("gateway", "market"))
                 and (backend != "market" or packet.get("deterministic_market_facts") or self.market_tool_available)
             ],
+            "deterministic_requirement_keys": _deterministic_requirement_keys(packet.get("evidence_contract") or {})
+            if packet.get("deterministic_injection") is True else [],
             "instruction": (
-                "Return only a version 1 research plan. Use gateway web_search only for discovery and "
+                "Return only a version 1 research plan. Deterministic index, breadth, portfolio-quote and "
+                "per-holding event searches are injected locally from the frozen contract; do not substitute "
+                "or broaden their symbols. Use gateway web_search only for discovery and "
                 "gateway web_read for source verification. Use market operations only when market appears in "
                 "available_backends; they read frozen caller-supplied facts when available, otherwise use promoted local public-market tools. "
                 "All timestamps in the evidence contract are UTC. For Chinese-market search terms, convert them to the "
@@ -241,16 +245,30 @@ class ToolCatalogMarketBackend:
     def __call__(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
         requirement_key = str(arguments.pop("_requirement_key", "") or "")
         requirement = self.requirements.get(requirement_key) or {}
-        capability = {"market_snapshot": "cn_market_snapshot", "market_breadth": "cn_market_breadth"}.get(operation)
+        capability = {
+            "market_snapshot": "cn_market_index_batch",
+            "market_breadth": "cn_market_breadth",
+            "holding_snapshot": "cn_equity_quote_batch",
+        }.get(operation)
         if capability is None:
             raise ValueError(f"unsupported live market operation: {operation}")
         window = requirement.get("window") if isinstance(requirement.get("window"), dict) else {}
         required_at = str(window.get("end") or self.contract.get("as_of") or "")
         mode = str(window.get("mode") or "")
         finality = "official_close" if mode == "exact" and required_at[11:16] == "07:00" else "intraday"
+        if operation == "holding_snapshot":
+            symbols = [str(value) for value in requirement.get("required_entities") or [] if str(value)]
+            if not symbols:
+                raise ValueError("holding_snapshot requires frozen portfolio entities")
+            inputs = {"symbols": symbols}
+        elif operation == "market_snapshot":
+            inputs = {"symbols": ["000001", "399001", "399006"]}
+        else:
+            inputs = {}
         resolution = self.runner.resolve_with_fallback(FactRequest(
             contract_version=1, capability=capability, required_at=required_at,
-            deadline_seconds=max(0.1, min(25.0, float(self.deadline()))), inputs={}, context={},
+            deadline_seconds=max(0.1, min(25.0, float(self.deadline()))), inputs=inputs,
+            context={"window_start": str(window.get("start") or required_at)},
             freshness_seconds=900.0 if finality == "intraday" else 0.0, finality=finality,
         ))
         if not resolution.succeeded or resolution.data is None:
@@ -368,6 +386,7 @@ class LocalResearchChain:
             gaps = list(verifier.get("missing_requirements") or verifier.get("problems") or [])
             planning_packet = {
                 **packet,
+                "deterministic_injection": True,
                 "research_discoveries": _discovery_digest(observations, contract),
                 "attempted_research_urls": sorted({
                     str((item.get("arguments") or {}).get("url") or "")
@@ -398,6 +417,7 @@ class LocalResearchChain:
                 if self.max_repairs is not None and round_number > self.max_repairs:
                     raise
                 continue
+            plan = _merge_mandatory_operations(plan, contract, max_operations=self.executor.max_operations)
             operations = self.executor.validate_plan(plan)
             for row in operations:
                 try:
@@ -490,6 +510,7 @@ def _verify_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> dic
         and not (row.get("evidence_class") == "public_if_present" and not row.get("required_entities"))
         and (not gap_text or key in gap_text)
     }
+    required -= {str(value) for value in packet.get("deterministic_requirement_keys") or []}
     planned = {
         str(row.get("requirement_key") or "")
         for row in operations if isinstance(row, dict)
@@ -769,13 +790,74 @@ def _has_matching_negative_search(observations: list[dict[str, Any]], requiremen
     terms = [str(term).casefold() for term in requirement.get("negative_query_terms") or []]
     if not terms:
         return False
-    return any(
+    queries = [
+        str((observation.get("arguments") or {}).get("query") or "").casefold()
+        for observation in observations
+        if observation.get("operation") == "web_search"
+        and observation.get("status") == "succeeded"
+        and str((observation.get("arguments") or {}).get("requirement_key") or "") == key
+        and all(term in str((observation.get("arguments") or {}).get("query") or "").casefold() for term in terms)
+    ]
+    return bool(queries) and all(
+        any(entity.casefold() in query for query in queries)
+        for entity in [str(value) for value in requirement.get("required_entities") or [] if str(value)]
+    ) and any(
         observation.get("operation") == "web_search"
         and observation.get("status") == "succeeded"
         and str((observation.get("arguments") or {}).get("requirement_key") or "") == key
         and all(term in str((observation.get("arguments") or {}).get("query") or "").casefold() for term in terms)
         for observation in observations
     )
+
+
+def _operation(
+    requirement_key: str, backend: str, operation: str, *, query: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "requirement_key": requirement_key, "backend": backend, "operation": operation,
+        "arguments": {
+            "query": query, "categories": "news" if query else None, "url": None,
+            "symbol": None, "render": None, "session_id": None, "actions": None,
+        },
+        "fallback_backends": [],
+    }
+
+
+def _merge_mandatory_operations(
+    plan: dict[str, Any], contract: dict[str, Any], *, max_operations: int,
+) -> dict[str, Any]:
+    """The model may supplement research but never omit deterministic blocker reads."""
+    proposed = list(plan.get("operations") or []) if isinstance(plan, dict) else []
+    requirements = {
+        str(item.get("key") or ""): item for item in contract.get("requirements") or []
+        if isinstance(item, dict)
+    }
+    required: list[dict[str, Any]] = []
+    if "current_market_state" in requirements:
+        required.append(_operation("current_market_state", "market", "market_snapshot"))
+    if "market_breadth" in requirements:
+        required.append(_operation("market_breadth", "market", "market_breadth"))
+    if requirements.get("portfolio_market_state", {}).get("required_entities"):
+        required.append(_operation("portfolio_market_state", "market", "holding_snapshot"))
+    event_requirement = requirements.get("portfolio_events_and_counterevidence") or {}
+    for entity in [str(value) for value in event_requirement.get("required_entities") or [] if str(value)]:
+        required.append(_operation(
+            "portfolio_events_and_counterevidence", "gateway", "web_search",
+            query=f"{entity} 公告 停复牌 财报 风险",
+        ))
+    required_keys = {(item["requirement_key"], item["operation"]) for item in required}
+    retained = [
+        item for item in proposed
+        if (str(item.get("requirement_key") or ""), str(item.get("operation") or "")) not in required_keys
+    ]
+    return {"version": 1, "operations": [*required, *retained][:max_operations]}
+
+
+def _deterministic_requirement_keys(contract: dict[str, Any]) -> list[str]:
+    keys = {str(item.get("key") or "") for item in contract.get("requirements") or [] if isinstance(item, dict)}
+    return sorted(keys.intersection({
+        "current_market_state", "market_breadth", "portfolio_market_state", "portfolio_events_and_counterevidence",
+    }))
 
 
 def _fallback_operation(backend: str) -> str:
@@ -850,8 +932,10 @@ def _fallback_read_rows(
 def _normalize_exact_close_fact_time(
     observation: dict[str, Any], contract: dict[str, Any], requirement_key: str,
 ) -> None:
-    if observation.get("operation") != "web_read":
-        return
+    # A fetched page may contain dynamic quotes newer than the frozen contract.
+    # Never relabel that page as an earlier market fact; only tools that return a
+    # timestamped historical observation may satisfy an exact window.
+    return
     requirement = next((
         row for row in contract.get("requirements") or []
         if str(row.get("key") or "") == str(requirement_key)

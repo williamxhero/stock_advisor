@@ -530,6 +530,8 @@ def _validate_capability_result(request: FactRequest, output: dict[str, Any]) ->
             return "tool_quote_result_invalid"
         if quote_time.date().isoformat() != expected_date or price <= 0:
             return "tool_quote_trading_date_mismatch" if quote_time.date().isoformat() != expected_date else "tool_quote_result_invalid"
+        if quote_time.astimezone(timezone.utc) > _parse_timestamp(request.required_at):
+            return "tool_quote_after_required_at"
         if request.finality in {"close", "official_close"}:
             if quote_time.time().hour < 15 or quote.get("status") != "closed":
                 return "tool_quote_finality_invalid"
@@ -563,6 +565,8 @@ def _validate_market_indices(request: FactRequest, data: dict[str, Any]) -> str 
             return "tool_market_result_invalid"
         if moment.date().isoformat() != expected_date or price <= 0:
             return "tool_market_trading_date_mismatch"
+        if moment.astimezone(timezone.utc) > _parse_timestamp(request.required_at):
+            return "tool_market_after_required_at"
         if request.finality in {"close", "official_close"} and (moment.time().hour < 15 or index.get("status") != "closed"):
             return "tool_market_finality_invalid"
     if set(seen) != {str(value) for value in expected} or data.get("finality") != request.finality:
@@ -582,6 +586,8 @@ def _validate_market_snapshot(request: FactRequest, data: dict[str, Any], fact_a
         return "tool_market_result_invalid"
     if observed.date().isoformat() != expected_date:
         return "tool_market_trading_date_mismatch"
+    if observed.astimezone(timezone.utc) > _parse_timestamp(request.required_at):
+        return "tool_market_after_required_at"
     if request.finality in {"close", "official_close"} and observed.time().hour < 15:
         return "tool_market_finality_invalid"
     if not isinstance(data.get("source"), str) or not data["source"].strip():
@@ -621,6 +627,8 @@ def _validate_market_breadth(request: FactRequest, data: dict[str, Any], fact_as
         return "tool_market_result_invalid"
     if observed.date().isoformat() != expected_date:
         return "tool_market_trading_date_mismatch"
+    if observed.astimezone(timezone.utc) > _parse_timestamp(request.required_at):
+        return "tool_market_after_required_at"
     if request.finality in {"close", "official_close"} and observed.time().hour < 15:
         return "tool_market_finality_invalid"
     if not isinstance(data.get("source"), str) or not data["source"].strip():

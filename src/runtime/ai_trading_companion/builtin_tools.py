@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.2"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1"}
+_VERSION = "1.1.3"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -343,6 +343,80 @@ def index_payload(body: str, symbols: list[dict[str, str]], finality: str) -> tu
     return {"indices": indices, "finality": finality, "source": "tencent_quote"}, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def minute_rows(value: object) -> list[str]:
+    """Tencent nests minute rows differently for equities and indices."""
+    if isinstance(value, str):
+        return [value] if re.match(r"^\d{4}\s+[-+]?\d", value.strip()) else []
+    if isinstance(value, list):
+        return [row for item in value for row in minute_rows(item)]
+    if isinstance(value, dict):
+        return [row for item in value.values() for row in minute_rows(item)]
+    return []
+
+
+def frozen_minute(symbol: dict[str, str], required_at: str, minute_endpoint: object = None) -> tuple[float, str, str]:
+    try:
+        cutoff = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(dt.timezone(dt.timedelta(hours=8)))
+    except ValueError:
+        fail(64, "required_at must be an ISO timestamp")
+    base = str(minute_endpoint or "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=")
+    source_url, body = fetch(base.replace("{symbol}", symbol["vendor_symbol"]) if "{symbol}" in base else base + symbol["vendor_symbol"])
+    try:
+        rows = minute_rows(json.loads(body))
+    except json.JSONDecodeError:
+        fail(75, "minute response is not JSON")
+    selected: tuple[dt.datetime, float] | None = None
+    for row in rows:
+        fields = row.strip().split()
+        if len(fields) < 2 or not re.fullmatch(r"\d{4}", fields[0]):
+            continue
+        try:
+            moment = dt.datetime.combine(cutoff.date(), dt.time(int(fields[0][:2]), int(fields[0][2:])), cutoff.tzinfo)
+            price = float(fields[1])
+        except ValueError:
+            continue
+        if price > 0 and moment <= cutoff and (selected is None or moment > selected[0]):
+            selected = (moment, price)
+    if selected is None:
+        fail(75, "minute response has no quote at or before required_at")
+    return selected[1], selected[0].astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"), source_url
+
+
+def frozen_minute_payload(
+    spot: dict[str, object], symbols: list[dict[str, str]], required_at: str, kind: str, minute_endpoint: object = None,
+) -> tuple[dict[str, object], str]:
+    field = "quotes" if kind == "equity" else "indices"
+    records = {str(item.get("symbol") or ""): dict(item) for item in spot.get(field, []) if isinstance(item, dict)}
+    frozen: list[dict[str, object]] = []
+    source_evidence: list[dict[str, object]] = []
+    latest: dt.datetime | None = None
+    for symbol in symbols:
+        item = records.get(symbol["symbol"])
+        if item is None:
+            fail(75, "spot quote is missing a requested symbol")
+        price, quote_at, source_url = frozen_minute(symbol, required_at, minute_endpoint)
+        item.update({
+            "price": price, "quote_at": quote_at,
+            "trading_date": dt.datetime.fromisoformat(quote_at.replace("Z", "+00:00")).astimezone(dt.timezone(dt.timedelta(hours=8))).date().isoformat(),
+            "status": "trading", "source": "tencent_minute",
+        })
+        previous_close = float(item.get("previous_close") or 0)
+        if previous_close <= 0:
+            fail(75, "minute quote has no valid previous close")
+        item["change"] = round(price - previous_close, 4)
+        item["change_percent"] = round((price - previous_close) / previous_close * 100, 4)
+        frozen.append(item)
+        moment = dt.datetime.fromisoformat(quote_at.replace("Z", "+00:00"))
+        latest = max(latest, moment) if latest else moment
+        source_evidence.append({"url": source_url, "fact_as_of": quote_at, "data": {field: [item], "finality": "intraday"}})
+    if latest is None:
+        fail(75, "minute response has no usable quotes")
+    return {
+        field: frozen, "finality": "intraday", "source": "tencent_minute",
+        "source_urls": [str(item["url"]) for item in source_evidence], "source_evidence": source_evidence,
+    }, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def market_snapshot_payload(body: str, finality: str) -> tuple[dict[str, object], str]:
     try:
         snapshot = json.loads(body)
@@ -495,6 +569,8 @@ def main() -> None:
         separator = "" if quote_url.endswith(("=", ",")) else "&q="
         _url, body = fetch(quote_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
         payload, fact_as_of = quote_payload(body, normalized, finality)
+        if finality == "intraday":
+            payload, fact_as_of = frozen_minute_payload(payload, normalized, str(request.get("required_at") or ""), "equity", inputs.get("tencent_minute_url"))
         result(payload, fact_as_of=fact_as_of)
         return
     if mode in {"cn_market_index_batch", "cn_market_index_tencent", "cn_market_index_sina"}:
@@ -516,6 +592,8 @@ def main() -> None:
         separator = "" if index_url.endswith(("=", ",")) else "&q="
         _url, body = fetch(index_url + separator + ",".join(item["vendor_symbol"] for item in normalized))
         payload, fact_as_of = index_payload(body, normalized, finality)
+        if finality == "intraday":
+            payload, fact_as_of = frozen_minute_payload(payload, normalized, str(request.get("required_at") or ""), "index", inputs.get("tencent_minute_url"))
         result(payload, fact_as_of=fact_as_of)
         return
     if mode == "cn_market_breadth":
@@ -586,7 +664,7 @@ def main() -> None:
             })
             if len(results) >= 10:
                 break
-        result({"url": url, "query": query, "results": results}, fact_as_of=str(request.get("required_at") or ""))
+        result({"url": url, "query": query, "results": results})
         return
     url = safe_url(inputs.get("url"))
     if mode == "browser_capture":
@@ -602,7 +680,7 @@ def main() -> None:
             fail(75, "response is not JSON")
         result({"url": url, "json": parsed})
     elif mode == "web_read":
-        result({"url": url, "text": strip_html(body)}, fact_as_of=str(request.get("required_at") or ""))
+        result({"url": url, "text": strip_html(body)})
     elif mode == "browser_capture":
         result({"url": url, "capture_mode": "static", "text": strip_html(body)})
     else:

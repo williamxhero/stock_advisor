@@ -138,7 +138,8 @@ class EvidenceV3Tests(TestCase):
         blockers = [row["key"] for row in contract["requirements"] if row["blocking"]]
         self.assertEqual([
             "indices_close", "turnover_compare", "market_breadth", "themes_and_capacity_cores",
-            "events_and_counterevidence", "prior_judgment_changes", "portfolio_close",
+            "events_and_counterevidence", "prior_judgment_changes", "portfolio_market_state",
+            "portfolio_events_and_counterevidence",
         ], blockers)
 
         rejected = EvidenceGate().evaluate(
@@ -204,6 +205,21 @@ class EvidenceV3Tests(TestCase):
         result = EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="intraday-attempt")
 
         self.assertTrue(result["passed"], result["problems"])
+
+    def test_intraday_contract_v4_blocks_publication_without_market_breadth_and_all_holdings(self):
+        contract = EvidenceContractFactory(_WeekdayCalendar()).build(
+            task_key="daily.execution.0945", stage="m0_research",
+            as_of="2026-08-31T01:45:00Z",
+            internal_context={"portfolio_entities": ["600487", "603861", "300421"]},
+        )
+
+        requirements = {item["key"]: item for item in contract["requirements"]}
+
+        self.assertEqual(4, contract["version"])
+        self.assertEqual(["600487", "603861", "300421"], requirements["portfolio_market_state"]["required_entities"])
+        self.assertEqual(["covered"], requirements["portfolio_market_state"]["allowed_coverage"])
+        self.assertEqual(["covered", "checked_no_change"], requirements["portfolio_events_and_counterevidence"]["allowed_coverage"])
+        self.assertTrue(requirements["market_breadth"]["blocking"])
 
     def test_rejects_foreign_reference_and_naive_runtime_time(self):
         foreign = EvidenceGate().evaluate(self._evidence("ev_other_1"), self.contract, self.observations, self.as_of, attempt_id="attempt-1")

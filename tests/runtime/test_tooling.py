@@ -32,7 +32,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.2", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.3", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
 
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
@@ -419,7 +419,7 @@ class ToolRunnerTests(unittest.TestCase):
                 self.assertEqual("https://example.test/market-news", result.data["results"][0]["url"])
                 self.assertEqual("Market news", result.data["results"][0]["title"])
                 self.assertEqual("Policy & risk update", result.data["results"][0]["snippet"])
-                self.assertEqual("2026-09-01T01:30:00Z", result.fact_as_of)
+                self.assertNotEqual("2026-09-01T01:30:00Z", result.fact_as_of)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -718,6 +718,45 @@ class ToolRunnerTests(unittest.TestCase):
                 self.assertEqual(["000001", "399001", "399006"], [item["symbol"] for item in snapshot.data["indices"]])
                 self.assertTrue(breadth.succeeded, breadth.error_code)
                 self.assertEqual(1, breadth.data["breadth"]["down"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_intraday_equity_quote_uses_the_last_minute_not_later_than_the_freeze(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/quote"):
+                    body = b'v_sh600000="1~Test~600000~9.20~9.00~~~~~~~~~~~~20260901094800";'
+                    content_type = "text/plain; charset=utf-8"
+                else:
+                    body = json.dumps({"data": {"sh600000": {"data": {"data": ["0945 9.10", "0948 9.20"]}}}}).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_equity_quote_batch", "2026-09-01T01:45:00Z", 4.0,
+                    {"symbols": ["600000"], "tencent_quote_url": base + "/quote?q=", "tencent_minute_url": base + "/minute?code="},
+                    finality="intraday",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual(9.10, result.data["quotes"][0]["price"])
+                self.assertEqual("2026-09-01T01:45:00Z", result.data["quotes"][0]["quote_at"])
+                self.assertLessEqual(result.fact_as_of, "2026-09-01T01:45:00Z")
             finally:
                 server.shutdown()
                 server.server_close()

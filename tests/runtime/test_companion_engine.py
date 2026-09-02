@@ -487,7 +487,7 @@ Protocol: OpportunityDiscovery-v1.3
             retryable=True,
         )
 
-        events = [event for event in self.store.pending_events() if event["event_type"] == "m1.failed"]
+        events = [event for event in self.store.pending_events() if event["event_type"] == "m1.retrying"]
         payload = json.loads(events[-1]["payload_json"])
         self.assertEqual("output_schema_invalid", payload["diagnostic_code"])
         self.assertIn("输出格式配置错误", payload["reason"])
@@ -508,7 +508,7 @@ Protocol: OpportunityDiscovery-v1.3
             },
         )
 
-        event = [item for item in self.store.pending_events() if item["event_type"] == "m1.failed"][-1]
+        event = [item for item in self.store.pending_events() if item["event_type"] == "m1.retrying"][-1]
         payload = json.loads(event["payload_json"])
         self.assertEqual("output_schema_invalid", payload["diagnostic_code"])
         self.assertIn("本地输出格式校验", payload["reason"])

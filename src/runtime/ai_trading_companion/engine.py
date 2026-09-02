@@ -659,10 +659,16 @@ class CompanionEngine:
         return cycle
 
     def m1_failed(self, cycle_id: str, reason: str, *, retryable: bool, details: dict[str, Any] | None = None) -> dict[str, Any]:
-        message = self._stage_failure_message("M1", str(reason), details)
         diagnostic_code = self._verifier_diagnostic_code(details) or self._diagnostic_code(str(reason))
         cycle = self.store.transition(cycle_id, "m1_retry_wait" if retryable else "waiting_for_repair")
-        self._emit_failure(cycle, "m1.failed", message, reason, {"diagnostic_code": diagnostic_code, "retryable": retryable})
+        if retryable:
+            message = self._stage_failure_message("M1", str(reason), details)
+            self._queue_event(cycle_id, "m1.retrying", {
+                "cycle": cycle, "reason": message, "diagnostic_code": diagnostic_code, "retryable": True,
+            })
+            return cycle
+        message = self._stage_failure_message("M1", str(reason), details)
+        self._emit_failure(cycle, "m1.failed", message, reason, {"diagnostic_code": diagnostic_code, "retryable": False})
         return cycle
 
     @classmethod
@@ -882,6 +888,8 @@ class CompanionEngine:
             if artifact["kind"] not in ai_kinds:
                 continue
             metadata = json.loads(artifact["metadata_json"] or "{}")
+            if artifact["kind"] == "system_fault" and metadata.get("retryable") is True:
+                continue
             item = {
                 "artifact_id": artifact["artifact_id"], "kind": artifact["kind"],
                 "at": artifact["sealed_at"], "as_of": artifact["as_of"],

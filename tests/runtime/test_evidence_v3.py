@@ -26,6 +26,47 @@ from ai_trading_companion.store import CompanionStore
 
 
 class EvidenceV3Tests(TestCase):
+    def test_official_index_close_accepts_complete_structured_tool_facts(self):
+        close = "2026-09-03T07:00:00Z"
+        rows = [
+            {"symbol": "000001", "name": "上证指数", "price": 3942.09, "previous_close": 3941.39,
+             "change": 0.7, "change_percent": 0.0178, "quote_at": close,
+             "trading_date": "2026-09-03", "status": "closed"},
+            {"symbol": "399001", "name": "深证成指", "price": 13625.12, "previous_close": 13611.55,
+             "change": 13.57, "change_percent": 0.0997, "quote_at": close,
+             "trading_date": "2026-09-03", "status": "closed"},
+            {"symbol": "399006", "name": "创业板指", "price": 3312.54, "previous_close": 3312.24,
+             "change": 0.3, "change_percent": 0.0091, "quote_at": close,
+             "trading_date": "2026-09-03", "status": "closed"},
+        ]
+        items = []
+        sources = []
+        refs = []
+        for number, row in enumerate(rows, 1):
+            ref = f"index-{number}"
+            excerpt = json.dumps({"finality": "official_close", "indices": [row]}, ensure_ascii=False)
+            refs.append(ref)
+            items.append({"evidence_ref": ref, "excerpt_text": excerpt, "fact_as_of": close,
+                          "published_at": None, "acquired_at": "2026-09-03T07:10:00Z"})
+            sources.append({"evidence_ref": ref, "excerpt": excerpt})
+        contract = {
+            "version": 4, "as_of": "2026-09-03T07:20:00Z", "requirements": [{
+                "key": "indices_close", "blocking": True, "allowed_coverage": ["covered"],
+                "finality": "official_close", "minimum_numeric_facts": 3,
+                "evidence_terms": [["上证", "沪指"], ["深成指", "深证成指"], ["创业板"], ["涨", "跌", "%"]],
+                "window": {"mode": "exact", "start": close, "end": close},
+            }],
+        }
+        observations = [{"attempt_id": "attempt", "backend": "market", "status": "succeeded",
+                         "non_empty": True, "evidence_items": items}]
+        evidence = {"schema_version": 3, "as_of": contract["as_of"], "sources": sources,
+                    "coverage": [{"requirement_key": "indices_close", "status": "covered",
+                                  "evidence_refs": refs}], "high_impact_events": []}
+
+        result = EvidenceGate().evaluate(evidence, contract, observations, contract["as_of"], attempt_id="attempt")
+
+        self.assertTrue(result["passed"], result["problems"])
+
     def test_diagnostic_rerun_resolves_frozen_m0_attempt_from_source_cycle(self):
         evidence = {"as_of": "2026-08-31T07:20:00Z", "sources": []}
         source_attempt = {

@@ -339,6 +339,12 @@ class _EvidenceGateV3:
             if row.get("status") == "checked_no_change" and not self._matching_negative_query(bound, requirement.get("negative_query_terms") or []):
                 problems.append(f"checked_no_change_query_not_matched:{key}"); missing.append(key)
                 continue
+            if key == "indices_close":
+                expected = {"000001", "399001", "399006"}
+                complete = self._index_close_facts(bound)
+                if complete != expected:
+                    problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
+                continue
             support = " ".join(EvidenceGate._normalize_text(item.get("excerpt")) for item in bound)
             term_groups = requirement.get("evidence_terms") or []
             if any(not any(str(term) in support for term in group) for group in term_groups):
@@ -432,6 +438,35 @@ class _EvidenceGateV3:
                 }
                 if symbol in required and valid == fields and quote.get("quote_at") and quote.get("trading_date") and quote.get("status"):
                     complete[symbol] = valid
+        return complete
+
+    @staticmethod
+    def _index_close_facts(sources: list[dict[str, Any]]) -> set[str]:
+        """Return canonical indices backed by complete typed official-close rows."""
+        expected = {"000001", "399001", "399006"}
+        fields = {"previous_close", "price", "change", "change_percent"}
+        complete: set[str] = set()
+        for source in sources:
+            try:
+                payload = json.loads(str(source.get("excerpt") or ""))
+            except (TypeError, ValueError):
+                continue
+            if payload.get("finality") not in {"close", "official_close"}:
+                continue
+            for index in payload.get("indices") or []:
+                if not isinstance(index, dict):
+                    continue
+                symbol = str(index.get("symbol") or "")
+                valid = all(
+                    isinstance(index.get(field), (int, float)) and not isinstance(index.get(field), bool)
+                    for field in fields
+                )
+                if (
+                    symbol in expected and valid and index.get("name")
+                    and index.get("status") == "closed" and index.get("trading_date")
+                    and str(index.get("quote_at") or "") == str(source.get("fact_as_of") or "")
+                ):
+                    complete.add(symbol)
         return complete
 
     @staticmethod

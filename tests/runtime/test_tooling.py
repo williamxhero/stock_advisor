@@ -32,7 +32,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.6", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.7", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
 
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
@@ -1041,6 +1041,49 @@ class ToolRunnerTests(unittest.TestCase):
                 self.assertEqual(7, result.data["breadth"]["suspended"])
                 self.assertEqual("mhd-v1-test", result.data["lineage"]["dataset_version"])
                 self.assertEqual("official_close", result.data["finality"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_official_close_breadth_falls_back_to_full_market_public_snapshot(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/markethub"):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                body = json.dumps({"data": {"total": 3, "diff": [
+                    {"f12": "600000", "f14": "浦发银行", "f2": 10.5, "f3": 1.2, "f124": 1788250200},
+                    {"f12": "000001", "f14": "平安银行", "f2": 11.2, "f3": -2.0, "f124": 1788250200},
+                    {"f12": "300001", "f14": "特锐德", "f2": 20.0, "f3": 0.0, "f124": 1788250200},
+                ]}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                    1, "cn_market_breadth", "2026-09-01T07:20:00Z", 6.0,
+                    {"markethub_url": f"http://127.0.0.1:{server.server_port}/markethub",
+                     "breadth_url": f"http://127.0.0.1:{server.server_port}/eastmoney"},
+                    finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("2026-09-01T07:00:00Z", result.fact_as_of)
+                self.assertEqual(("markethub:tool_process_failed", "eastmoney:succeeded"), result.attempts)
+                self.assertEqual(1, result.data["breadth"]["up"])
+                self.assertEqual(1, result.data["breadth"]["down"])
             finally:
                 server.shutdown()
                 server.server_close()

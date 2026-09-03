@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.6"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5"}
+_VERSION = "1.1.7"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -26,6 +26,7 @@ _ADAPTERS = {
     "cn_equity_quote_batch": {"tencent": "cn_equity_quote_tencent", "sina": "cn_equity_quote_sina"},
     "cn_equity_current_bar": {"markethub": "cn_equity_current_bar", "tencent": "cn_equity_current_bar_tencent"},
     "cn_market_index_batch": {"tencent": "cn_market_index_tencent", "sina": "cn_market_index_sina"},
+    "cn_market_breadth": {"markethub": "cn_market_breadth_markethub", "eastmoney": "cn_market_breadth_eastmoney"},
 }
 
 
@@ -597,7 +598,8 @@ def breadth_page_url(endpoint: str, page: int) -> str:
     separator = "&" if "?" in endpoint else "?"
     return endpoint + separator + (
         "pn=" + str(page) + "&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
-        "&fltt=2&invt=2&fid=f3&fs=m%3A0%2Bt%3A6%2Cm%3A0%2Bt%3A80"
+        "&fltt=2&invt=2&fid=f3"
+        "&fs=m%3A0%2Bt%3A6%2Cm%3A0%2Bt%3A80%2Cm%3A1%2Bt%3A2%2Cm%3A1%2Bt%3A23"
         "&fields=f12%2Cf14%2Cf2%2Cf3%2Cf124"
     )
 
@@ -724,6 +726,13 @@ def market_breadth_payload(endpoint: str, finality: str) -> tuple[dict[str, obje
     local = observed.astimezone(dt.timezone(dt.timedelta(hours=8)))
     if finality in {"close", "official_close"} and local.time() < dt.time(15, 0):
         fail(75, "market breadth does not meet close finality")
+    # A supplier may refresh immutable closing rows after 15:00.  The close
+    # fact becomes effective at the exchange close; acquisition remains a
+    # separate timestamp in the tool receipt.
+    effective = (
+        dt.datetime.combine(local.date(), dt.time(15, 0), local.tzinfo)
+        if finality in {"close", "official_close"} else observed
+    )
     data = {
         "is_trading_day": True, "trading_date": local.date().isoformat(), "source": "eastmoney_breadth",
         "source_urls": [first_url],
@@ -734,7 +743,7 @@ def market_breadth_payload(endpoint: str, finality: str) -> tuple[dict[str, obje
         },
         "finality": finality,
     }
-    fact_as_of = observed.isoformat().replace("+00:00", "Z")
+    fact_as_of = effective.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     data["source_evidence"] = [{"url": first_url, "fact_as_of": fact_as_of, "data": {
         "trading_date": data["trading_date"], "breadth": data["breadth"], "finality": finality,
     }}]
@@ -867,12 +876,15 @@ def main() -> None:
             )
         result(payload, fact_as_of=fact_as_of)
         return
-    if mode == "cn_market_breadth":
+    if mode in {"cn_market_breadth", "cn_market_breadth_markethub", "cn_market_breadth_eastmoney"}:
         finality = str(request.get("finality") or "observed")
         if finality not in {"intraday", "realtime", "close", "official_close"}:
             fail(64, "unsupported market finality")
         markethub_url = inputs.get("markethub_url")
-        if markethub_url or (finality in {"close", "official_close"} and not inputs.get("breadth_url")):
+        if mode == "cn_market_breadth_markethub" or (
+            mode == "cn_market_breadth"
+            and (markethub_url or (finality in {"close", "official_close"} and not inputs.get("breadth_url")))
+        ):
             payload, fact_as_of = markethub_breadth_payload(
                 safe_url(markethub_url or "http://yosef-server:8803/api/stocks/market-breadth"),
                 str(request.get("required_at") or ""), finality,

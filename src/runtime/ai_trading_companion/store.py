@@ -2087,8 +2087,13 @@ class CompanionStore:
     def pending_research_jobs(self, *, limit: int = 4) -> list[dict[str, Any]]:
         with self.connection() as c:
             return [dict(row) for row in c.execute(
-                """SELECT * FROM companion_research_job WHERE state IN ('pending','retry')
-                   ORDER BY created_at LIMIT ?""",
+                """SELECT j.* FROM companion_research_job j
+                   LEFT JOIN narrative_artifact a ON a.artifact_id=j.source_artifact_id
+                   LEFT JOIN companion_message_batch b
+                     ON b.batch_id=json_extract(a.metadata_json,'$.batch_id')
+                   WHERE j.state IN ('pending','retry')
+                   ORDER BY CASE WHEN b.state='pending' THEN 0 ELSE 1 END,
+                            j.created_at,j.job_id LIMIT ?""",
                 (limit,),
             )]
 

@@ -550,6 +550,47 @@ class UnifiedCognitionTests(unittest.TestCase):
         with self.store.connection() as connection:
             self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM companion_cycle WHERE trigger='manual_chat'").fetchone()[0])
 
+    def test_progress_reply_does_not_complete_batch_before_fresh_research(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-09-03")
+        text = "做一次晚间盘后回顾"
+        self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="evening-review")
+        batch_id, messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        created = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text, conversation["as_of"],
+            {"batch_id": batch_id},
+        )
+        source = next(
+            item for item in self.store.artifacts(conversation["cycle_id"])
+            if item["artifact_id"] == created["artifact_id"]
+        )
+        model_result = {
+            "answer": {"points": ["我先核对今天收盘后的行情和事件。"], "material_ids": []},
+            "needs_fresh_search": True,
+            "public_search_request": {
+                "topics": ["A股盘后行情"],
+                "questions": ["今天主要指数、市场宽度和持仓表现如何？"],
+            },
+            "propositions": [],
+            "actions": [],
+        }
+        broker = Mock()
+        broker.invoke.return_value = BrokerResponse(
+            output_text=json.dumps(model_result, ensure_ascii=False), result=model_result,
+            actual_model="test", provider="fake", intellect="standard",
+            fulfilled_intellect="standard", request_id="evening-review",
+        )
+
+        with patch("ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker):
+            run_unified_cognition(
+                self.engine, self.store, self.portfolio, conversation["cycle_id"], source,
+                messages, [batch_id], True, mode="conversation",
+            )
+
+        batch = self.store.pending_message_batches(conversation["cycle_id"], "conversation")
+        jobs = self.store.pending_research_jobs(limit=4)
+        self.assertEqual([batch_id], [item["batch_id"] for item in batch])
+        self.assertEqual(source["artifact_id"], jobs[0]["source_artifact_id"])
+
     def test_ambiguous_analysis_intent_needs_clarification_without_creating_a_cycle(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-08-27")
         text = "Analyze this."

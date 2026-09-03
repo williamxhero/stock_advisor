@@ -144,8 +144,19 @@ class ManualAnalysisProfileResolver:
 
     @staticmethod
     def _normalize_time_scope(time_scope: str) -> str:
-        """Map an unambiguous user-facing weekend-to-session phrase to its canonical scope."""
+        """Map unambiguous user-facing session phrases to canonical scopes."""
         folded = time_scope.casefold()
+        completed_close_terms = (
+            "已收盘交易日", "最近交易日收盘", "最近一个交易日收盘", "今日收盘", "当天收盘", "盘后",
+        )
+        completed_close_english = (
+            "latest completed trading day", "most recent completed trading day",
+            "latest completed close", "post-close", "post close",
+        )
+        if any(term in time_scope for term in completed_close_terms) or any(
+            term in folded for term in completed_close_english
+        ):
+            return "post_close"
         is_weekend_to_next_session = (
             ("周末" in time_scope and ("周一" in time_scope or "下一交易日" in time_scope))
             or ("weekend" in folded and ("monday" in folded or "next trading session" in folded))

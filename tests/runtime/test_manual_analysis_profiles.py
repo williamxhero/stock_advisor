@@ -81,6 +81,19 @@ class ManualAnalysisProfileResolverTests(TestCase):
         self.assertEqual("next_trading_session", profile["analysis"]["time_scope"])
         self.assertEqual(raw_scope, profile["analysis"]["requested_time_scope"])
 
+    def test_normalizes_latest_completed_trading_day_scope_after_close(self) -> None:
+        raw_scope = "最近一个已收盘交易日，截至当前时点"
+
+        profile = self.resolver.resolve("2026-09-03T22:14:16+08:00", {
+            "subject": "A股市场与当前完整持仓",
+            "time_scope": raw_scope,
+            "goal": "完成晚间盘后回顾",
+        })
+
+        self.assertEqual("post_close_review", profile["profile_id"])
+        self.assertEqual("post_close", profile["analysis"]["time_scope"])
+        self.assertEqual(raw_scope, profile["analysis"]["requested_time_scope"])
+
     def test_requires_explicit_subject_time_scope_and_goal(self) -> None:
         with self.assertRaisesRegex(AnalysisClarificationRequired, "time_scope"):
             self.resolver.resolve("2026-08-28T10:00:00+08:00", {"subject": "券商", "goal": "复核"})

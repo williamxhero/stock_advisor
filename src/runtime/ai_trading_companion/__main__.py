@@ -1447,7 +1447,9 @@ def run_chat_research(
         )
         data, _ = _call_stage(
             store, cycle, "chat_followup", local_packet, "companion-chat-result-v2.schema.json",
-            search=False, timeout=int(TASK_POLICIES[cycle["task_key"]].m1_timeout.total_seconds()),
+            search=False, timeout=int(TASK_POLICIES.get(
+                cycle["task_key"], TASK_POLICIES["daily.execution.0945"],
+            ).m1_timeout.total_seconds()),
         )
         reply = express_cognition_answer(data["answer"])
         revision = data.get("judgment_revision")
@@ -1514,11 +1516,23 @@ def run_pending_workflow_feedback(
 
 
 def _foreground_busy(store: CompanionStore) -> bool:
+    """Return true only for foreground work that can still make progress.
+
+    Cycle states are durable audit facts and can survive a killed worker.  They
+    are therefore not evidence that a foreground worker is alive.  A durable
+    worker claim is; a due queued cycle also deserves the next gateway tick
+    before optional background research.
+    """
+    due_at = iso(datetime.now(timezone.utc))
     with store.connection() as connection:
         return bool(connection.execute(
-            """SELECT 1 FROM companion_cycle
-               WHERE state IN ('queued','researching_m0','h0_locked','researching_m1','judging_m1','m1_retry_wait')
-               LIMIT 1"""
+            """SELECT 1 FROM schedule_worker_claim
+               UNION ALL
+               SELECT 1 FROM companion_cycle
+                WHERE state='queued'
+                  AND julianday(COALESCE(work_start_at,scheduled_for)) <= julianday(?)
+               LIMIT 1""",
+            (due_at,),
         ).fetchone())
 
 
@@ -2032,6 +2046,7 @@ def run_unified_cognition(
             reply_to_batch_id=batch_ids[-1] if batch_ids else None,
             reply_to_batch_ids=batch_ids, stream_id=stream_id, kind=reply_kind,
             allow_structured_format=allow_structured_format, presented=presented,
+            complete_batches=not (outcome.needs_fresh_search and outcome.public_search_request),
         )
     elif mode == "h0":
         store.mark_batches_responded(batch_ids, source["artifact_id"])

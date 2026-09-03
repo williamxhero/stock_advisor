@@ -792,6 +792,7 @@ class CompanionEngine:
         self, cycle_id: str, text: str, *, reply_to_batch_id: str | None = None,
         reply_to_batch_ids: list[str] | None = None, stream_id: str | None = None, kind: str = "ai_chat",
         allow_structured_format: bool = False, presented: PresentedMessage | None = None,
+        complete_batches: bool = True,
     ) -> dict[str, Any]:
         if kind not in {"ai_chat", "premarket_chat"}:
             raise ValueError(f"unsupported chat artifact kind: {kind}")
@@ -827,12 +828,13 @@ class CompanionEngine:
             }, presented),
         )
         batch_ids = reply_to_batch_ids or ([reply_to_batch_id] if reply_to_batch_id else [])
-        self.store.mark_batches_responded(batch_ids, artifact["artifact_id"])
+        if complete_batches:
+            self.store.mark_batches_responded(batch_ids, artifact["artifact_id"])
         event_type = "premarket.reply.ready" if kind == "premarket_chat" else "chat.ready"
         self.emit(cycle, event_type, {
             "cycle": cycle, "text": presented.markdown, "presentation": presented.metadata()["presentation"], "reply_to_batch_id": reply_to_batch_id, "stream_id": stream_id,
             "message": presented.message(),
-            "source_artifact_id": artifact["artifact_id"],
+            "source_artifact_id": artifact["artifact_id"], "response_complete": complete_batches,
         })
         return cycle
 

@@ -88,6 +88,7 @@ class EvidenceResolution:
     error_code: str | None = None
     exit_code: int | None = None
     attempts: tuple[str, ...] = ()
+    route_adapter: str | None = None
 
     @classmethod
     def failed(cls, capability: str, code: str, *, tool_version: str | None = None,
@@ -252,6 +253,7 @@ class ToolRunner:
         self.max_stdout_bytes = max(1, int(max_stdout_bytes))
         self.artifacts = ToolArtifactStore(catalog.root, max_bytes=archive_max_bytes)
         self._cache: dict[str, EvidenceResolution] = {}
+        self._open_circuits: set[tuple[str, str, str, str]] = set()
         self.need_reporter = need_reporter
 
     def resolve(self, request: FactRequest, *, _tool: PublishedTool | None = None) -> EvidenceResolution:
@@ -395,17 +397,29 @@ class ToolRunner:
             self._report_capability_need(request, failed)
             return failed
         attempts: list[str] = []
+        failures: list[EvidenceResolution] = []
         last: EvidenceResolution | None = None
         deadline = datetime.now(timezone.utc).timestamp() + request.deadline_seconds
         for tool in candidates:
+            circuit_key = self._circuit_key(request, tool)
+            if circuit_key is not None and circuit_key in self._open_circuits:
+                attempts.append(f"{tool.adapter}:circuit_open")
+                continue
             remaining = deadline - datetime.now(timezone.utc).timestamp()
             if remaining <= 0:
                 break
             attempt_request = replace(request, deadline_seconds=remaining)
             result = self.resolve(attempt_request, _tool=tool)
+            if result.route_adapter is None:
+                result = replace(result, route_adapter=tool.adapter)
             attempts.append(f"{tool.adapter}:{'succeeded' if result.succeeded else result.error_code}")
             last = result
+            if not result.succeeded:
+                failures.append(result)
             self._record_health(tool, result)
+            if not result.succeeded and self._is_deterministic_failure(result):
+                if circuit_key is not None:
+                    self._open_circuits.add(circuit_key)
             if result.succeeded:
                 resolved = replace(result, attempts=tuple(attempts))
                 self._cache[cache_key] = resolved
@@ -413,7 +427,16 @@ class ToolRunner:
                 if request.context.get("capability_need_on_success") is True:
                     self._report_capability_need(request, resolved)
                 return resolved
-        failed = replace(last or EvidenceResolution.failed(request.capability, "tool_no_candidate_satisfied"), attempts=tuple(attempts))
+        failed = replace(
+            last or EvidenceResolution.failed(
+                request.capability,
+                "tool_circuit_open" if attempts and all(item.endswith(":circuit_open") for item in attempts)
+                else "tool_no_candidate_satisfied",
+            ),
+            attempts=tuple(attempts),
+        )
+        if (request.context.get("cycle_id") or request.context.get("attempt_id")) and failures and len(failures) == len(candidates) and all(self._is_deterministic_failure(item) for item in failures):
+            failed = replace(failed, error_code="tool_routes_exhausted_deterministic")
         self._append_audit(request, failed)
         self._report_capability_need(request, failed)
         return failed
@@ -432,6 +455,9 @@ class ToolRunner:
             "urgency": urgency, "examples": [{"inputs": request.inputs, "required_at": request.required_at}],
             "failure_trace": {"succeeded": result.succeeded, "error_code": result.error_code,
                               "attempts": list(result.attempts), "tool_version": result.tool_version,
+                              "exit_code": result.exit_code,
+                              "diagnostic_artifact_ref": result.diagnostic_artifact_ref,
+                              "route": {"adapter": result.route_adapter, "version": result.tool_version},
                               "raw_artifact_ref": result.raw_artifact_ref},
             "source_hints": source_hints,
         }
@@ -452,6 +478,9 @@ class ToolRunner:
             "inputs": request.inputs, "fact_as_of": result.fact_as_of,
             "source": (result.data or {}).get("source") or (result.data or {}).get("url"),
             "raw_artifact_ref": result.raw_artifact_ref,
+            "diagnostic_artifact_ref": result.diagnostic_artifact_ref,
+            "exit_code": result.exit_code,
+            "route": {"adapter": result.route_adapter, "version": result.tool_version},
             "technical_validation": list(result.technical_validation),
         }
         with (audit_root / "resolutions.ndjson").open("a", encoding="utf-8") as handle:
@@ -465,7 +494,7 @@ class ToolRunner:
         health["attempts"] = int(health.get("attempts") or 0) + 1
         if result.succeeded:
             health["successes"] = int(health.get("successes") or 0) + 1
-        elif result.error_code in {"tool_stdout_invalid_json", "tool_result_invalid", "tool_fact_as_of_invalid"} or (result.error_code or "").startswith(("tool_quote_", "tool_market_")):
+        elif self._is_deterministic_failure(result):
             health["degraded"] = True
             health["degrade_reason"] = result.error_code
         else:
@@ -487,6 +516,24 @@ class ToolRunner:
     def _health_path(self, tool: PublishedTool) -> Path:
         safe_name = f"{tool.capability}-{tool.adapter}-{tool.version}".replace("/", "_")
         return self.catalog.root / ".health" / f"{safe_name}.json"
+
+    @staticmethod
+    def _circuit_key(request: FactRequest, tool: PublishedTool) -> tuple[str, str, str, str] | None:
+        cycle_id = str(request.context.get("cycle_id") or request.context.get("attempt_id") or "").strip()
+        return (cycle_id, request.capability, tool.adapter, tool.version) if cycle_id else None
+
+    def _is_deterministic_failure(self, result: EvidenceResolution) -> bool:
+        code = result.error_code or ""
+        if code in {"tool_timeout", "tool_network_transient"}:
+            return False
+        if code == "tool_process_failed" and result.diagnostic_artifact_ref:
+            try:
+                diagnostic = self.read_artifact(result.diagnostic_artifact_ref).decode("utf-8", errors="replace").lower()
+            except Exception:
+                diagnostic = ""
+            if "network read failed" in diagnostic or "upstream http 5" in diagnostic:
+                return False
+        return True
 
 
 def _validate_capability_result(request: FactRequest, output: dict[str, Any]) -> str | None:

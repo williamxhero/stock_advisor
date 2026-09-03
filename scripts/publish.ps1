@@ -11,8 +11,11 @@ $output = Join-Path $projectRoot "dist\$Runtime\AITradingCompanion"
 $outputParent = Split-Path -Parent $output
 $revision = (& git -C $projectRoot rev-parse HEAD 2>$null)
 if (-not $revision) { throw 'A formal package requires a Git source revision.' }
-$dirty = -not [string]::IsNullOrWhiteSpace((& git -C $projectRoot status --short 2>$null | Out-String))
-if ($dirty) { throw 'A formal package requires a clean Git worktree. Commit or remove release-scope changes first.' }
+# A user's private, untracked notes are explicitly outside the product source
+# revision and must neither be deleted nor block a reproducible package. Any
+# tracked modification remains a release blocker.
+$dirty = -not [string]::IsNullOrWhiteSpace((& git -C $projectRoot status --short --untracked-files=no 2>$null | Out-String))
+if ($dirty) { throw 'A formal package requires a clean tracked Git worktree. Commit or remove release-scope changes first.' }
 if (Test-Path -LiteralPath $output) {
     $resolvedOutput = [IO.Path]::GetFullPath($output)
     $resolvedParent = [IO.Path]::GetFullPath($outputParent)

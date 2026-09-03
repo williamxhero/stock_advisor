@@ -235,10 +235,11 @@ class ToolCatalogResearchBackend:
 class ToolCatalogMarketBackend:
     """Resolve public market facts through promoted tools and expose evidence-shaped results."""
 
-    def __init__(self, runner: ToolRunner, *, contract: dict[str, Any], deadline: Callable[[], float]) -> None:
+    def __init__(self, runner: ToolRunner, *, contract: dict[str, Any], deadline: Callable[[], float], cycle_id: str = "") -> None:
         self.runner = runner
         self.contract = contract
         self.deadline = deadline
+        self.cycle_id = cycle_id
         self.requirements = {
             str(row.get("key") or ""): row
             for row in contract.get("requirements") or [] if isinstance(row, dict)
@@ -278,11 +279,11 @@ class ToolCatalogMarketBackend:
         resolution = self.runner.resolve_with_fallback(FactRequest(
             contract_version=1, capability=capability, required_at=required_at,
             deadline_seconds=max(0.1, min(25.0, float(self.deadline()))), inputs=inputs,
-            context={"window_start": str(window.get("start") or required_at)},
+            context={"window_start": str(window.get("start") or required_at), "cycle_id": self.cycle_id},
             freshness_seconds=900.0 if finality == "intraday" else 0.0, finality=finality,
         ))
         if not resolution.succeeded or resolution.data is None:
-            raise RuntimeError(f"tool resolution failed: {capability}:{resolution.error_code}")
+            raise ToolResolutionError(capability, resolution)
         source_rows = [row for row in resolution.data.get("source_evidence") or []
                        if isinstance(row, dict) and str(row.get("url") or "").startswith(("http://", "https://"))]
         if not source_rows:
@@ -338,6 +339,15 @@ class ToolCatalogMarketBackend:
             return {"url": urls[0], "text": excerpt, "raw_artifact_ref": cached.get("raw_artifact_ref"), "results": results}
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
+
+
+class ToolResolutionError(RuntimeError):
+    """Carry immutable resolution facts across the read-only research boundary."""
+
+    def __init__(self, capability: str, resolution: Any) -> None:
+        self.capability = capability
+        self.resolution = resolution
+        super().__init__(f"tool resolution failed: {capability}:{resolution.error_code}")
 
 
 class DeterministicMarketBackend:
@@ -445,13 +455,15 @@ class LocalResearchChain:
                 observation["backend"] = backend
                 observations.append(observation)
             except Exception as exc:
-                observations.append({
+                failure = {
                     "attempt_id": attempt_id, "observation_id": f"failure-{len(observations) + 1}",
                     "tool": row["operation"], "backend": row["backend"], "operation": row["operation"],
                     "status": "failed", "ok": False, "non_empty": False,
                     "arguments": {**row["arguments"], "requirement_key": row["requirement_key"]},
                     "error_category": type(exc).__name__,
-                })
+                }
+                _attach_tool_resolution_failure(failure, exc)
+                observations.append(failure)
         evidence = _compile_evidence(packet, contract, observations)
         verifier = self.gate.evaluate(
             evidence, contract, observations, str(packet.get("as_of") or contract.get("as_of") or ""),
@@ -530,13 +542,15 @@ class LocalResearchChain:
                     observation["backend"] = backend
                     observations.append(observation)
                 except Exception as exc:
-                    observations.append({
+                    failure = {
                         "attempt_id": attempt_id, "observation_id": f"failure-{len(observations) + 1}",
                         "tool": row["operation"], "backend": row["backend"], "operation": row["operation"],
                         "status": "failed", "ok": False, "non_empty": False,
                         "arguments": {**row["arguments"], "requirement_key": row["requirement_key"]},
                         "error_category": type(exc).__name__,
-                    })
+                    }
+                    _attach_tool_resolution_failure(failure, exc)
+                    observations.append(failure)
             evidence = _compile_evidence(packet, contract, observations)
             verifier = self.gate.evaluate(
                 evidence, contract, observations, str(packet.get("as_of") or contract.get("as_of") or ""),
@@ -578,6 +592,11 @@ class LocalResearchChain:
             if self.max_repairs is not None and round_number > self.max_repairs:
                 break
         bundle_bytes, bundle_hash = freeze_evidence_bundle(evidence)
+        verifier = {
+            **verifier,
+            "attempted_backends": sorted({route for item in observations for route in item.get("tool_attempts", [])}),
+            "safe_boundary": "no_trading_action_qualified",
+        }
         failure = {
             "type": "stage_failure", "stage": str(packet.get("stage") or "research"),
             "category": "evidence_insufficient",
@@ -973,6 +992,14 @@ def _merge_mandatory_operations(
             str((item.get("arguments") or {}).get("query") or "") if item["operation"] == "web_search" else "",
         )
         if identity not in completed:
+            if any(
+                item.get("status") == "failed"
+                and str((item.get("arguments") or {}).get("requirement_key") or "") == key
+                and item.get("operation") == identity[1]
+                and item.get("tool_error_code") in {"tool_circuit_open", "tool_routes_exhausted_deterministic"}
+                for item in observations or []
+            ):
+                return False
             return True
         # A technically successful call may still have failed semantic coverage
         # (for example an incomplete quote batch). Repeat only that named
@@ -986,6 +1013,16 @@ def _merge_mandatory_operations(
         if (str(item.get("requirement_key") or ""), str(item.get("operation") or "")) not in mandatory_operation_keys
     ]
     return {"version": 1, "operations": [*required, *retained][:max_operations]}
+
+
+def _attach_tool_resolution_failure(observation: dict[str, Any], exc: Exception) -> None:
+    if not isinstance(exc, ToolResolutionError):
+        return
+    resolution = exc.resolution
+    observation["tool_error_code"] = resolution.error_code
+    observation["tool_attempts"] = list(resolution.attempts)
+    observation["tool_exit_code"] = resolution.exit_code
+    observation["tool_diagnostic_artifact_ref"] = resolution.diagnostic_artifact_ref
 
 
 def _deterministic_requirement_keys(contract: dict[str, Any]) -> list[str]:

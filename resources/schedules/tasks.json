@@ -10,7 +10,7 @@
     {"task_key": "daily.opportunity.0900", "at": "09:00", "lead_minutes": 30},
     {"task_key": "daily.execution.0945", "at": "09:45", "lead_minutes": 0},
     {"task_key": "daily.execution.1030", "at": "10:30", "lead_minutes": 0},
-    {"task_key": "daily.execution.1430", "at": "14:30", "lead_minutes": 0},
+    {"task_key": "daily.execution.1430", "at": "14:30", "lead_minutes": 5},
     {"task_key": "daily.review.1520", "at": "15:20", "lead_minutes": 0}
   ],
   "periodic": [

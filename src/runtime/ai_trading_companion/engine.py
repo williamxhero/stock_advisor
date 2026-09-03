@@ -733,7 +733,8 @@ class CompanionEngine:
             return cls._user_fault_message(reason, stage)
         missing = "、".join(str(item) for item in details.get("missing_requirements") or []) or "关键事实覆盖"
         backends = "、".join(str(item) for item in details.get("attempted_backends") or []) or "未取得可用后端结果"
-        return f"{stage} 未发布：缺少 {missing}；已尝试 {backends}。需要取得同一时点、可回溯到本轮工具结果的证据后再运行。"
+        boundary = str(details.get("safe_boundary") or "no_trading_action_qualified")
+        return f"{stage} 未发布：缺少 {missing}；已尝试 {backends}。{boundary}；需要取得同一时点、可回溯到本轮工具结果的证据后再运行。"
 
     def m2_ready(
         self, cycle_id: str, m2: str, *, as_of: str | None = None,

@@ -681,6 +681,31 @@ Protocol: OpportunityDiscovery-v1.3
             self.assertEqual("companion-published-message/v2", payload["message"]["contract"])
             self.assertTrue(payload["message"]["text_projection"].strip())
 
+    def test_current_bar_route_exhaustion_publishes_one_precise_m0_fault(self):
+        failed_cycle = self.engine.start_cycle(
+            "daily.execution.1430", "2026-08-25T14:30:00+08:00", iso(self.now),
+        )
+        self.engine.research_started(failed_cycle["cycle_id"])
+        self.engine.research_failed(
+            failed_cycle["cycle_id"], "evidence_insufficient: blocking_requirement_missing:portfolio_current_bar",
+            details={
+                "missing_requirements": ["portfolio_current_bar"],
+                "attempted_backends": ["markethub", "tencent"],
+                "safe_boundary": "no_trading_action_qualified",
+            },
+        )
+
+        events = [item for item in self.store.pending_events() if item["event_type"] == "research.failed"]
+        self.assertEqual(1, len(events))
+        payload = json.loads(events[0]["payload_json"])
+        self.assertEqual("failed", payload["cycle"]["state"])
+        text = payload["message"]["text_projection"]
+        self.assertIn("portfolio_current_bar", text)
+        self.assertIn("markethub", text)
+        self.assertIn("tencent", text)
+        self.assertIn("no_trading_action_qualified", text)
+        self.assertFalse(any(item["event_type"] in {"m0.ready", "m1.ready"} for item in self.store.pending_events()))
+
     def test_no_h0_skips_m2(self):
         self.ready()
         self.engine.command({"command_id": "commit", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0"})
@@ -1303,6 +1328,31 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertEqual({"state": "ok"}, result)
         self.assertEqual(["research"], events)
         store.finish_scheduled_worker.assert_called_once_with("cycle")
+
+    def test_1430_lead_window_only_warms_dependencies_until_the_formal_slot(self):
+        events: list[str] = []
+        store = Mock()
+        store.get_cycle.return_value = {
+            "state": "queued", "kind": "scheduled", "task_key": "daily.execution.1430",
+            "scheduled_for": "2026-08-25T14:30:00+08:00",
+            "schedule_snapshot_json": json.dumps({"trigger": {"lead_minutes": 5}}),
+        }
+        with patch("ai_trading_companion.__main__.ensure_registered_policy"), patch(
+            "ai_trading_companion.__main__._prefetch_market_breadth", side_effect=lambda: events.append("prepare")), patch(
+            "ai_trading_companion.__main__.run_research", side_effect=lambda *args: events.append("research") or {"state": "ok"},
+        ), patch("ai_trading_companion.__main__.process_h0_cognition"):
+            early = run_scheduled_cycle(
+                Mock(), store, Mock(), Mock(), "cycle", True,
+                at=datetime.fromisoformat("2026-08-25T14:25:00+08:00"),
+            )
+            formal = run_scheduled_cycle(
+                Mock(), store, Mock(), Mock(), "cycle", True,
+                at=datetime.fromisoformat("2026-08-25T14:30:00+08:00"),
+            )
+
+        self.assertEqual("queued", early["state"])
+        self.assertEqual({"state": "ok"}, formal)
+        self.assertEqual(["prepare", "research"], events)
 
     def test_premarket_cycle_is_prepared_before_0830_without_starting_research(self):
         completed: list[str] = []

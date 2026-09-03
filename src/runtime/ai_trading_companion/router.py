@@ -9,7 +9,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .effort_policy import CognitiveEffortPolicy, EffortPolicyFacts
-from .stage_expression import normalize_stage_output, semantic_snapshot_conflicts
+from .stage_expression import canonical_direction, normalize_stage_output, semantic_snapshot_conflicts
 
 
 RESEARCH_STAGES = frozenset({"m0_research", "m1_research", "outcome_research", "chat_research"})
@@ -233,6 +233,34 @@ class CognitiveRouter:
                 problems.append("qualified_snapshot_has_no_direction")
             if snapshot.get("qualified") and (not snapshot.get("triggers") or not snapshot.get("invalidations")):
                 problems.append("qualified_snapshot_lacks_execution_boundary")
+        if stage in {"m1_judgment", "m2"} and isinstance(normalized.semantic, dict) and "current_action" in normalized.semantic:
+            semantic = normalized.semantic
+            action = str(semantic.get("current_action") or "")
+            if action not in {"observe", "reduce_risk", "allow_add_risk", "avoid"}:
+                problems.append("judgment_current_action_invalid")
+            direction = canonical_direction(semantic.get("direction"))
+            if semantic.get("qualified") and not action:
+                problems.append("qualified_judgment_lacks_current_action")
+            if direction in {"unqualified", "unknown"} and action not in {"", "observe"}:
+                problems.append("unqualified_judgment_has_nonconservative_action")
+            conditions = [item for item in semantic.get("transition_conditions") or [] if isinstance(item, dict)]
+            if semantic.get("qualified") and not conditions:
+                problems.append("qualified_judgment_lacks_joint_confirmation")
+            for condition in conditions:
+                if not all(str(condition.get(key) or "").strip() for key in ("price", "breadth", "persistence")):
+                    problems.append("judgment_transition_lacks_joint_confirmation")
+                    break
+            positions = [item for item in semantic.get("position_focus") or [] if isinstance(item, dict)]
+            if len(positions) > 2:
+                problems.append("judgment_overloads_position_focus")
+            priorities = [item.get("priority") for item in positions]
+            if priorities and sorted(priorities) != list(range(1, len(priorities) + 1)):
+                problems.append("judgment_position_priority_is_not_contiguous")
+            if any(
+                any(marker in str(item.get("reason") or "") for marker in ("浮亏", "亏损最多", "成本最高", "成本价"))
+                for item in positions
+            ):
+                problems.append("judgment_position_priority_is_cost_anchored")
         return {"passed": not problems, "problems": problems, "profile": profile.as_json()}
 
 

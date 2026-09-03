@@ -1,0 +1,31 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,
+  "required":["result_version","semantic"],"properties":{
+    "result_version":{"type":"integer","const":4},
+    "semantic":{"type":"object","additionalProperties":false,
+      "required":["summary","direction","qualified","horizon","current_action","key_evidence","transition_conditions","position_focus","risks","unknowns"],
+      "properties":{
+        "summary":{"type":"string","minLength":1,"maxLength":360},
+        "direction":{"type":"string","enum":["bullish","bearish","neutral","avoid","unqualified","unknown"]},
+        "qualified":{"type":"boolean"},
+        "horizon":{"type":"string","minLength":1,"maxLength":80},
+        "current_action":{"type":"string","enum":["observe","reduce_risk","allow_add_risk","avoid"]},
+        "key_evidence":{"type":"array","maxItems":3,"items":{"type":"string","minLength":1,"maxLength":240}},
+        "transition_conditions":{"type":"array","maxItems":2,"items":{"type":"object","additionalProperties":false,"required":["outcome","price","breadth","persistence"],"properties":{
+          "outcome":{"type":"string","enum":["upgrade","downgrade"]},
+          "price":{"type":"string","minLength":1,"maxLength":180},
+          "breadth":{"type":"string","minLength":1,"maxLength":180},
+          "persistence":{"type":"string","minLength":1,"maxLength":180}
+        }}},
+        "position_focus":{"type":"array","maxItems":2,"items":{"type":"object","additionalProperties":false,"required":["symbol","priority","reason","action"],"properties":{
+          "symbol":{"type":"string","minLength":1,"maxLength":80},
+          "priority":{"type":"integer","minimum":1,"maximum":2},
+          "reason":{"type":"string","minLength":1,"maxLength":240},
+          "action":{"type":"string","enum":["observe","reduce_risk","allow_add_risk","avoid"]}
+        }}},
+        "risks":{"type":"array","maxItems":2,"items":{"type":"string","minLength":1,"maxLength":180}},
+        "unknowns":{"type":"array","maxItems":1,"items":{"type":"string","minLength":1,"maxLength":180}}
+      }
+    }
+  }
+}

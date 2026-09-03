@@ -659,7 +659,11 @@ class CompanionEngine:
             raise ValueError("M1 judgment qualification conflicts with the verified snapshot")
         if snapshot is not None and verified_output.get("snapshot") is not None and snapshot != verified_output.get("snapshot"):
             raise ValueError("M1 snapshot does not match the verified judgment attempt")
-        recovered = any(attempt["status"] in {"failed", "timed_out"} for attempt in self.store.attempts(cycle_id))
+        verifier = json.loads(judgment_attempt.get("verifier_json") or "{}")
+        recovered = (
+            not bool(verifier.get("fallback"))
+            and any(attempt["status"] in {"failed", "timed_out"} for attempt in self.store.attempts(cycle_id))
+        )
         if self.store.latest_artifact(cycle_id, "m1"):
             raise ValueError("formal M1 already exists")
         if cycle["state"] not in {"researching_m1", "judging_m1", "m1_retry_wait"}:

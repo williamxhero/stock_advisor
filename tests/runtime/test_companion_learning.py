@@ -13,7 +13,7 @@ from ai_trading_companion.learning import JudgmentLifecycle, WorkflowEvolution
 from ai_trading_companion.packet_builder import RuntimePacketBuilder as _RuntimePacketBuilder
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.router import CognitiveRouter
-from ai_trading_companion.stage_expression import normalize_stage_output
+from ai_trading_companion.stage_expression import normalize_stage_output, safe_stage_output
 from ai_trading_companion.store import CompanionStore
 
 
@@ -292,6 +292,104 @@ class CompanionLearningTests(unittest.TestCase):
         })
         self.assertIn("偏空", normalized.text)
         self.assertNotIn("bearish", normalized.text)
+
+    def test_v4_m1_leads_with_current_action_and_requires_joint_confirmation(self):
+        normalized = normalize_stage_output("m1_judgment", {
+            "result_version": 4,
+            "semantic": {
+                "summary": "指数小幅走高，但下跌家数仍明显更多，强势没有扩散。",
+                "direction": "neutral",
+                "qualified": True,
+                "horizon": "午后",
+                "current_action": "observe",
+                "key_evidence": [
+                    "三大指数约上涨0.4%",
+                    "午间下跌家数仍明显多于上涨家数",
+                ],
+                "transition_conditions": [{
+                    "outcome": "upgrade",
+                    "price": "三大指数守住午间区域",
+                    "breadth": "上涨家数持续超过下跌家数并出现成交扩散",
+                    "persistence": "连续一段时间保持",
+                }, {
+                    "outcome": "downgrade",
+                    "price": "指数陆续跌回前收以下",
+                    "breadth": "下跌家数继续扩大并出现更多弱势股",
+                    "persistence": "持续而非单次瞬时波动",
+                }],
+                "position_focus": [{
+                    "symbol": "力星股份",
+                    "priority": 1,
+                    "reason": "若午后明显落后所属板块，风险先于浮亏处理",
+                    "action": "reduce_risk",
+                }],
+                "risks": [],
+                "unknowns": ["午后成交是否扩散到更多板块"],
+            },
+        })
+
+        self.assertTrue(normalized.text.startswith("午后我维持中性，当前继续观察"))
+        self.assertIn("指数小幅走高，但下跌家数仍明显更多", normalized.text)
+        self.assertIn("三大指数守住午间区域", normalized.text)
+        self.assertIn("上涨家数持续超过下跌家数", normalized.text)
+        self.assertIn("连续一段时间保持", normalized.text)
+        self.assertIn("优先盯力星股份", normalized.text)
+        self.assertNotIn("我现在更倾向于", normalized.text)
+        self.assertNotIn("接下来主要看", normalized.text)
+        self.assertEqual("neutral", normalized.snapshot["direction"])
+        self.assertEqual("observe", normalized.snapshot["current_action"])
+        self.assertEqual("午后", normalized.snapshot["claims"][0]["horizon"])
+
+    def test_v4_m1_rejects_single_signal_turns_and_cost_anchored_position_priority(self):
+        semantic = {
+            "summary": "市场仍在分化。", "direction": "neutral", "qualified": True,
+            "horizon": "午后", "current_action": "observe", "key_evidence": ["广度偏弱"],
+            "transition_conditions": [{
+                "outcome": "upgrade", "price": "指数守住午间区域",
+                "breadth": "上涨家数持续超过下跌家数", "persistence": "连续一段时间保持",
+            }, {
+                "outcome": "downgrade", "price": "指数陆续跌回前收以下",
+                "breadth": "下跌家数继续扩大", "persistence": "持续而非单次瞬时波动",
+            }],
+            "position_focus": [{
+                "symbol": "力星股份", "priority": 1, "reason": "午后明显落后所属板块",
+                "action": "reduce_risk",
+            }],
+            "risks": [], "unknowns": [],
+        }
+        accepted = CognitiveRouter().verify("m1_judgment", {"task_key": "daily.execution.1030"}, {
+            "result_version": 4, "semantic": semantic,
+        })
+        weak_condition = CognitiveRouter().verify("m1_judgment", {"task_key": "daily.execution.1030"}, {
+            "result_version": 4,
+            "semantic": {**semantic, "transition_conditions": [{
+                "outcome": "downgrade", "price": "指数跌破前收", "breadth": "", "persistence": "",
+            }]},
+        })
+        cost_anchored = CognitiveRouter().verify("m1_judgment", {"task_key": "daily.execution.1030"}, {
+            "result_version": 4,
+            "semantic": {**semantic, "position_focus": [{
+                "symbol": "力星股份", "priority": 1, "reason": "浮亏最多，成本最高",
+                "action": "reduce_risk",
+            }]},
+        })
+
+        self.assertTrue(accepted["passed"], accepted["problems"])
+        self.assertIn("judgment_transition_lacks_joint_confirmation", weak_condition["problems"])
+        self.assertIn("judgment_position_priority_is_cost_anchored", cost_anchored["problems"])
+
+    def test_safe_formal_fallback_is_natural_and_conservative(self):
+        m0 = normalize_stage_output("m0_compose", safe_stage_output("m0_compose"))
+        m1 = normalize_stage_output("m1_judgment", safe_stage_output("m1_judgment", horizon="午后"))
+        m2 = normalize_stage_output("m2", safe_stage_output("m2", horizon="午后"))
+
+        self.assertIn("先只保留客观观察", m0.text)
+        self.assertNotIn("偏多", m0.text)
+        for result in (m1, m2):
+            self.assertTrue(result.text.startswith("午后我维持暂不形成方向，当前继续观察"))
+            self.assertEqual("unqualified", result.snapshot["direction"])
+            self.assertEqual("observe", result.snapshot["current_action"])
+            self.assertNotIn("provider_candidate_not_publishable", result.text)
 
     def test_packet_and_verifier_reject_a_false_non_trading_day_m0(self):
         class TradingDayCalendar:

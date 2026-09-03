@@ -47,7 +47,7 @@ from .scheduler import SHANGHAI, conversation_auto_submit_at, ensure_registered_
 from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
 from .runtime_strategy_policy import RuntimeStrategyControls, RuntimeStrategyPolicy
-from .stage_expression import normalize_stage_output
+from .stage_expression import normalize_stage_output, safe_stage_output
 from .local_research import (
     BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
     ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend,
@@ -118,6 +118,25 @@ def _m1_retry_feedback(exc: Exception) -> dict[str, Any] | None:
         "schema_problems": problems(schema.get("problems")),
         "business_problems": problems(business.get("problems")),
     }
+
+
+def _save_safe_stage_fallback(
+    store: CompanionStore, cycle: dict[str, Any], stage: str, packet: dict[str, Any], *, horizon: str,
+) -> tuple[dict[str, Any], str]:
+    """Seal a local conservative reply after a provider candidate has failed closed."""
+    output = safe_stage_output(stage, horizon=horizon)
+    attempt = store.begin_attempt(
+        cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), str(packet.get("sha256") or "local-fallback"),
+        model="runtime-safe-fallback", reasoning_effort="deterministic", search_enabled=False,
+        timeout_seconds=0, routing_reason="verified-stage-safe-fallback",
+        runner_fingerprint="runtime-safe-fallback/v1", input_packet=packet,
+    )
+    store.finish_attempt(
+        attempt["attempt_id"], "succeeded", output=output,
+        verifier={"passed": True, "fallback": True, "reason": "provider_candidate_not_publishable"},
+        actual_model="runtime-safe-fallback",
+    )
+    return output, attempt["attempt_id"]
 
 
 def resolve_stage_controls(
@@ -951,6 +970,9 @@ def run_research(
     compose_controls = resolve_stage_controls(
         store, "m0_compose", timeout=compose_timeout, search=False,
     )
+    evidence: dict[str, Any] | None = None
+    evidence_attempt_id: str | None = None
+    local_packet: dict[str, Any] | None = None
     for number in range(1, 3):
         try:
             checkpoint = store.stage_checkpoint(cycle["cycle_id"], "m0_research", public_packet["sha256"])
@@ -979,7 +1001,7 @@ def run_research(
                 m0_output, compose_attempt_id = compose_checkpoint["output"], compose_checkpoint["attempt_id"]
             else:
                 compose_stage = _call_stage(
-                    store, cycle, "m0_compose", local_packet, "companion-m0-result-v2.schema.json",
+                    store, cycle, "m0_compose", local_packet, "companion-m0-result-v3.schema.json",
                     search=False, timeout=compose_timeout, frozen_controls=compose_controls,
                 )
                 m0_output, compose_attempt_id = compose_stage.output, compose_stage.attempt_id
@@ -1007,6 +1029,19 @@ def run_research(
                     on_progress()
                 time.sleep(2)
                 continue
+            if isinstance(exc, (BrokerError, TimeoutError)) and evidence is not None and evidence_attempt_id and local_packet is not None:
+                fallback, fallback_attempt_id = _save_safe_stage_fallback(
+                    store, cycle, "m0_compose", local_packet, horizon="当前",
+                )
+                m0_result = normalize_stage_output("m0_compose", fallback)
+                ready = engine.research_ready(
+                    cycle["cycle_id"], m0_result.text,
+                    evidence_attempt_id=evidence_attempt_id, compose_attempt_id=fallback_attempt_id,
+                    evidence_packet_hash=public_packet["sha256"], packet_hash=local_packet["sha256"],
+                    evidence_as_of=evidence.get("as_of"),
+                )
+                publish_observatory_evaluation(store, cycle["cycle_id"])
+                return ready
             engine.research_failed(cycle["cycle_id"], str(exc))
             publish_observatory_evaluation(store, cycle["cycle_id"])
             if on_progress:
@@ -1093,6 +1128,7 @@ def run_m1(
         )
         raise
     verification_feedback: dict[str, Any] | None = None
+    local_packet: dict[str, Any] | None = None
     for number in range(1, M1_MAX_JUDGMENT_ATTEMPTS + 1):
         try:
             cycle = engine.m1_judgment_started(cycle_id)
@@ -1121,7 +1157,7 @@ def run_m1(
                 judgment, judgment_attempt_id = judgment_checkpoint["output"], judgment_checkpoint["attempt_id"]
             else:
                 judgment_stage = _call_stage(
-                    store, cycle, "m1_judgment", local_packet, "companion-m1-result-v3.schema.json",
+                    store, cycle, "m1_judgment", local_packet, "companion-m1-result-v4.schema.json",
                     search=False, timeout=judgment_timeout, frozen_controls=judgment_controls,
                 )
                 judgment, judgment_attempt_id = judgment_stage.output, judgment_stage.attempt_id
@@ -1140,12 +1176,28 @@ def run_m1(
                 remaining = 0
             retryable = _m1_should_retry(exc, attempt_number=number, remaining_seconds=remaining)
             details = getattr(exc, "verifier", None)
+            if isinstance(exc, (BrokerError, TimeoutError)) and not retryable and local_packet is not None:
+                fallback, fallback_attempt_id = _save_safe_stage_fallback(
+                    store, cycle, "m1_judgment", local_packet,
+                    horizon="当前",
+                )
+                m1_result = normalize_stage_output("m1_judgment", fallback)
+                return engine.m1_ready(
+                    cycle_id, m1_result.text, as_of=evidence.get("as_of"),
+                    research_attempt_id=evidence_attempt_id, judgment_attempt_id=fallback_attempt_id,
+                    research_packet_hash=public_packet["sha256"], judgment_packet_hash=local_packet["sha256"],
+                    snapshot=m1_result.snapshot, qualified=bool(m1_result.qualified),
+                )
+            if not retryable:
+                engine.m1_failed(
+                    cycle_id, str(exc), retryable=False,
+                    details=details if isinstance(details, dict) else None,
+                )
+                raise
             engine.m1_failed(
-                cycle_id, str(exc), retryable=retryable,
+                cycle_id, str(exc), retryable=True,
                 details=details if isinstance(details, dict) else None,
             )
-            if not retryable:
-                raise
             verification_feedback = _m1_retry_feedback(exc)
             cycle = store.get_cycle(cycle_id)
             time.sleep(2)
@@ -1168,15 +1220,19 @@ def run_m2(engine: CompanionEngine, store: CompanionStore, cycle_id: str, execut
     packet = finalize_stage_packet(
         RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(cycle, "m2", as_of=frozen_as_of), controls,
     )
-    stage_result = _call_stage(
-        store, cycle, "m2", packet, "companion-m2-result-v2.schema.json",
-        search=False, timeout=timeout, frozen_controls=controls,
-    )
-    store.save_stage_checkpoint(cycle_id, "m2", packet["sha256"], stage_result.attempt_id, stage_result.output)
-    m2_result = normalize_stage_output("m2", stage_result.output)
+    try:
+        stage_result = _call_stage(
+            store, cycle, "m2", packet, "companion-m2-result-v3.schema.json",
+            search=False, timeout=timeout, frozen_controls=controls,
+        )
+        store.save_stage_checkpoint(cycle_id, "m2", packet["sha256"], stage_result.attempt_id, stage_result.output)
+        output, attempt_id = stage_result.output, stage_result.attempt_id
+    except (BrokerError, TimeoutError):
+        output, attempt_id = _save_safe_stage_fallback(store, cycle, "m2", packet, horizon="当前")
+    m2_result = normalize_stage_output("m2", output)
     return engine.m2_ready(
         cycle_id, m2_result.text, snapshot=m2_result.snapshot, as_of=frozen_as_of,
-        attempt_id=stage_result.attempt_id, packet_hash=packet["sha256"],
+        attempt_id=attempt_id, packet_hash=packet["sha256"],
     )
 
 

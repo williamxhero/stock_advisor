@@ -462,6 +462,37 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual(["600487", "603861"], request.inputs["symbols"])
         self.assertEqual("2026-09-01T01:45:00Z", request.required_at)
 
+    def test_current_bar_uses_only_contract_frozen_symbols(self) -> None:
+        contract = {
+            "version": 4, "as_of": "2026-09-01T01:46:00Z",
+            "requirements": [{
+                "key": "portfolio_current_bar", "blocking": True,
+                "allowed_coverage": ["covered"], "required_entities": ["600487", "603861"],
+                "window": {"mode": "after_start_to_end", "start": "2026-09-01T01:41:00Z", "end": "2026-09-01T01:46:00Z"},
+            }],
+        }
+        runner = mock.Mock()
+        runner.resolve_with_fallback.return_value = EvidenceResolution(
+            True, "cn_equity_current_bar", "1.1.5", "2026-09-01T01:45:30Z", "2026-09-01T01:45:31Z", {
+                "source": "markethub_current_bar", "finality": "intraday",
+                "source_evidence": [{
+                    "url": "http://yosef-server:8803/api/stocks/quotes?datetime=now",
+                    "fact_as_of": "2026-09-01T01:45:30Z",
+                    "data": {"bars": [{"symbol": "600487", "close": 66.06}, {"symbol": "603861", "close": 19.11}]},
+                }],
+            }, "artifact:sha256:" + "e" * 64, None, (), attempts=("default:succeeded",),
+        )
+
+        ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0)("current_bar", {
+            "_requirement_key": "portfolio_current_bar", "symbol": "000001",
+        })
+
+        request = runner.resolve_with_fallback.call_args.args[0]
+        self.assertEqual("cn_equity_current_bar", request.capability)
+        self.assertEqual(["600487", "603861"], request.inputs["symbols"])
+        self.assertEqual("1m", request.inputs["freq"])
+        self.assertEqual("2026-09-01T01:46:00Z", request.required_at)
+
     def test_post_close_breadth_keeps_official_close_finality_in_a_bounded_window(self) -> None:
         contract = {
             "version": 4, "as_of": "2026-09-01T07:20:00Z",

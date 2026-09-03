@@ -231,6 +231,12 @@ class EvidenceContractFactory:
                 "required_entities": holdings,
                 "minimum_numeric_facts": 4 * len(holdings) if holdings else 0,
             },
+            *([{
+                "key": "portfolio_current_bar", "blocking": True,
+                "allowed_coverage": ["covered"], "window": dict(market_window),
+                "evidence_class": "public_if_present", "required_entities": holdings,
+                "minimum_numeric_facts": 4 * len(holdings),
+            }] if holdings and market_window.get("mode") == "after_start_to_end" else []),
             {
                 "key": "portfolio_events_and_counterevidence", "blocking": True,
                 "allowed_coverage": ["covered", "checked_no_change"],

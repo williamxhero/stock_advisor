@@ -567,6 +567,22 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertNotIn(secret_h0, json.dumps(packet, ensure_ascii=False))
         self.assertNotIn("h0", [artifact["kind"] for artifact in packet["artifacts"]])
 
+    def test_current_bars_are_projected_into_the_verified_fact_digest(self):
+        digest = _RuntimePacketBuilder._verified_fact_digest({"sources": [{
+            "evidence_ref": "ev-current-bar",
+            "excerpt": json.dumps({"bars": [{
+                "symbol": "600487", "freq": "1m", "interval_start": "2026-09-03T09:45:00+08:00",
+                "interval_end": "2026-09-03T09:46:00+08:00", "close": 66.06,
+                "is_final": False, "observed_at": "2026-09-03T09:45:30+08:00",
+                "freshness_ms": 0, "source_semantics": "native",
+            }]}, ensure_ascii=False),
+        }]})
+
+        self.assertEqual("ev-current-bar", digest[0]["evidence_ref"])
+        excerpt = json.loads(digest[0]["excerpt"])
+        self.assertEqual("600487", excerpt["bars"][0]["symbol"])
+        self.assertEqual("北京时间2026-09-03 09:45", excerpt["bars"][0]["observed_at_china"])
+
     def test_m1_public_research_inherits_only_prior_public_context(self):
         self.ready()
         secret_h0 = "这是不能发给联网研究的私人判断"

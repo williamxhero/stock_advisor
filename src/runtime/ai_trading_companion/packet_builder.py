@@ -250,7 +250,7 @@ class RuntimePacketBuilder:
             if not isinstance(source, dict):
                 continue
             excerpt = str(source.get("excerpt") or "")
-            if any(marker in excerpt for marker in ('"quotes"', '"indices"', '"breadth"')):
+            if any(marker in excerpt for marker in ('"quotes"', '"indices"', '"breadth"', '"bars"')):
                 rows.append({"evidence_ref": source.get("evidence_ref"), "excerpt": RuntimePacketBuilder._with_china_quote_times(excerpt)[:8000]})
         return rows
 
@@ -273,6 +273,13 @@ class RuntimePacketBuilder:
                 try:
                     local = datetime.fromisoformat(str(quote_at).replace("Z", "+00:00")).astimezone(ZoneInfo("Asia/Shanghai"))
                     copy["quote_at_china"] = f"北京时间{local:%Y-%m-%d %H:%M}"
+                except ValueError:
+                    pass
+            observed_at = copy.get("observed_at")
+            if observed_at and "observed_at_china" not in copy:
+                try:
+                    local = datetime.fromisoformat(str(observed_at).replace("Z", "+00:00")).astimezone(ZoneInfo("Asia/Shanghai"))
+                    copy["observed_at_china"] = f"北京时间{local:%Y-%m-%d %H:%M}"
                 except ValueError:
                     pass
             return copy

@@ -33,7 +33,7 @@ RESEARCH_PLAN_SCHEMA: dict[str, Any] = {
                 "requirement_key": {"type": "string", "minLength": 1},
                 "backend": {"type": "string", "enum": ["market", "gateway"]},
                 "operation": {"type": "string", "enum": [
-                    "market_snapshot", "market_breadth", "sector_snapshot", "holding_snapshot",
+                    "market_snapshot", "market_breadth", "sector_snapshot", "holding_snapshot", "current_bar",
                     "web_search", "web_read", "web_browser",
                 ]},
                 "arguments": {
@@ -72,7 +72,7 @@ RESEARCH_PLAN_SCHEMA: dict[str, Any] = {
 
 
 _OPERATIONS = {
-    "market": {"market_snapshot", "market_breadth", "sector_snapshot", "holding_snapshot"},
+    "market": {"market_snapshot", "market_breadth", "sector_snapshot", "holding_snapshot", "current_bar"},
     "gateway": {"web_search", "web_read", "web_browser"},
 }
 _BACKEND_ORDER = {"market": 0, "gateway": 1}
@@ -251,6 +251,7 @@ class ToolCatalogMarketBackend:
             "market_snapshot": "cn_market_index_batch",
             "market_breadth": "cn_market_breadth",
             "holding_snapshot": "cn_equity_quote_batch",
+            "current_bar": "cn_equity_current_bar",
         }.get(operation)
         if capability is None:
             raise ValueError(f"unsupported live market operation: {operation}")
@@ -261,11 +262,11 @@ class ToolCatalogMarketBackend:
         finality = declared_finality or (
             "official_close" if mode == "exact" and required_at[11:16] == "07:00" else "intraday"
         )
-        if operation == "holding_snapshot":
+        if operation in {"holding_snapshot", "current_bar"}:
             symbols = [str(value) for value in requirement.get("required_entities") or [] if str(value)]
             if not symbols:
-                raise ValueError("holding_snapshot requires frozen portfolio entities")
-            inputs = {"symbols": symbols}
+                raise ValueError(f"{operation} requires frozen portfolio entities")
+            inputs = {"symbols": symbols, **({"freq": "1m"} if operation == "current_bar" else {})}
         elif operation == "market_snapshot":
             inputs = {"symbols": ["000001", "399001", "399006"]}
         else:
@@ -941,6 +942,8 @@ def _merge_mandatory_operations(
         required.append(_operation("market_breadth", "market", "market_breadth"))
     if requirements.get("portfolio_market_state", {}).get("required_entities"):
         required.append(_operation("portfolio_market_state", "market", "holding_snapshot"))
+    if requirements.get("portfolio_current_bar", {}).get("required_entities"):
+        required.append(_operation("portfolio_current_bar", "market", "current_bar"))
     material_events = requirements.get("material_events_and_counterevidence") or {}
     if "checked_no_change" in set(material_events.get("allowed_coverage") or []):
         required.append(_operation(
@@ -989,7 +992,7 @@ def _deterministic_requirement_keys(contract: dict[str, Any]) -> list[str]:
     keys = {str(item.get("key") or "") for item in contract.get("requirements") or [] if isinstance(item, dict)}
     return sorted(keys.intersection({
         "current_market_state", "indices_close", "market_breadth", "portfolio_market_state",
-        "portfolio_events_and_counterevidence",
+        "portfolio_current_bar", "portfolio_events_and_counterevidence",
     }))
 
 

@@ -32,7 +32,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.4", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.5", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
 
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
@@ -816,6 +816,86 @@ class ToolRunnerTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 server.server_close()
+
+    def test_current_equity_bar_returns_a_fresh_forming_market_hub_interval(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path != "/stocks/quotes?codes=600000&freq=1m&datetime=now&count=1&adjust=none":
+                    self.send_error(400, "unexpected MarketHub current-Bar request")
+                    return
+                body = json.dumps({
+                    "items": [{
+                        "code": "600000", "trade_time": "2026-09-01T09:45:00+08:00", "freq": "1m",
+                        "open": 9.1, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 1200.0,
+                        "amount": 11040.0, "adjust": "none", "is_suspended": False, "is_st": False,
+                        "interval_start": "2026-09-01T09:45:00+08:00",
+                        "interval_end": "2026-09-01T09:46:00+08:00", "is_final": False,
+                        "observed_at": "2026-09-01T09:45:30+08:00",
+                        "last_trade_at": "2026-09-01T09:45:00+08:00", "provider": "mootdx",
+                        "source_semantics": "native", "freshness_ms": 0, "degraded": False,
+                        "market_status": "trading",
+                    }],
+                    "meta": {"complete": True}, "errors": [],
+                }).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_equity_current_bar", "2026-09-01T01:46:00Z", 4.0,
+                    {"symbols": ["600000"], "freq": "1m", "markethub_url": f"http://127.0.0.1:{server.server_port}/stocks/quotes"},
+                    finality="intraday",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("2026-09-01T01:45:30Z", result.fact_as_of)
+                self.assertEqual("600000", result.data["bars"][0]["symbol"])
+                self.assertFalse(result.data["bars"][0]["is_final"])
+                self.assertEqual("native", result.data["bars"][0]["source_semantics"])
+                self.assertEqual(
+                    "http://127.0.0.1:%d/stocks/quotes?codes=600000&freq=1m&datetime=now&count=1&adjust=none" % server.server_port,
+                    result.data["source_urls"][0],
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_current_equity_bar_rejects_a_stale_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            self.publish_tool(root, "cn_equity_current_bar", """
+                import json
+                print(json.dumps({
+                    "contract": "ai-trading-tool-result/v1", "fact_as_of": "2026-09-01T01:45:30Z",
+                    "data": {"finality": "intraday", "bars": [{
+                        "symbol": "600000", "exchange": "SSE", "market": "CN-A", "freq": "1m",
+                        "interval_start": "2026-09-01T09:45:00+08:00", "interval_end": "2026-09-01T09:46:00+08:00",
+                        "observed_at": "2026-09-01T09:45:30+08:00", "last_trade_at": "2026-09-01T09:45:00+08:00",
+                        "open": 9.1, "high": 9.3, "low": 9.0, "close": 9.2, "volume": 1200, "amount": 11040,
+                        "freshness_ms": 300001, "is_final": False, "degraded": True,
+                        "provider": "mootdx", "source_semantics": "native",
+                    }]},
+                }))
+            """)
+
+            result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                1, "cn_equity_current_bar", "2026-09-01T01:46:00Z", 2.0,
+                {"symbols": ["600000"], "freq": "1m"}, finality="intraday",
+            ))
+
+            self.assertFalse(result.succeeded)
+            self.assertEqual("tool_current_bar_stale", result.error_code)
 
     def test_market_snapshot_rejects_nontrading_or_stale_data(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

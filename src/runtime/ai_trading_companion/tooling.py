@@ -497,6 +497,8 @@ def _validate_capability_result(request: FactRequest, output: dict[str, Any]) ->
         return _validate_market_snapshot(request, output["data"], str(output["fact_as_of"]))
     if request.capability == "cn_market_breadth":
         return _validate_market_breadth(request, output["data"], str(output["fact_as_of"]))
+    if request.capability == "cn_equity_current_bar":
+        return _validate_current_equity_bars(request, output["data"])
     if request.capability != "cn_equity_quote_batch":
         return None
     data = output["data"]
@@ -548,6 +550,55 @@ def _validate_capability_result(request: FactRequest, output: dict[str, Any]) ->
             return "tool_quote_calculation_invalid"
     if set(seen) != set(expected_symbols) or data.get("finality") != request.finality:
         return "tool_quote_finality_invalid" if data.get("finality") != request.finality else "tool_quote_symbol_mismatch"
+    return None
+
+
+def _validate_current_equity_bars(request: FactRequest, data: dict[str, Any]) -> str | None:
+    bars = data.get("bars")
+    expected = request.inputs.get("symbols")
+    freq = request.inputs.get("freq")
+    if not isinstance(bars, list) or not isinstance(expected, list) or not bars or freq not in {"1m", "30m"}:
+        return "tool_current_bar_result_invalid"
+    expected_symbols = [str(symbol).strip() for symbol in expected]
+    if len(set(expected_symbols)) != len(expected_symbols):
+        return "tool_current_bar_request_invalid"
+    expected_date = _parse_timestamp(request.required_at).astimezone(_SHANGHAI).date().isoformat()
+    required_at = _parse_timestamp(request.required_at)
+    seen: set[str] = set()
+    for bar in bars:
+        if not isinstance(bar, dict) or not isinstance(bar.get("symbol"), str):
+            return "tool_current_bar_result_invalid"
+        symbol = bar["symbol"]
+        if symbol not in expected_symbols or symbol in seen:
+            return "tool_current_bar_symbol_mismatch"
+        seen.add(symbol)
+        if bar.get("freq") != freq or bar.get("market") != "CN-A" or bar.get("exchange") not in {"SSE", "SZSE", "BSE"}:
+            return "tool_current_bar_identity_invalid"
+        try:
+            interval_start = _parse_timestamp(str(bar.get("interval_start") or ""))
+            interval_end = _parse_timestamp(str(bar.get("interval_end") or ""))
+            observed_at = _parse_timestamp(str(bar.get("observed_at") or ""))
+            last_trade_at = _parse_timestamp(str(bar.get("last_trade_at") or ""))
+            open_price, high, low, close = (float(bar[field]) for field in ("open", "high", "low", "close"))
+            volume, amount = float(bar.get("volume")), float(bar.get("amount"))
+            freshness_ms = int(bar.get("freshness_ms"))
+        except (KeyError, TypeError, ValueError):
+            return "tool_current_bar_result_invalid"
+        if (interval_start >= interval_end or observed_at > required_at or last_trade_at > observed_at
+                or observed_at.astimezone(_SHANGHAI).date().isoformat() != expected_date):
+            return "tool_current_bar_after_required_at" if observed_at > required_at else "tool_current_bar_time_invalid"
+        if min(open_price, high, low, close) <= 0 or not (low <= open_price <= high and low <= close <= high) or volume < 0 or amount < 0:
+            return "tool_current_bar_values_invalid"
+        if freshness_ms < 0 or freshness_ms > 300_000:
+            return "tool_current_bar_stale"
+        if not isinstance(bar.get("is_final"), bool) or not isinstance(bar.get("degraded"), bool):
+            return "tool_current_bar_status_invalid"
+        if request.finality in {"close", "official_close"} and not bar["is_final"]:
+            return "tool_current_bar_finality_invalid"
+        if bar.get("source_semantics") not in {"native", "derived"} or not str(bar.get("provider") or "").strip():
+            return "tool_current_bar_source_invalid"
+    if seen != set(expected_symbols) or data.get("finality") != request.finality:
+        return "tool_current_bar_symbol_mismatch"
     return None
 
 

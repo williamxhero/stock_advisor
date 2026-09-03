@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.4"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3"}
+_VERSION = "1.1.5"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -17,6 +17,7 @@ _CAPABILITIES = {
     "article_range": "article_range",
     "cn_equity_identity": "cn_equity_identity",
     "cn_equity_quote_batch": "cn_equity_quote_batch",
+    "cn_equity_current_bar": "cn_equity_current_bar",
     "cn_market_index_batch": "cn_market_index_batch",
     "cn_market_snapshot": "cn_market_snapshot",
     "cn_market_breadth": "cn_market_breadth",
@@ -264,6 +265,75 @@ def quote_payload(body: str, symbols: list[dict[str, str]], finality: str) -> tu
     if latest is None:
         fail(64, "at least one symbol is required")
     return {"quotes": quotes, "finality": finality, "source": "tencent_quote"}, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def current_bar_payload(body: str, symbols: list[dict[str, str]], freq: str, finality: str, source_url: str) -> tuple[dict[str, object], str]:
+    try:
+        response = json.loads(body)
+        items = response["items"]
+        meta = response["meta"]
+    except (KeyError, TypeError, json.JSONDecodeError):
+        fail(75, "MarketHub current Bar response is invalid")
+    if not isinstance(items, list) or not isinstance(meta, dict) or meta.get("complete") is not True:
+        fail(75, "MarketHub current Bar response is incomplete")
+    by_code = {str(row.get("code") or ""): row for row in items if isinstance(row, dict)}
+    if len(by_code) != len(items):
+        fail(75, "MarketHub current Bar response has duplicate symbols")
+    if set(by_code) != {item["symbol"] for item in symbols}:
+        fail(75, "MarketHub current Bar response has missing or mismatched symbol")
+    bars: list[dict[str, object]] = []
+    latest: dt.datetime | None = None
+    for identity_row in symbols:
+        row = by_code.get(identity_row["symbol"])
+        if row is None or str(row.get("freq") or "") != freq:
+            fail(75, "MarketHub current Bar response has missing or mismatched symbol")
+        try:
+            interval_start = dt.datetime.fromisoformat(str(row["interval_start"]))
+            interval_end = dt.datetime.fromisoformat(str(row["interval_end"]))
+            observed_at = dt.datetime.fromisoformat(str(row["observed_at"]))
+            last_trade_at = dt.datetime.fromisoformat(str(row["last_trade_at"]))
+            open_price, high, low, close = (float(row[field]) for field in ("open", "high", "low", "close"))
+            volume, amount = float(row["volume"]), float(row["amount"])
+            freshness_ms = int(row["freshness_ms"])
+        except (KeyError, TypeError, ValueError):
+            fail(75, "MarketHub current Bar values are invalid")
+        if any(moment.tzinfo is None for moment in (interval_start, interval_end, observed_at, last_trade_at)):
+            fail(75, "MarketHub current Bar timestamp is invalid")
+        if interval_end <= interval_start or not (low <= open_price <= high and low <= close <= high):
+            fail(75, "MarketHub current Bar interval or OHLC is invalid")
+        if volume < 0 or amount < 0 or freshness_ms < 0 or freshness_ms > 300_000:
+            fail(75, "MarketHub current Bar freshness or volume is invalid")
+        is_final = row.get("is_final")
+        degraded = row.get("degraded")
+        if not isinstance(is_final, bool) or not isinstance(degraded, bool):
+            fail(75, "MarketHub current Bar status is invalid")
+        if finality in {"close", "official_close"} and not is_final:
+            fail(75, "MarketHub current Bar does not meet finality")
+        source_semantics = str(row.get("source_semantics") or "")
+        if source_semantics not in {"native", "derived"}:
+            fail(75, "MarketHub current Bar source semantics is invalid")
+        provider = str(row.get("provider") or "").strip()
+        market_status = str(row.get("market_status") or "").strip()
+        if not provider or not market_status:
+            fail(75, "MarketHub current Bar source is invalid")
+        latest = max(latest, observed_at) if latest else observed_at
+        bars.append({
+            "symbol": identity_row["symbol"], "exchange": identity_row["exchange"], "market": identity_row["market"],
+            "freq": freq, "trade_time": str(row.get("trade_time") or ""),
+            "interval_start": interval_start.isoformat(), "interval_end": interval_end.isoformat(),
+            "open": open_price, "high": high, "low": low, "close": close, "volume": volume, "amount": amount,
+            "is_suspended": bool(row.get("is_suspended")), "is_st": bool(row.get("is_st")),
+            "is_final": is_final, "observed_at": observed_at.isoformat(), "last_trade_at": last_trade_at.isoformat(),
+            "freshness_ms": freshness_ms, "degraded": degraded, "market_status": market_status,
+            "provider": provider, "source_semantics": source_semantics, "source": "markethub_current_bar",
+        })
+    if latest is None:
+        fail(75, "MarketHub current Bar response is empty")
+    fact_as_of = latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    evidence = {"bars": bars, "finality": finality, "source": "markethub_current_bar"}
+    return {**evidence, "source_urls": [source_url], "source_evidence": [{
+        "url": source_url, "fact_as_of": fact_as_of, "data": evidence,
+    }]}, fact_as_of
 
 
 def sina_payload(body: str, symbols: list[dict[str, str]], finality: str, *, kind: str) -> tuple[dict[str, object], str]:
@@ -658,6 +728,24 @@ def main() -> None:
                 payload, normalized, str(request.get("required_at") or ""), "equity",
                 inputs.get("tencent_minute_url"), finality=finality,
             )
+        result(payload, fact_as_of=fact_as_of)
+        return
+    if mode == "cn_equity_current_bar":
+        symbols = inputs.get("symbols")
+        if not isinstance(symbols, list) or not symbols or len({str(value).strip() for value in symbols}) != len(symbols):
+            fail(64, "symbols must be a non-empty, deduplicated array")
+        freq = str(inputs.get("freq") or "")
+        if freq not in {"1m", "30m"}:
+            fail(64, "current Bar frequency must be 1m or 30m")
+        finality = str(request.get("finality") or "observed")
+        if finality not in {"observed", "realtime", "intraday", "close", "official_close"}:
+            fail(64, "unsupported current Bar finality")
+        normalized = [identity(symbol) for symbol in symbols]
+        base_url = safe_url(inputs.get("markethub_url") or "http://yosef-server:8803/api/stocks/quotes")
+        separator = "&" if "?" in base_url else "?"
+        url = base_url + separator + "codes=" + quote_plus(",".join(item["symbol"] for item in normalized)) + "&freq=" + freq + "&datetime=now&count=1&adjust=none"
+        resolved_url, body = fetch(url)
+        payload, fact_as_of = current_bar_payload(body, normalized, freq, finality, resolved_url)
         result(payload, fact_as_of=fact_as_of)
         return
     if mode in {"cn_market_index_batch", "cn_market_index_tencent", "cn_market_index_sina"}:

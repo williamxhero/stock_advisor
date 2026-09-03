@@ -1,6 +1,7 @@
 """Structured, local-only acquisition followed by an immutable evidence seal."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -71,6 +72,19 @@ RESEARCH_PLAN_SCHEMA: dict[str, Any] = {
 }
 
 
+def _research_plan_schema(evidence_contract: dict[str, Any]) -> dict[str, Any]:
+    """Bind planner output to the contract's canonical requirement vocabulary."""
+    schema = copy.deepcopy(RESEARCH_PLAN_SCHEMA)
+    requirement_keys = sorted({
+        str(row.get("key") or "")
+        for row in evidence_contract.get("requirements") or []
+        if isinstance(row, dict) and str(row.get("key") or "")
+    })
+    if requirement_keys:
+        schema["properties"]["operations"]["items"]["properties"]["requirement_key"]["enum"] = requirement_keys
+    return schema
+
+
 _OPERATIONS = {
     "market": {"market_snapshot", "market_breadth", "sector_snapshot", "holding_snapshot", "current_bar"},
     "gateway": {"web_search", "web_read", "web_browser"},
@@ -126,7 +140,8 @@ class BrokerResearchPlanner:
             "deterministic_requirement_keys": _deterministic_requirement_keys(packet.get("evidence_contract") or {})
             if packet.get("deterministic_injection") is True else [],
             "instruction": (
-                "Return only a version 1 research plan. Deterministic index, breadth, portfolio-quote and "
+                "Return only a version 1 research plan. Copy requirement_key exactly from evidence_contract.requirements; "
+                "never invent, rename, split, or broaden requirement keys. Deterministic index, breadth, portfolio-quote and "
                 "per-holding event searches are injected locally from the frozen contract; do not substitute "
                 "or broaden their symbols. Use gateway web_search only for discovery and "
                 "gateway web_read for source verification. Use market operations only when market appears in "
@@ -142,7 +157,8 @@ class BrokerResearchPlanner:
         }
         request = BrokerRequest(
             stage="research", packet=planning_packet, packet_sha256=canonical_packet_hash(planning_packet),
-            intellect=self.intellect, effort=self.effort, schema=RESEARCH_PLAN_SCHEMA,
+            intellect=self.intellect, effort=self.effort,
+            schema=_research_plan_schema(planning_packet["evidence_contract"] or {}),
             visible_stream=False, absolute_deadline=float(self.deadline()), verifier_name="research-plan/v1",
             verifier=lambda output: _verify_research_plan(planning_packet, output),
         )

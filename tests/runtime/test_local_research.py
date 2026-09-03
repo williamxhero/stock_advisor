@@ -274,6 +274,21 @@ class LocalResearchTests(unittest.TestCase):
         self.assertNotIn("tools", request.packet)
         self.assertTrue(request.verifier({"version": 1, "operations": [row("web_search", query="收盘")]})["passed"])
 
+    def test_planner_schema_only_allows_exact_contract_requirement_keys(self) -> None:
+        broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})
+        contract = {**CONTRACT, "requirements": [
+            *CONTRACT["requirements"],
+            {"key": "events", "blocking": True, "window": CONTRACT["requirements"][0]["window"]},
+        ]}
+        planner = BrokerResearchPlanner(broker, intellect="smart", effort="medium", deadline=lambda: 123.0)
+
+        planner({"as_of": CONTRACT["as_of"], "evidence_contract": contract}, [], 0)
+
+        request = broker.invoke.call_args.args[0]
+        requirement_schema = request.schema["properties"]["operations"]["items"]["properties"]["requirement_key"]
+        self.assertEqual(["events", "market"], requirement_schema["enum"])
+        self.assertIn("Copy requirement_key exactly", request.packet["instruction"])
+
     def test_planner_converts_chinese_market_close_to_shanghai_time(self) -> None:
         broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})
         planner = BrokerResearchPlanner(broker, intellect="smart", effort="medium", deadline=lambda: 123.0)

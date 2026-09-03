@@ -308,9 +308,13 @@ class ToolCatalogMarketBackend:
         # made a valid pre-freeze snapshot invisible and forced a later live
         # read, which the frozen-time gate correctly rejected.
         home = os.environ.get("AI_TRADING_COMPANION_HOME")
+        snapshot_name = (
+            "market-breadth-official-close-snapshot.json"
+            if finality == "official_close" else "market-breadth-snapshot.json"
+        )
         path = (
-            Path(home) / "runtime" / "market-breadth-snapshot.json"
-            if home else self.runner.catalog.root.parent / "market-breadth-snapshot.json"
+            Path(home) / "runtime" / snapshot_name
+            if home else self.runner.catalog.root.parent / snapshot_name
         )
         try:
             cached = json.loads(path.read_text(encoding="utf-8"))

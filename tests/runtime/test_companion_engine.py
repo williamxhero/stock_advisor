@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from ai_trading_companion.engine import CompanionEngine, iso, parse
@@ -14,6 +15,7 @@ from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.__main__ import (
     FORMAL_MEMORY_MAX_ACTIONS,
     _formal_adaptive_research,
+    _prefetch_market_breadth,
     _market_breadth_prefetch_loop,
     run_m1,
     run_pending_m1,
@@ -70,6 +72,37 @@ class CompanionEngineTests(unittest.TestCase):
         _market_breadth_prefetch_loop(StopAfterTwoWaits(), interval_seconds=0, run_once=lambda: calls.append("prefetch"))
 
         self.assertEqual(["prefetch", "prefetch"], calls)
+
+    def test_post_close_prefetch_persists_official_breadth_snapshot(self):
+        from ai_trading_companion.tooling import EvidenceResolution
+
+        runner = Mock()
+        runner.resolve_with_fallback.return_value = EvidenceResolution(
+            True, "cn_market_breadth", "1.1.3", "2026-09-02T07:00:01Z", "2026-09-02T07:00:02Z",
+            {
+                "source": "official_close_prefetch", "finality": "official_close",
+                "source_urls": ["https://example.test/close"],
+                "breadth": {"up": 9, "down": 8, "flat": 7},
+            },
+            "artifact:sha256:" + "a" * 64, None, (), attempts=("default:succeeded",),
+        )
+        with tempfile.TemporaryDirectory() as home:
+            runtime = Path(home) / "runtime"
+            runtime.mkdir()
+            paths = SimpleNamespace(runtime=runtime, tools=Path(home) / "tools")
+            with patch("ai_trading_companion.__main__.PATHS", paths), \
+                 patch("ai_trading_companion.__main__.ToolCatalog"), \
+                 patch("ai_trading_companion.__main__.ToolRunner", return_value=runner), \
+                 patch("ai_trading_companion.__main__._BREADTH_PREFETCH_LOCK") as lock, \
+                 patch("ai_trading_companion.__main__.datetime") as mocked_datetime:
+                lock.acquire.return_value = True
+                mocked_datetime.now.return_value = datetime(2026, 9, 2, 15, 1, tzinfo=timezone.utc)
+                _prefetch_market_breadth()
+
+            request = runner.resolve_with_fallback.call_args.args[0]
+            self.assertEqual("official_close", request.finality)
+            snapshot = json.loads((runtime / "market-breadth-official-close-snapshot.json").read_text(encoding="utf-8"))
+            self.assertEqual("official_close", snapshot["data"]["finality"])
 
     def test_user_visible_event_cannot_bypass_the_v2_publication_contract(self):
         for event_type in published_event_types():

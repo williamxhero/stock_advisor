@@ -52,7 +52,7 @@ from .local_research import (
     BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
     ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend,
 )
-from .tooling import ToolCatalog, ToolRunner
+from .tooling import FactRequest, ToolCatalog, ToolRunner
 from .tool_manager import ToolManagerRuntime
 from .store import CompanionStore
 from .trading_calendar import XshgTradingCalendar
@@ -463,7 +463,12 @@ def _prefetch_market_breadth() -> None:
     """Persist a recent public breadth snapshot for the next frozen task boundary."""
     if not _BREADTH_PREFETCH_LOCK.acquire(blocking=False):
         return
-    target = PATHS.runtime / "market-breadth-snapshot.json"
+    finality = "official_close" if datetime.now(SHANGHAI).hour >= 15 else "intraday"
+    snapshot_name = (
+        "market-breadth-official-close-snapshot.json"
+        if finality == "official_close" else "market-breadth-snapshot.json"
+    )
+    target = PATHS.runtime / snapshot_name
     try:
         if target.exists() and (time.time() - target.stat().st_mtime) < 30:
             return
@@ -471,7 +476,7 @@ def _prefetch_market_breadth() -> None:
         resolution = ToolRunner(ToolCatalog(PATHS.tools)).resolve_with_fallback(FactRequest(
             contract_version=1, capability="cn_market_breadth", required_at=requested_at,
             deadline_seconds=8.0, inputs={}, context={"purpose": "runtime_prefetch"},
-            freshness_seconds=0.0, finality="intraday",
+            freshness_seconds=0.0, finality=finality,
         ))
         if not resolution.succeeded or resolution.data is None or not resolution.fact_as_of:
             return

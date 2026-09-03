@@ -504,6 +504,38 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual("official_close", request.finality)
         self.assertEqual("2026-09-01T07:20:00Z", request.required_at)
 
+    def test_premarket_uses_yesterday_official_close_breadth_snapshot(self) -> None:
+        contract = {
+            "version": 4, "as_of": "2026-09-03T00:30:05Z",
+            "requirements": [{
+                "key": "market_breadth", "blocking": True, "allowed_coverage": ["covered"],
+                "finality": "official_close",
+                "window": {"mode": "exact", "start": "2026-09-02T07:00:00Z", "end": "2026-09-02T07:00:00Z"},
+            }],
+        }
+        runner = mock.Mock()
+        runner.catalog.root = Path(tempfile.gettempdir()) / "missing-market-tools"
+
+        with tempfile.TemporaryDirectory() as home:
+            runtime = Path(home) / "runtime"
+            runtime.mkdir()
+            (runtime / "market-breadth-official-close-snapshot.json").write_text(json.dumps({
+                "fact_as_of": "2026-09-02T07:00:00Z",
+                "data": {
+                    "source": "official_close_prefetch", "finality": "official_close",
+                    "source_urls": ["https://example.test/close"],
+                    "breadth": {"up": 9, "down": 8, "flat": 7},
+                },
+            }), encoding="utf-8")
+            with mock.patch.dict("os.environ", {"AI_TRADING_COMPANION_HOME": home}):
+                result = ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0)(
+                    "market_breadth", {"_requirement_key": "market_breadth"},
+                )
+
+        runner.resolve_with_fallback.assert_not_called()
+        self.assertEqual("https://example.test/close", result["url"])
+        self.assertEqual("2026-09-02T07:00:00Z", result["results"][0]["fact_as_of"])
+
     def test_post_close_research_uses_tool_fallback_then_freezes_qualified_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "tools"

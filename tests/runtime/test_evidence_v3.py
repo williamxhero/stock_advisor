@@ -449,6 +449,30 @@ class EvidenceV3Tests(TestCase):
         self.assertTrue(accepted["passed"], accepted["problems"])
         self.assertIn("m0_contains_unverified_numeric_claim:0.7", rejected["problems"])
 
+    def test_m0_expression_verifier_accepts_positive_signs_and_trailing_zeroes(self):
+        packet = {"stage": "m0_compose", "verified_fact_digest": [{"excerpt": json.dumps({
+            "quotes": [{"name": "力星股份", "price": 16.8, "change": 0.03, "change_percent": 0.2575}],
+        })}]}
+        output = {"semantic": {
+            "summary": "力星股份报16.80，较前收上涨+0.03，涨幅+0.2575%。",
+            "observations": [], "risks": [], "unknowns": [],
+        }}
+
+        verdict = CognitiveRouter().verify("m0_compose", packet, output)
+
+        self.assertTrue(verdict["passed"], verdict["problems"])
+        wrong_sign = {"semantic": {
+            "summary": "力星股份变动-0.03。", "observations": [], "risks": [], "unknowns": [],
+        }}
+        packet["verified_fact_digest"][0]["excerpt"] = json.dumps({
+            "quotes": [{"symbol": "002150", "change": 0.03}],
+        })
+
+        self.assertIn(
+            "m0_contains_unverified_numeric_claim:-0.03",
+            CognitiveRouter().verify("m0_compose", packet, wrong_sign)["problems"],
+        )
+
     def test_rejects_foreign_reference_and_naive_runtime_time(self):
         foreign = EvidenceGate().evaluate(self._evidence("ev_other_1"), self.contract, self.observations, self.as_of, attempt_id="attempt-1")
         self.assertIn("source_ref_not_in_current_attempt", foreign["problems"])

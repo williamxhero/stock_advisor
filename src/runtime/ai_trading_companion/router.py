@@ -180,7 +180,13 @@ class CognitiveRouter:
                 "已检查且无变化", "完整覆盖", "protocol", "requirement",
             )):
                 problems.append("m0_exposes_internal_process")
-            unknown_numbers = sorted(set(_numeric_tokens(body)) - _verified_numeric_tokens(packet))
+            verified_numbers = {
+                _numeric_comparison_key(value) for value in _verified_numeric_tokens(packet)
+            }
+            unknown_numbers = sorted({
+                value for value in _numeric_tokens(body)
+                if _numeric_comparison_key(value) not in verified_numbers
+            })
             problems.extend(f"m0_contains_unverified_numeric_claim:{value}" for value in unknown_numbers)
         if stage == "m0_compose":
             contract = packet.get("evidence_contract") if isinstance(packet.get("evidence_contract"), dict) else {}
@@ -262,6 +268,16 @@ def _number_text(value: Any) -> str:
 
 def _numeric_tokens(value: str) -> list[str]:
     return re.findall(r"(?<![\dA-Za-z])[-+]?\d+(?:\.\d+)?", value)
+
+
+def _numeric_comparison_key(token: str) -> str:
+    """Normalize harmless display syntax without weakening numeric identity."""
+    unsigned = token[1:] if token.startswith("+") else token
+    if "." not in unsigned:
+        return unsigned
+    integer, fraction = unsigned.split(".", 1)
+    fraction = fraction.rstrip("0")
+    return integer if not fraction else f"{integer}.{fraction}"
 
 
 def _verified_numeric_tokens(packet: dict[str, Any]) -> set[str]:

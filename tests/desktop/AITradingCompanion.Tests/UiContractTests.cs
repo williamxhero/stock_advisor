@@ -194,6 +194,20 @@ public sealed class UiContractTests
     }
 
     [Fact]
+    public void SubmittedMessagesStayLocallyNonStagedUntilTheRuntimeProjectionConfirmsThem()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln"))) root = root.Parent;
+        Assert.NotNull(root);
+        var code = File.ReadAllText(Path.Combine(root.FullName!,
+            "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml.cs"));
+
+        Assert.Contains("_locallySubmittedMessageIds", code, StringComparison.Ordinal);
+        Assert.Contains("message with { State = \"submitted\" }", code, StringComparison.Ordinal);
+        Assert.Contains("message.State != \"staged\"", code, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TodayTaskRowsUseTheCycleIdentityReturnedByTheRuntimeSnapshot()
     {
         var root = new DirectoryInfo(AppContext.BaseDirectory);

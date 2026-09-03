@@ -34,6 +34,7 @@ public partial class MainWindow : Window, IDisposable
     private readonly Dictionary<string, List<CompanionTimelineEntry>> _localStagedByCycle = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _judgmentDrafts;
     private readonly HashSet<string> _locallyWithdrawnMessageIds = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _locallySubmittedMessageIds = new(StringComparer.Ordinal);
     private readonly HashSet<string> _locallyLockedCycles = new(StringComparer.Ordinal);
     private readonly HashSet<string> _editGraceRequestedCycles = new(StringComparer.Ordinal);
     private readonly Dictionary<string, CompanionAiTimelineEntry> _localAiNoticesByCycle = new(StringComparer.Ordinal);
@@ -222,11 +223,9 @@ public partial class MainWindow : Window, IDisposable
         if (!isH0 && staged == 0) return;
         SetLocalAiNotice(_companionProjection.CycleId, "chat_pending", "正在想…");
         if (!await SendCompanionCommandAsync(type, null, showAiError: true)) return;
-        var localStaged = LocalStaged();
-        for (var index = 0; index < localStaged.Count; index++)
+        foreach (var message in CombinedUserMessages().Where(message => message.State == "staged"))
         {
-            if (localStaged[index].State == "staged")
-                localStaged[index] = localStaged[index] with { State = "submitted" };
+            if (message.MessageId is not null) _locallySubmittedMessageIds.Add(message.MessageId);
         }
         if (isH0) _locallyLockedCycles.Add(_companionProjection.CycleId);
         RenderUserMessages();
@@ -389,6 +388,8 @@ public partial class MainWindow : Window, IDisposable
         if (projection.IsH0Locked) _locallyLockedCycles.Remove(projection.CycleId);
         var knownIds = projection.UserMessages.Select(message => message.MessageId).Where(id => id is not null).ToHashSet(StringComparer.Ordinal);
         LocalStaged().RemoveAll(message => message.MessageId is not null && knownIds.Contains(message.MessageId));
+        _locallySubmittedMessageIds.RemoveWhere(messageId => projection.UserMessages.Any(message =>
+            message.MessageId == messageId && message.State != "staged"));
         ResolveLocalAiNotice(projection.CycleId, projection.AiMessages);
         RenderAiMessages(WithLocalAiNotice(projection.CycleId, projection.AiMessages));
         RenderUserMessages();
@@ -662,7 +663,12 @@ public partial class MainWindow : Window, IDisposable
         return projected.Concat(LocalStaged())
             .Where(message => message.MessageId is null || !_locallyWithdrawnMessageIds.Contains(message.MessageId))
             .GroupBy(message => message.MessageId ?? $"{message.At:O}-{message.Text}", StringComparer.Ordinal)
-            .Select(group => group.Last());
+            .Select(group => group.Last())
+            .Select(message => message.MessageId is not null
+                && message.State == "staged"
+                && _locallySubmittedMessageIds.Contains(message.MessageId)
+                    ? message with { State = "submitted" }
+                    : message);
     }
 
     private List<CompanionTimelineEntry> LocalStaged()

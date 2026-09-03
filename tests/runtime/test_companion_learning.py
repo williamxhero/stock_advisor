@@ -314,6 +314,9 @@ class CompanionLearningTests(unittest.TestCase):
         }, packet["calendar_context"])
         self.assertEqual("m0_objective_observation_only", packet["protocol"]["stage_scope"])
         self.assertNotIn("建议总股票仓位", packet["protocol"]["text"])
+        compact_protocol = "".join(packet["protocol"]["text"].split()).lower()
+        for internal_marker in ("本阶段", "m0客观观察", "冻结工具", "确定性投影", "冻结证据"):
+            self.assertNotIn(internal_marker, compact_protocol)
         rejected = CognitiveRouter().verify("m0_compose", packet, {
             "m0_markdown": "`状态: skipped` 2026-08-31为周日，非A股交易日。",
         })

@@ -341,10 +341,9 @@ class RuntimePacketBuilder:
                 "protocol_id": protocol_id,
                 "stage_scope": "m0_objective_observation_only",
                 "text": (
-                    "本阶段只形成 M0 客观观察，不执行完整协议中的操作决策章节。"
-                    "只陈述已冻结证据支持的市场事实、证据冲突和未知项；"
+                    "直接描述交易者此刻最值得注意的客观盘面，只陈述有事实支持的市场状况、冲突和未知项；"
                     "禁止方向判断、预测、机会排序、买卖、持有、加减仓、清仓、目标仓位、具体股数或金额。"
-                    "完整执行协议将在独立 M1 阶段使用。"
+                    "方向与操作决策由后续独立判断处理。"
                 ),
             }
         definitions = json.loads(

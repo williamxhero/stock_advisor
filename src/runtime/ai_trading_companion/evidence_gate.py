@@ -345,6 +345,11 @@ class _EvidenceGateV3:
                 if complete != expected:
                     problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
                 continue
+            if key == "market_breadth":
+                breadth_facts = self._market_breadth_facts(bound)
+                if len(breadth_facts) < int(requirement.get("minimum_numeric_facts") or 0):
+                    problems.append(f"blocking_requirement_lacks_numeric_facts:{key}"); missing.append(key)
+                continue
             support = " ".join(EvidenceGate._normalize_text(item.get("excerpt")) for item in bound)
             term_groups = requirement.get("evidence_terms") or []
             if any(not any(str(term) in support for term in group) for group in term_groups):
@@ -357,11 +362,6 @@ class _EvidenceGateV3:
                 absent_entities = [entity for entity in required_entities if entity not in quote_facts]
                 if absent_entities:
                     problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
-                continue
-            if key == "market_breadth":
-                breadth_facts = self._market_breadth_facts(bound)
-                if len(breadth_facts) < int(requirement.get("minimum_numeric_facts") or 0):
-                    problems.append(f"blocking_requirement_lacks_numeric_facts:{key}"); missing.append(key); continue
                 continue
             numeric_facts = set(re.findall(
                 r"(?<![\d.])\d+(?:\.\d+)?\s*(?:%|％|万亿元|亿元|万亿|亿|万家|家|只|股|元)", support,

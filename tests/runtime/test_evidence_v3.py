@@ -322,6 +322,7 @@ class EvidenceV3Tests(TestCase):
         contract = {"version": 4, "as_of": as_of, "requirements": [{
             "key": "market_breadth", "blocking": True, "allowed_coverage": ["covered"],
             "minimum_numeric_facts": 3,
+            "evidence_terms": [["上涨"], ["下跌"], ["家", "只"]],
             "window": {"mode": "after_start_to_end", "start": "2026-08-31T01:30:00Z", "end": as_of},
         }]}
         excerpt = json.dumps({"breadth": {"up": 632, "down": 2203, "flat": 57}}, ensure_ascii=False)

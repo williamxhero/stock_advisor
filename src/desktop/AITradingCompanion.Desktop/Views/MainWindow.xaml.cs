@@ -53,6 +53,7 @@ public partial class MainWindow : Window, IDisposable
     private string? _voiceOriginCycleId;
     private string? _voiceContextFile;
     private bool _suppressDraftUpdate;
+    private bool _inputActionInFlight;
     private bool _disposed;
 
     public MainWindow(MainViewModel viewModel, AppPaths paths)
@@ -149,13 +150,26 @@ public partial class MainWindow : Window, IDisposable
 
     private async void MainSend_Click(object sender, RoutedEventArgs e)
     {
-        if (_companionProjection is null) return;
+        if (_inputActionInFlight) return;
+        _inputActionInFlight = true;
+        UpdateInputState();
+        try { await StageCurrentInputAsync(); }
+        finally
+        {
+            _inputActionInFlight = false;
+            UpdateInputState();
+        }
+    }
+
+    private async Task<bool> StageCurrentInputAsync()
+    {
+        if (_companionProjection is null) return false;
         var text = MainJudgmentInputBox.Text.Trim();
-        if (string.IsNullOrWhiteSpace(text)) return;
+        if (string.IsNullOrWhiteSpace(text)) return false;
         var messageId = _editingStagedMessageId ?? Guid.NewGuid().ToString();
         var phase = CompanionInputPolicy.MessagePhase(_companionProjection.State, IsH0LockedForUi());
         var editing = _editingStagedMessageId is not null;
-        if (!await SendCompanionCommandAsync(editing ? "edit_staged_message" : "stage_message", text, messageId: messageId)) return;
+        if (!await SendCompanionCommandAsync(editing ? "edit_staged_message" : "stage_message", text, messageId: messageId)) return false;
         if (editing)
         {
             var index = LocalStaged().FindIndex(message => message.MessageId == messageId);
@@ -172,23 +186,50 @@ public partial class MainWindow : Window, IDisposable
         }
         RenderUserMessages();
         UpdateInputState();
+        return true;
     }
 
     private async void MainCommit_Click(object sender, RoutedEventArgs e)
     {
+        if (_companionProjection is null || _inputActionInFlight) return;
+        _inputActionInFlight = true;
+        UpdateInputState();
+        try { await CommitCurrentInputAsync(); }
+        finally
+        {
+            _inputActionInFlight = false;
+            UpdateInputState();
+        }
+    }
+
+    private async Task CommitCurrentInputAsync()
+    {
         if (_companionProjection is null) return;
+        var hasDraftText = !string.IsNullOrWhiteSpace(MainJudgmentInputBox.Text);
+        var h0Locked = IsH0LockedForUi();
+        var staged = CombinedUserMessages().Count(message => message.State == "staged");
+        if (!CompanionInputPolicy.CanCommit(_companionProjection.State, h0Locked, staged, hasDraftText)) return;
+        if (hasDraftText && !await StageCurrentInputAsync()) return;
+
         var isConversation = _companionProjection.State == "open";
         var isPreM0 = _companionProjection.State == "queued";
         var isH0 = !isPreM0 && !IsH0LockedForUi();
         if (isConversation) isH0 = false;
-        var staged = CombinedUserMessages().Count(message => message.State == "staged");
-        var h0Locked = IsH0LockedForUi();
+        staged = CombinedUserMessages().Count(message => message.State == "staged");
+        h0Locked = IsH0LockedForUi();
         if (!CompanionInputPolicy.CanCommit(_companionProjection.State, h0Locked, staged)) return;
         var type = isConversation ? "commit_conversation_batch" : isPreM0 ? "commit_pre_m0" : isH0 ? "commit_h0" : "commit_chat_batch";
         if (!isH0 && staged == 0) return;
         SetLocalAiNotice(_companionProjection.CycleId, "chat_pending", "正在想…");
         if (!await SendCompanionCommandAsync(type, null, showAiError: true)) return;
+        var localStaged = LocalStaged();
+        for (var index = 0; index < localStaged.Count; index++)
+        {
+            if (localStaged[index].State == "staged")
+                localStaged[index] = localStaged[index] with { State = "submitted" };
+        }
         if (isH0) _locallyLockedCycles.Add(_companionProjection.CycleId);
+        RenderUserMessages();
         UpdateInputState();
     }
 
@@ -732,7 +773,7 @@ public partial class MainWindow : Window, IDisposable
     private void UpdateInputState()
     {
         if (!IsInitialized) return;
-        var busy = _voiceState is VoiceInputState.Recording or VoiceInputState.Transcribing;
+        var busy = _inputActionInFlight || _voiceState is VoiceInputState.Recording or VoiceInputState.Transcribing;
         var hasCycle = _companionProjection is not null;
         var supportsMessaging = CompanionInputPolicy.CanDraft(_companionProjection?.State);
         var h0Locked = IsH0LockedForUi();
@@ -741,7 +782,8 @@ public partial class MainWindow : Window, IDisposable
         MainSendButton.IsEnabled = !busy && hasCycle && supportsMessaging && !string.IsNullOrWhiteSpace(MainJudgmentInputBox.Text);
         MainCommitButton.Content = CompanionInputPolicy.CommitLabel(_companionProjection?.State, h0Locked);
         MainCommitButton.IsEnabled = !busy && hasCycle
-            && CompanionInputPolicy.CanCommit(_companionProjection?.State, h0Locked, staged);
+            && CompanionInputPolicy.CanCommit(_companionProjection?.State, h0Locked, staged,
+                hasDraftText: !string.IsNullOrWhiteSpace(MainJudgmentInputBox.Text));
         MainVoiceButton.IsEnabled = hasCycle && supportsMessaging && _voiceState != VoiceInputState.Transcribing;
         MainVoiceButton.Content = _voiceState switch
         {

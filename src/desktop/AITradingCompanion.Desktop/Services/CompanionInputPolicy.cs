@@ -9,8 +9,8 @@ public static class CompanionInputPolicy
     public static string MessagePhase(string? state, bool h0Locked) =>
         state == "open" ? "conversation" : state == "queued" ? "pre_m0" : h0Locked ? "chat" : "h0";
 
-    public static bool CanCommit(string? state, bool h0Locked, int stagedMessages) =>
-        CanDraft(state) && (state == "queued" ? stagedMessages > 0 : !h0Locked || stagedMessages > 0);
+    public static bool CanCommit(string? state, bool h0Locked, int stagedMessages, bool hasDraftText = false) =>
+        CanDraft(state) && (hasDraftText || (state == "queued" ? stagedMessages > 0 : !h0Locked || stagedMessages > 0));
 
     public static string CommitLabel(string? state, bool h0Locked) =>
         state is "open" or "queued" || h0Locked ? "提交" : "提交 H0";

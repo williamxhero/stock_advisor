@@ -33,4 +33,11 @@ public sealed class CompanionInputPolicyTests
         Assert.True(CompanionInputPolicy.CanCommit("open", h0Locked: false, stagedMessages: 1));
         Assert.Equal("提交", CompanionInputPolicy.CommitLabel("open", h0Locked: false));
     }
+
+    [Fact]
+    public void DraftTextCanBeCommittedAsOneSendAndCommitAction()
+    {
+        Assert.True(CompanionInputPolicy.CanCommit("queued", h0Locked: false, stagedMessages: 0, hasDraftText: true));
+        Assert.True(CompanionInputPolicy.CanCommit("awaiting_h0", h0Locked: true, stagedMessages: 0, hasDraftText: true));
+    }
 }

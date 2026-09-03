@@ -201,8 +201,7 @@
                         <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
                         <Grid>
                             <TextBox x:Name="MainJudgmentInputBox" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="76" MaxHeight="160"
-                                     TextChanged="MainJudgmentInputBox_TextChanged" VerticalScrollBarVisibility="Auto"
-                                     ToolTip="文字只保存在当前判断草稿中；点击发送后进入待提交区。" />
+                                     TextChanged="MainJudgmentInputBox_TextChanged" VerticalScrollBarVisibility="Auto" />
                             <Canvas x:Name="WaveformCanvas" MinHeight="76" IsHitTestVisible="False" Visibility="Collapsed"
                                     Background="#E60E1726" ClipToBounds="True">
                                 <Polyline x:Name="WaveformLine" Stroke="{StaticResource AccentBrush}" StrokeThickness="2" StrokeLineJoin="Round" />

@@ -482,26 +482,39 @@ def _prefetch_market_breadth() -> None:
     """Persist a recent public breadth snapshot for the next frozen task boundary."""
     if not _BREADTH_PREFETCH_LOCK.acquire(blocking=False):
         return
-    finality = "official_close" if datetime.now(SHANGHAI).hour >= 15 else "intraday"
+    local_now = datetime.now(SHANGHAI)
+    finality = "official_close" if local_now.hour >= 15 else "intraday"
     snapshot_name = (
         "market-breadth-official-close-snapshot.json"
         if finality == "official_close" else "market-breadth-snapshot.json"
     )
     target = PATHS.runtime / snapshot_name
     try:
-        if target.exists() and (time.time() - target.stat().st_mtime) < 30:
-            return
         requested_at = iso(datetime.now(timezone.utc) + timedelta(seconds=30))
-        resolution = ToolRunner(ToolCatalog(PATHS.tools)).resolve_with_fallback(FactRequest(
+        request = FactRequest(
             contract_version=1, capability="cn_market_breadth", required_at=requested_at,
             deadline_seconds=8.0, inputs={}, context={"purpose": "runtime_prefetch"},
             freshness_seconds=0.0, finality=finality,
-        ))
+        )
+        runner = ToolRunner(ToolCatalog(PATHS.tools))
+        if target.exists():
+            try:
+                cached = json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                cached = None
+            if (
+                isinstance(cached, dict)
+                and runner.cached_resolution_is_valid(request, cached)
+                and (finality == "official_close" or (time.time() - target.stat().st_mtime) < 30)
+            ):
+                return
+        resolution = runner.resolve_with_fallback(request)
         if not resolution.succeeded or resolution.data is None or not resolution.fact_as_of:
             return
         temporary = target.with_suffix(".tmp")
         temporary.write_text(json.dumps({"fact_as_of": resolution.fact_as_of, "data": resolution.data,
-                                         "raw_artifact_ref": resolution.raw_artifact_ref}, ensure_ascii=False), encoding="utf-8")
+                                         "raw_artifact_ref": resolution.raw_artifact_ref,
+                                         "technical_validation": list(resolution.technical_validation)}, ensure_ascii=False), encoding="utf-8")
         temporary.replace(target)
     except Exception:
         # A prefetch never changes a formal task's outcome except by making a

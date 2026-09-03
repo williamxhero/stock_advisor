@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -173,6 +175,13 @@ class CognitiveRouter:
                 wrong_labels = {f"星期{suffix}" for suffix in "一二三四五六日"} | {f"周{suffix}" for suffix in "一二三四五六日"}
                 if any(f"{expected_date}为{label}" in body for label in wrong_labels - expected_labels):
                     problems.append("m0_calendar_weekday_conflict")
+            if any(marker in body for marker in (
+                "本阶段", "m0客观观察", "冻结工具", "确定性投影", "冻结证据",
+                "已检查且无变化", "完整覆盖", "protocol", "requirement",
+            )):
+                problems.append("m0_exposes_internal_process")
+            unknown_numbers = sorted(set(_numeric_tokens(body)) - _verified_numeric_tokens(packet))
+            problems.extend(f"m0_contains_unverified_numeric_claim:{value}" for value in unknown_numbers)
         if stage == "m0_compose":
             contract = packet.get("evidence_contract") if isinstance(packet.get("evidence_contract"), dict) else {}
             portfolio_requirement = next((
@@ -181,16 +190,21 @@ class CognitiveRouter:
             ), {})
             entities = [str(value).lower() for value in portfolio_requirement.get("required_entities") or [] if str(value)]
             body = "".join(normalized.text.split()).lower()
-            missing_entities = [entity for entity in entities if entity not in body]
-            if missing_entities:
-                problems.append("m0_missing_portfolio_market_coverage:" + ",".join(missing_entities))
             if entities and any(marker in body for marker in ("未覆盖", "未被覆盖", "没有持仓行情", "持仓行情未知")):
                 problems.append("m0_claims_portfolio_quote_gap_despite_qualified_evidence")
             quotes = _frozen_portfolio_quotes(packet.get("verified_fact_digest"))
+            mentioned_entities = [entity for entity in entities if entity in body]
+            if len(mentioned_entities) > 2:
+                problems.append("m0_overloads_reply_with_holding_quotes")
             for entity in entities:
+                if entity not in body:
+                    continue
                 quote = quotes.get(entity)
                 if quote is None:
                     problems.append("m0_missing_verified_portfolio_quote:" + entity)
+                    continue
+                detail_markers = ("价格", "前收", "变动", "涨幅", "变动幅度")
+                if sum(marker in body for marker in detail_markers) < 2:
                     continue
                 for field in ("price", "previous_close", "change", "change_percent"):
                     value = quote.get(field)
@@ -244,6 +258,58 @@ def _walk_quotes(value: Any) -> list[dict[str, Any]]:
 def _number_text(value: Any) -> str:
     number = float(value)
     return (f"{number:.4f}").rstrip("0").rstrip(".")
+
+
+def _numeric_tokens(value: str) -> list[str]:
+    return re.findall(r"(?<![\dA-Za-z])[-+]?\d+(?:\.\d+)?", value)
+
+
+def _verified_numeric_tokens(packet: dict[str, Any]) -> set[str]:
+    exact_tokens = set(_numeric_tokens(json.dumps(packet, ensure_ascii=False, sort_keys=True)))
+    tokens = {
+        alias
+        for value in exact_tokens
+        for alias in _numeric_display_aliases(value)
+    }
+    for key in ("as_of", "scheduled_for"):
+        value = packet.get(key)
+        if not value:
+            continue
+        try:
+            local = datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(ZoneInfo("Asia/Shanghai"))
+        except ValueError:
+            continue
+        tokens.update(_numeric_tokens(local.isoformat()))
+        tokens.update((local.strftime("%H"), local.strftime("%M"), local.strftime("%S")))
+    for quote in _frozen_portfolio_quotes(packet.get("verified_fact_digest")).values():
+        local_time = _china_quote_time(quote.get("quote_at"))
+        if local_time:
+            tokens.update(_numeric_tokens(local_time))
+    return tokens
+
+
+def _numeric_display_aliases(token: str) -> set[str]:
+    """Allow ordinary display rounding without admitting unrelated numbers."""
+    aliases = {token}
+    try:
+        number = Decimal(token)
+    except InvalidOperation:
+        return aliases
+    canonical = _compact_decimal(number)
+    aliases.add(canonical or "0")
+    decimal_places = max(0, -number.as_tuple().exponent)
+    for places in range(1, min(decimal_places, 3)):
+        quantum = Decimal(1).scaleb(-places)
+        rounded = _compact_decimal(number.quantize(quantum, rounding=ROUND_HALF_UP))
+        aliases.add(rounded or "0")
+    if decimal_places and abs(number) >= 10:
+        aliases.add(format(number.quantize(Decimal("1"), rounding=ROUND_HALF_UP), "f"))
+    return aliases
+
+
+def _compact_decimal(number: Decimal) -> str:
+    rendered = format(number, "f")
+    return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
 
 
 def _china_quote_time(value: Any) -> str | None:

@@ -11,6 +11,14 @@ from .store import now
 
 STATE_TERMS = re.compile(r"买入|卖出|成交|加仓|减仓|清仓|持仓|成本|仓位|总资产|股票资产")
 FUTURE_TERMS = re.compile(r"计划|准备|打算|考虑|建议|如果|若|明天|等到|满足.*后")
+COMPLETE_PORTFOLIO_SCOPE_MARKERS = (
+    "完整账户", "完整持仓", "全部持仓", "全量持仓", "所有持仓", "这是全部", "以下为全部",
+)
+_COMPLETE_PORTFOLIO_SCOPE = "(?:" + "|".join(map(re.escape, COMPLETE_PORTFOLIO_SCOPE_MARKERS)) + ")"
+INCOMPLETE_PORTFOLIO_SCOPE = re.compile(
+    rf"(?:不是|并非|不包含|未包含|没包含|还没|尚未).{{0,8}}{_COMPLETE_PORTFOLIO_SCOPE}|"
+    rf"{_COMPLETE_PORTFOLIO_SCOPE}.{{0,8}}(?:并不完整|不完整|未列全|没列全|未列完|没列完|还有遗漏)"
+)
 
 
 def is_portfolio_statement(text: str) -> bool:
@@ -20,6 +28,13 @@ def is_portfolio_statement(text: str) -> bool:
 def is_future_action_statement(text: str) -> bool:
     action = re.search(r"买入|卖出|加仓|减仓|清仓", text)
     return bool(action and FUTURE_TERMS.search(text[:action.start()]))
+
+
+def has_complete_portfolio_scope(text: str) -> bool:
+    return (
+        any(marker in text for marker in COMPLETE_PORTFOLIO_SCOPE_MARKERS)
+        and not INCOMPLETE_PORTFOLIO_SCOPE.search(text)
+    )
 
 
 class PortfolioService:
@@ -200,8 +215,7 @@ class PortfolioService:
         source_artifact_id: str | None,
     ) -> dict[str, Any]:
         """Atomically replace positions only when the user explicitly says the scope is complete."""
-        completeness_markers = ("完整账户", "完整持仓", "全部持仓", "全量持仓", "这是全部", "以下为全部")
-        if not any(marker in source_text for marker in completeness_markers):
+        if not has_complete_portfolio_scope(source_text):
             return self._record_needs_input(
                 source_text, {"statement_type": "current_state", "changes": changes},
                 cycle_id, source_artifact_id, ["明确的完整账户或全部持仓范围"],

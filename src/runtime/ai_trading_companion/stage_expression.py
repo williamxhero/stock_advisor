@@ -68,6 +68,17 @@ def express_stage_semantics(stage: str, semantic: dict[str, Any]) -> str:
     if not summary:
         raise ValueError(f"{stage} semantic summary is required")
     paragraphs = [summary]
+    if stage == "m0":
+        observations = [str(value).strip() for value in semantic.get("observations") or [] if str(value).strip()][:2]
+        risks = [str(value).strip() for value in semantic.get("risks") or [] if str(value).strip()][:1]
+        unknowns = [str(value).strip() for value in semantic.get("unknowns") or [] if str(value).strip()][:1]
+        if observations:
+            paragraphs.append("我主要依据的是：" + "；".join(observations) + "。")
+        if risks:
+            paragraphs.append("需要防的是：" + risks[0] + "。")
+        if unknowns:
+            paragraphs.append("现在最影响判断的缺口是：" + unknowns[0] + "。")
+        return "\n\n".join(paragraphs)
     if stage in {"m1", "m2"}:
         direction = str(semantic.get("direction") or "").strip()
         if direction:

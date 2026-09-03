@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .backup import BackupManager
-from .cognition import UnifiedCognition
+from .cognition import UnifiedCognition, verify_cognition_result
 from .cognition_expression import express_cognition_answer
 from .adaptive_memory import AdaptiveMemoryResearch, MemoryResearchError
 from .broker_client import BrokerError, BrokerRequest, BrokerResponse, ProviderBrokerClient, canonical_packet_hash
@@ -492,43 +492,6 @@ def _prefetch_market_breadth() -> None:
         _BREADTH_PREFETCH_LOCK.release()
 
 
-def _anchor_m0_facts(output: dict[str, Any], packet: dict[str, Any]) -> dict[str, Any]:
-    """Keep immutable market facts out of free-form model generation."""
-    if packet.get("stage") != "m0_compose" or not isinstance(output.get("semantic"), dict):
-        return output
-    anchored = json.loads(json.dumps(output, ensure_ascii=False))
-    facts: list[str] = []
-    for row in packet.get("verified_fact_digest") or []:
-        try:
-            payload = json.loads(str(row.get("excerpt") or ""))
-        except (AttributeError, TypeError, ValueError):
-            continue
-        for index in payload.get("indices") or []:
-            if isinstance(index, dict):
-                facts.append(
-                    f"{index.get('name') or index.get('symbol')}：{index.get('price')}，前收{index.get('previous_close')}，"
-                    f"变动{index.get('change')}，变动幅度{index.get('change_percent')}%。"
-                )
-        breadth = payload.get("breadth")
-        if isinstance(breadth, dict):
-            facts.append(f"市场广度：上涨{breadth.get('up')}家，下跌{breadth.get('down')}家，平盘{breadth.get('flat')}家。")
-        for quote in payload.get("quotes") or []:
-            if not isinstance(quote, dict):
-                continue
-            local = str(quote.get("quote_at_china") or quote.get("quote_at") or "")
-            clock = local[-5:] if len(local) >= 5 else local
-            status = "交易状态" if quote.get("status") == "trading" else str(quote.get("status") or "状态未知")
-            facts.append(
-                f"{quote.get('name') or quote.get('symbol')}（{quote.get('symbol')}）北京时间{clock}："
-                f"价格{quote.get('price')}，前收{quote.get('previous_close')}，变动{quote.get('change')}，"
-                f"变动幅度{quote.get('change_percent')}%，{status}。"
-            )
-    if facts:
-        anchored["semantic"]["summary"] = "本阶段为 M0 客观观察；以下行情字段由冻结工具结果确定性投影。"
-        anchored["semantic"]["observations"] = facts
-    return anchored
-
-
 def _call_stage(
     store: CompanionStore,
     cycle: dict[str, Any],
@@ -640,7 +603,7 @@ def _call_stage(
         if not search or not schema_name.startswith("companion-evidence-result-"):
             schema = json.loads((SCHEMAS / schema_name).read_text(encoding="utf-8"))
             def verified_output(output: dict[str, Any]) -> dict[str, Any]:
-                return router.verify(stage, packet, _anchor_m0_facts(output, packet))
+                return router.verify(stage, packet, output)
             request = BrokerRequest(
                 stage=stage, packet=request_packet, packet_sha256=request_hash,
                 intellect=decision.intellect, effort=decision.reasoning_effort, schema=schema,
@@ -653,7 +616,7 @@ def _call_stage(
             outcome = broker.invoke(request)
             if not isinstance(outcome.result, dict):
                 raise BrokerError(f"Broker produced no qualified result for {stage}", category="broker_output_invalid")
-            data = _anchor_m0_facts(outcome.result, packet)
+            data = outcome.result
             verifier = router.verify(stage, packet, data)
             if evidence_verifier is not None:
                 verifier["evidence_gate"] = evidence_verifier
@@ -1942,8 +1905,8 @@ def run_unified_cognition(
                 schema=json.loads((SCHEMAS / "companion-cognition-result-v2.schema.json").read_text(encoding="utf-8")),
                 visible_stream=False,
                 absolute_deadline=deadline,
-                verifier_name="unified-cognition/v1",
-                verifier=lambda _output: {"passed": True, "problems": []},
+                verifier_name="unified-cognition/v2",
+                verifier=lambda output: verify_cognition_result(messages, output),
             ))
             if not isinstance(outcome.result, dict):
                 raise BrokerError("Broker produced no qualified cognition result", category="broker_output_invalid")

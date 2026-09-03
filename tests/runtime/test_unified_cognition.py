@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 from ai_trading_companion.__main__ import _conversation_retry_intellect, run_unified_cognition
 from ai_trading_companion.broker_client import BrokerError, BrokerResponse
-from ai_trading_companion.cognition import UnifiedCognition
+from ai_trading_companion.cognition import UnifiedCognition, verify_cognition_result
 from ai_trading_companion.cognition_expression import express_cognition_answer
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
@@ -36,6 +36,70 @@ class _WeekdayCalendar:
 
 
 class UnifiedCognitionTests(unittest.TestCase):
+    def test_fixture_cognition_uses_complete_snapshot_for_all_holdings_wording(self) -> None:
+        text = "以上是我目前所有持仓：603179 新泉股份300股，成本38.1。"
+
+        result = UnifiedCognition.fixture_result([{
+            "message_id": "holdings", "body_text": text,
+        }], "chat")
+
+        self.assertEqual("portfolio.replace_complete_snapshot", result["actions"][0]["action_type"])
+        self.assertNotIn("statement_type", result["actions"][0])
+
+    def test_fixture_cognition_does_not_treat_negated_all_holdings_as_complete(self) -> None:
+        text = "603179 新泉股份300股，成本38.1。这还不是我目前所有持仓。"
+
+        result = UnifiedCognition.fixture_result([{
+            "message_id": "holdings", "body_text": text,
+        }], "chat")
+
+        self.assertEqual("portfolio.apply", result["actions"][0]["action_type"])
+
+    def test_complete_holdings_fact_rejects_a_reply_that_reintroduces_unreported_assets(self) -> None:
+        text = "白云电器700股、力星股份200股、鼎捷数智100股，总资产229153元。以上是我目前所有持仓。"
+        messages = [{"message_id": "holdings", "body_text": text}]
+        snapshot_action = {
+            "action_type": "portfolio.replace_complete_snapshot",
+            "changes": [],
+            "source_span": {"message_id": "holdings", "start": 0, "end": len(text), "quote": text},
+        }
+        bad = {
+            "answer": {"points": [
+                "已记录你当前披露的完整持仓。三只股票市值和总资产存在较大差额，说明账户中还可能包含现金、基金或其他非股票资产；本次不把缺失资产推定为零。"
+            ], "material_ids": []},
+            "actions": [snapshot_action],
+        }
+        good = {
+            "answer": {"points": [
+                "已按你给出的完整口径记录：目前全部持仓就是白云电器700股、力星股份200股和鼎捷数智100股，总资产229153元。"
+            ], "material_ids": []},
+            "actions": [snapshot_action],
+        }
+
+        rejected = verify_cognition_result(messages, bad)
+        accepted = verify_cognition_result(messages, good)
+
+        self.assertFalse(rejected["passed"])
+        self.assertIn("answer_contradicts_authoritative_complete_portfolio", rejected["problems"])
+        self.assertTrue(accepted["passed"], accepted["problems"])
+
+    def test_complete_holdings_fact_requires_complete_snapshot_action(self) -> None:
+        text = "以上是我目前所有持仓：603179 新泉股份300股。"
+        result = {
+            "answer": {"points": ["已记录。"], "material_ids": []},
+            "actions": [{
+                "action_type": "portfolio.apply",
+                "statement_type": "current_state",
+                "changes": [],
+                "source_span": {"message_id": "holdings", "start": 0, "end": len(text), "quote": text},
+            }],
+        }
+
+        verdict = verify_cognition_result([{"message_id": "holdings", "body_text": text}], result)
+
+        self.assertFalse(verdict["passed"])
+        self.assertIn("complete_portfolio_requires_snapshot_action:holdings", verdict["problems"])
+
     def test_active_provider_call_graph_is_semantic_and_never_writes_legacy_markdown_fields(self):
         schema_path = PROJECT_ROOT / "resources" / "contracts" / "companion-cognition-result-v2.schema.json"
         self.assertTrue(schema_path.is_file())
@@ -265,6 +329,7 @@ class UnifiedCognitionTests(unittest.TestCase):
         request = broker.invoke.call_args.args[0]
         self.assertFalse(request.visible_stream)
         self.assertEqual("standard", request.intellect)
+        self.assertEqual("unified-cognition/v2", request.verifier_name)
         self.assertEqual(6_000, request.output_token_limit)
         self.assertNotIn("tools", json.dumps(request.packet, ensure_ascii=False))
         self.assertEqual("记住了", express_cognition_answer(output["answer"]))

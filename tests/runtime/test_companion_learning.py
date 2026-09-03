@@ -339,7 +339,7 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertFalse(rejected["passed"])
         self.assertIn("m0_calendar_context_conflict", rejected["problems"])
         self.assertIn("m0_calendar_weekday_conflict", rejected["problems"])
-        self.assertTrue(accepted["passed"])
+        self.assertTrue(accepted["passed"], accepted["problems"])
         self.assertFalse(action_leak["passed"])
         self.assertIn("m0_contains_direction_or_action", action_leak["problems"])
         self.assertFalse(v2_action_leak["passed"])

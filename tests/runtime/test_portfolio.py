@@ -165,6 +165,33 @@ class PortfolioServiceTests(unittest.TestCase):
         self.assertEqual({"603179", "603993"}, {item["code"] for item in reverted["snapshot"]["positions"]})
         self.assertEqual(2, len(reverted["reversal_transaction_ids"]))
 
+    def test_all_current_holdings_wording_is_an_authoritative_complete_snapshot(self):
+        changes = [{"action": "position_correction", "code": "603179", "name": "新泉股份", "shares": 300, "price": 38.1, "average_cost": 38.1, "occurred_at": None, "evidence": {"instrument": "603179 新泉股份", "action": "持有", "shares": "300股", "price": "38.1", "average_cost": "38.1", "total_assets": None}}]
+
+        result = self.service.replace_complete_snapshot(
+            "603179 新泉股份 300股，成本38.1。以上是我目前所有持仓。",
+            changes,
+            "cycle",
+            "all-current-holdings",
+        )
+
+        self.assertEqual("applied", result["state"])
+        self.assertTrue(result["complete_snapshot"])
+        self.assertEqual(["603179"], [item["code"] for item in self.service.snapshot()["positions"]])
+
+    def test_negated_all_holdings_wording_does_not_replace_the_snapshot(self):
+        changes = [{"action": "position_correction", "code": "603179", "name": "新泉股份", "shares": 300, "price": 38.1, "average_cost": 38.1, "occurred_at": None, "evidence": {"instrument": "603179 新泉股份", "action": "持有", "shares": "300股", "price": "38.1", "average_cost": "38.1", "total_assets": None}}]
+
+        result = self.service.replace_complete_snapshot(
+            "603179 新泉股份300股，成本38.1。这还不是我目前所有持仓。",
+            changes,
+            "cycle",
+            "incomplete-current-holdings",
+        )
+
+        self.assertEqual("needs_input", result["state"])
+        self.assertFalse(result.get("complete_snapshot", False))
+
     def test_complete_snapshot_requires_explicit_scope_marker(self):
         changes = [{"action": "position_correction", "code": "603179", "name": "新泉股份", "shares": 300, "price": 38.1, "average_cost": 38.1, "occurred_at": None, "evidence": {"instrument": "603179 新泉股份", "action": "持有", "shares": "300股", "price": "38.1", "average_cost": "38.1", "total_assets": None}}]
 

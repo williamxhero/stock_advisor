@@ -9,7 +9,6 @@ from unittest.mock import Mock, patch
 from ai_trading_companion.__main__ import (
     M1_MAX_JUDGMENT_ATTEMPTS,
     _call_stage,
-    _anchor_m0_facts,
     _evidence_read_cutoff,
     _frozen_m0_source_attempt,
     _m1_research_as_of,
@@ -346,18 +345,109 @@ class EvidenceV3Tests(TestCase):
         output["semantic"]["summary"] = "600487 价格67.97，前收67.34，变动0.63，变动幅度0.9356%，处于交易状态，北京时间13:22。"
         self.assertTrue(CognitiveRouter().verify("m0_compose", packet, output)["passed"])
 
-    def test_m0_anchor_replaces_model_market_numbers_with_frozen_facts(self):
+    def test_m0_verifier_rejects_unverified_market_numbers_without_rewriting_interpretation(self):
         packet = {"stage": "m0_compose", "verified_fact_digest": [{"excerpt": json.dumps({
             "indices": [{"name": "上证指数", "price": 3900, "previous_close": 4000, "change": -100, "change_percent": -2.5}],
             "breadth": {"up": 1, "down": 2, "flat": 3},
             "quotes": [{"name": "样本", "symbol": "600487", "price": 10, "previous_close": 9, "change": 1,
                         "change_percent": 11.1, "quote_at_china": "北京时间2026-08-31 13:22", "status": "trading"}],
         })}]}
-        result = _anchor_m0_facts({"semantic": {"summary": "错误价格99", "observations": ["错误"], "risks": [], "unknowns": []}}, packet)
+        result = {"semantic": {"summary": "错误价格99", "observations": ["错误"], "risks": [], "unknowns": []}}
         text = " ".join([result["semantic"]["summary"], *result["semantic"]["observations"]])
-        self.assertNotIn("错误价格99", text)
-        for expected in ("上证指数：3900", "上涨1家，下跌2家，平盘3家", "样本（600487）北京时间13:22", "价格10，前收9"):
-            self.assertIn(expected, text)
+        verdict = CognitiveRouter().verify("m0_compose", packet, result)
+
+        self.assertIn("错误价格99", text)
+        self.assertIn("m0_contains_unverified_numeric_claim:99", verdict["problems"])
+
+    def test_m0_verifier_keeps_the_useful_observation_primary_and_uses_only_brief_fact_support(self):
+        packet = {"stage": "m0_compose", "verified_fact_digest": [{"excerpt": json.dumps({
+            "indices": [
+                {"name": "上证指数", "price": 3959.46, "previous_close": 3941.39, "change": 18.07, "change_percent": 0.4585},
+                {"name": "深证成指", "price": 13667.53, "previous_close": 13611.55, "change": 55.98, "change_percent": 0.4113},
+                {"name": "创业板指", "price": 3329.65, "previous_close": 3312.24, "change": 17.41, "change_percent": 0.5256},
+            ],
+            "breadth": {"up": 1505, "down": 1227, "flat": 163},
+            "quotes": [
+                {"name": "力星股份", "symbol": "300421", "price": 17.0, "previous_close": 16.8, "change": 0.2, "change_percent": 1.1905, "quote_at_china": "北京时间2026-09-03 09:45", "status": "trading"},
+                {"name": "白云电器", "symbol": "603861", "price": 11.77, "previous_close": 11.65, "change": 0.12, "change_percent": 1.03, "quote_at_china": "北京时间2026-09-03 09:45", "status": "trading"},
+            ],
+        })}]}
+        summary = "开盘整体偏暖，但强度一般；你持有的两只票都略强于指数，目前没有出现需要立刻处理的异常。"
+
+        result = {"semantic": {
+            "summary": summary,
+            "observations": ["三大指数小幅上涨，市场上涨家数略多于下跌家数。"],
+            "risks": ["开盘强度还不够，后续若量价不能扩散，容易回落。"],
+            "unknowns": ["成交额能否继续放大。"],
+        }}
+
+        self.assertEqual(summary, result["semantic"]["summary"])
+        self.assertLessEqual(len(result["semantic"]["observations"]), 2)
+        self.assertTrue(CognitiveRouter().verify("m0_compose", packet, result)["passed"])
+        rendered = " ".join([result["semantic"]["summary"], *result["semantic"]["observations"]])
+        self.assertNotIn("本阶段为 M0", rendered)
+        self.assertNotIn("确定性投影", rendered)
+
+    def test_m0_expression_verifier_accepts_interpretation_without_repeating_every_holding_quote(self):
+        packet = {
+            "stage": "m0_compose",
+            "evidence_contract": {"requirements": [{
+                "key": "portfolio_market_state", "required_entities": ["300421", "603861"],
+            }]},
+            "verified_fact_digest": [{"excerpt": json.dumps({"quotes": [
+                {"name": "力星股份", "symbol": "300421", "price": 17.0, "previous_close": 16.8,
+                 "change": 0.2, "change_percent": 1.1905, "quote_at": "2026-09-03T01:45:00Z", "status": "trading"},
+                {"name": "白云电器", "symbol": "603861", "price": 11.77, "previous_close": 11.65,
+                 "change": 0.12, "change_percent": 1.03, "quote_at": "2026-09-03T01:45:00Z", "status": "trading"},
+            ]})}],
+        }
+        output = {"semantic": {
+            "summary": "开盘整体偏暖，但强度一般；两只持仓都略强于指数，暂时没有独立异常。",
+            "observations": ["上涨家数略多于下跌家数，但还不是强势普涨。"],
+            "risks": ["强度若不能扩散，早盘优势容易收窄。"],
+            "unknowns": [],
+        }}
+
+        verdict = CognitiveRouter().verify("m0_compose", packet, output)
+
+        self.assertTrue(verdict["passed"], verdict["problems"])
+
+    def test_m0_expression_verifier_rejects_internal_process_language_and_unverified_numbers(self):
+        packet = {"stage": "m0_compose", "verified_fact_digest": [{"excerpt": json.dumps({
+            "indices": [{"name": "上证指数", "price": 3959.46, "change_percent": 0.4585}],
+        })}]}
+        internal = {"semantic": {
+            "summary": "本阶段为 M0 客观观察；以下字段由冻结工具结果确定性投影。",
+            "observations": [], "risks": [], "unknowns": [],
+        }}
+        invented = {"semantic": {
+            "summary": "上证指数现在是99点。", "observations": [], "risks": [], "unknowns": [],
+        }}
+
+        internal_verdict = CognitiveRouter().verify("m0_compose", packet, internal)
+        invented_verdict = CognitiveRouter().verify("m0_compose", packet, invented)
+
+        self.assertIn("m0_exposes_internal_process", internal_verdict["problems"])
+        self.assertIn("m0_contains_unverified_numeric_claim:99", invented_verdict["problems"])
+
+    def test_m0_expression_verifier_accepts_truthful_display_rounding_only(self):
+        packet = {"stage": "m0_compose", "verified_fact_digest": [{"excerpt": json.dumps({
+            "indices": [{"name": "上证指数", "price": 3959.46, "change_percent": 0.4585}],
+        })}]}
+        rounded = {"semantic": {
+            "summary": "上证指数约3959点，涨幅约0.5%，盘面偏暖但不算强。",
+            "observations": [], "risks": [], "unknowns": [],
+        }}
+        unrelated = {"semantic": {
+            "summary": "上证指数涨幅约0.7%，盘面偏暖但不算强。",
+            "observations": [], "risks": [], "unknowns": [],
+        }}
+
+        accepted = CognitiveRouter().verify("m0_compose", packet, rounded)
+        rejected = CognitiveRouter().verify("m0_compose", packet, unrelated)
+
+        self.assertTrue(accepted["passed"], accepted["problems"])
+        self.assertIn("m0_contains_unverified_numeric_claim:0.7", rejected["problems"])
 
     def test_rejects_foreign_reference_and_naive_runtime_time(self):
         foreign = EvidenceGate().evaluate(self._evidence("ev_other_1"), self.contract, self.observations, self.as_of, attempt_id="attempt-1")

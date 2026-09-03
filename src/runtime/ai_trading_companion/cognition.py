@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -8,7 +9,7 @@ from typing import Any
 
 from .learning import WorkflowEvolution
 from .cognition_compat import adapt_legacy_cognition_result
-from .portfolio import explicit_fixture_extraction, is_portfolio_statement
+from .portfolio import explicit_fixture_extraction, has_complete_portfolio_scope, is_portfolio_statement
 from .store import digest
 from .task_profiles import AnalysisClarificationRequired
 from .user_learning import explicit_expression_preference, user_method_claim
@@ -22,6 +23,39 @@ class CognitionOutcome:
     propositions_recorded: int
     needs_fresh_search: bool
     public_search_request: dict[str, Any] | None
+
+
+_COMPLETE_PORTFOLIO_ANSWER_CONTRADICTION = re.compile(
+    r"当前披露|不把(?:缺失|未披露).{0,12}(?:资产|持仓).{0,12}推定为零|"
+    r"(?:还|仍|也)?可能(?:还)?(?:包含|存在|有).{0,48}(?:基金|其他(?:非股票)?资产|其他(?:股票|证券|持仓))"
+)
+
+
+def verify_cognition_result(messages: list[dict[str, Any]], result: dict[str, Any]) -> dict[str, Any]:
+    """Protect explicit private-fact scope before a model answer can be published."""
+    complete_message_ids = {
+        str(message.get("message_id") or "")
+        for message in messages
+        if is_portfolio_statement(str(message.get("body_text") or ""))
+        and has_complete_portfolio_scope(str(message.get("body_text") or ""))
+    }
+    if not complete_message_ids:
+        return {"passed": True, "problems": []}
+
+    problems: list[str] = []
+    snapshot_message_ids = {
+        str((action.get("source_span") or {}).get("message_id") or "")
+        for action in result.get("actions") or []
+        if action.get("action_type") == "portfolio.replace_complete_snapshot"
+    }
+    for message_id in sorted(complete_message_ids - snapshot_message_ids):
+        problems.append(f"complete_portfolio_requires_snapshot_action:{message_id}")
+
+    answer = result.get("answer")
+    answer_text = "\n".join(str(point) for point in (answer.get("points") or [])) if isinstance(answer, dict) else ""
+    if _COMPLETE_PORTFOLIO_ANSWER_CONTRADICTION.search(answer_text):
+        problems.append("answer_contradicts_authoritative_complete_portfolio")
+    return {"passed": not problems, "problems": problems}
 
 
 class UnifiedCognition:
@@ -42,6 +76,9 @@ class UnifiedCognition:
             "动作只能是 portfolio.apply、portfolio.replace_complete_snapshot、workflow.propose 或 analysis.request。"
             "analysis.request 只表达明确的 subject、time_scope 和 goal；不得指定任务键、日程、证据策略或内部 ID。持仓表默认是局部更新；"
             "只有原文明确说明这是完整账户/全部持仓快照时，才能使用 replace_complete_snapshot；否则绝不能把缺失股票推成零。"
+            "用户明确说完整、全部或所有持仓时，持仓范围本身也是用户权威事实，必须使用 replace_complete_snapshot；"
+            "不得因总资产与持仓市值有差额就改称‘当前披露’、猜测另有基金或其他持仓，或拒绝清零遗漏的旧持仓。"
+            "账户总资产可以包含现金，这不否定证券持仓范围的完整性。"
             "普通聊天绝不修订正式 M1/M2。"
             "不得宣称动作已经成功，系统会在本地执行后追加真实回执。每个命题和动作必须引用单条原消息的精确字符区间，"
             "start 包含、end 不包含，quote 必须与该切片逐字相同。"
@@ -90,11 +127,14 @@ class UnifiedCognition:
                     "occurred_at": change.get("occurred_at"),
                     "evidence": {key: evidence.get(key) for key in ("instrument", "action", "shares", "price", "average_cost", "total_assets")},
                 })
-            actions.append({
-                "action_type": "portfolio.apply", "statement_type": extraction.get("statement_type", "none"),
+            action = {
+                "action_type": "portfolio.replace_complete_snapshot" if has_complete_portfolio_scope(text) else "portfolio.apply",
                 "changes": changes,
                 "source_span": {"message_id": message["message_id"], "start": 0, "end": len(text), "quote": text},
-            })
+            }
+            if action["action_type"] == "portfolio.apply":
+                action["statement_type"] = extraction.get("statement_type", "none")
+            actions.append(action)
         return {
             "answer": None if mode == "h0" else {"points": ["已收到这批消息。我会把你说的个人事实作为最新口径；涉及市场的判断仍由我独立核验。"], "material_ids": []},
             "needs_fresh_search": False, "public_search_request": None,

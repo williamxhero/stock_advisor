@@ -246,6 +246,22 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertIn("核心仍然偏弱", artifact["body_markdown"])
         self.assertNotIn("m0_markdown", artifact["metadata_json"])
 
+    def test_m0_expression_sounds_like_a_companion_not_a_stage_report(self):
+        text = express_stage_semantics("m0", {
+            "summary": "开盘整体偏暖，但还不是强势普涨。",
+            "observations": ["上涨家数略多于下跌家数", "持仓表现有分化"],
+            "risks": ["早盘优势可能收窄", "第二个次要风险不应继续堆叠"],
+            "unknowns": ["量能是否跟上", "第二个次要缺口不应继续堆叠"],
+        })
+
+        self.assertIn("开盘整体偏暖", text)
+        self.assertIn("上涨家数略多于下跌家数", text)
+        self.assertNotIn("我看到的是", text)
+        self.assertNotIn("我更担心的是", text)
+        self.assertNotIn("现在还不能确认的是", text)
+        self.assertNotIn("第二个次要风险", text)
+        self.assertNotIn("第二个次要缺口", text)
+
     def test_structured_judgment_expression_keeps_direction_and_qualification(self):
         text = express_stage_semantics("m1", {
             "summary": "承接还没有形成共振。", "direction": "继续观望", "qualified": False,

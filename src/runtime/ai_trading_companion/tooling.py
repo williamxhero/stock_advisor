@@ -383,6 +383,33 @@ class ToolRunner:
     def read_artifact(self, reference: str) -> bytes:
         return self.artifacts.read(reference)
 
+    def cached_resolution_is_valid(self, request: FactRequest, cached: dict[str, Any]) -> bool:
+        """Revalidate a persisted resolution against its immutable raw output."""
+        try:
+            request.to_wire()
+            raw_artifact_ref = str(cached["raw_artifact_ref"])
+            output = json.loads(self.read_artifact(raw_artifact_ref))
+            if (
+                not isinstance(output, dict)
+                or set(output) != {"contract", "fact_as_of", "data"}
+                or output.get("contract") != _RESULT_CONTRACT
+                or not isinstance(output.get("data"), dict)
+                or output.get("fact_as_of") != cached.get("fact_as_of")
+                or output.get("data") != cached.get("data")
+            ):
+                return False
+            _parse_timestamp(str(output["fact_as_of"]))
+            if _validate_capability_result(request, output):
+                return False
+            if "technical_validation" in cached:
+                checks = cached["technical_validation"]
+                required = {"tool_process_succeeded", "tool_result_schema_valid", "raw_output_archived"}
+                if not isinstance(checks, list) or not required.issubset(checks):
+                    return False
+            return True
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+
     def resolve_with_fallback(self, request: FactRequest) -> EvidenceResolution:
         cache_key = json.dumps(request.to_wire(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         cached = self._cache.get(cache_key)

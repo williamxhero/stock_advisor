@@ -56,6 +56,42 @@ def packet_builder(store: CompanionStore) -> RuntimePacketBuilder:
 
 
 class CompanionEngineTests(unittest.TestCase):
+    @staticmethod
+    def _breadth_resolution(*, trading_date: str = "2026-09-02"):
+        from ai_trading_companion.tooling import EvidenceResolution
+
+        fact_as_of = f"{trading_date}T07:00:00Z"
+        data = {
+            "is_trading_day": True,
+            "trading_date": trading_date,
+            "source": "official_close_prefetch",
+            "finality": "official_close",
+            "source_urls": ["https://example.test/close"],
+            "breadth": {"up": 9, "down": 8, "flat": 7},
+        }
+        return EvidenceResolution(
+            True, "cn_market_breadth", "1.1.3", fact_as_of, f"{trading_date}T07:00:01Z",
+            data, "artifact:sha256:" + "a" * 64, None,
+            ("tool_process_succeeded", "tool_result_schema_valid", "raw_output_archived"),
+            attempts=("markethub:tool_process_failed", "eastmoney:succeeded"),
+        )
+
+    @staticmethod
+    def _breadth_raw(resolution) -> bytes:
+        return json.dumps({
+            "contract": "ai-trading-tool-result/v1",
+            "fact_as_of": resolution.fact_as_of,
+            "data": resolution.data,
+        }).encode("utf-8")
+
+    @staticmethod
+    def _enable_real_cache_validation(runner: Mock) -> None:
+        from ai_trading_companion.tooling import ToolRunner
+
+        runner.cached_resolution_is_valid.side_effect = (
+            lambda request, cached: ToolRunner.cached_resolution_is_valid(runner, request, cached)
+        )
+
     def test_breadth_prefetch_loop_runs_without_waiting_for_gateway_tick(self):
         calls: list[str] = []
 
@@ -74,18 +110,8 @@ class CompanionEngineTests(unittest.TestCase):
         self.assertEqual(["prefetch", "prefetch"], calls)
 
     def test_post_close_prefetch_persists_official_breadth_snapshot(self):
-        from ai_trading_companion.tooling import EvidenceResolution
-
         runner = Mock()
-        runner.resolve_with_fallback.return_value = EvidenceResolution(
-            True, "cn_market_breadth", "1.1.3", "2026-09-02T07:00:01Z", "2026-09-02T07:00:02Z",
-            {
-                "source": "official_close_prefetch", "finality": "official_close",
-                "source_urls": ["https://example.test/close"],
-                "breadth": {"up": 9, "down": 8, "flat": 7},
-            },
-            "artifact:sha256:" + "a" * 64, None, (), attempts=("default:succeeded",),
-        )
+        runner.resolve_with_fallback.return_value = self._breadth_resolution()
         with tempfile.TemporaryDirectory() as home:
             runtime = Path(home) / "runtime"
             runtime.mkdir()
@@ -103,6 +129,126 @@ class CompanionEngineTests(unittest.TestCase):
             self.assertEqual("official_close", request.finality)
             snapshot = json.loads((runtime / "market-breadth-official-close-snapshot.json").read_text(encoding="utf-8"))
             self.assertEqual("official_close", snapshot["data"]["finality"])
+            self.assertIn("tool_result_schema_valid", snapshot["technical_validation"])
+
+    def test_post_close_prefetch_reuses_an_old_mtime_snapshot_after_revalidating_its_artifact(self):
+        resolution = self._breadth_resolution()
+        runner = Mock()
+        runner.read_artifact.return_value = self._breadth_raw(resolution)
+        self._enable_real_cache_validation(runner)
+        with tempfile.TemporaryDirectory() as home:
+            runtime = Path(home) / "runtime"
+            runtime.mkdir()
+            target = runtime / "market-breadth-official-close-snapshot.json"
+            target.write_text(json.dumps({
+                "fact_as_of": resolution.fact_as_of,
+                "data": resolution.data,
+                "raw_artifact_ref": resolution.raw_artifact_ref,
+            }), encoding="utf-8")
+            old_mtime = target.stat().st_mtime
+            paths = SimpleNamespace(runtime=runtime, tools=Path(home) / "tools")
+            with patch("ai_trading_companion.__main__.PATHS", paths), \
+                 patch("ai_trading_companion.__main__.ToolCatalog"), \
+                 patch("ai_trading_companion.__main__.ToolRunner", return_value=runner), \
+                 patch("ai_trading_companion.__main__._BREADTH_PREFETCH_LOCK") as lock, \
+                 patch("ai_trading_companion.__main__.time.time", return_value=old_mtime + 31), \
+                 patch("ai_trading_companion.__main__.datetime", wraps=datetime) as mocked_datetime:
+                lock.acquire.return_value = True
+                mocked_datetime.now.return_value = datetime(2026, 9, 2, 22, 15, tzinfo=timezone(timedelta(hours=8)))
+                _prefetch_market_breadth()
+
+        runner.resolve_with_fallback.assert_not_called()
+        runner.read_artifact.assert_called_once_with(resolution.raw_artifact_ref)
+
+    def test_post_close_prefetch_refreshes_unusable_snapshots(self):
+        good = self._breadth_resolution()
+        cases = {
+            "wrong_date": ({**good.data, "trading_date": "2026-09-01"}, list(good.technical_validation)),
+            "not_official_close": ({**good.data, "finality": "intraday"}, list(good.technical_validation)),
+            "invalid_breadth": (
+                {**good.data, "breadth": {"up": -1, "down": 8, "flat": 7}},
+                list(good.technical_validation),
+            ),
+            "technical_checks_incomplete": (good.data, ["tool_result_schema_valid"]),
+        }
+        for name, (cached_data, technical_validation) in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as home:
+                runtime = Path(home) / "runtime"
+                runtime.mkdir()
+                target = runtime / "market-breadth-official-close-snapshot.json"
+                target.write_text(json.dumps({
+                    "fact_as_of": good.fact_as_of,
+                    "data": cached_data,
+                    "raw_artifact_ref": good.raw_artifact_ref,
+                    "technical_validation": technical_validation,
+                }), encoding="utf-8")
+                runner = Mock()
+                runner.read_artifact.return_value = json.dumps({
+                    "contract": "ai-trading-tool-result/v1",
+                    "fact_as_of": good.fact_as_of,
+                    "data": cached_data,
+                }).encode("utf-8")
+                runner.resolve_with_fallback.return_value = good
+                self._enable_real_cache_validation(runner)
+                paths = SimpleNamespace(runtime=runtime, tools=Path(home) / "tools")
+                with patch("ai_trading_companion.__main__.PATHS", paths), \
+                     patch("ai_trading_companion.__main__.ToolCatalog"), \
+                     patch("ai_trading_companion.__main__.ToolRunner", return_value=runner), \
+                     patch("ai_trading_companion.__main__._BREADTH_PREFETCH_LOCK") as lock, \
+                     patch("ai_trading_companion.__main__.datetime", wraps=datetime) as mocked_datetime:
+                    lock.acquire.return_value = True
+                    mocked_datetime.now.return_value = datetime(2026, 9, 2, 22, 15, tzinfo=timezone(timedelta(hours=8)))
+                    _prefetch_market_breadth()
+
+                runner.resolve_with_fallback.assert_called_once()
+
+    def test_post_close_prefetch_refreshes_a_corrupt_snapshot(self):
+        good = self._breadth_resolution()
+        runner = Mock()
+        runner.resolve_with_fallback.return_value = good
+        with tempfile.TemporaryDirectory() as home:
+            runtime = Path(home) / "runtime"
+            runtime.mkdir()
+            (runtime / "market-breadth-official-close-snapshot.json").write_text("{", encoding="utf-8")
+            paths = SimpleNamespace(runtime=runtime, tools=Path(home) / "tools")
+            with patch("ai_trading_companion.__main__.PATHS", paths), \
+                 patch("ai_trading_companion.__main__.ToolCatalog"), \
+                 patch("ai_trading_companion.__main__.ToolRunner", return_value=runner), \
+                 patch("ai_trading_companion.__main__._BREADTH_PREFETCH_LOCK") as lock, \
+                 patch("ai_trading_companion.__main__.datetime", wraps=datetime) as mocked_datetime:
+                lock.acquire.return_value = True
+                mocked_datetime.now.return_value = datetime(2026, 9, 2, 22, 15, tzinfo=timezone(timedelta(hours=8)))
+                _prefetch_market_breadth()
+
+        runner.resolve_with_fallback.assert_called_once()
+
+    def test_post_close_prefetch_refreshes_a_qualified_previous_trading_day_snapshot(self):
+        previous = self._breadth_resolution(trading_date="2026-09-01")
+        current = self._breadth_resolution(trading_date="2026-09-02")
+        runner = Mock()
+        runner.read_artifact.return_value = self._breadth_raw(previous)
+        runner.resolve_with_fallback.return_value = current
+        self._enable_real_cache_validation(runner)
+        with tempfile.TemporaryDirectory() as home:
+            runtime = Path(home) / "runtime"
+            runtime.mkdir()
+            (runtime / "market-breadth-official-close-snapshot.json").write_text(json.dumps({
+                "fact_as_of": previous.fact_as_of,
+                "data": previous.data,
+                "raw_artifact_ref": previous.raw_artifact_ref,
+                "technical_validation": list(previous.technical_validation),
+            }), encoding="utf-8")
+            paths = SimpleNamespace(runtime=runtime, tools=Path(home) / "tools")
+            with patch("ai_trading_companion.__main__.PATHS", paths), \
+                 patch("ai_trading_companion.__main__.ToolCatalog"), \
+                 patch("ai_trading_companion.__main__.ToolRunner", return_value=runner), \
+                 patch("ai_trading_companion.__main__._BREADTH_PREFETCH_LOCK") as lock, \
+                 patch("ai_trading_companion.__main__.datetime", wraps=datetime) as mocked_datetime:
+                lock.acquire.return_value = True
+                mocked_datetime.now.return_value = datetime(2026, 9, 2, 22, 15, tzinfo=timezone(timedelta(hours=8)))
+                _prefetch_market_breadth()
+
+        runner.resolve_with_fallback.assert_called_once()
 
     def test_user_visible_event_cannot_bypass_the_v2_publication_contract(self):
         for event_type in published_event_types():

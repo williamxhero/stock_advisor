@@ -591,7 +591,10 @@ def _call_stage(
                 backends["market"] = (
                     DeterministicMarketBackend(market_facts)
                     if isinstance(market_facts, dict) and market_facts
-                    else ToolCatalogMarketBackend(tool_runner, contract=contract, deadline=lambda: deadline - time.monotonic())
+                    else ToolCatalogMarketBackend(
+                        tool_runner, contract=contract, deadline=lambda: deadline - time.monotonic(),
+                        cycle_id=str(cycle["cycle_id"]),
+                    )
                 )
             executor = ReadOnlyResearchExecutor(backends, max_operations=controls.max_operations)
             research = LocalResearchChain(
@@ -1583,7 +1586,10 @@ def run_schedules(engine: CompanionEngine, store: CompanionStore, at: datetime, 
     return results
 
 
-def run_scheduled_cycle(engine: CompanionEngine, store: CompanionStore, exchange: LocalExchange, portfolio: PortfolioService, cycle_id: str, execute: bool) -> dict[str, Any]:
+def run_scheduled_cycle(
+    engine: CompanionEngine, store: CompanionStore, exchange: LocalExchange, portfolio: PortfolioService,
+    cycle_id: str, execute: bool, *, at: datetime | None = None,
+) -> dict[str, Any]:
     cycle = store.get_cycle(cycle_id)
     try:
         if cycle["state"] != "queued":
@@ -1591,6 +1597,16 @@ def run_scheduled_cycle(engine: CompanionEngine, store: CompanionStore, exchange
         snapshot = json.loads(cycle.get("schedule_snapshot_json") or "{}")
         if snapshot:
             ensure_registered_policy(cycle["task_key"], snapshot, datetime.fromisoformat(cycle["scheduled_for"]))
+        # The 14:30 cycle may be claimed at its five-minute lead window, but
+        # that claim buys only read-only preparation.  M0/H0/M1 remain
+        # authority-bound to the formal slot; the queued cycle will be claimed
+        # again at 14:30 after this lightweight warm-up releases its worker.
+        if cycle.get("task_key") == "daily.execution.1430":
+            formal_at = datetime.fromisoformat(cycle["scheduled_for"]).astimezone(SHANGHAI)
+            current_at = (at or datetime.now(timezone.utc)).astimezone(SHANGHAI)
+            if current_at < formal_at:
+                _prefetch_market_breadth()
+                return cycle
         result = run_research(engine, store, cycle, execute, lambda: flush(store, exchange))
         process_h0_cognition(engine, store, portfolio, cycle_id, execute)
         return result

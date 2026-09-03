@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from ai_trading_companion.broker_client import BrokerError
-from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, WebAccessGatewayBackend
+from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, WebAccessGatewayBackend, _merge_mandatory_operations
 from ai_trading_companion.tooling import EvidenceResolution, FactRequest, ToolCatalog, ToolRunner
 
 CONTRACT = {"version": 3, "as_of": "2026-08-27T07:00:00Z", "requirements": [{"key": "market", "blocking": True, "allowed_coverage": ["covered"], "window": {"mode": "exact", "start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z"}}]}
@@ -18,6 +18,23 @@ def row(operation: str, *, query: str | None = None, url: str | None = None) -> 
     return {"requirement_key": "market", "backend": "gateway", "operation": operation, "arguments": {"query": query, "categories": "news", "url": url, "symbol": None, "render": "auto", "session_id": None, "actions": None}, "fallback_backends": []}
 
 class LocalResearchTests(unittest.TestCase):
+    def test_circuit_broken_current_bar_is_not_reinserted_by_repair(self) -> None:
+        contract = {
+            "version": 4, "requirements": [{
+                "key": "portfolio_current_bar", "blocking": True, "required_entities": ["600487"],
+            }],
+        }
+        plan = _merge_mandatory_operations(
+            {"version": 1, "operations": []}, contract, max_operations=24,
+            observations=[{
+                "status": "failed", "operation": "current_bar",
+                "arguments": {"requirement_key": "portfolio_current_bar"},
+                "tool_error_code": "tool_routes_exhausted_deterministic",
+            }],
+        )
+
+        self.assertEqual([], plan["operations"])
+
     def test_invalid_broker_plan_uses_the_existing_bounded_repair_round(self) -> None:
         calls = 0
         received_gaps: list[list[str]] = []

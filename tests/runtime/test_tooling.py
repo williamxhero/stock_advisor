@@ -32,7 +32,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.5", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.6", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
 
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
@@ -285,6 +285,24 @@ class ToolRunnerTests(unittest.TestCase):
             self.assertEqual("backup", result.data["source"])
             self.assertEqual(["default:tool_process_failed", "backup:succeeded"], list(result.attempts))
             self.assertTrue((root / ".audit" / "resolutions.ndjson").exists())
+
+    def test_deterministic_route_failure_is_audited_and_circuit_broken_per_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            self.publish_tool(root, "cn_equity_identity", "import sys; print('invalid contract shape', file=sys.stderr); sys.exit(64)")
+            runner = ToolRunner(ToolCatalog(root))
+            request = self.request(context={"cycle_id": "scheduled-1430"})
+
+            first = runner.resolve_with_fallback(request)
+            second = runner.resolve_with_fallback(request)
+
+            self.assertEqual("tool_routes_exhausted_deterministic", first.error_code)
+            self.assertEqual("tool_circuit_open", second.error_code)
+            audit = [json.loads(line) for line in (root / ".audit" / "resolutions.ndjson").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(64, audit[0]["exit_code"])
+            self.assertTrue(audit[0]["diagnostic_artifact_ref"].startswith("artifact:sha256:"))
+            self.assertEqual({"adapter": "default", "version": "1.0.0"}, audit[0]["route"])
+            self.assertTrue((root / ".health" / "cn_equity_identity-default-1.0.0.json").exists())
 
     def test_fallback_cache_requires_the_same_fact_time_and_finality(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -867,6 +885,51 @@ class ToolRunnerTests(unittest.TestCase):
                     "http://127.0.0.1:%d/stocks/quotes?codes=600000&freq=1m&datetime=now&count=1&adjust=none" % server.server_port,
                     result.data["source_urls"][0],
                 )
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_current_equity_bar_uses_derived_tencent_minutes_after_markethub_failure(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/stocks/quotes"):
+                    self.send_error(503, "MarketHub unavailable")
+                    return
+                if self.path.startswith("/minute?code=sh600000"):
+                    body = json.dumps({"data": {"sh600000": {"data": [
+                        "1428 10.00 100 1000", "1429 10.20 120 1224",
+                    ]}}}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_error(404)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                    1, "cn_equity_current_bar", "2026-09-01T06:30:00Z", 4.0,
+                    {"symbols": ["600000"], "freq": "1m", "markethub_url": f"{base}/stocks/quotes",
+                     "tencent_minute_url": f"{base}/minute?code="},
+                    finality="intraday",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual(("markethub:tool_process_failed", "tencent:succeeded"), result.attempts)
+                bar = result.data["bars"][0]
+                self.assertEqual("derived", bar["source_semantics"])
+                self.assertEqual("tencent_minute", bar["provider"])
+                self.assertEqual(10.2, bar["close"])
             finally:
                 server.shutdown()
                 server.server_close()

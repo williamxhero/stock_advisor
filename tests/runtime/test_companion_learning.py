@@ -317,6 +317,9 @@ class CompanionLearningTests(unittest.TestCase):
         compact_protocol = "".join(packet["protocol"]["text"].split()).lower()
         for internal_marker in ("本阶段", "m0客观观察", "冻结工具", "确定性投影", "冻结证据"):
             self.assertNotIn(internal_marker, compact_protocol)
+        self.assertIn("整篇最多提及两只持仓", _RuntimePacketBuilder.prompt(packet))
+        self.assertEqual(2, packet["m0_compose_requirements"]["maximum_entities_to_mention"])
+        self.assertNotIn("For every portfolio entity", packet["m0_compose_requirements"]["instruction"])
         rejected = CognitiveRouter().verify("m0_compose", packet, {
             "m0_markdown": "`状态: skipped` 2026-08-31为周日，非A股交易日。",
         })

@@ -92,7 +92,8 @@ class RuntimePacketBuilder:
                 )
                 packet["verified_fact_digest"] = self._verified_fact_digest(evidence or {})
                 packet["m0_compose_requirements"] = {
-                    "instruction": "For every portfolio entity below, state the frozen price, previous close, change, change percentage, quote time and trading status exactly as supplied by verified_fact_digest. Render every quote time as `北京时间HH:MM` using quote_at_china; never interpret a UTC `Z` clock as China local time. Do not publish a claim that any listed entity is uncovered.",
+                    "instruction": "Mention at most two portfolio entities, and only when they materially support the main market observation; do not enumerate the remaining holdings. If a quote detail is stated, use the frozen price, previous close, change, change percentage, quote time and trading status exactly as supplied by verified_fact_digest. Render quote time as `北京时间HH:MM` using quote_at_china; never interpret a UTC `Z` clock as China local time. Do not publish a claim that a listed entity is uncovered.",
+                    "maximum_entities_to_mention": 2,
                     "portfolio_entity_codes": next((
                         list(item.get("required_entities") or []) for item in packet["evidence_contract"].get("requirements") or []
                         if isinstance(item, dict) and item.get("key") == "portfolio_market_state"
@@ -425,7 +426,7 @@ class RuntimePacketBuilder:
         )
         instruction = {
             "m0_research": "广泛搜索公开市场信息并输出 Evidence v3 证据剪报。输出 as_of 必须逐字使用 Stage Packet 的 as_of，逐项填写 evidence_contract.requirements 的 coverage。sources、coverage、conflicts 与 high_impact_events 只能引用本轮工具返回的 opaque evidence_ref；source 只能写 evidence_ref、连续原文 excerpt 和分析字段，绝不写 URL、标题、来源身份或任何时间戳。checked_no_change 必须由本轮匹配的负查询支持。严格遵守冻结窗口；区分事实可靠性与传播影响，记录实际覆盖和关键失败。可以用 companion_context 调整搜索重点，但只把其中公开股票、题材和事件用于搜索，禁止把账户、成交、身份、路径或其他私密细节写入搜索词。除本包明确提供的内容外，不读取本地文件或用户资料。",
-            "m0_compose": "基于冻结证据先给出有取舍、有解释力的盘面观察：最重要的格局是什么、强弱在哪里、为什么值得用户在意。事实只选一到两个最能支撑观察的例子，不得逐项复述指数、持仓报价或输入字段。summary 必须是面向交易者的观察，不得解释 M0、阶段、冻结、工具、确定性投影或内部流程。risks 和 unknowns 只保留会实质改变当前观察的一项；没有就留空，不得罗列未请求的数据、常识性盘中 caveat、覆盖口径或‘已检查且无变化’的技术含义。calendar_context 是本地交易日历给出的确定性事实，优先级高于记忆和网页；若历史材料与它冲突，必须把历史材料视为错误或过期信息。盘前交流只能改变关注点，不能替代公开核验，也不能要求 AI 赞同。可以解释此刻盘面偏暖、偏冷、强弱、分化和异常，但为保护随后 H0 与盲 M1 的独立性，严禁给出方向预测、机会排序、买卖、仓位、操作建议或隐藏的 M1 结论。",
+            "m0_compose": "基于冻结证据先给出有取舍、有解释力的盘面观察：最重要的格局是什么、强弱在哪里、为什么值得用户在意。事实只选一到两个最能支撑观察的例子，不得逐项复述指数、持仓报价或输入字段。整篇最多提及两只持仓的名称或代码；即使全部持仓都有行情，也不要逐只点评。summary 必须是面向交易者的观察，不得解释 M0、阶段、冻结、工具、确定性投影或内部流程。risks 和 unknowns 只保留会实质改变当前观察的一项；没有就留空，不得罗列未请求的数据、常识性盘中 caveat、覆盖口径或‘已检查且无变化’的技术含义。calendar_context 是本地交易日历给出的确定性事实，优先级高于记忆和网页；若历史材料与它冲突，必须把历史材料视为错误或过期信息。盘前交流只能改变关注点，不能替代公开核验，也不能要求 AI 赞同。可以解释此刻盘面偏暖、偏冷、强弱、分化和异常，但为保护随后 H0 与盲 M1 的独立性，严禁给出方向预测、机会排序、买卖、仓位、操作建议或隐藏的 M1 结论。",
             "m1_research": "补查 M0之后的公开增量信息和最强反证，输出 as_of 必须逐字使用 Stage Packet 的 as_of；按 Evidence v3 逐项填写 evidence_contract.requirements 的 coverage。仅引用本轮工具轨迹返回的 opaque evidence_ref；source 只可含 evidence_ref、连续原文 excerpt 和分析字段，运行时独占 URL、标题、来源身份和时间戳。checked_no_change 必须有本轮匹配负查询支撑。必须明确记录关键证据冲突和显著事件；不要推测或询问用户 H0，不读取本地文件或私人资料。",
             "outcome_research": "只搜索判断快照在指定 T+N 时点的可验证结果。先核实从判断日起实际经过的 A 股交易日数量；尚未到目标交易日、当日未收盘或正式数据不足时 checkpoint_ready=false 并给出 next_check_at，不得把自然日冒充交易日。达到目标后严格按当时预选基准计算方向、时机、MFE/MAE和数据质量；每条可用观察必须附两个独立公开来源（价格、基准或交叉核验），冲突或不足就标记缺失，不得事后改写原判断。market_regime 使用指数趋势、广度、成交变化和波动率；字段未知必须为 null。",
             "chat_research": "只根据 validation_context 中脱敏后的公开主题和问题补查公开信息。不得尝试恢复、猜测或寻找用户私人上下文；输出可核验来源、覆盖缺口和自然摘要。",

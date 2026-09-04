@@ -49,6 +49,25 @@ class MessageBatchTests(TestCase):
         self.assertEqual(batch_id, recoverable[0]["batch_id"])
         self.assertEqual("chat_human", recoverable[0]["source_kind"])
 
+    def test_memory_research_deadline_is_recoverable_after_cooldown(self):
+        message = self.store.stage_message(self.cycle["cycle_id"], "盘中复盘", "chat", message_id="message")
+        batch_id, _ = self.store.commit_staged_messages(self.cycle["cycle_id"], "chat")
+        artifact = self.store.append_artifact(
+            self.cycle["cycle_id"], "chat_human", "human", message["body_text"],
+            "2026-08-26T01:45:00Z",
+        )
+        job = self.store.start_cognition_job(
+            self.cycle["cycle_id"], artifact["artifact_id"], "conversation", message["body_text"],
+        )
+        self.store.claim_cognition_job(job["job_id"])
+        self.store.finish_cognition_job(job["job_id"], error="memory research reached its response deadline")
+        future = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
+
+        self.assertEqual(
+            [batch_id],
+            [item["batch_id"] for item in self.store.recoverable_conversation_jobs(before=future)],
+        )
+
     def test_expired_running_conversation_lease_becomes_recoverable(self):
         message = self.store.stage_message(self.cycle["cycle_id"], "盘后总结", "chat", message_id="message")
         batch_id, _ = self.store.commit_staged_messages(self.cycle["cycle_id"], "chat")

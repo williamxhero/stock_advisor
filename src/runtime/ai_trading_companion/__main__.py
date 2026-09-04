@@ -2080,14 +2080,17 @@ def run_unified_cognition(
     memory_research: dict[str, Any] | None = None,
     absolute_deadline: float | None = None,
     cancelled: Callable[[], bool] | None = None,
+    claimed_job: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Understand once, then execute allowlisted capabilities from receipts."""
     if not messages:
         raise RuntimeError("no submitted messages for cognition")
     cycle = store.get_cycle(cycle_id)
     cognition = UnifiedCognition(store, portfolio, engine)
-    job = store.start_cognition_job(cycle_id, source["artifact_id"], mode, source["body_markdown"])
-    if job["state"] != "completed":
+    job = claimed_job or store.start_cognition_job(
+        cycle_id, source["artifact_id"], mode, source["body_markdown"],
+    )
+    if claimed_job is None and job["state"] != "completed":
         job = store.claim_cognition_job(job["job_id"])
         if not job["claimed"]:
             return {"cycle_id": cycle_id, "job_id": job["job_id"], "state": job["state"], "receipts": []}
@@ -2226,19 +2229,29 @@ def run_chat(
         raise RuntimeError("no unresponded submitted messages")
     if source is None:
         raise RuntimeError("submitted conversation artifact is missing")
+    job = store.start_cognition_job(
+        cycle_id, source["artifact_id"], "conversation", source["body_markdown"],
+    )
+    if job["state"] != "completed":
+        job = store.claim_cognition_job(job["job_id"])
+        if not job["claimed"]:
+            return {
+                "cycle_id": cycle_id, "job_id": job["job_id"],
+                "state": job["state"], "receipts": [],
+            }
     engine.record_submitted_messages(cycle_id, messages)
     memory_context: list[dict[str, Any]] | None = None
     memory_research: dict[str, Any] | None = None
     deadline: float | None = None
-    if source_kind == "chat_human":
-        if engine.memory is None:
-            raise MemoryResearchError("MemoryHub is required for ordinary chat")
-        timeout_seconds = int(TASK_POLICIES.get(
-            cycle["task_key"], TASK_POLICIES["daily.execution.0945"],
-        ).m1_timeout.total_seconds())
-        deadline = time.monotonic() + timeout_seconds
-        resumed = store.resumed_chat_research_checkpoint(cycle_id, source["artifact_id"])
-        try:
+    try:
+        if source_kind == "chat_human":
+            if engine.memory is None:
+                raise MemoryResearchError("MemoryHub is required for ordinary chat")
+            timeout_seconds = int(TASK_POLICIES.get(
+                cycle["task_key"], TASK_POLICIES["daily.execution.0945"],
+            ).m1_timeout.total_seconds())
+            deadline = time.monotonic() + timeout_seconds
+            resumed = store.resumed_chat_research_checkpoint(cycle_id, source["artifact_id"])
             memory_result = AdaptiveMemoryResearch(
                 engine.memory,
                 engine.memory_space_id,
@@ -2253,22 +2266,24 @@ def run_chat(
                 ),
                 cancelled=cancelled,
             )
-        except MemoryResearchError:
-            if store.chat_research_terminated(cycle_id):
-                return {"cycle_id": cycle_id, "state": "terminated"}
-            raise
-        memory_context = list(memory_result.context)
-        memory_research = {
-            "snapshot": memory_result.snapshot,
-            "actions": list(memory_result.actions),
-            "episode_ids": [str(item["episode_id"]) for item in memory_result.context if item.get("episode_id")],
-        }
+            memory_context = list(memory_result.context)
+            memory_research = {
+                "snapshot": memory_result.snapshot,
+                "actions": list(memory_result.actions),
+                "episode_ids": [str(item["episode_id"]) for item in memory_result.context if item.get("episode_id")],
+            }
+    except Exception as exc:
+        store.finish_cognition_job(job["job_id"], error=str(exc))
+        if isinstance(exc, MemoryResearchError) and store.chat_research_terminated(cycle_id):
+            return {"cycle_id": cycle_id, "state": "terminated"}
+        raise
     try:
         result = run_unified_cognition(
             engine, store, portfolio, cycle_id, source, messages, batch_ids, execute,
             mode="conversation", reply_kind=reply_kind, on_progress=on_progress,
             memory_context=memory_context, memory_research=memory_research,
             absolute_deadline=deadline, cancelled=cancelled,
+            claimed_job=job,
         )
     except MemoryResearchError:
         if store.chat_research_terminated(cycle_id):

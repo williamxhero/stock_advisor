@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from ai_trading_companion.__main__ import _discover_chat_external_evidence, run_chat
-from ai_trading_companion.adaptive_memory import AdaptiveMemoryResearch
+from ai_trading_companion.adaptive_memory import AdaptiveMemoryResearch, MemoryResearchResult
 from ai_trading_companion.broker_client import BrokerResponse
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter, MemoryUnavailable
@@ -45,6 +46,55 @@ class _RecordingMemory(InMemoryMemoryAdapter):
 
 
 class AdaptiveMemoryResearchTests(unittest.TestCase):
+    def test_chat_claim_covers_memory_research_before_cognition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = CompanionStore(root / "runtime.sqlite3")
+            engine = CompanionEngine(
+                store, memory=_RecordingMemory(), memory_space_id="test-space",
+            )
+            portfolio = PortfolioService(root, store)
+            conversation = store.ensure_daily_conversation("2026-09-04")
+            message = store.stage_message(
+                conversation["cycle_id"], "复盘14:30", "conversation", message_id="m",
+            )
+            batch_id, _ = store.commit_staged_messages(conversation["cycle_id"], "conversation")
+            store.append_artifact(
+                conversation["cycle_id"], "chat_human", "human", message["body_text"],
+                conversation["as_of"], {"batch_id": batch_id},
+            )
+            started = threading.Event()
+            release = threading.Event()
+            collect_calls = 0
+
+            def collect(*_args, **_kwargs) -> MemoryResearchResult:
+                nonlocal collect_calls
+                collect_calls += 1
+                if collect_calls == 1:
+                    started.set()
+                    release.wait(2)
+                return MemoryResearchResult({"snapshot_id": "frozen"}, (), ())
+
+            first_result: list[dict] = []
+            with (
+                patch.object(AdaptiveMemoryResearch, "collect", side_effect=collect),
+                patch("ai_trading_companion.__main__.run_unified_cognition", return_value={"state": "completed"}),
+            ):
+                worker = threading.Thread(target=lambda: first_result.append(run_chat(
+                    engine, store, portfolio, conversation["cycle_id"], batch_id, False,
+                )))
+                worker.start()
+                self.assertTrue(started.wait(1))
+                duplicate = run_chat(
+                    engine, store, portfolio, conversation["cycle_id"], batch_id, False,
+                )
+                release.set()
+                worker.join(2)
+
+            self.assertEqual("running", duplicate["state"])
+            self.assertEqual(1, collect_calls)
+            self.assertEqual([{"state": "completed"}], first_result)
+
     def test_action_budget_returns_collected_context_without_an_unbounded_model_loop(self) -> None:
         memory = _RecordingMemory()
         memory.append(_episode("test-space", "prior", "close evidence", "2026-09-01T07:00:00Z"))

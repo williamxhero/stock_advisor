@@ -1895,6 +1895,28 @@ def _conversation_retry_intellect(intellect: str, attempt_count: int) -> str:
     return "smart" if intellect == "standard" and attempt_count >= 2 else intellect
 
 
+def _cognition_failure_detail(error: Exception) -> str:
+    """Persist actionable Broker classification without storing model output."""
+    if not isinstance(error, BrokerError):
+        return str(error)
+    verifier = error.verifier if isinstance(error.verifier, dict) else {}
+    problems: list[str] = []
+    for section in (verifier, verifier.get("schema"), verifier.get("business")):
+        if not isinstance(section, dict):
+            continue
+        problems.extend(str(item) for item in section.get("problems") or [])
+    return json.dumps({
+        "message": str(error),
+        "category": error.category,
+        "request_id": error.request_id,
+        "verifier": {
+            "name": verifier.get("name"),
+            "passed": verifier.get("passed"),
+            "problems": list(dict.fromkeys(problems)),
+        },
+    }, ensure_ascii=False, sort_keys=True)
+
+
 def _next_memory_research_action(
     store: CompanionStore, cycle: dict[str, Any], state: dict[str, Any], deadline: float,
 ) -> dict[str, Any]:
@@ -2148,7 +2170,7 @@ def run_unified_cognition(
             raise MemoryResearchError("memory research was terminated by the user")
         outcome = cognition.apply(cycle, source, messages, mode, data, memory_research=memory_research)
     except Exception as exc:
-        store.finish_cognition_job(job["job_id"], error=str(exc))
+        store.finish_cognition_job(job["job_id"], error=_cognition_failure_detail(exc))
         if stream:
             if engine.store.chat_research_terminated(cycle_id):
                 engine.emit(cycle, "chat.stream.cancelled", {"cycle": cycle, "stream_id": stream["stream_id"]})
@@ -2273,7 +2295,7 @@ def run_chat(
                 "episode_ids": [str(item["episode_id"]) for item in memory_result.context if item.get("episode_id")],
             }
     except Exception as exc:
-        store.finish_cognition_job(job["job_id"], error=str(exc))
+        store.finish_cognition_job(job["job_id"], error=_cognition_failure_detail(exc))
         if isinstance(exc, MemoryResearchError) and store.chat_research_terminated(cycle_id):
             return {"cycle_id": cycle_id, "state": "terminated"}
         raise

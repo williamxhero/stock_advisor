@@ -233,7 +233,11 @@ class UnifiedCognitionTests(unittest.TestCase):
 
         def interrupted(request):
             self.assertIsNone(request.on_delta)
-            raise BrokerError("connection lost", category="broker_unavailable")
+            raise BrokerError(
+                "connection lost", category="broker_unavailable",
+                request_id="request-1",
+                verifier={"passed": False, "business": {"problems": ["missing_required_action"]}},
+            )
 
         broker.invoke.side_effect = interrupted
         with patch("ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker), self.assertRaises(BrokerError):
@@ -242,6 +246,14 @@ class UnifiedCognitionTests(unittest.TestCase):
         stream = self.store.stream_messages(conversation["cycle_id"])[0]
         self.assertEqual("failed", stream["state"])
         self.assertEqual("", stream["text"])
+        with self.store.connection() as connection:
+            error = connection.execute(
+                "SELECT error FROM companion_cognition_job WHERE cycle_id=?",
+                (conversation["cycle_id"],),
+            ).fetchone()[0]
+        self.assertIn("broker_unavailable", error)
+        self.assertIn("missing_required_action", error)
+        self.assertIn("request-1", error)
 
     def test_pre_stream_memory_failure_closes_job_and_publishes_failure_stream(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-08-27")

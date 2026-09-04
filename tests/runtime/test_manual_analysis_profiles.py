@@ -112,6 +112,32 @@ class ManualAnalysisProfileResolverTests(TestCase):
                 self.assertEqual("post_close", profile["analysis"]["time_scope"])
                 self.assertEqual(raw_scope, profile["analysis"]["requested_time_scope"])
 
+    def test_normalizes_explicit_completed_close_through_present_scope(self) -> None:
+        for raw_scope in (
+            "2026年9月3日收盘至当前",
+            "9月3日收盘截至当前时点",
+            "最近交易日收盘到现在",
+            "September 3 close through now",
+        ):
+            with self.subTest(raw_scope=raw_scope):
+                profile = self.resolver.resolve("2026-09-04T11:09:07+08:00", {
+                    "subject": "A股市场与当前完整持仓",
+                    "time_scope": raw_scope,
+                    "goal": "完成晚间盘后回顾",
+                })
+
+                self.assertEqual("post_close_review", profile["profile_id"])
+                self.assertEqual("post_close", profile["analysis"]["time_scope"])
+                self.assertEqual(raw_scope, profile["analysis"]["requested_time_scope"])
+
+    def test_does_not_treat_a_future_current_session_close_as_completed(self) -> None:
+        with self.assertRaisesRegex(AnalysisClarificationRequired, "does not match"):
+            self.resolver.resolve("2026-09-04T11:09:07+08:00", {
+                "subject": "A股市场与当前完整持仓",
+                "time_scope": "当前交易日收盘前",
+                "goal": "完成晚间盘后回顾",
+            })
+
     def test_explicit_post_close_scope_uses_latest_completed_close_before_market(self) -> None:
         profile = self.resolver.resolve("2026-09-04T08:00:00+08:00", {
             "subject": "A股市场与当前完整持仓",

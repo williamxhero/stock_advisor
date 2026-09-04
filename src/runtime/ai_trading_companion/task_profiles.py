@@ -1,6 +1,7 @@
 """Deterministic, versioned profiles for manual formal analysis."""
 from __future__ import annotations
 
+import re
 from datetime import datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -163,7 +164,30 @@ class ManualAnalysisProfileResolver:
         close_to_next_session = (
             "收盘" in time_scope and any(term in time_scope for term in ("下一交易日", "下一个交易日"))
         ) or ("close" in folded and "next trading" in folded)
-        if close_to_next_session or any(term in time_scope for term in completed_close_terms) or any(
+        chinese_completed_close_anchor = bool(re.search(
+            r"(?:(?:\d{4}年)?\d{1,2}月\d{1,2}日|最近(?:一个)?交易日|上一交易日|前一交易日|昨日|已)[^。；，]{0,10}收盘",
+            time_scope,
+        ))
+        chinese_present_endpoint = any(term in time_scope for term in (
+            "至当前", "到当前", "截至当前", "延伸到当前",
+            "至现在", "到现在", "截至现在", "延伸到现在",
+        ))
+        english_completed_close_anchor = bool(re.search(
+            r"(?:latest|recent|previous|yesterday|\d{1,2}[/-]\d{1,2}|"
+            r"january|february|march|april|may|june|july|august|september|october|november|december)"
+            r"[^.]{0,24}\bclose\b",
+            folded,
+        ))
+        english_present_endpoint = bool(re.search(
+            r"\b(?:through|to|until|as of)\s+(?:the\s+)?(?:current|present|now)\b",
+            folded,
+        ))
+        close_to_present = (
+            chinese_completed_close_anchor and chinese_present_endpoint
+        ) or (
+            english_completed_close_anchor and english_present_endpoint
+        )
+        if close_to_next_session or close_to_present or any(term in time_scope for term in completed_close_terms) or any(
             term in folded for term in completed_close_english
         ):
             return "post_close"

@@ -129,15 +129,27 @@ def _save_safe_stage_fallback(
 ) -> tuple[dict[str, Any], str]:
     """Seal a local conservative reply after a provider candidate has failed closed."""
     output = safe_stage_output(stage, horizon=horizon, packet=packet)
+    business_verifier = CognitiveRouter().verify(stage, packet, output)
     attempt = store.begin_attempt(
         cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), str(packet.get("sha256") or "local-fallback"),
         model="runtime-safe-fallback", reasoning_effort="deterministic", search_enabled=False,
         timeout_seconds=0, routing_reason="verified-stage-safe-fallback",
         runner_fingerprint="runtime-safe-fallback/v1", input_packet=packet,
     )
+    verifier = {
+        **business_verifier,
+        "fallback": True,
+        "reason": "provider_candidate_not_publishable",
+    }
+    if not business_verifier.get("passed"):
+        store.finish_attempt(
+            attempt["attempt_id"], "failed", output=output, verifier=verifier,
+            error="safe fallback did not pass local verification",
+            actual_model="runtime-safe-fallback",
+        )
+        raise EvidenceInsufficient(verifier)
     store.finish_attempt(
-        attempt["attempt_id"], "succeeded", output=output,
-        verifier={"passed": True, "fallback": True, "reason": "provider_candidate_not_publishable"},
+        attempt["attempt_id"], "succeeded", output=output, verifier=verifier,
         actual_model="runtime-safe-fallback",
     )
     return output, attempt["attempt_id"]
@@ -1133,9 +1145,13 @@ def run_research(
                 time.sleep(2)
                 continue
             if isinstance(exc, (BrokerError, TimeoutError)) and evidence is not None and evidence_attempt_id and local_packet is not None:
-                fallback, fallback_attempt_id = _save_safe_stage_fallback(
-                    store, cycle, "m0_compose", local_packet, horizon="当前",
-                )
+                try:
+                    fallback, fallback_attempt_id = _save_safe_stage_fallback(
+                        store, cycle, "m0_compose", local_packet, horizon="当前",
+                    )
+                except EvidenceInsufficient as fallback_exc:
+                    engine.research_failed(cycle["cycle_id"], str(fallback_exc), details=fallback_exc.verifier)
+                    raise
                 m0_result = normalize_stage_output("m0_compose", fallback)
                 ready = engine.research_ready(
                     cycle["cycle_id"], m0_result.text,
@@ -1280,10 +1296,17 @@ def run_m1(
             retryable = _m1_should_retry(exc, attempt_number=number, remaining_seconds=remaining)
             details = getattr(exc, "verifier", None)
             if isinstance(exc, (BrokerError, TimeoutError)) and not retryable and local_packet is not None:
-                fallback, fallback_attempt_id = _save_safe_stage_fallback(
-                    store, cycle, "m1_judgment", local_packet,
-                    horizon="当前",
-                )
+                try:
+                    fallback, fallback_attempt_id = _save_safe_stage_fallback(
+                        store, cycle, "m1_judgment", local_packet,
+                        horizon="当前",
+                    )
+                except EvidenceInsufficient as fallback_exc:
+                    engine.m1_failed(
+                        cycle_id, str(fallback_exc), retryable=False,
+                        details=fallback_exc.verifier,
+                    )
+                    raise
                 m1_result = normalize_stage_output("m1_judgment", fallback)
                 return engine.m1_ready(
                     cycle_id, m1_result.text, as_of=evidence.get("as_of"),

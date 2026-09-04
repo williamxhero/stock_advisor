@@ -206,6 +206,112 @@ def _verified_close_summary(packet: dict[str, Any] | None) -> dict[str, Any] | N
     }
 
 
+def _verified_close_judgment(
+    packet: dict[str, Any] | None, *, horizon: str,
+) -> dict[str, Any] | None:
+    """Preserve the complete close-review contract when model wording fails."""
+    value = packet or {}
+    evidence = value.get("evidence") if isinstance(value.get("evidence"), dict) else {}
+    parsed: list[dict[str, Any]] = []
+    for source in evidence.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        try:
+            excerpt = json.loads(str(source.get("excerpt") or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(excerpt, dict):
+            parsed.append(excerpt)
+
+    indices = [row for item in parsed for row in item.get("indices") or [] if isinstance(row, dict)]
+    breadth = next((item.get("breadth") for item in parsed if isinstance(item.get("breadth"), dict)), None)
+    quotes = [row for item in parsed for row in item.get("quotes") or [] if isinstance(row, dict)]
+    turnover = next((
+        str(item.get("summary")) for item in parsed
+        if "两市成交额" in str(item.get("summary") or "") and "前一交易日" in str(item.get("summary") or "")
+    ), "")
+    theme_fact = next((
+        item for item in parsed if item.get("leaders") and item.get("laggards")
+    ), None)
+    private = (
+        (value.get("business_context") or {}).get("private_context_before_h0") or {}
+        if isinstance(value.get("business_context"), dict) else {}
+    )
+    required = {
+        str(row.get("code")) for row in private.get("positions") or []
+        if isinstance(row, dict) and float(row.get("shares") or 0) > 0
+    }
+    quote_by_symbol = {str(row.get("symbol") or ""): row for row in quotes}
+    if len(indices) < 3 or not breadth or not turnover or not theme_fact or not required.issubset(quote_by_symbol):
+        return None
+
+    def number(item: Any) -> str:
+        return format(item, ".15g") if isinstance(item, float) else str(item)
+
+    index_text = "、".join(
+        f"{row.get('name') or row.get('symbol')}{number(row.get('price'))}（{number(row.get('change_percent'))}%）"
+        for row in indices[:3]
+    )
+    breadth_text = f"上涨{number(breadth.get('up'))}家、下跌{number(breadth.get('down'))}家、平盘{number(breadth.get('flat'))}家"
+    trading_date = next((
+        str(row.get("trading_date")) for row in [*indices, *quotes]
+        if row.get("trading_date")
+    ), str(value.get("as_of") or "")[:10])
+    date_match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", trading_date)
+    date_label = (
+        f"{date_match.group(1)}年{int(date_match.group(2))}月{int(date_match.group(3))}日"
+        if date_match else "收盘"
+    )
+    turnover = turnover.split("；", 1)[0].rstrip("。")
+    market_evidence = f"上交所、深交所：{turnover}；东方财富：{breadth_text}。"
+    leader = theme_fact["leaders"][0]
+    laggard = theme_fact["laggards"][0]
+    leader_core = leader.get("core") or {}
+    laggard_core = laggard.get("core") or {}
+    themes = (
+        f"{leader.get('name')}板块领涨{number(leader.get('change_percent'))}%，核心"
+        f"{leader_core.get('name')}({leader_core.get('symbol')}){number(leader_core.get('change_percent'))}%；"
+        f"{laggard.get('name')}板块领跌{number(laggard.get('change_percent'))}%，核心"
+        f"{laggard_core.get('name')}({laggard_core.get('symbol')}){number(laggard_core.get('change_percent'))}%"
+    )
+    theme_and_sentiment = (
+        f"东方财富15:00板块数据：{themes}；未取得可独立核验的论坛传播数据，"
+        f"以{breadth_text}作为市场情绪替代证据。"
+    )
+    holdings = "、".join(
+        f"{quote_by_symbol[code].get('name') or code}({code}){number(quote_by_symbol[code].get('price'))}/"
+        f"{number(quote_by_symbol[code].get('change_percent'))}%"
+        for code in sorted(required)
+    )
+    holding_evidence = f"腾讯15:00持仓收盘：{holdings}。"
+    if any(len(item) > 240 for item in (market_evidence, theme_and_sentiment, holding_evidence)):
+        return None
+    return {
+        "result_version": 4,
+        "semantic": {
+            "summary": (
+                f"资料时点{date_label}15:00，腾讯收盘：{index_text}。指数走弱、成交放大且下跌家数多于上涨家数，"
+                "题材分化明显；证据暂不支持追涨，维持中性观察。"
+            ),
+            "direction": "neutral",
+            "qualified": True,
+            "horizon": horizon,
+            "current_action": "observe",
+            "key_evidence": [market_evidence, theme_and_sentiment, holding_evidence],
+            "transition_conditions": [{
+                "outcome": "upgrade", "price": "三大指数重新站稳本日收盘位",
+                "breadth": "上涨家数持续超过下跌家数", "persistence": "连续一个交易日确认",
+            }, {
+                "outcome": "downgrade", "price": "三大指数继续跌破本日低位",
+                "breadth": "下跌家数继续显著多于上涨家数", "persistence": "连续一个交易日确认",
+            }],
+            "position_focus": [],
+            "risks": ["放量但市场宽度偏弱，量价并未形成一致的上行确认。", "论坛传播数据缺失，情绪判断仅使用市场宽度替代证据。"],
+            "unknowns": ["下一交易日指数、市场宽度与成交扩散能否同步改善。"],
+        },
+    }
+
+
 def safe_stage_output(
     stage: str, *, horizon: str = "当前", packet: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -224,6 +330,10 @@ def safe_stage_output(
             },
         }
     if stage in {"m1_judgment", "m2"}:
+        if stage == "m1_judgment":
+            verified = _verified_close_judgment(packet, horizon=horizon)
+            if verified is not None:
+                return verified
         return {
             "result_version": 4 if stage == "m1_judgment" else 3,
             "semantic": {

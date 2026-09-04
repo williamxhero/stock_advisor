@@ -69,6 +69,66 @@ class EvidenceV3Tests(TestCase):
         self.assertNotIn("信息还在核对", rendered)
         self.assertTrue(CognitiveRouter().verify("m0_compose", packet, output)["passed"])
 
+    def test_m1_safe_fallback_preserves_complete_close_review_evidence(self):
+        def source(value):
+            return {"excerpt": json.dumps(value, ensure_ascii=False)}
+
+        packet = {
+            "task_key": "daily.review.1520",
+            "task_profile": {
+                "evidence_family": "completed_close",
+                "analysis": {"goal": "给出成交额、全部持仓、来源和资料时点"},
+            },
+            "business_context": {"private_context_before_h0": {"positions": [
+                {"code": code, "shares": 100} for code in ("000997", "002891", "300421", "601899", "603861")
+            ]}},
+            "evidence": {"sources": [
+                source({"indices": [
+                    {"name": "上证指数", "price": 3930.12, "change_percent": -0.3036},
+                    {"name": "深证成指", "price": 13516.97, "change_percent": -0.7938},
+                    {"name": "创业板指", "price": 3286.55, "change_percent": -0.7846},
+                ]}),
+                source({"breadth": {"up": 2225, "down": 2794, "flat": 188}}),
+                source({"summary": "2026-09-04两市成交额20335.82亿元，上一交易日2026-09-03成交额17606.92亿元，较前一交易日+2728.90亿元（+15.50%）"}),
+                source({
+                    "leaders": [{"name": "畜禽饲料", "change_percent": 8.46,
+                                 "core": {"name": "新希望", "symbol": "000876", "change_percent": 10.0}}],
+                    "laggards": [{"name": "玻纤制造", "change_percent": -4.82,
+                                  "core": {"name": "中国巨石", "symbol": "600176", "change_percent": -5.75}}],
+                }),
+                *[source({"quotes": [{
+                    "symbol": code, "name": name, "price": price, "change_percent": change,
+                }]}) for code, name, price, change in (
+                    ("000997", "新大陆", 21.6, 2.4182), ("002891", "中宠股份", 28.61, 2.7289),
+                    ("300421", "力星股份", 16.35, -2.5626), ("601899", "紫金矿业", 33.35, 0.1201),
+                    ("603861", "白云电器", 11.69, -0.341),
+                )],
+            ]},
+        }
+
+        output = safe_stage_output("m1_judgment", packet=packet)
+        rendered = express_stage_semantics("m1", output["semantic"])
+        verdict = CognitiveRouter().verify("m1_judgment", packet, output)
+
+        self.assertTrue(verdict["passed"], verdict["problems"])
+        self.assertIn("20335.82亿元", rendered)
+        self.assertIn("领涨", rendered)
+        self.assertIn("论坛传播数据", rendered)
+        for code in ("000997", "002891", "300421", "601899", "603861"):
+            self.assertIn(code, rendered)
+
+    def test_unqualified_close_review_cannot_bypass_requested_coverage(self):
+        packet = {
+            "task_key": "daily.review.1520",
+            "task_profile": {"evidence_family": "completed_close", "analysis": {"goal": "成交额、来源与时点"}},
+        }
+        output = safe_stage_output("m1_judgment")
+
+        verdict = CognitiveRouter().verify("m1_judgment", packet, output)
+
+        self.assertFalse(verdict["passed"])
+        self.assertIn("close_review_lacks_numeric_turnover_comparison", verdict["problems"])
+
     def test_stage_expression_does_not_double_terminal_punctuation(self):
         output = safe_stage_output("m0_compose", packet={
             "verified_fact_digest": [

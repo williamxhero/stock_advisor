@@ -271,7 +271,6 @@ def _close_review_coverage_problems(packet: dict[str, Any], semantic: dict[str, 
     if (
         packet.get("task_key") != "daily.review.1520"
         or task_profile.get("evidence_family") != "completed_close"
-        or not semantic.get("qualified")
     ):
         return []
 

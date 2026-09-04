@@ -100,6 +100,19 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.assertFalse(verdict["passed"])
         self.assertIn("complete_portfolio_requires_snapshot_action:holdings", verdict["problems"])
 
+    def test_complete_holdings_query_does_not_require_snapshot_action(self) -> None:
+        text = (
+            "请完整交付今天14:30盘中执行复盘，只回复一次。必须包含三大指数、市场宽度、"
+            "我的全部持仓分钟行情、风险判断、后续条件，并注明来源与资料时点。"
+        )
+
+        verdict = verify_cognition_result(
+            [{"message_id": "review", "body_text": text}],
+            {"answer": {"points": ["我会先核验数据。"]}, "actions": []},
+        )
+
+        self.assertEqual({"passed": True, "problems": []}, verdict)
+
     def test_active_provider_call_graph_is_semantic_and_never_writes_legacy_markdown_fields(self):
         schema_path = PROJECT_ROOT / "resources" / "contracts" / "companion-cognition-result-v2.schema.json"
         self.assertTrue(schema_path.is_file())

@@ -9,7 +9,12 @@ from typing import Any
 
 from .learning import WorkflowEvolution
 from .cognition_compat import adapt_legacy_cognition_result
-from .portfolio import explicit_fixture_extraction, has_complete_portfolio_scope, is_portfolio_statement
+from .portfolio import (
+    explicit_fixture_extraction,
+    has_complete_portfolio_scope,
+    is_complete_portfolio_snapshot_statement,
+    is_portfolio_statement,
+)
 from .store import digest
 from .task_profiles import AnalysisClarificationRequired
 from .user_learning import explicit_expression_preference, user_method_claim
@@ -36,8 +41,7 @@ def verify_cognition_result(messages: list[dict[str, Any]], result: dict[str, An
     complete_message_ids = {
         str(message.get("message_id") or "")
         for message in messages
-        if is_portfolio_statement(str(message.get("body_text") or ""))
-        and has_complete_portfolio_scope(str(message.get("body_text") or ""))
+        if is_complete_portfolio_snapshot_statement(str(message.get("body_text") or ""))
     }
     if not complete_message_ids:
         return {"passed": True, "problems": []}

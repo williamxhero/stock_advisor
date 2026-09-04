@@ -19,6 +19,9 @@ INCOMPLETE_PORTFOLIO_SCOPE = re.compile(
     rf"(?:不是|并非|不包含|未包含|没包含|还没|尚未).{{0,8}}{_COMPLETE_PORTFOLIO_SCOPE}|"
     rf"{_COMPLETE_PORTFOLIO_SCOPE}.{{0,8}}(?:并不完整|不完整|未列全|没列全|未列完|没列完|还有遗漏)"
 )
+COMPLETE_PORTFOLIO_FACT = re.compile(
+    r"(?:\d+(?:\.\d+)?\s*股)|(?:空仓|没有持仓|无持仓)"
+)
 
 
 def is_portfolio_statement(text: str) -> bool:
@@ -34,6 +37,15 @@ def has_complete_portfolio_scope(text: str) -> bool:
     return (
         any(marker in text for marker in COMPLETE_PORTFOLIO_SCOPE_MARKERS)
         and not INCOMPLETE_PORTFOLIO_SCOPE.search(text)
+    )
+
+
+def is_complete_portfolio_snapshot_statement(text: str) -> bool:
+    """Distinguish an authoritative snapshot from a request about all holdings."""
+    return bool(
+        is_portfolio_statement(text)
+        and has_complete_portfolio_scope(text)
+        and COMPLETE_PORTFOLIO_FACT.search(text)
     )
 
 

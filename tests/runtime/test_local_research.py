@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from ai_trading_companion.broker_client import BrokerError
-from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, WebAccessGatewayBackend, _merge_mandatory_operations
+from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, ToolResolutionError, WebAccessGatewayBackend, _merge_mandatory_operations
 from ai_trading_companion.tooling import EvidenceResolution, FactRequest, ToolCatalog, ToolRunner
 
 CONTRACT = {"version": 3, "as_of": "2026-08-27T07:00:00Z", "requirements": [{"key": "market", "blocking": True, "allowed_coverage": ["covered"], "window": {"mode": "exact", "start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z"}}]}
@@ -493,6 +493,177 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual("cn_equity_quote_batch", request.capability)
         self.assertEqual(["600487", "603861"], request.inputs["symbols"])
         self.assertEqual("2026-09-01T01:45:00Z", request.required_at)
+
+    def test_exact_close_market_tools_fall_back_to_strict_daily_ledger_evidence(self) -> None:
+        close = "2026-09-03T07:00:00Z"
+        as_of = "2026-09-03T07:20:00Z"
+        contracts = {
+            "indices_close": {
+                "operation": "market_snapshot", "capability": "cn_market_index_batch",
+                "entities": ["000001", "399001", "399006"], "field": "indices",
+            },
+            "portfolio_market_state": {
+                "operation": "holding_snapshot", "capability": "cn_equity_quote_batch",
+                "entities": ["300378", "300421", "603861"], "field": "quotes",
+            },
+        }
+        rows = {
+            "indices_close": [
+                {"symbol": "000001", "name": "上证指数", "exchange": "SSE", "source": "ledger",
+                 "price": 3942.09, "previous_close": 3941.39, "change": 0.7, "change_percent": 0.0178,
+                 "quote_at": close, "trading_date": "2026-09-03", "status": "closed"},
+                {"symbol": "399001", "name": "深证成指", "exchange": "SZSE", "source": "ledger",
+                 "price": 13625.12, "previous_close": 13611.55, "change": 13.57, "change_percent": 0.0997,
+                 "quote_at": close, "trading_date": "2026-09-03", "status": "closed"},
+                {"symbol": "399006", "name": "创业板指", "exchange": "SZSE", "source": "ledger",
+                 "price": 3312.54, "previous_close": 3312.24, "change": 0.3, "change_percent": 0.0091,
+                 "quote_at": close, "trading_date": "2026-09-03", "status": "closed"},
+            ],
+            "portfolio_market_state": [
+                {"symbol": "300378", "name": "鼎捷数智", "market": "CN-A", "exchange": "SZSE", "source": "ledger",
+                 "price": 40.0, "previous_close": 39.0, "change": 1.0, "change_percent": 2.5641,
+                 "quote_at": close, "trading_date": "2026-09-03", "status": "closed"},
+                {"symbol": "300421", "name": "力星股份", "market": "CN-A", "exchange": "SZSE", "source": "ledger",
+                 "price": 20.0, "previous_close": 20.0, "change": 0.0, "change_percent": 0.0,
+                 "quote_at": close, "trading_date": "2026-09-03", "status": "closed"},
+                {"symbol": "603861", "name": "白云电器", "market": "CN-A", "exchange": "SSE", "source": "ledger",
+                 "price": 10.0, "previous_close": 12.0, "change": -2.0, "change_percent": -16.6667,
+                 "quote_at": close, "trading_date": "2026-09-03", "status": "closed"},
+            ],
+        }
+        ledger = [
+            {
+                "title": f"verified {key} {item['symbol']}",
+                "url": f"https://example.test/{key}/{item['symbol']}",
+                "known_at": "2026-09-03T07:10:00Z", "coverage_state": "observed",
+                "text": json.dumps({"finality": "official_close", spec["field"]: [item]}, ensure_ascii=False),
+            }
+            for key, spec in contracts.items() for item in rows[key]
+        ]
+        ledger.append({
+            "title": "verified market breadth", "url": "https://example.test/market-breadth",
+            "known_at": "2026-09-03T07:10:00Z", "coverage_state": "observed",
+            "text": json.dumps({
+                "trading_date": "2026-09-03", "finality": "official_close",
+                "breadth": {"up": 2218, "down": 2827, "flat": 166, "limit_up": 51, "limit_down": 8},
+            }, ensure_ascii=False),
+        })
+        runner = mock.Mock()
+        runner.catalog.root = Path(tempfile.gettempdir()) / "missing-market-tools"
+        runner.resolve_with_fallback.side_effect = lambda request: EvidenceResolution.failed(
+            request.capability, "tool_process_failed",
+        )
+
+        for key, spec in contracts.items():
+            contract = {
+                "version": 4, "as_of": as_of, "requirements": [{
+                    "key": key, "blocking": True, "allowed_coverage": ["covered"],
+                    "required_entities": spec["entities"], "finality": "official_close",
+                    "window": {"mode": "exact", "start": close, "end": close},
+                }],
+            }
+            result = ToolCatalogMarketBackend(
+                runner, contract=contract, deadline=lambda: 10.0, daily_ledger=ledger,
+            )(spec["operation"], {"_requirement_key": key})
+
+            self.assertEqual("daily_evidence_ledger", result["source"])
+            self.assertIsNone(result["results"][0]["raw_artifact_ref"])
+            payloads = [json.loads(item["excerpt_text"]) for item in result["results"]]
+            self.assertEqual(set(spec["entities"]), {
+                row["symbol"] for payload in payloads for row in payload[spec["field"]]
+            })
+
+        self.assertEqual(2, runner.resolve_with_fallback.call_count)
+
+        runner.reset_mock()
+        combined_contract = {
+            "version": 4, "as_of": as_of, "requirements": [
+                {
+                    "key": key, "blocking": True, "allowed_coverage": ["covered"],
+                    "required_entities": spec["entities"], "finality": "official_close",
+                    "minimum_numeric_facts": 12 if key == "portfolio_market_state" else 3,
+                    "window": {"mode": "exact", "start": close, "end": close},
+                }
+                for key, spec in contracts.items()
+            ] + [{
+                "key": "market_breadth", "blocking": True, "allowed_coverage": ["covered"],
+                "finality": "official_close", "minimum_numeric_facts": 3,
+                "window": {"mode": "exact", "start": close, "end": close},
+            }],
+        }
+        backend = ToolCatalogMarketBackend(
+            runner, contract=combined_contract, deadline=lambda: 10.0, daily_ledger=ledger,
+        )
+        self.assertEqual("daily_evidence_ledger", backend(
+            "market_breadth", {"_requirement_key": "market_breadth"},
+        )["source"])
+        runner.reset_mock()
+        research = LocalResearchChain(
+            lambda *_: {"version": 1, "operations": []},
+            ReadOnlyResearchExecutor({"market": backend}), max_repairs=0,
+        ).run({"as_of": as_of}, combined_contract, attempt_id="ledger-close")
+
+        self.assertTrue(research.qualified, (research.verifier["problems"], research.observations))
+        self.assertEqual(3, runner.resolve_with_fallback.call_count)
+
+    def test_exact_close_ledger_fallback_rejects_any_contract_downgrade(self) -> None:
+        close = "2026-09-03T07:00:00Z"
+        contract = {
+            "version": 4, "as_of": "2026-09-03T07:20:00Z", "requirements": [{
+                "key": "indices_close", "blocking": True, "allowed_coverage": ["covered"],
+                "finality": "official_close",
+                "window": {"mode": "exact", "start": close, "end": close},
+            }],
+        }
+
+        def valid_ledger() -> list[dict]:
+            values = [
+                ("000001", "上证指数", "SSE", 3942.09, 3941.39, 0.7, 0.0178),
+                ("399001", "深证成指", "SZSE", 13625.12, 13611.55, 13.57, 0.0997),
+                ("399006", "创业板指", "SZSE", 3312.54, 3312.24, 0.3, 0.0091),
+            ]
+            return [{
+                "title": name, "url": f"https://example.test/{symbol}",
+                "known_at": "2026-09-03T07:10:00Z", "coverage_state": "observed",
+                "text": json.dumps({"finality": "official_close", "indices": [{
+                    "symbol": symbol, "name": name, "exchange": exchange, "source": "ledger",
+                    "price": price, "previous_close": previous, "change": change,
+                    "change_percent": percent, "quote_at": close,
+                    "trading_date": "2026-09-03", "status": "closed",
+                }]}, ensure_ascii=False),
+            } for symbol, name, exchange, price, previous, change, percent in values]
+
+        cases = {}
+        wrong_time = valid_ledger()
+        payload = json.loads(wrong_time[0]["text"]); payload["indices"][0]["quote_at"] = "2026-09-03T06:59:00Z"
+        wrong_time[0]["text"] = json.dumps(payload, ensure_ascii=False); cases["wrong time"] = wrong_time
+        wrong_finality = valid_ledger()
+        payload = json.loads(wrong_finality[0]["text"]); payload["finality"] = "intraday"
+        wrong_finality[0]["text"] = json.dumps(payload, ensure_ascii=False); cases["wrong finality"] = wrong_finality
+        cases["missing entity"] = valid_ledger()[:-1]
+        bad_numeric = valid_ledger()
+        payload = json.loads(bad_numeric[0]["text"]); payload["indices"][0]["change_percent"] = "unknown"
+        bad_numeric[0]["text"] = json.dumps(payload, ensure_ascii=False); cases["bad numeric"] = bad_numeric
+        private_url = valid_ledger(); private_url[0]["url"] = "file:///trusted-looking.json"; cases["non-public url"] = private_url
+        future_known = valid_ledger(); future_known[0]["known_at"] = "2026-09-03T07:21:00Z"; cases["future known"] = future_known
+        conflicting = valid_ledger()
+        conflict = json.loads(json.dumps(conflicting[0], ensure_ascii=False))
+        payload = json.loads(conflict["text"]); payload["indices"][0]["price"] = 1.0
+        conflict["text"] = json.dumps(payload, ensure_ascii=False); conflict["url"] += "?conflict=1"
+        conflicting.append(conflict); cases["conflicting duplicate"] = conflicting
+
+        for label, ledger in cases.items():
+            with self.subTest(label):
+                runner = mock.Mock()
+                runner.resolve_with_fallback.return_value = EvidenceResolution.failed(
+                    "cn_market_index_batch", "tool_process_failed",
+                )
+                backend = ToolCatalogMarketBackend(
+                    runner, contract=contract, deadline=lambda: 10.0, daily_ledger=ledger,
+                )
+                with self.assertRaises(ToolResolutionError):
+                    backend("market_snapshot", {"_requirement_key": "indices_close"})
+                runner.resolve_with_fallback.assert_called_once()
 
     def test_current_bar_uses_only_contract_frozen_symbols(self) -> None:
         contract = {

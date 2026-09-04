@@ -627,6 +627,11 @@ def _validate_capability_result(request: FactRequest, output: dict[str, Any]) ->
     return None
 
 
+def validate_capability_data(request: FactRequest, fact_as_of: str, data: dict[str, Any]) -> str | None:
+    """Apply the promoted-tool result contract to an alternate structured evidence source."""
+    return _validate_capability_result(request, {"fact_as_of": fact_as_of, "data": data})
+
+
 def _validate_current_equity_bars(request: FactRequest, data: dict[str, Any]) -> str | None:
     bars = data.get("bars")
     expected = request.inputs.get("symbols")

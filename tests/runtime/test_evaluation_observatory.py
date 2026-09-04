@@ -340,6 +340,26 @@ class EvaluationObservatoryTests(unittest.TestCase):
         self.assertIn("legacy_incomplete", snapshot.completeness)
         self.assertIsNone(snapshot.qualified_duration_seconds)
 
+    def test_legacy_backfill_reuses_frozen_snapshot_after_cycle_changes(self) -> None:
+        scheduled = "2026-08-27T09:45:00+08:00"
+        with patch("ai_trading_companion.store.now", return_value=scheduled):
+            cycle = self.store.create_cycle("daily.execution.0945", scheduled, scheduled)
+
+        first_report = self.observatory._backfill_legacy()
+        first_summary = self.observatory.query(
+            SnapshotQuery(snapshot_kind="evaluation", cycle_id=cycle["cycle_id"])
+        )[0]
+        self.store.queue_event(cycle["cycle_id"], "research.retrying", {"attempt": 2})
+
+        replay_report = self.observatory._backfill_legacy()
+        replay_summary = self.observatory.query(
+            SnapshotQuery(snapshot_kind="evaluation", cycle_id=cycle["cycle_id"])
+        )[0]
+
+        self.assertEqual(1, first_report["evaluation_snapshots"])
+        self.assertEqual(1, replay_report["evaluation_snapshots"])
+        self.assertEqual(first_summary.snapshot_id, replay_summary.snapshot_id)
+
     def test_judgment_outcomes_preserve_the_original_conditions_at_each_horizon(self) -> None:
         scheduled = "2026-08-28T09:45:00+08:00"
         with patch("ai_trading_companion.store.now", return_value=scheduled):

@@ -666,18 +666,34 @@ class EvaluationObservatory:
             )]
             router_cells = [str(row["cell_key"]) for row in connection.execute("SELECT DISTINCT cell_key FROM router_evaluation")]
             strategy_cells = [str(row["cell_key"]) for row in connection.execute("SELECT DISTINCT cell_key FROM runtime_strategy_evaluation")]
+            frozen_legacy_requests = {
+                str(row["request_id"])
+                for row in connection.execute(
+                    """SELECT request_id FROM observatory_request
+                         WHERE request_id LIKE 'legacy-evaluation:%'
+                            OR request_id LIKE 'legacy-experiment:%'"""
+                )
+            }
         evaluations = 0
         experiments = 0
         for cycle in cycles:
+            request_id = f"legacy-evaluation:{cycle['cycle_id']}"
+            if request_id in frozen_legacy_requests:
+                evaluations += 1
+                continue
             snapshot = self.evaluate(EvaluationRequest(
                 cycle_id=cycle["cycle_id"], observed_at=str(cycle["updated_at"]), legacy_incomplete=True,
-                request_id=f"legacy-evaluation:{cycle['cycle_id']}",
+                request_id=request_id,
             ))
             if snapshot.snapshot_id:
                 evaluations += 1
         for cell_key in dict.fromkeys([*router_cells, *strategy_cells]):
+            request_id = f"legacy-experiment:{cell_key}"
+            if request_id in frozen_legacy_requests:
+                experiments += 1
+                continue
             snapshot = self.assess_experiment(ExperimentRequest(
-                cell_key, source_kind="historical_replay", request_id=f"legacy-experiment:{cell_key}",
+                cell_key, source_kind="historical_replay", request_id=request_id,
             ))
             if snapshot.snapshot_id:
                 experiments += 1

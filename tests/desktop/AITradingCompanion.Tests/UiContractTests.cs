@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Markup;
 using System.Windows.Media;
 
 namespace AITradingCompanion.Tests;
@@ -13,10 +14,11 @@ public sealed class UiContractTests
         Exception? failure = null;
         var thread = new Thread(() =>
         {
+            Window? window = null;
             try
             {
-                var app = EnsureApplication();
-                var style = Assert.IsType<Style>(app.Resources["ThinScrollBarStyle"]);
+                var resources = LoadApplicationResources();
+                var style = Assert.IsType<Style>(resources["ThinScrollBarStyle"]);
                 var vertical = new ScrollBar { Style = style, Orientation = Orientation.Vertical };
                 vertical.Measure(new Size(20, 200));
                 vertical.Arrange(new Rect(0, 0, 2, 200));
@@ -53,7 +55,8 @@ public sealed class UiContractTests
                     Text = string.Join(Environment.NewLine, Enumerable.Range(1, 40).Select(item => $"line {item}")),
                 };
                 var panel = new StackPanel { Children = { viewer, list, text } };
-                var window = new Window { Content = panel, Width = 180, Height = 320, ShowInTaskbar = false };
+                window = new Window { Content = panel, Width = 180, Height = 320, ShowInTaskbar = false };
+                window.Resources.MergedDictionaries.Add(resources);
                 window.Show();
                 window.UpdateLayout();
 
@@ -78,9 +81,12 @@ public sealed class UiContractTests
                 Assert.All(allInternal.Where(item => item.IsVisible && item.Orientation == Orientation.Vertical), item => Assert.Equal(2d, item.ActualWidth));
                 Assert.All(allInternal.Where(item => item.IsVisible && item.Orientation == Orientation.Horizontal), item => Assert.Equal(2d, item.ActualHeight));
                 Assert.All(allInternal, item => Assert.Empty(Descendants<RepeatButton>(item)));
-                window.Close();
             }
             catch (Exception exception) { failure = exception; }
+            finally
+            {
+                window?.Close();
+            }
         });
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
@@ -363,11 +369,27 @@ public sealed class UiContractTests
         }
     }
 
-    private static AITradingCompanion.Desktop.App EnsureApplication()
+    private static ResourceDictionary LoadApplicationResources()
     {
-        if (Application.Current is AITradingCompanion.Desktop.App current) return current;
-        var app = new AITradingCompanion.Desktop.App();
-        app.InitializeComponent();
-        return app;
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln"))) root = root.Parent;
+        Assert.NotNull(root);
+        var source = File.ReadAllText(Path.Combine(root.FullName!,
+            "src", "desktop", "AITradingCompanion.Desktop", "App.xaml"));
+        const string open = "<Application.Resources>";
+        const string close = "</Application.Resources>";
+        var start = source.IndexOf(open, StringComparison.Ordinal);
+        var end = source.IndexOf(close, StringComparison.Ordinal);
+        Assert.True(start >= 0 && end > start, "App.xaml must contain Application.Resources.");
+        var content = source[(start + open.Length)..end];
+        var dictionary = $"""
+            <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                                xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                                xmlns:sys="clr-namespace:System;assembly=mscorlib">
+            {content}
+            </ResourceDictionary>
+            """;
+        return Assert.IsType<ResourceDictionary>(XamlReader.Parse(dictionary));
     }
+
 }

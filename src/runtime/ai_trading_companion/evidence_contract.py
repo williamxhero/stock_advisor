@@ -47,6 +47,21 @@ class EvidenceContractFactory:
         contract["contract_hash"] = self.contract_hash(contract)
         return contract
 
+    def build_completed_close_chat(
+        self, *, as_of: str, internal_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Freeze a targeted conversation lookup to the latest completed close."""
+        frozen = self._aware(as_of)
+        contract = {
+            "version": 4,
+            "as_of": frozen.isoformat().replace("+00:00", "Z"),
+            "requirements": self._manual_requirements(
+                frozen, "completed_close", internal_context or {},
+            ),
+        }
+        contract["contract_hash"] = self.contract_hash(contract)
+        return contract
+
     def _requirements(
         self, task_key: str, stage: str, as_of: datetime,
         task_profile: dict[str, Any] | None = None,

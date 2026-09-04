@@ -115,7 +115,12 @@ class ManualAnalysisProfileResolver:
         }
 
     def _profile_id(self, requested: datetime, time_scope: str) -> str:
-        if not self.calendar.is_trading_day(requested.date()):
+        if time_scope == "post_close":
+            # An explicit completed-close request is anchored to the latest
+            # finished trading session, independent of the wall-clock session
+            # in which the user asks for it.
+            actual = "post_close_review"
+        elif not self.calendar.is_trading_day(requested.date()):
             actual = "non_trading_outlook"
         else:
             clock = requested.timetz().replace(tzinfo=None)

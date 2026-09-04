@@ -75,6 +75,11 @@ class RuntimePacketBuilder:
                         task_profile=profile,
                         internal_context=self._internal_evidence_context(cycle, packet_as_of),
                     )
+            elif stage == "chat_research" and self._asks_for_completed_close(context):
+                packet["evidence_contract"] = self.evidence_contract_factory.build_completed_close_chat(
+                    as_of=packet_as_of,
+                    internal_context=self._internal_evidence_context(cycle, packet_as_of),
+                )
             else:
                 packet["evidence_requirements"] = self._evidence_requirements(cycle, stage)
             packet["public_research_scope"] = self._public_scope(cycle, stage, evidence, context, packet_as_of, memory_cards)
@@ -324,6 +329,17 @@ class RuntimePacketBuilder:
                 "blocking": True,
             })
         return requirements
+
+    @staticmethod
+    def _asks_for_completed_close(context: dict[str, Any] | None) -> bool:
+        if not isinstance(context, dict):
+            return False
+        text = json.dumps({
+            key: context.get(key) for key in ("topics", "questions")
+        }, ensure_ascii=False).casefold()
+        return any(marker in text for marker in (
+            "盘后", "收盘", "已收盘", "post-close", "post close", "completed close",
+        ))
 
     def _pre_m0_context(self, cycle: dict[str, Any]) -> list[dict[str, str]]:
         return [

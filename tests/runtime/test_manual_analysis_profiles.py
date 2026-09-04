@@ -94,13 +94,23 @@ class ManualAnalysisProfileResolverTests(TestCase):
         self.assertEqual("post_close", profile["analysis"]["time_scope"])
         self.assertEqual(raw_scope, profile["analysis"]["requested_time_scope"])
 
+    def test_explicit_post_close_scope_uses_latest_completed_close_before_market(self) -> None:
+        profile = self.resolver.resolve("2026-09-04T08:00:00+08:00", {
+            "subject": "A股市场与当前完整持仓",
+            "time_scope": "post_close",
+            "goal": "完成晚间盘后回顾",
+        })
+
+        self.assertEqual("post_close_review", profile["profile_id"])
+        self.assertEqual("completed_close", profile["evidence_family"])
+
     def test_requires_explicit_subject_time_scope_and_goal(self) -> None:
         with self.assertRaisesRegex(AnalysisClarificationRequired, "time_scope"):
             self.resolver.resolve("2026-08-28T10:00:00+08:00", {"subject": "券商", "goal": "复核"})
         with self.assertRaisesRegex(AnalysisClarificationRequired, "does not match"):
             self.resolver.resolve(
                 "2026-08-28T10:00:00+08:00",
-                {**self.analysis, "time_scope": "post_close"},
+                {**self.analysis, "time_scope": "pre_market"},
             )
 
     def test_profile_freezes_manual_window_instead_of_a_schedule_time(self) -> None:
@@ -140,6 +150,24 @@ class ManualAnalysisProfileResolverTests(TestCase):
         }, requirements["market_breadth"]["window"])
         self.assertEqual("official_close", requirements["portfolio_market_state"]["finality"])
         self.assertEqual("exact", requirements["portfolio_market_state"]["window"]["mode"])
+
+    def test_chat_research_close_questions_freeze_the_latest_completed_close(self) -> None:
+        with TemporaryDirectory() as temporary:
+            store = CompanionStore(Path(temporary) / "runtime.sqlite3")
+            conversation = store.ensure_daily_conversation("2026-09-04")
+            packet = RuntimePacketBuilder(
+                Path("resources"), store,
+                evidence_contract_factory=EvidenceContractFactory(_Calendar()),
+            ).build(
+                conversation, "chat_research", as_of="2026-09-04T00:02:00Z",
+                context={"questions": ["2026年9月3日A股正式收盘表现如何？"]},
+            )
+
+        requirements = {row["key"]: row for row in packet["evidence_contract"]["requirements"]}
+        self.assertEqual({
+            "start": "2026-09-03T07:00:00Z", "end": "2026-09-03T07:00:00Z", "mode": "exact",
+        }, requirements["current_market_state"]["window"])
+        self.assertEqual("official_close", requirements["market_breadth"]["finality"])
 
     def test_lunch_contract_accepts_late_published_morning_close_and_checks_events_since_1030(self) -> None:
         profile = self.resolver.resolve("2026-08-31T12:51:12.238+08:00", {

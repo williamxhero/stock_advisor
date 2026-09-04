@@ -210,6 +210,41 @@ def test_fresh_research_reply_is_the_artifact_that_completes_the_batch(tmp_path)
     assert final["body_markdown"] == "今天的盘后回顾已经完成。"
 
 
+def test_historical_intraday_research_freezes_the_requested_clock(tmp_path) -> None:
+    store = CompanionStore(tmp_path / "runtime.sqlite3")
+    engine = CompanionEngine(store)
+    conversation, job, _ = _queued_research(
+        store, day="2026-09-04",
+        text="请交付今天14:30盘中执行复盘和全部持仓分钟行情。",
+    )
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE narrative_artifact SET known_at=? WHERE artifact_id=?",
+            ("2026-09-04T09:42:26Z", job["source_artifact_id"]),
+        )
+
+    class Builder:
+        calls = []
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def build(self, *_args, **kwargs):
+            Builder.calls.append(kwargs)
+            return {"sha256": "frozen"}
+
+    evidence = {"as_of": "2026-09-04T06:30:00.000Z", "sources": [], "critical_gaps": ["market_breadth"]}
+    followup = {"answer": {"points": ["已按14:30时点核对。"], "material_ids": []}, "judgment_revision": None}
+    with patch("ai_trading_companion.__main__.RuntimePacketBuilder", Builder), patch(
+        "ai_trading_companion.__main__._call_stage", side_effect=[(evidence, None), (followup, None)],
+    ):
+        run_chat_research(engine, store, job, True)
+
+    assert Builder.calls[0]["as_of"] == "2026-09-04T06:30:00.000Z"
+    assert Builder.calls[0]["context"]["mode"] == "intraday_snapshot"
+    assert Builder.calls[0]["context"]["from_as_of"] == "2026-09-04T06:30:00.000Z"
+
+
 def test_fresh_research_reply_completes_every_batch_frozen_into_the_job(tmp_path) -> None:
     store = CompanionStore(tmp_path / "runtime.sqlite3")
     engine = CompanionEngine(store)

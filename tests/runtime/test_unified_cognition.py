@@ -9,7 +9,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from ai_trading_companion.__main__ import _conversation_retry_intellect, run_unified_cognition
+from ai_trading_companion.__main__ import (
+    _conversation_research_target_as_of,
+    _conversation_retry_intellect,
+    run_unified_cognition,
+)
 from ai_trading_companion.broker_client import BrokerError, BrokerResponse
 from ai_trading_companion.cognition import UnifiedCognition, verify_cognition_result
 from ai_trading_companion.cognition_expression import express_cognition_answer
@@ -190,6 +194,35 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.assertEqual("standard", _conversation_retry_intellect("standard", 1))
         self.assertEqual("smart", _conversation_retry_intellect("standard", 2))
         self.assertEqual("expert", _conversation_retry_intellect("expert", 2))
+
+    def test_historical_intraday_chat_target_uses_the_message_day(self) -> None:
+        self.assertEqual(
+            "2026-09-04T06:30:00.000Z",
+            _conversation_research_target_as_of(
+                "请交付今天14:30盘中执行复盘和全部持仓分钟行情。",
+                "2026-09-04T09:42:26Z",
+            ),
+        )
+
+    def test_historical_intraday_chat_research_has_a_frozen_v4_contract(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-09-04")
+        target = "2026-09-04T06:30:00Z"
+
+        packet = RuntimePacketBuilder(
+            PROJECT_ROOT / "resources", self.store,
+            evidence_contract_factory=EvidenceContractFactory(_WeekdayCalendar()),
+        ).build(
+            conversation, "chat_research", as_of=target,
+            context={"mode": "intraday_snapshot", "from_as_of": target},
+        )
+
+        contract = packet["evidence_contract"]
+        requirements = {row["key"]: row for row in contract["requirements"]}
+        self.assertEqual(4, contract["version"])
+        self.assertEqual(target, contract["as_of"])
+        self.assertEqual(target, requirements["current_market_state"]["window"]["end"])
+        self.assertFalse(requirements["market_breadth"]["blocking"])
+        self.assertNotIn("material_events_and_counterevidence", requirements)
 
     def test_cognition_schema_declares_types_for_enum_and_const_properties(self) -> None:
         schema = json.loads((PROJECT_ROOT / "resources" / "contracts" / "companion-cognition-result-v2.schema.json").read_text(encoding="utf-8"))

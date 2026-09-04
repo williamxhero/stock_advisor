@@ -75,6 +75,11 @@ class RuntimePacketBuilder:
                         task_profile=profile,
                         internal_context=self._internal_evidence_context(cycle, packet_as_of),
                     )
+            elif stage == "chat_research" and self._asks_for_intraday_snapshot(context):
+                packet["evidence_contract"] = self.evidence_contract_factory.build_intraday_chat(
+                    as_of=packet_as_of,
+                    internal_context=self._internal_evidence_context(cycle, packet_as_of),
+                )
             elif stage == "chat_research" and self._asks_for_completed_close(context):
                 packet["evidence_contract"] = self.evidence_contract_factory.build_completed_close_chat(
                     as_of=packet_as_of,
@@ -340,6 +345,14 @@ class RuntimePacketBuilder:
         return any(marker in text for marker in (
             "盘后", "收盘", "已收盘", "post-close", "post close", "completed close",
         ))
+
+    @staticmethod
+    def _asks_for_intraday_snapshot(context: dict[str, Any] | None) -> bool:
+        return bool(
+            isinstance(context, dict)
+            and context.get("mode") == "intraday_snapshot"
+            and context.get("from_as_of")
+        )
 
     def _pre_m0_context(self, cycle: dict[str, Any]) -> list[dict[str, str]]:
         return [

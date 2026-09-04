@@ -62,6 +62,33 @@ class EvidenceContractFactory:
         contract["contract_hash"] = self.contract_hash(contract)
         return contract
 
+    def build_intraday_chat(
+        self, *, as_of: str, internal_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Freeze a historical intraday lookup while allowing honest breadth gaps."""
+        frozen = self._aware(as_of)
+        requirements = []
+        for requirement in self._manual_requirements(
+            frozen, "intraday_snapshot", internal_context or {},
+        ):
+            key = str(requirement.get("key") or "")
+            if key in {"material_events_and_counterevidence", "portfolio_events_and_counterevidence"}:
+                continue
+            row = dict(requirement)
+            if key == "market_breadth":
+                # Historical breadth is not always recoverable from public APIs.
+                # Still acquire it deterministically, but let the reply disclose
+                # a precise gap instead of suppressing every other verified fact.
+                row["blocking"] = False
+            requirements.append(row)
+        contract = {
+            "version": 4,
+            "as_of": frozen.isoformat().replace("+00:00", "Z"),
+            "requirements": requirements,
+        }
+        contract["contract_hash"] = self.contract_hash(contract)
+        return contract
+
     def _requirements(
         self, task_key: str, stage: str, as_of: datetime,
         task_profile: dict[str, Any] | None = None,

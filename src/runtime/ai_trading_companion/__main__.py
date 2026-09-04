@@ -7,13 +7,14 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 import sys
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1550,9 +1551,16 @@ def run_chat_research(
         data = None
     else:
         builder = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
+        research_target = _conversation_research_target_as_of(
+            str(source.get("body_markdown") or ""),
+            str(source.get("known_at") or source.get("as_of") or cycle["as_of"]),
+        )
+        research_context = dict(public_scope)
+        if research_target:
+            research_context.update({"mode": "intraday_snapshot", "from_as_of": research_target})
         research_packet = builder.build(
-            cycle, "chat_research", context=public_scope,
-            as_of=iso(datetime.now(timezone.utc)),
+            cycle, "chat_research", context=research_context,
+            as_of=research_target or iso(datetime.now(timezone.utc)),
         )
         evidence, _ = _call_stage(
             store, cycle, "chat_research", research_packet, "companion-evidence-result-v3.schema.json",
@@ -1893,6 +1901,30 @@ def _receipt_safe_stream_prefix(text: str) -> str:
 def _conversation_retry_intellect(intellect: str, attempt_count: int) -> str:
     """Escalate a retried conversation when the standard provider tier is unavailable."""
     return "smart" if intellect == "standard" and attempt_count >= 2 else intellect
+
+
+def _conversation_research_target_as_of(text: str, known_at: str) -> str | None:
+    """Resolve an explicit historical intraday clock without model inference."""
+    if not any(marker in text for marker in ("盘中", "分钟行情", "分钟线", "时点")):
+        return None
+    clock = re.search(r"(?<!\d)([01]?\d|2[0-3])[:：]([0-5]\d)(?!\d)", text)
+    if not clock:
+        return None
+    known = datetime.fromisoformat(known_at.replace("Z", "+00:00")).astimezone(SHANGHAI)
+    explicit = re.search(r"(?:(\d{4})[年/-])?(\d{1,2})[月/-](\d{1,2})日?", text)
+    if explicit:
+        year = int(explicit.group(1) or known.year)
+        target_date = date(year, int(explicit.group(2)), int(explicit.group(3)))
+    elif any(marker in text for marker in ("今天", "今日", "当天")):
+        target_date = known.date()
+    else:
+        return None
+    target = datetime.combine(
+        target_date, datetime_time(int(clock.group(1)), int(clock.group(2))), SHANGHAI,
+    )
+    if target > known + timedelta(minutes=5):
+        return None
+    return iso(target.astimezone(timezone.utc))
 
 
 def _cognition_failure_detail(error: Exception) -> str:

@@ -363,6 +363,15 @@ class _EvidenceGateV3:
                 if absent_entities:
                     problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
                 continue
+            if key == "portfolio_current_bar":
+                bar_facts = self._portfolio_current_bar_facts(bound, required_entities)
+                numeric_count = sum(len(values) for values in bar_facts.values())
+                if numeric_count < int(requirement.get("minimum_numeric_facts") or 0):
+                    problems.append(f"blocking_requirement_lacks_numeric_facts:{key}"); missing.append(key); continue
+                absent_entities = [entity for entity in required_entities if entity not in bar_facts]
+                if absent_entities:
+                    problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
+                continue
             numeric_facts = set(re.findall(
                 r"(?<![\d.])\d+(?:\.\d+)?\s*(?:%|％|万亿元|亿元|万亿|亿|万家|家|只|股|元)", support,
             ))
@@ -437,6 +446,35 @@ class _EvidenceGateV3:
                     if isinstance(quote.get(field), (int, float)) and not isinstance(quote.get(field), bool)
                 }
                 if symbol in required and valid == fields and quote.get("quote_at") and quote.get("trading_date") and quote.get("status"):
+                    complete[symbol] = valid
+        return complete
+
+    @staticmethod
+    def _portfolio_current_bar_facts(
+        sources: list[dict[str, Any]], required_entities: list[str],
+    ) -> dict[str, set[str]]:
+        """Return complete deterministic OHLC facts for each required symbol."""
+        required = set(required_entities)
+        fields = {"open", "high", "low", "close"}
+        complete: dict[str, set[str]] = {}
+        for source in sources:
+            try:
+                payload = json.loads(str(source.get("excerpt") or ""))
+            except (TypeError, ValueError):
+                continue
+            for bar in payload.get("bars") or []:
+                if not isinstance(bar, dict):
+                    continue
+                symbol = str(bar.get("symbol") or "")
+                valid = {
+                    field for field in fields
+                    if isinstance(bar.get(field), (int, float)) and not isinstance(bar.get(field), bool)
+                }
+                metadata_complete = all(bar.get(field) for field in (
+                    "freq", "trade_time", "interval_start", "interval_end", "observed_at",
+                    "market_status", "provider", "source_semantics",
+                )) and isinstance(bar.get("is_final"), bool)
+                if symbol in required and valid == fields and metadata_complete:
                     complete[symbol] = valid
         return complete
 

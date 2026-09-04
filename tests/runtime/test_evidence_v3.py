@@ -375,6 +375,46 @@ class EvidenceV3Tests(TestCase):
         failed = EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")
         self.assertIn("blocking_requirement_lacks_numeric_facts:portfolio_market_state", failed["problems"])
 
+    def test_v4_portfolio_current_bars_are_qualified_from_structured_tool_json(self):
+        as_of = "2026-09-04T06:30:05Z"
+        contract = {"version": 4, "as_of": as_of, "requirements": [{
+            "key": "portfolio_current_bar", "blocking": True, "allowed_coverage": ["covered"],
+            "required_entities": ["600487", "603861"], "minimum_numeric_facts": 8,
+            "window": {"mode": "after_start_to_end", "start": "2026-09-04T06:25:05Z", "end": as_of},
+        }]}
+        bars = [{
+            "symbol": symbol, "freq": "1m", "trade_time": "2026-09-04T14:29:00+08:00",
+            "interval_start": "2026-09-04T14:29:00+08:00", "interval_end": "2026-09-04T14:30:00+08:00",
+            "open": base, "high": base + 0.2, "low": base - 0.1, "close": base + 0.1,
+            "volume": 1000.0, "amount": 10000.0, "is_final": False,
+            "observed_at": "2026-09-04T14:30:00+08:00", "market_status": "trading",
+            "provider": "tencent_minute", "source_semantics": "derived",
+        } for symbol, base in (("600487", 10.0), ("603861", 20.0))]
+        excerpt = json.dumps({"bars": bars, "finality": "intraday"}, ensure_ascii=False, sort_keys=True)
+        evidence = {
+            "schema_version": 3, "as_of": as_of,
+            "sources": [{"evidence_ref": "bars", "excerpt": excerpt}],
+            "coverage": [{"requirement_key": "portfolio_current_bar", "status": "covered",
+                          "evidence_refs": ["bars"]}],
+            "high_impact_events": [],
+        }
+        observations = [{
+            "attempt_id": "attempt", "backend": "market", "status": "succeeded", "non_empty": True,
+            "evidence_items": [{"evidence_ref": "bars", "excerpt_text": excerpt,
+                                "fact_as_of": "2026-09-04T06:30:00Z", "published_at": None,
+                                "acquired_at": as_of}],
+        }]
+
+        result = EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")
+
+        self.assertTrue(result["passed"], result["problems"])
+        bars[1].pop("provider")
+        malformed_excerpt = json.dumps({"bars": bars, "finality": "intraday"}, ensure_ascii=False, sort_keys=True)
+        evidence["sources"][0]["excerpt"] = malformed_excerpt
+        observations[0]["evidence_items"][0]["excerpt_text"] = malformed_excerpt
+        malformed = EvidenceGate().evaluate(evidence, contract, observations, as_of, attempt_id="attempt")
+        self.assertIn("blocking_requirement_lacks_numeric_facts:portfolio_current_bar", malformed["problems"])
+
     def test_v4_market_breadth_is_qualified_from_structured_tool_json(self):
         as_of = "2026-08-31T01:45:00Z"
         contract = {"version": 4, "as_of": as_of, "requirements": [{

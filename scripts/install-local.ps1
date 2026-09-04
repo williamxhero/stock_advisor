@@ -84,7 +84,18 @@ try {
     }
 } finally {
     if (Test-Path -LiteralPath $staging) {
-        Remove-Item -LiteralPath $staging -Recurse -Force
+        $resolvedStaging = [IO.Path]::GetFullPath($staging)
+        $resolvedCompanionHome = [IO.Path]::GetFullPath($companionHome).TrimEnd('\')
+        if (-not $resolvedStaging.StartsWith(
+            $resolvedCompanionHome + [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw "Refusing to clean staging outside companion home: $resolvedStaging"
+        }
+        # Remove-Item can be replaced by the host's recoverable-delete proxy.
+        # This directory is a unique, validated install staging path and must
+        # be removed synchronously without masking the original install error.
+        [IO.Directory]::Delete($resolvedStaging, $true)
     }
 }
 $env:AI_TRADING_COMPANION_INSTALL_ROOT = $app

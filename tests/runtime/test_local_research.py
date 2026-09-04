@@ -4,12 +4,15 @@ import unittest
 import json
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from ai_trading_companion.broker_client import BrokerError
 from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, ToolResolutionError, WebAccessGatewayBackend, _merge_mandatory_operations
+from ai_trading_companion.market_breadth_cache import MarketBreadthSnapshotCache
 from ai_trading_companion.tooling import EvidenceResolution, FactRequest, ToolCatalog, ToolRunner
 
 CONTRACT = {"version": 3, "as_of": "2026-08-27T07:00:00Z", "requirements": [{"key": "market", "blocking": True, "allowed_coverage": ["covered"], "window": {"mode": "exact", "start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z"}}]}
@@ -737,6 +740,144 @@ class LocalResearchTests(unittest.TestCase):
         request = runner.resolve_with_fallback.call_args.args[0]
         self.assertEqual("official_close", request.finality)
         self.assertEqual("2026-09-01T07:20:00Z", request.required_at)
+
+    def test_frozen_market_breadth_selects_latest_cached_snapshot_not_after_required_at(self) -> None:
+        contract = {
+            "version": 4, "as_of": "2026-09-04T14:30:05.749+08:00",
+            "requirements": [{
+                "key": "market_breadth", "blocking": True, "allowed_coverage": ["covered"],
+                "finality": "intraday",
+                "window": {
+                    "mode": "after_start_to_end",
+                    "start": "2026-09-04T14:15:05.749+08:00",
+                    "end": "2026-09-04T14:30:05.749+08:00",
+                },
+            }],
+        }
+        runner = mock.Mock()
+        runner.catalog.root = Path(tempfile.gettempdir()) / "missing-market-tools"
+        runner.resolve_with_fallback.side_effect = AssertionError("frozen cache hit must not fetch live evidence")
+
+        with tempfile.TemporaryDirectory() as home:
+            runtime = Path(home) / "runtime"
+            runtime.mkdir()
+            (runtime / "market-breadth-snapshot.json").write_text(json.dumps({
+                "contract": "ai-trading-market-breadth-cache/v1",
+                "snapshots": [
+                    {
+                        "result_contract": "ai-trading-tool-result/v1",
+                        "fact_as_of": "2026-09-04T14:29:39+08:00",
+                        "acquired_at": "2026-09-04T14:29:40+08:00",
+                        "data": {
+                            "source": "eastmoney", "finality": "intraday",
+                            "source_urls": ["https://example.test/breadth-before-freeze"],
+                            "breadth": {"up": 3000, "down": 2000, "flat": 100},
+                        },
+                        "raw_artifact_ref": "artifact:sha256:" + "a" * 64,
+                        "technical_validation": ["tool_process_succeeded", "tool_result_schema_valid", "raw_output_archived"],
+                    },
+                    {
+                        "result_contract": "ai-trading-tool-result/v1",
+                        "fact_as_of": "2026-09-04T14:30:10+08:00",
+                        "acquired_at": "2026-09-04T14:30:11+08:00",
+                        "data": {
+                            "source": "eastmoney", "finality": "intraday",
+                            "source_urls": ["https://example.test/breadth-after-freeze"],
+                            "breadth": {"up": 3100, "down": 1900, "flat": 100},
+                        },
+                        "raw_artifact_ref": "artifact:sha256:" + "b" * 64,
+                        "technical_validation": ["tool_process_succeeded", "tool_result_schema_valid", "raw_output_archived"],
+                    },
+                    {
+                        "result_contract": "ai-trading-tool-result/v1",
+                        "fact_as_of": "2026-09-04T14:29:50+08:00",
+                        "acquired_at": "2026-09-04T14:30:06+08:00",
+                        "data": {
+                            "source": "eastmoney", "finality": "intraday",
+                            "source_urls": ["https://example.test/breadth-learned-after-freeze"],
+                            "breadth": {"up": 3050, "down": 1950, "flat": 100},
+                        },
+                        "raw_artifact_ref": "artifact:sha256:" + "c" * 64,
+                        "technical_validation": ["tool_process_succeeded", "tool_result_schema_valid", "raw_output_archived"],
+                    },
+                ],
+            }), encoding="utf-8")
+            with mock.patch.dict("os.environ", {"AI_TRADING_COMPANION_HOME": home}):
+                result = ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0)(
+                    "market_breadth", {"_requirement_key": "market_breadth"},
+                )
+
+        self.assertEqual("https://example.test/breadth-before-freeze", result["url"])
+        self.assertEqual("2026-09-04T14:29:39+08:00", result["results"][0]["fact_as_of"])
+        runner.resolve_with_fallback.assert_not_called()
+
+    def test_market_breadth_cache_is_bounded_and_selects_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "market-breadth-snapshot.json"
+            cache = MarketBreadthSnapshotCache(path, max_snapshots=2)
+            for second in (30, 39, 50):
+                cache.append({
+                    "result_contract": "ai-trading-tool-result/v1",
+                    "fact_as_of": f"2026-09-04T14:29:{second}+08:00",
+                    "acquired_at": f"2026-09-04T14:29:{second + 1}+08:00",
+                    "data": {
+                        "source": "eastmoney", "finality": "intraday",
+                        "source_urls": [f"https://example.test/{second}"],
+                    },
+                    "raw_artifact_ref": "artifact:sha256:" + str(second)[0] * 64,
+                    "technical_validation": ["tool_process_succeeded", "tool_result_schema_valid", "raw_output_archived"],
+                    "attempts": ["markethub:tool_process_failed", "eastmoney:succeeded"],
+                })
+
+            restarted = MarketBreadthSnapshotCache(path, max_snapshots=2)
+            selected = restarted.select(
+                required_at="2026-09-04T14:29:45+08:00",
+                window_start="2026-09-04T14:15:00+08:00",
+                finality="intraday",
+            )
+
+            self.assertEqual(2, len(restarted.snapshots()))
+            self.assertIsNotNone(selected)
+            self.assertEqual("2026-09-04T14:29:39+08:00", selected["fact_as_of"])
+
+    def test_market_breadth_cache_publishes_complete_generations_during_concurrent_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = MarketBreadthSnapshotCache(Path(directory) / "market-breadth-snapshot.json", max_snapshots=8)
+
+            def snapshot(index: int) -> dict:
+                return {
+                    "result_contract": "ai-trading-tool-result/v1",
+                    "fact_as_of": f"2026-09-04T14:29:{index:02d}+08:00",
+                    "acquired_at": f"2026-09-04T14:30:{index:02d}+08:00",
+                    "data": {
+                        "source": "eastmoney", "finality": "intraday",
+                        "source_urls": [f"https://example.test/{index}"],
+                    },
+                }
+
+            cache.append(snapshot(0))
+            start = threading.Event()
+
+            def write(index: int) -> None:
+                start.wait()
+                cache.append(snapshot(index))
+
+            def read() -> None:
+                start.wait()
+                for _ in range(100):
+                    rows = MarketBreadthSnapshotCache(cache.path, max_snapshots=8).snapshots()
+                    self.assertGreaterEqual(len(rows), 1)
+                    self.assertLessEqual(len(rows), 8)
+                    self.assertTrue(all(row.get("result_contract") == "ai-trading-tool-result/v1" for row in rows))
+
+            with ThreadPoolExecutor(max_workers=9) as pool:
+                futures = [pool.submit(write, index) for index in range(1, 9)]
+                futures.append(pool.submit(read))
+                start.set()
+                for future in futures:
+                    future.result()
+
+            self.assertEqual(8, len(cache.snapshots()))
 
     def test_premarket_uses_yesterday_official_close_breadth_snapshot(self) -> None:
         contract = {

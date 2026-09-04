@@ -64,7 +64,7 @@ class CompanionEngineTests(unittest.TestCase):
         data = {
             "is_trading_day": True,
             "trading_date": trading_date,
-            "source": "official_close_prefetch",
+            "source": "eastmoney",
             "finality": "official_close",
             "source_urls": ["https://example.test/close"],
             "breadth": {"up": 9, "down": 8, "flat": 7},
@@ -109,7 +109,7 @@ class CompanionEngineTests(unittest.TestCase):
 
         self.assertEqual(["prefetch", "prefetch"], calls)
 
-    def test_post_close_prefetch_persists_official_breadth_snapshot(self):
+    def test_prefetch_persists_eastmoney_fallback_when_markethub_fails(self):
         runner = Mock()
         runner.resolve_with_fallback.return_value = self._breadth_resolution()
         with tempfile.TemporaryDirectory() as home:
@@ -127,9 +127,14 @@ class CompanionEngineTests(unittest.TestCase):
 
             request = runner.resolve_with_fallback.call_args.args[0]
             self.assertEqual("official_close", request.finality)
-            snapshot = json.loads((runtime / "market-breadth-official-close-snapshot.json").read_text(encoding="utf-8"))
+            cache = json.loads((runtime / "market-breadth-official-close-snapshot.json").read_text(encoding="utf-8"))
+            self.assertEqual("ai-trading-market-breadth-cache/v1", cache["contract"])
+            snapshot = cache["snapshots"][0]
+            self.assertEqual("ai-trading-tool-result/v1", snapshot["result_contract"])
+            self.assertEqual("2026-09-02T07:00:01Z", snapshot["acquired_at"])
             self.assertEqual("official_close", snapshot["data"]["finality"])
             self.assertIn("tool_result_schema_valid", snapshot["technical_validation"])
+            self.assertEqual(["markethub:tool_process_failed", "eastmoney:succeeded"], snapshot["attempts"])
 
     def test_post_close_prefetch_reuses_an_old_mtime_snapshot_after_revalidating_its_artifact(self):
         resolution = self._breadth_resolution()

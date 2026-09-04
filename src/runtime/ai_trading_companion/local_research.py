@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from .acquisition import AcquisitionBoundary
 from .evidence_gate import EvidenceGate
 from .broker_client import BrokerError, BrokerRequest, ProviderBrokerClient, canonical_packet_hash
+from .market_breadth_cache import MarketBreadthSnapshotCache
 from .tooling import FactRequest, ToolRunner, validate_capability_data
 
 
@@ -477,16 +478,13 @@ class ToolCatalogMarketBackend:
             if home else self.runner.catalog.root.parent / snapshot_name
         )
         try:
-            cached = json.loads(path.read_text(encoding="utf-8"))
+            cached = MarketBreadthSnapshotCache(path).select(
+                required_at=required_at, window_start=window_start, finality=finality,
+            )
+            if cached is None:
+                return None
             fact_as_of = str(cached["fact_as_of"])
-            fact = datetime.fromisoformat(fact_as_of.replace("Z", "+00:00"))
-            start = datetime.fromisoformat(window_start.replace("Z", "+00:00")) if window_start else None
-            end = datetime.fromisoformat(required_at.replace("Z", "+00:00"))
-            if (start and fact < start) or fact > end:
-                return None
             data = dict(cached["data"])
-            if str(data.get("finality") or "") != finality:
-                return None
             urls = [str(url) for url in data.get("source_urls") or [] if str(url).startswith(("http://", "https://"))]
             if not urls:
                 return None

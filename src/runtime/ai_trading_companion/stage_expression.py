@@ -77,7 +77,7 @@ def _semantic_snapshot(semantic: dict[str, Any]) -> dict[str, Any]:
 
 def _condition_text(condition: dict[str, Any]) -> str:
     return "，".join(
-        str(condition.get(key) or "").strip()
+        str(condition.get(key) or "").strip().rstrip("。！？；，,.!?; ")
         for key in ("price", "breadth", "persistence")
         if str(condition.get(key) or "").strip()
     )

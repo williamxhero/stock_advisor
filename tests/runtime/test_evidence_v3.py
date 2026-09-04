@@ -70,6 +70,20 @@ class EvidenceV3Tests(TestCase):
 
         self.assertNotIn("。。", rendered)
 
+    def test_judgment_expression_cleans_punctuation_inside_compound_conditions(self):
+        rendered = express_stage_semantics("m1", {
+            "summary": "市场广度偏弱。", "direction": "bearish", "qualified": True,
+            "horizon": "下一交易日", "current_action": "reduce_risk", "key_evidence": [],
+            "transition_conditions": [{
+                "outcome": "upgrade", "price": "指数站稳收盘位。",
+                "breadth": "上涨家数超过下跌家数。", "persistence": "持续一个交易日。",
+            }],
+            "position_focus": [], "risks": [], "unknowns": [],
+        })
+
+        self.assertNotIn("。，", rendered)
+        self.assertIn("指数站稳收盘位，上涨家数超过下跌家数，持续一个交易日", rendered)
+
     def test_official_index_close_accepts_complete_structured_tool_facts(self):
         close = "2026-09-03T07:00:00Z"
         rows = [

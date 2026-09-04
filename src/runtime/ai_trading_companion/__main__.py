@@ -52,6 +52,7 @@ from .local_research import (
     BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
     ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend,
 )
+from .market_breadth_cache import MarketBreadthSnapshotCache
 from .tooling import FactRequest, ToolCatalog, ToolRunner
 from .tool_manager import ToolManagerRuntime
 from .store import CompanionStore
@@ -539,11 +540,9 @@ def _prefetch_market_breadth() -> None:
             freshness_seconds=0.0, finality=finality,
         )
         runner = ToolRunner(ToolCatalog(PATHS.tools))
+        cache = MarketBreadthSnapshotCache(target)
         if target.exists():
-            try:
-                cached = json.loads(target.read_text(encoding="utf-8"))
-            except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                cached = None
+            cached = cache.latest(finality=finality)
             if (
                 isinstance(cached, dict)
                 and runner.cached_resolution_is_valid(request, cached)
@@ -553,11 +552,15 @@ def _prefetch_market_breadth() -> None:
         resolution = runner.resolve_with_fallback(request)
         if not resolution.succeeded or resolution.data is None or not resolution.fact_as_of:
             return
-        temporary = target.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"fact_as_of": resolution.fact_as_of, "data": resolution.data,
-                                         "raw_artifact_ref": resolution.raw_artifact_ref,
-                                         "technical_validation": list(resolution.technical_validation)}, ensure_ascii=False), encoding="utf-8")
-        temporary.replace(target)
+        cache.append({
+            "result_contract": "ai-trading-tool-result/v1",
+            "fact_as_of": resolution.fact_as_of,
+            "acquired_at": resolution.acquired_at,
+            "data": resolution.data,
+            "raw_artifact_ref": resolution.raw_artifact_ref,
+            "technical_validation": list(resolution.technical_validation),
+            "attempts": list(resolution.attempts),
+        })
     except Exception:
         # A prefetch never changes a formal task's outcome except by making a
         # already-observed snapshot available; failures remain non-authoritative.

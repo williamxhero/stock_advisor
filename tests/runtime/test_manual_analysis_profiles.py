@@ -194,6 +194,11 @@ class ManualAnalysisProfileResolverTests(TestCase):
         }, requirements["market_breadth"]["window"])
         self.assertEqual("official_close", requirements["portfolio_market_state"]["finality"])
         self.assertEqual("exact", requirements["portfolio_market_state"]["window"]["mode"])
+        self.assertEqual(["covered"], requirements["turnover_compare"]["allowed_coverage"])
+        self.assertTrue(requirements["turnover_compare"]["blocking"])
+        self.assertEqual(["covered"], requirements["themes_and_capacity_cores"]["allowed_coverage"])
+        self.assertTrue(requirements["themes_and_capacity_cores"]["blocking"])
+        self.assertTrue(requirements["forum_and_sentiment"]["blocking"])
 
     def test_chat_research_close_questions_freeze_the_latest_completed_close(self) -> None:
         with TemporaryDirectory() as temporary:

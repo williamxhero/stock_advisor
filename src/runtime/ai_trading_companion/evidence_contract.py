@@ -94,7 +94,14 @@ class EvidenceContractFactory:
         task_profile: dict[str, Any] | None = None,
         internal_context: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        if task_profile is not None and stage == "m0_research":
+        if (
+            task_profile is not None
+            and stage == "m0_research"
+            and not (
+                task_key == "daily.review.1520"
+                and str(task_profile.get("evidence_family") or "") == "completed_close"
+            )
+        ):
             return self._manual_requirements(
                 as_of, str(task_profile["evidence_family"]), internal_context or {},
             )

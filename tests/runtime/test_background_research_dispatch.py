@@ -1,10 +1,38 @@
 from __future__ import annotations
 
+import threading
 from unittest.mock import patch
 
 from ai_trading_companion.__main__ import run_background, run_chat_research
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.store import CompanionStore
+
+
+def test_background_dispatcher_never_blocks_or_overlaps_foreground_ticks() -> None:
+    from ai_trading_companion.__main__ import _BackgroundDispatcher
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    calls = 0
+
+    def slow_background() -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        release.wait(2)
+        finished.set()
+
+    dispatcher = _BackgroundDispatcher(slow_background)
+
+    assert dispatcher.submit()
+    assert started.wait(1)
+    assert not dispatcher.submit()
+    assert calls == 1
+    release.set()
+    assert finished.wait(1)
+    assert dispatcher.wait_idle(1)
+    assert dispatcher.submit()
 
 
 def _queued_research(store: CompanionStore, *, day: str, text: str) -> tuple[dict, dict, str]:

@@ -395,6 +395,39 @@ def _gateway_snapshot(engine: CompanionEngine, store: CompanionStore, portfolio:
     raise ValueError("unknown snapshot kind")
 
 
+class _BackgroundDispatcher:
+    """Run optional maintenance once at a time without blocking the message pump."""
+
+    def __init__(self, action: Callable[[], Any]) -> None:
+        self._action = action
+        self._state_lock = threading.Lock()
+        self._idle = threading.Event()
+        self._idle.set()
+
+    def submit(self) -> bool:
+        with self._state_lock:
+            if not self._idle.is_set():
+                return False
+            self._idle.clear()
+            threading.Thread(
+                target=self._run, name="companion-background", daemon=True,
+            ).start()
+            return True
+
+    def _run(self) -> None:
+        try:
+            self._action()
+        except Exception:
+            # Optional maintenance records its own actionable failures.  An
+            # unexpected failure must still release the single-worker slot.
+            pass
+        finally:
+            self._idle.set()
+
+    def wait_idle(self, timeout: float | None = None) -> bool:
+        return self._idle.wait(timeout)
+
+
 def run_gateway(execute: bool = False) -> None:
     """Serve desktop requests without granting the desktop database access."""
     engine, store, exchange, portfolio = runtime()
@@ -410,6 +443,7 @@ def run_gateway(execute: bool = False) -> None:
         daemon=True,
     )
     breadth_prefetcher.start()
+    background_dispatcher = _BackgroundDispatcher(lambda: run_background(engine, store, execute))
     def command(payload: dict[str, Any]) -> dict[str, Any]:
         contract = payload.get("contract")
         if contract == "schedule-user-command/v1":
@@ -452,7 +486,7 @@ def run_gateway(execute: bool = False) -> None:
                 # run_unified_cognition records the durable failure and the next
                 # gateway tick observes the retry cooldown/attempt ceiling.
                 pass
-        run_background(engine, store, execute)
+        background_dispatcher.submit()
         flush(store, exchange)
     import asyncio
     try:

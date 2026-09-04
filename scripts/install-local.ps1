@@ -16,10 +16,15 @@ $app = Join-Path $companionHome 'app'
 $staging = "$app.staging-$([guid]::NewGuid().ToString('N'))"
 
 function Stop-InstalledCompanionProcessTree {
-    param([Parameter(Mandatory = $true)][string]$InstallRoot)
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallRoot,
+        [Parameter(Mandatory = $true)][string]$CompanionRoot
+    )
 
-    if (-not (Test-Path -LiteralPath $InstallRoot)) { return }
     $normalizedRoot = ([System.IO.Path]::GetFullPath($InstallRoot).TrimEnd('\') + '\').ToLowerInvariant()
+    $normalizedRuntimePythonRoot = (
+        [System.IO.Path]::GetFullPath((Join-Path $CompanionRoot 'runtime\python')).TrimEnd('\') + '\'
+    ).ToLowerInvariant()
     $processes = @(Get-CimInstance Win32_Process)
     $selected = New-Object 'System.Collections.Generic.Dictionary[uint32,object]'
     $depths = New-Object 'System.Collections.Generic.Dictionary[uint32,int]'
@@ -28,7 +33,12 @@ function Stop-InstalledCompanionProcessTree {
     foreach ($process in $processes) {
         $executable = if ($process.ExecutablePath) { $process.ExecutablePath.ToLowerInvariant() } else { '' }
         $commandLine = if ($process.CommandLine) { $process.CommandLine.ToLowerInvariant() } else { '' }
-        if ($executable.StartsWith($normalizedRoot) -or $commandLine.Contains($normalizedRoot)) {
+        $isInstalledProcess = $executable.StartsWith($normalizedRoot) -or $commandLine.Contains($normalizedRoot)
+        $isRuntimeGateway = (
+            $executable.StartsWith($normalizedRuntimePythonRoot) -and
+            $commandLine.Contains('-m ai_trading_companion serve-gateway')
+        )
+        if ($isInstalledProcess -or $isRuntimeGateway) {
             $processId = [uint32]$process.ProcessId
             if (-not $selected.ContainsKey($processId)) {
                 $selected.Add($processId, $process)
@@ -59,6 +69,25 @@ function Stop-InstalledCompanionProcessTree {
     if ($selected.Count -gt 0) { Start-Sleep -Milliseconds 500 }
 }
 
+function Move-DirectoryWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [int]$MaximumAttempts = 10,
+        [int]$DelayMilliseconds = 200
+    )
+
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        try {
+            Move-Item -LiteralPath $Source -Destination $Destination
+            return
+        } catch {
+            if ($attempt -eq $MaximumAttempts) { throw }
+            Start-Sleep -Milliseconds $DelayMilliseconds
+        }
+    }
+}
+
 New-Item -ItemType Directory -Path $companionHome -Force | Out-Null
 $pythonHome = Join-Path $companionHome 'runtime\python'
 $python = Join-Path $pythonHome 'Scripts\python.exe'
@@ -69,16 +98,16 @@ if (-not (Test-Path -LiteralPath $python)) {
 $backup = $null
 try {
     Copy-Item -LiteralPath $source -Destination $staging -Recurse -Force
-    Stop-InstalledCompanionProcessTree -InstallRoot $app
+    Stop-InstalledCompanionProcessTree -InstallRoot $app -CompanionRoot $companionHome
     if (Test-Path -LiteralPath $app) {
         $backup = Join-Path $companionHome ("app-backup-" + (Get-Date -Format 'yyyyMMddHHmmss'))
-        Move-Item -LiteralPath $app -Destination $backup
+        Move-DirectoryWithRetry -Source $app -Destination $backup
     }
     try {
-        Move-Item -LiteralPath $staging -Destination $app
+        Move-DirectoryWithRetry -Source $staging -Destination $app
     } catch {
         if ($backup -and (Test-Path -LiteralPath $backup) -and -not (Test-Path -LiteralPath $app)) {
-            Move-Item -LiteralPath $backup -Destination $app
+            Move-DirectoryWithRetry -Source $backup -Destination $app
         }
         throw
     }

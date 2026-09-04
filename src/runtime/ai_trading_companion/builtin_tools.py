@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.7"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6"}
+_VERSION = "1.1.8"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -474,15 +474,18 @@ def tencent_current_bar_payload(
                 fail(75, "Tencent minute row has invalid values")
             if tape and (moment <= tape[-1][0] or cumulative_volume < tape[-1][2] or cumulative_amount < tape[-1][3]):
                 fail(75, "Tencent minute tape is non-monotonic")
-            if moment <= cutoff:
+            # The endpoint also exposes the currently forming minute.  A row
+            # labelled HH:MM is only usable after its one-minute interval has
+            # ended; otherwise it is future evidence relative to required_at.
+            if moment + dt.timedelta(minutes=1) <= cutoff:
                 tape.append((moment, price, cumulative_volume, cumulative_amount))
         if len(tape) < 2:
             fail(75, "Tencent minute tape lacks a complete interval")
         moment, close, volume_total, amount_total = tape[-1]
         prior_moment, open_price, prior_volume, prior_amount = tape[-2]
         interval_end = moment + dt.timedelta(minutes=1)
-        if interval_end > cutoff or cutoff - interval_end > dt.timedelta(minutes=5):
-            fail(75, "Tencent minute tape is stale or after required_at")
+        if cutoff - interval_end > dt.timedelta(minutes=5):
+            fail(75, "Tencent minute tape is stale")
         volume, amount = volume_total - prior_volume, amount_total - prior_amount
         if volume < 0 or amount < 0:
             fail(75, "Tencent minute tape is non-monotonic")

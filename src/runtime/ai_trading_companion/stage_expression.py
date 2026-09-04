@@ -256,7 +256,11 @@ def express_stage_semantics(stage: str, semantic: dict[str, Any]) -> str:
         if risks:
             paragraphs.append("要留意" + _sentence_piece(risks[0]) + "。")
         if unknowns:
-            paragraphs.append("还需要确认" + _sentence_piece(unknowns[0]) + "。")
+            unknown = _sentence_piece(unknowns[0])
+            if unknown.startswith("缺少"):
+                paragraphs.append("本次未取得" + unknown.removeprefix("缺少") + "。")
+            else:
+                paragraphs.append("还需要确认" + unknown + "。")
         return "\n\n".join(paragraphs)
     if stage in {"m1", "m2"}:
         direction = str(semantic.get("direction") or "").strip()

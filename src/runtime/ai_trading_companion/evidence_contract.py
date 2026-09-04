@@ -132,7 +132,7 @@ class EvidenceContractFactory:
                     "minimum_numeric_facts": 3,
                 },
                 {
-                    "key": "turnover_compare", "blocking": False,
+                    "key": "turnover_compare", "blocking": True,
                     "allowed_coverage": ["covered"],
                     "window": {"start": close_text, "end": close_text, "mode": "exact"},
                     "evidence_terms": [["成交额", "成交"], ["亿", "万亿"], ["昨日", "前一交易日", "上一交易日", "较前日", "较上日"]],
@@ -147,7 +147,7 @@ class EvidenceContractFactory:
                     "minimum_numeric_facts": 2,
                 },
                 {
-                    "key": "themes_and_capacity_cores", "blocking": False,
+                    "key": "themes_and_capacity_cores", "blocking": True,
                     "allowed_coverage": ["covered"],
                     "window": {"start": close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
                     "evidence_terms": [["板块", "题材"], ["领涨", "涨幅居前", "强势"], ["领跌", "跌幅居前", "弱势"]],
@@ -183,7 +183,7 @@ class EvidenceContractFactory:
                     "negative_query_terms": ["公告", "停复牌", "财报", "风险"],
                 },
                 {
-                    "key": "forum_and_sentiment", "blocking": False,
+                    "key": "forum_and_sentiment", "blocking": True,
                     "allowed_coverage": ["covered", "checked_no_change"],
                     "window": {"start": prior_close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
                 },

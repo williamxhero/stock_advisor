@@ -324,7 +324,7 @@ class RuntimePacketBuilder:
                     ("daily.execution.0945", "daily.execution.1030", "daily.execution.1430"),
                 )),
             },
-            {"key": "forum_and_sentiment", "description": "可审计的论坛传播与市场情绪线索", "blocking": False},
+            {"key": "forum_and_sentiment", "description": "可审计的论坛传播与市场情绪线索", "blocking": True},
         ]
         with self.store.connection() as connection:
             has_positions = connection.execute("SELECT 1 FROM portfolio_position WHERE shares>0 LIMIT 1").fetchone() is not None

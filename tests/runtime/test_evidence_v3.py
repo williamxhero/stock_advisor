@@ -27,6 +27,17 @@ from ai_trading_companion.store import CompanionStore
 
 
 class EvidenceV3Tests(TestCase):
+    def test_m0_expression_states_a_missing_fact_as_current_absence(self):
+        rendered = express_stage_semantics("m0", {
+            "summary": "收盘市场整体偏弱。",
+            "observations": [],
+            "risks": [],
+            "unknowns": ["缺少成交额及较前一交易日比较，无法判断量价配合。"],
+        })
+
+        self.assertIn("本次未取得成交额及较前一交易日比较", rendered)
+        self.assertNotIn("还需要确认缺少", rendered)
+
     def test_m0_safe_fallback_uses_complete_verified_close_instead_of_claiming_a_gap(self):
         packet = {
             "stage": "m0_compose",
@@ -250,16 +261,18 @@ class EvidenceV3Tests(TestCase):
             requirements["market_breadth"]["window"],
         )
         self.assertEqual("official_close", requirements["market_breadth"]["finality"])
-        self.assertFalse(requirements["turnover_compare"]["blocking"])
+        self.assertTrue(requirements["turnover_compare"]["blocking"])
         self.assertEqual(["covered"], requirements["turnover_compare"]["allowed_coverage"])
-        self.assertFalse(requirements["themes_and_capacity_cores"]["blocking"])
+        self.assertTrue(requirements["themes_and_capacity_cores"]["blocking"])
         self.assertEqual(["covered"], requirements["themes_and_capacity_cores"]["allowed_coverage"])
+        self.assertTrue(requirements["forum_and_sentiment"]["blocking"])
         self.assertEqual(["covered"], requirements["portfolio_market_state"]["allowed_coverage"])
         blockers = [row["key"] for row in contract["requirements"] if row["blocking"]]
         self.assertEqual([
-            "indices_close", "market_breadth", "events_and_counterevidence",
+            "indices_close", "turnover_compare", "market_breadth", "themes_and_capacity_cores",
+            "events_and_counterevidence",
             "prior_judgment_changes", "portfolio_market_state",
-            "portfolio_events_and_counterevidence",
+            "portfolio_events_and_counterevidence", "forum_and_sentiment",
         ], blockers)
 
         rejected = EvidenceGate().evaluate(

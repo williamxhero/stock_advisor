@@ -50,6 +50,18 @@ def _queued_research(store: CompanionStore, *, day: str, text: str) -> tuple[dic
     return conversation, job, batch_id
 
 
+def _claim_formal_analysis(store: CompanionStore, conversation: dict, batch_id: str) -> dict:
+    cycle, _ = store.create_manual_analysis_cycle(
+        request_id="analysis:" + batch_id,
+        task_key="daily.review.1520",
+        requested_at=conversation["as_of"],
+        source={"conversation_cycle_id": conversation["cycle_id"], "batch_id": batch_id},
+        task_profile_id="post_close_review",
+        task_profile_version=3,
+    )
+    return cycle
+
+
 def test_stale_historical_cycle_does_not_starve_chat_research(tmp_path) -> None:
     store = CompanionStore(tmp_path / "runtime.sqlite3")
     engine = CompanionEngine(store)
@@ -119,6 +131,21 @@ def test_research_for_an_unanswered_batch_precedes_orphaned_backlog(tmp_path) ->
     selected = store.pending_research_jobs(limit=1)
 
     assert selected[0]["job_id"] == current_job["job_id"]
+
+
+def test_research_for_a_batch_owned_by_active_formal_analysis_is_deferred(tmp_path) -> None:
+    store = CompanionStore(tmp_path / "runtime.sqlite3")
+    conversation, job, batch_id = _queued_research(
+        store, day="2026-09-03", text="做一次晚间盘后回顾",
+    )
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE companion_research_job SET public_scope_json=? WHERE job_id=?",
+            ('{"_reply_to_batch_ids":["' + batch_id + '"],"questions":[],"topics":[]}', job["job_id"]),
+        )
+    _claim_formal_analysis(store, conversation, batch_id)
+
+    assert store.pending_research_jobs(limit=1) == []
 
 
 def test_committed_batch_without_a_cognition_job_is_recoverable_once_per_cycle(tmp_path) -> None:
@@ -296,6 +323,53 @@ def test_research_job_does_not_publish_after_formal_analysis_completes_during_se
             "SELECT state,error FROM companion_research_job WHERE job_id=?", (job["job_id"],),
         ).fetchone()
     assert tuple(state) == ("complete", None)
+
+
+def test_research_job_yields_when_formal_analysis_claims_batch_during_search(tmp_path) -> None:
+    store = CompanionStore(tmp_path / "runtime.sqlite3")
+    engine = CompanionEngine(store)
+    conversation, job, batch_id = _queued_research(
+        store, day="2026-09-03", text="做一次晚间盘后回顾",
+    )
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE companion_research_job SET public_scope_json=? WHERE job_id=?",
+            ('{"_reply_to_batch_ids":["' + batch_id + '"],"questions":[],"topics":[]}', job["job_id"]),
+        )
+    job = store.pending_research_jobs(limit=1)[0]
+    evidence = {
+        "as_of": "2026-09-03T14:30:00Z", "spoken_summary": "收盘数据已经核对。",
+        "sources": [], "critical_gaps": [],
+    }
+
+    class Builder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def build(self, *_args, **_kwargs):
+            return {"sha256": "frozen"}
+
+    def claim_during_search(*_args, **_kwargs):
+        _claim_formal_analysis(store, conversation, batch_id)
+        return evidence, None
+
+    with patch("ai_trading_companion.__main__.RuntimePacketBuilder", Builder), patch(
+        "ai_trading_companion.__main__._call_stage", side_effect=claim_during_search,
+    ) as call_stage:
+        result = run_chat_research(engine, store, job, True)
+
+    assert call_stage.call_count == 1
+    assert result["deferred_to_manual_analysis"] is True
+    assert store.latest_artifact(job["cycle_id"], "ai_chat") is None
+    with store.connection() as connection:
+        state = connection.execute(
+            "SELECT state,error FROM companion_research_job WHERE job_id=?", (job["job_id"],),
+        ).fetchone()
+        batch = connection.execute(
+            "SELECT state,response_artifact_id FROM companion_message_batch WHERE batch_id=?", (batch_id,),
+        ).fetchone()
+    assert tuple(state) == ("pending", None)
+    assert tuple(batch) == ("pending", None)
 
 
 def test_fresh_research_can_publish_materials_from_its_verified_evidence(tmp_path) -> None:

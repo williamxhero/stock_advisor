@@ -1493,6 +1493,13 @@ def run_chat_research(
             "sources": [], "critical_gaps": [],
             "superseded_by_completed_batch": True,
         }
+    if reply_to_batch_ids and store.manual_analysis_owns_message_batches(reply_to_batch_ids):
+        return {
+            "as_of": iso(datetime.now(timezone.utc)),
+            "spoken_summary": "来源消息已进入正式分析，公开补查让位等待正式结果。",
+            "sources": [], "critical_gaps": [],
+            "deferred_to_manual_analysis": True,
+        }
     if not execute:
         evidence = {
             "as_of": iso(datetime.now(timezone.utc)), "spoken_summary": "Fixture 模式：公开补查尚未执行。",
@@ -1514,6 +1521,8 @@ def run_chat_research(
         if reply_to_batch_ids and not store.has_pending_message_batches(reply_to_batch_ids):
             store.finish_research_job(job["job_id"])
             return {**evidence, "superseded_by_completed_batch": True}
+        if reply_to_batch_ids and store.manual_analysis_owns_message_batches(reply_to_batch_ids):
+            return {**evidence, "deferred_to_manual_analysis": True}
         local_packet = builder.build(
             cycle, "chat", evidence=evidence, message_batch=source["body_markdown"],
             context={"fresh_search_completed": True}, as_of=str(evidence.get("as_of") or iso(datetime.now(timezone.utc))),

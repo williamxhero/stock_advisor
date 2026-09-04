@@ -1386,6 +1386,22 @@ class CompanionStore:
             ).fetchone()
         return row is not None
 
+    def manual_analysis_owns_message_batches(self, batch_ids: list[str]) -> bool:
+        """Whether a non-failed formal cycle owns any frozen conversation batch."""
+        normalized = sorted({str(value) for value in batch_ids if str(value)})
+        if not normalized:
+            return False
+        placeholders = ",".join("?" for _ in normalized)
+        with self.connection() as c:
+            row = c.execute(
+                f"""SELECT 1 FROM companion_cycle
+                     WHERE trigger='manual_chat' AND state NOT IN ('failed','dismissed')
+                       AND json_extract(request_source_json,'$.batch_id') IN ({placeholders})
+                     LIMIT 1""",
+                normalized,
+            ).fetchone()
+        return row is not None
+
     def recoverable_conversation_jobs(self, *, before: str, max_attempts: int = 9, limit: int = 2) -> list[dict[str, Any]]:
         """Return interrupted or transiently failed conversations that still need a reply."""
         with self.connection() as c:
@@ -2138,16 +2154,32 @@ class CompanionStore:
 
     def pending_research_jobs(self, *, limit: int = 4) -> list[dict[str, Any]]:
         with self.connection() as c:
-            return [dict(row) for row in c.execute(
+            rows = [dict(row) for row in c.execute(
                 """SELECT j.* FROM companion_research_job j
                    LEFT JOIN narrative_artifact a ON a.artifact_id=j.source_artifact_id
                    LEFT JOIN companion_message_batch b
                      ON b.batch_id=json_extract(a.metadata_json,'$.batch_id')
                    WHERE j.state IN ('pending','retry')
                    ORDER BY CASE WHEN b.state='pending' THEN 0 ELSE 1 END,
-                            j.created_at,j.job_id LIMIT ?""",
-                (limit,),
+                            j.created_at,j.job_id""",
             )]
+        selected: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                scope = json.loads(row.get("public_scope_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                scope = {}
+            batch_ids = [str(value) for value in scope.get("_reply_to_batch_ids") or [] if str(value)]
+            if (
+                batch_ids
+                and self.has_pending_message_batches(batch_ids)
+                and self.manual_analysis_owns_message_batches(batch_ids)
+            ):
+                continue
+            selected.append(row)
+            if len(selected) >= limit:
+                break
+        return selected
 
     def finish_research_job(self, job_id: str, *, error: str | None = None, retry: bool = False) -> None:
         with self.connection() as c:

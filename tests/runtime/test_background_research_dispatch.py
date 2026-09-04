@@ -107,6 +107,30 @@ def test_research_for_an_unanswered_batch_precedes_orphaned_backlog(tmp_path) ->
     assert selected[0]["job_id"] == current_job["job_id"]
 
 
+def test_committed_batch_without_a_cognition_job_is_recoverable_once_per_cycle(tmp_path) -> None:
+    store = CompanionStore(tmp_path / "runtime.sqlite3")
+    conversation = store.ensure_daily_conversation("2026-09-03")
+    for text in ("第一条", "第二条"):
+        message = store.stage_message(conversation["cycle_id"], text, "conversation")
+        batch_id, _ = store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        artifact = store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text, conversation["as_of"],
+            {"batch_id": batch_id, "message_ids": [message["message_id"]]},
+        )
+        with store.connection() as connection:
+            connection.execute(
+                "UPDATE companion_message SET source_artifact_id=? WHERE message_id=?",
+                (artifact["artifact_id"], message["message_id"]),
+            )
+
+    recoverable = store.recoverable_conversation_jobs(before="9999-12-31T23:59:59Z")
+
+    assert len(recoverable) == 1
+    assert recoverable[0]["cycle_id"] == conversation["cycle_id"]
+    assert recoverable[0]["source_kind"] == "chat_human"
+    assert recoverable[0]["recovery_reason"] == "cognition_not_started"
+
+
 def test_fresh_research_reply_is_the_artifact_that_completes_the_batch(tmp_path) -> None:
     store = CompanionStore(tmp_path / "runtime.sqlite3")
     engine = CompanionEngine(store)

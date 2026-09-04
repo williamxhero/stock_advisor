@@ -1375,22 +1375,62 @@ class CompanionStore:
             )]
 
     def recoverable_conversation_jobs(self, *, before: str, max_attempts: int = 9, limit: int = 2) -> list[dict[str, Any]]:
-        """Return failed conversations whose original submitted batch still needs a reply."""
+        """Return interrupted or transiently failed conversations that still need a reply."""
         with self.connection() as c:
-            return [dict(row) for row in c.execute(
-                """SELECT j.job_id,j.cycle_id,a.kind AS source_kind,b.batch_id
+            failed = [dict(row) for row in c.execute(
+                """SELECT j.job_id,j.cycle_id,a.kind AS source_kind,b.batch_id,
+                          j.completed_at AS ready_at,'transient_cognition_failure' AS recovery_reason
                      FROM companion_cognition_job j
                      JOIN narrative_artifact a ON a.artifact_id=j.source_artifact_id
-                     JOIN companion_message_batch b ON b.cycle_id=j.cycle_id AND b.state='pending'
+                     JOIN companion_message_batch b
+                       ON b.batch_id=(
+                           SELECT pending.batch_id FROM companion_message_batch pending
+                            WHERE pending.cycle_id=j.cycle_id AND pending.state='pending'
+                            ORDER BY pending.submitted_at,pending.batch_id LIMIT 1
+                       )
                      WHERE j.mode='conversation' AND j.state='failed'
                        AND j.attempt_count<? AND j.completed_at<=?
                        AND (j.error LIKE '%broker_unavailable%' OR j.error LIKE '%Broker HTTP 503%'
                             OR j.error LIKE '%connection%' OR j.error LIKE '%timed out%'
                             OR j.error LIKE '%lease expired%')
-                     ORDER BY j.completed_at,j.job_id,b.submitted_at,b.batch_id
-                     LIMIT ?""",
-                (max_attempts, before, limit),
+                     ORDER BY j.completed_at,j.job_id,b.submitted_at,b.batch_id""",
+                (max_attempts, before),
             )]
+            stranded = [dict(row) for row in c.execute(
+                """SELECT NULL AS job_id,b.cycle_id,'chat_human' AS source_kind,
+                          MIN(b.batch_id) AS batch_id,MIN(b.submitted_at) AS ready_at,
+                          'cognition_not_started' AS recovery_reason
+                     FROM companion_message_batch b
+                    WHERE b.phase='conversation' AND b.state='pending' AND b.submitted_at<=?
+                      AND EXISTS (
+                          SELECT 1 FROM companion_message m
+                           WHERE m.batch_id=b.batch_id AND m.source_artifact_id IS NOT NULL
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM companion_message m
+                          JOIN companion_cognition_job j ON j.source_artifact_id=m.source_artifact_id
+                           WHERE m.batch_id=b.batch_id AND j.mode='conversation'
+                      )
+                    GROUP BY b.cycle_id""",
+                (before,),
+            )]
+        ordered = sorted(
+            [*failed, *stranded], key=lambda row: (
+                str(row.get("ready_at") or ""), str(row.get("cycle_id") or ""),
+                str(row.get("batch_id") or ""),
+            ),
+        )
+        selected: list[dict[str, Any]] = []
+        seen_cycles: set[str] = set()
+        for row in ordered:
+            cycle_id = str(row.get("cycle_id") or "")
+            if cycle_id in seen_cycles:
+                continue
+            seen_cycles.add(cycle_id)
+            selected.append(row)
+            if len(selected) >= limit:
+                break
+        return selected
 
     def messages_for_batches(self, batch_ids: list[str]) -> list[dict[str, Any]]:
         if not batch_ids:

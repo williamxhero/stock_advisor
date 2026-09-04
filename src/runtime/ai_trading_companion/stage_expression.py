@@ -116,8 +116,11 @@ def _v4_judgment_expression(semantic: dict[str, Any]) -> str:
     evidence = [item for item in evidence if item not in summary]
     if summary:
         paragraphs.append(summary + ("。" if not summary.endswith(("。", "！", "？")) else ""))
-    elif evidence:
-        paragraphs.append("，".join(evidence) + "。")
+    if evidence:
+        paragraphs.append(" ".join(
+            item if item.endswith(("。", "！", "？")) else item + "。"
+            for item in evidence
+        ))
     conditions = [item for item in semantic.get("transition_conditions") or [] if isinstance(item, dict)]
     for condition in conditions:
         text = _sentence_piece(_condition_text(condition))

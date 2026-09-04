@@ -261,7 +261,71 @@ class CognitiveRouter:
                 for item in positions
             ):
                 problems.append("judgment_position_priority_is_cost_anchored")
+            if stage == "m1_judgment":
+                problems.extend(_close_review_coverage_problems(packet, semantic))
         return {"passed": not problems, "problems": problems, "profile": profile.as_json()}
+
+
+def _close_review_coverage_problems(packet: dict[str, Any], semantic: dict[str, Any]) -> list[str]:
+    task_profile = packet.get("task_profile") if isinstance(packet.get("task_profile"), dict) else {}
+    if (
+        packet.get("task_key") != "daily.review.1520"
+        or task_profile.get("evidence_family") != "completed_close"
+        or not semantic.get("qualified")
+    ):
+        return []
+
+    fields = [
+        semantic.get("summary"),
+        *(semantic.get("key_evidence") or []),
+        *(item.get("reason") for item in semantic.get("position_focus") or [] if isinstance(item, dict)),
+        *(semantic.get("risks") or []),
+        *(semantic.get("unknowns") or []),
+    ]
+    body = " ".join(str(value or "") for value in fields)
+    compact = "".join(body.split())
+    problems: list[str] = []
+
+    if not (
+        "成交" in compact
+        and any(term in compact for term in ("前一交易日", "上一交易日", "昨日", "较前日", "较上日"))
+        and any(term in compact for term in ("亿元", "万亿元", "万亿"))
+        and len(_numeric_tokens(body)) >= 2
+    ):
+        problems.append("close_review_lacks_numeric_turnover_comparison")
+    if not (
+        any(term in compact for term in ("板块", "题材", "概念"))
+        and any(term in compact for term in ("领涨", "涨幅居前", "强势"))
+        and any(term in compact for term in ("领跌", "跌幅居前", "弱势"))
+    ):
+        problems.append("close_review_lacks_theme_leaders_and_laggards")
+    if not (
+        any(term in compact for term in ("论坛", "讨论热度", "传播", "市场情绪", "情绪"))
+        and any(term in compact for term in ("数据", "证据", "热度", "替代", "未取得", "缺少"))
+    ):
+        problems.append("close_review_lacks_forum_or_sentiment_substitute")
+
+    analysis = task_profile.get("analysis") if isinstance(task_profile.get("analysis"), dict) else {}
+    goal = str(analysis.get("goal") or "")
+    if "来源" in goal and not any(
+        term in compact for term in ("来源", "上交所", "深交所", "交易所", "东方财富", "腾讯", "公告")
+    ):
+        problems.append("close_review_lacks_requested_source_attribution")
+    if "时点" in goal and not re.search(
+        r"(?:截至|资料时点|数据时点|[0-2]?\d:[0-5]\d|20\d{2}年|\d{1,2}月\d{1,2}日)", compact,
+    ):
+        problems.append("close_review_lacks_requested_fact_timing")
+
+    if "全部" in goal and "持仓" in goal:
+        business_context = packet.get("business_context") if isinstance(packet.get("business_context"), dict) else {}
+        private_context = business_context.get("private_context_before_h0") or {}
+        for position in private_context.get("positions") or []:
+            if not isinstance(position, dict) or float(position.get("shares") or 0) <= 0:
+                continue
+            code, name = str(position.get("code") or ""), str(position.get("name") or "")
+            if not ((code and code in compact) or (name and name in compact)):
+                problems.append("close_review_omits_active_position:" + (code or name))
+    return problems
 
 
 def _frozen_portfolio_quotes(value: Any) -> dict[str, dict[str, Any]]:

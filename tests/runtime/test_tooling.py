@@ -32,7 +32,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.7", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.8", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
 
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
@@ -898,6 +898,9 @@ class ToolRunnerTests(unittest.TestCase):
                 if self.path.startswith("/minute?code=sh600000"):
                     body = json.dumps({"data": {"sh600000": {"data": [
                         "1428 10.00 100 1000", "1429 10.20 120 1224",
+                        # Tencent exposes the still-forming current minute too.
+                        # A 14:30:13 cutoff must keep the completed 14:29 bar.
+                        "1430 10.30 125 1275",
                     ]}}}).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -930,6 +933,7 @@ class ToolRunnerTests(unittest.TestCase):
                 self.assertEqual("derived", bar["source_semantics"])
                 self.assertEqual("tencent_minute", bar["provider"])
                 self.assertEqual(10.2, bar["close"])
+                self.assertEqual("2026-09-01T14:30:00+08:00", bar["interval_end"])
             finally:
                 server.shutdown()
                 server.server_close()

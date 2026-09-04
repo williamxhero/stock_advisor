@@ -30,11 +30,32 @@ class ToolRunnerTests(unittest.TestCase):
             custom.write_text(json.dumps({
                 "contract": "ai-trading-tool-current/v1", "version": "custom-1",
             }), encoding="utf-8")
+            turnover_routing = root / "cn_market_turnover_compare" / "routing.json"
+            turnover_routing.parent.mkdir(parents=True)
+            turnover_routing.write_text(json.dumps({
+                "contract": "ai-trading-tool-routing/v1",
+                "candidates": [
+                    {"adapter": "eastmoney", "version": "1.1.9"},
+                    {"adapter": "markethub", "version": "1.1.9"},
+                ],
+            }), encoding="utf-8")
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.9", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.10", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
+            routing = json.loads(turnover_routing.read_text(encoding="utf-8"))
+            self.assertEqual(
+                ["eastmoney_history", "official_exchanges", "eastmoney_spot_markethub", "tencent_spot_markethub"],
+                [row["adapter"] for row in routing["candidates"]],
+            )
+            official_manifest = json.loads((
+                root / "cn_market_turnover_compare" / "adapters" / "official_exchanges"
+                / "versions" / "1.1.10" / "manifest.json"
+            ).read_text(encoding="utf-8"))
+            self.assertEqual({
+                "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
+            }, official_manifest["egress"])
 
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
         version_root = root / capability / "versions" / "1.0.0"
@@ -1158,6 +1179,15 @@ class ToolRunnerTests(unittest.TestCase):
                         "unit": "CNY", "current_amount": 350_000_000_000.0,
                         "previous_amount": 300_000_000_000.0, "change_amount": 50_000_000_000.0,
                         "change_ratio": 1 / 6, "source": "markethub_test",
+                        "scope_definition": "test_exchange_totals", "scope_note": "test CNY scope",
+                        "current_markets": [
+                            {"exchange": "SSE", "market_total_id": "test_sse", "amount": 150_000_000_000.0, "unit": "CNY"},
+                            {"exchange": "SZSE", "market_total_id": "test_szse", "amount": 200_000_000_000.0, "unit": "CNY"},
+                        ],
+                        "previous_markets": [
+                            {"exchange": "SSE", "market_total_id": "test_sse", "amount": 130_000_000_000.0, "unit": "CNY"},
+                            {"exchange": "SZSE", "market_total_id": "test_szse", "amount": 170_000_000_000.0, "unit": "CNY"},
+                        ],
                     }
                 else:
                     payload = {
@@ -1191,7 +1221,8 @@ class ToolRunnerTests(unittest.TestCase):
                 runner = ToolRunner(ToolCatalog(root))
                 turnover = runner.resolve_with_fallback(FactRequest(
                     1, "cn_market_turnover_compare", "2026-09-01T07:00:00Z", 5.0,
-                    {"eastmoney_kline_url": base + "/kline", "markethub_turnover_url": base + "/turnover"},
+                    {"eastmoney_kline_url": base + "/kline", "sse_turnover_url": base + "/sse",
+                     "szse_turnover_url": base + "/szse", "markethub_turnover_url": base + "/turnover"},
                     finality="official_close",
                 ))
                 sectors = runner.resolve_with_fallback(FactRequest(
@@ -1201,7 +1232,10 @@ class ToolRunnerTests(unittest.TestCase):
                 ))
 
                 self.assertTrue(turnover.succeeded, turnover.error_code)
-                self.assertEqual(("eastmoney:tool_process_failed", "markethub:succeeded"), turnover.attempts)
+                self.assertEqual((
+                    "eastmoney_history:tool_process_failed", "official_exchanges:tool_process_failed",
+                    "eastmoney_spot_markethub:succeeded",
+                ), turnover.attempts)
                 self.assertTrue(sectors.succeeded, sectors.error_code)
                 self.assertEqual(("eastmoney:tool_process_failed", "markethub:succeeded"), sectors.attempts)
             finally:
@@ -1218,16 +1252,36 @@ class ToolRunnerTests(unittest.TestCase):
                     self.end_headers()
                     return
                 query = parse_qs(urlsplit(self.path).query)
+                if self.path.startswith("/tencent"):
+                    records = []
+                    for vendor, symbol, timestamp, amount in (
+                        ("sh000001", "000001", "20260904161403", "500000000"),
+                        ("sz399106", "399106", "20260904161421", "500000000"),
+                    ):
+                        fields = [""] * 88
+                        fields[0:5] = ["1", vendor, symbol, "1", "1"]
+                        fields[30] = timestamp
+                        fields[35] = f"1/1/{amount}"
+                        records.append(f'v_{vendor}="{"~".join(fields)}";')
+                    body = "\n".join(records).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if self.path.startswith("/spot"):
                     page = int(query.get("pn", ["1"])[0])
                     start = (page - 1) * 100
                     rows = [{
-                        "f12": f"{600000 + index:06d}", "f6": 1_000_000.0, "f124": 1788505200,
+                        "f12": (f"{600000 + index:06d}" if index < 500 else f"{index - 499:06d}"),
+                        "f6": 1_000_000.0, "f124": 1788505200,
                     } for index in range(start, min(start + 100, 1000))]
                     payload = {"data": {"total": 1000, "diff": rows}}
                 else:
                     payload = [{
-                        "code": f"{600000 + index:06d}", "trade_time": "2026-09-03",
+                        "code": (f"{600000 + index:06d}" if index < 500 else f"{index - 499:06d}"),
+                        "trade_time": "2026-09-03",
                         "amount": 900_000.0,
                     } for index in range(self.previous_count)]
                 body = json.dumps(payload).encode("utf-8")
@@ -1250,27 +1304,294 @@ class ToolRunnerTests(unittest.TestCase):
                 request = FactRequest(
                     1, "cn_market_turnover_compare", "2026-09-04T07:00:00Z", 8.0,
                     {"eastmoney_kline_url": base + "/kline", "eastmoney_spot_url": base + "/spot",
+                     "sse_turnover_url": base + "/sse", "szse_turnover_url": base + "/szse",
+                     "tencent_turnover_url": base + "/tencent?q=",
                      "markethub_snapshot_url": base + "/snapshot"}, finality="official_close",
                 )
-                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(request)
-
-                self.assertTrue(result.succeeded, result.error_code)
-                self.assertEqual(("eastmoney:tool_process_failed", "markethub:succeeded"), result.attempts)
-                self.assertEqual(1_000_000_000.0, result.data["current_amount"])
-                self.assertEqual(900_000_000.0, result.data["previous_amount"])
-                self.assertEqual({"current_security_count": 1000, "previous_security_count": 1000}, result.data["coverage"])
-
                 Handler.previous_count = 100
                 partial_runner = ToolRunner(ToolCatalog(root))
                 partial = partial_runner.resolve_with_fallback(request)
                 self.assertFalse(partial.succeeded)
                 self.assertEqual("tool_process_failed", partial.error_code)
-                self.assertEqual(
-                    ("eastmoney:tool_process_failed", "markethub:tool_process_failed"), partial.attempts,
-                )
+                self.assertEqual({
+                    "eastmoney_history:tool_process_failed", "official_exchanges:tool_process_failed",
+                    "eastmoney_spot_markethub:tool_process_failed", "tencent_spot_markethub:tool_process_failed",
+                }, set(partial.attempts))
                 self.assertIsNotNone(partial.diagnostic_artifact_ref)
                 diagnostic = partial_runner.artifacts.read(partial.diagnostic_artifact_ref).decode("utf-8")
                 self.assertIn("previous turnover snapshot is incomplete", diagnostic)
+
+                Handler.previous_count = 1000
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(request)
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual((
+                    "eastmoney_history:tool_process_failed", "official_exchanges:tool_process_failed",
+                    "eastmoney_spot_markethub:succeeded",
+                ), result.attempts)
+                self.assertEqual(1_000_000_000.0, result.data["current_amount"])
+                self.assertEqual(900_000_000.0, result.data["previous_amount"])
+                self.assertEqual({"current_security_count": 1000, "previous_security_count": 1000}, result.data["coverage"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_turnover_current_falls_back_from_eastmoney_to_tencent_exact_amounts(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            tencent_case = "ok"
+            previous_count = 1000
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith(("/kline", "/spot", "/sse", "/szse")):
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                if self.path.startswith("/tencent"):
+                    records = []
+                    for vendor, name, symbol, price, previous, timestamp, volume, amount in (
+                        ("sh000001", "上证指数", "000001", "3930.12", "3942.09", "20260904161403", "537286161", "938255187184"),
+                        ("sz399106", "深证综指", "399106", "2492.96", "2512.87", "20260904161421", "678475372", "1092412648913"),
+                    ):
+                        if self.tencent_case == "wrong_date":
+                            timestamp = "20260903" + timestamp[8:]
+                        elif self.tencent_case == "open":
+                            timestamp = timestamp[:8] + "145900"
+                        exact_amount = "0" if self.tencent_case == "zero_amount" else amount
+                        fields = [""] * 88
+                        fields[0:5] = [
+                            "1", name,
+                            ("399001" if self.tencent_case == "wrong_identity" and vendor == "sz399106" else symbol),
+                            price, previous,
+                        ]
+                        fields[30] = timestamp
+                        fields[35] = (
+                            f"{price}/{volume}" if self.tencent_case == "wrong_field"
+                            else f"{price}/{volume}/{exact_amount}"
+                        )
+                        fields[36] = volume
+                        fields[37] = str(round(int(amount) / 10_000))
+                        records.append(f'v_{vendor}="{"~".join(fields)}";')
+                    body = "\n".join(records).encode("gb18030")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=gb18030")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                body = json.dumps([{
+                    "code": (f"{600000 + index:06d}" if index < 500 else f"{index - 499:06d}"),
+                    "trade_time": "2026-09-03",
+                    "amount": 900_000.0,
+                } for index in range(self.previous_count)]).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                request = FactRequest(
+                    1, "cn_market_turnover_compare", "2026-09-04T07:20:00Z", 8.0,
+                    {"eastmoney_kline_url": base + "/kline", "eastmoney_spot_url": base + "/spot",
+                     "sse_turnover_url": base + "/sse", "szse_turnover_url": base + "/szse",
+                     "tencent_turnover_url": base + "/tencent?q=", "markethub_snapshot_url": base + "/snapshot"},
+                    finality="official_close",
+                )
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(request)
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual((
+                    "eastmoney_history:tool_process_failed", "official_exchanges:tool_process_failed",
+                    "eastmoney_spot_markethub:tool_process_failed", "tencent_spot_markethub:succeeded",
+                ), result.attempts)
+                self.assertEqual(2_030_667_836_097.0, result.data["current_amount"])
+                self.assertEqual([
+                    {"exchange": "SSE", "market_total_id": "sh000001",
+                     "amount": 938_255_187_184, "unit": "CNY"},
+                    {"exchange": "SZSE", "market_total_id": "sz399106",
+                     "amount": 1_092_412_648_913, "unit": "CNY"},
+                ], result.data["current_markets"])
+                self.assertTrue(any("/tencent?q=sh000001,sz399106" in url for url in result.data["source_urls"]))
+
+                for case, previous_count in (
+                    ("wrong_date", 1000), ("open", 1000), ("wrong_field", 1000),
+                    ("wrong_identity", 1000), ("zero_amount", 1000), ("ok", 100),
+                ):
+                    with self.subTest(case=case):
+                        Handler.tencent_case = case
+                        Handler.previous_count = previous_count
+                        failed = ToolRunner(ToolCatalog(root)).resolve_with_fallback(request)
+                        self.assertFalse(failed.succeeded)
+                        self.assertEqual("tool_process_failed", failed.error_code)
+                        self.assertIn("tencent_spot_markethub:tool_process_failed", failed.attempts)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_official_exchange_turnover_uses_two_common_sessions_and_unit_conversion(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            skip_previous = False
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/kline"):
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                query = parse_qs(urlsplit(self.path).query)
+                trading_date = query.get("SEARCH_DATE", query.get("txtQueryDate", [""]))[0]
+                amounts = {
+                    "2026-09-04": ("9395.56", "10,940.26"),
+                    "2026-09-03": ("8206.03", "9,400.89"),
+                    "2026-09-02": ("7000.00", "8,000.00"),
+                }
+                published = trading_date in amounts and not (self.skip_previous and trading_date == "2026-09-03")
+                if self.path.startswith("/sse"):
+                    rows = ([{"PRODUCT_CODE": "17", "TRADE_AMT": amounts[trading_date][0],
+                              "TRADE_DATE": trading_date.replace("-", "")}] if published else [])
+                    body = ("jsonpCallback(" + json.dumps({"result": rows}) + ")").encode("utf-8")
+                else:
+                    data = ([{"zbmc": "成交量（亿）", "gp": "1.00"},
+                             {"zbmc": "成交金额（亿元）", "gp": amounts[trading_date][1]}]
+                            if published else [])
+                    body = json.dumps([{
+                        "metadata": {"conditions": [{"name": "txtQueryDate", "defaultValue": trading_date}]},
+                        "data": data, "error": None,
+                    }], ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                    1, "cn_market_turnover_compare", "2026-09-04T07:20:00Z", 8.0,
+                    {"eastmoney_kline_url": base + "/kline", "sse_turnover_url": base + "/sse",
+                     "szse_turnover_url": base + "/szse"}, finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual((
+                    "eastmoney_history:tool_process_failed", "official_exchanges:succeeded",
+                ), result.attempts)
+                self.assertEqual(2_033_582_000_000.0, result.data["current_amount"])
+                self.assertEqual(1_760_692_000_000.0, result.data["previous_amount"])
+                self.assertEqual(272_890_000_000.0, result.data["change_amount"])
+                self.assertAlmostEqual(272_890 / 1_760_692, result.data["change_ratio"])
+                self.assertEqual("exchange_published_stock_total", result.data["scope_definition"])
+                self.assertEqual(4, len(result.data["source_evidence"]))
+                self.assertEqual(4, len(result.data["source_urls"]))
+                self.assertEqual("2026-09-04T07:00:00Z", result.fact_as_of)
+
+                Handler.skip_previous = True
+                prior_common = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                    1, "cn_market_turnover_compare", "2026-09-04T07:20:00Z", 8.0,
+                    {"eastmoney_kline_url": base + "/kline", "sse_turnover_url": base + "/sse",
+                     "szse_turnover_url": base + "/szse"}, finality="official_close",
+                ))
+                self.assertTrue(prior_common.succeeded, prior_common.error_code)
+                self.assertEqual("2026-09-02", prior_common.data["previous_trading_date"])
+                self.assertEqual(1_500_000_000_000.0, prior_common.data["previous_amount"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_official_exchange_turnover_fails_closed_to_the_next_provider(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            case = "wrong_date"
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/kline"):
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                if self.path.startswith("/fallback"):
+                    payload = {
+                        "contract": "markethub-cn-market-turnover-compare-v1",
+                        "trading_date": "2026-09-04", "previous_trading_date": "2026-09-03",
+                        "fact_as_of": "2026-09-04T15:00:00+08:00", "scope": "SSE+SZSE",
+                        "scope_definition": "test_exchange_totals", "scope_note": "test CNY scope",
+                        "unit": "CNY", "current_amount": 200.0, "previous_amount": 100.0,
+                        "change_amount": 100.0, "change_ratio": 1.0, "source": "fallback_test",
+                        "current_markets": [
+                            {"exchange": "SSE", "market_total_id": "test_sse", "amount": 90.0, "unit": "CNY"},
+                            {"exchange": "SZSE", "market_total_id": "test_szse", "amount": 110.0, "unit": "CNY"},
+                        ],
+                        "previous_markets": [
+                            {"exchange": "SSE", "market_total_id": "test_sse", "amount": 40.0, "unit": "CNY"},
+                            {"exchange": "SZSE", "market_total_id": "test_szse", "amount": 60.0, "unit": "CNY"},
+                        ],
+                    }
+                    body = json.dumps(payload).encode("utf-8")
+                else:
+                    query = parse_qs(urlsplit(self.path).query)
+                    trading_date = query.get("SEARCH_DATE", query.get("txtQueryDate", [""]))[0]
+                    published = self.case != "not_published"
+                    if self.path.startswith("/sse"):
+                        echoed_date = "20260903" if self.case == "wrong_date" else trading_date.replace("-", "")
+                        product_code = "01" if self.case == "wrong_product" else "17"
+                        rows = ([{"PRODUCT_CODE": product_code, "TRADE_AMT": "1.00", "TRADE_DATE": echoed_date}]
+                                if published else [])
+                        body = ("jsonpCallback(" + json.dumps({"result": rows}) + ")").encode("utf-8")
+                    elif self.case == "missing_exchange":
+                        self.send_response(503)
+                        self.end_headers()
+                        return
+                    else:
+                        data = ([{"zbmc": "成交金额（亿元）", "gp": "1.00"}] if published else [])
+                        body = json.dumps([{
+                            "metadata": {"conditions": [{"name": "txtQueryDate", "defaultValue": trading_date}]},
+                            "data": data, "error": ("upstream error" if self.case == "szse_error" else None),
+                        }], ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                for case in (
+                    "wrong_date", "missing_exchange", "not_published", "wrong_product", "szse_error",
+                ):
+                    with self.subTest(case=case):
+                        Handler.case = case
+                        root = Path(directory) / case / "tools"
+                        ensure_builtin_tools(root)
+                        result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                            1, "cn_market_turnover_compare", "2026-09-04T07:20:00Z", 8.0,
+                            {"eastmoney_kline_url": base + "/kline", "sse_turnover_url": base + "/sse",
+                             "szse_turnover_url": base + "/szse", "markethub_turnover_url": base + "/fallback"},
+                            finality="official_close",
+                        ))
+                        self.assertTrue(result.succeeded, result.error_code)
+                        self.assertEqual((
+                            "eastmoney_history:tool_process_failed", "official_exchanges:tool_process_failed",
+                            "eastmoney_spot_markethub:succeeded",
+                        ), result.attempts)
             finally:
                 server.shutdown()
                 server.server_close()

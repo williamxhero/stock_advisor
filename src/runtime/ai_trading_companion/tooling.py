@@ -670,9 +670,38 @@ def _validate_market_turnover_compare(
         return "tool_market_turnover_calculation_invalid"
     if not math.isclose(change_ratio, change_amount / previous_amount, rel_tol=1e-9, abs_tol=1e-9):
         return "tool_market_turnover_calculation_invalid"
+    if not str(data.get("scope_definition") or "").strip() or not str(data.get("scope_note") or "").strip():
+        return "tool_market_turnover_scope_invalid"
+    if not _valid_market_turnover_breakdown(data.get("current_markets"), current_amount):
+        return "tool_market_turnover_scope_invalid"
+    if not _valid_market_turnover_breakdown(data.get("previous_markets"), previous_amount):
+        return "tool_market_turnover_scope_invalid"
     if not str(data.get("source") or "").strip() or not _valid_public_source_urls(data.get("source_urls")):
         return "tool_market_source_urls_invalid"
     return None
+
+
+def _valid_market_turnover_breakdown(value: Any, expected_amount: float) -> bool:
+    if not isinstance(value, list) or len(value) != 2:
+        return False
+    by_exchange: dict[str, float] = {}
+    for row in value:
+        if not isinstance(row, dict):
+            return False
+        exchange = str(row.get("exchange") or "")
+        identity = str(row.get("market_total_id") or "").strip()
+        if exchange not in {"SSE", "SZSE"} or exchange in by_exchange or not identity or row.get("unit") != "CNY":
+            return False
+        try:
+            amount = float(row.get("amount"))
+        except (TypeError, ValueError):
+            return False
+        if amount <= 0:
+            return False
+        by_exchange[exchange] = amount
+    return set(by_exchange) == {"SSE", "SZSE"} and math.isclose(
+        sum(by_exchange.values()), expected_amount, rel_tol=1e-9, abs_tol=0.01,
+    )
 
 
 def _validate_market_sector_snapshot(

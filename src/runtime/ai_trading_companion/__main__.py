@@ -1470,6 +1470,9 @@ def run_chat_research(
     if not source:
         raise RuntimeError("chat research source artifact is missing")
     public_scope = json.loads(job["public_scope_json"])
+    reply_to_batch_ids = [
+        str(value) for value in public_scope.pop("_reply_to_batch_ids", []) if str(value)
+    ]
     if not execute:
         evidence = {
             "as_of": iso(datetime.now(timezone.utc)), "spoken_summary": "Fixture 模式：公开补查尚未执行。",
@@ -1511,7 +1514,8 @@ def run_chat_research(
     source_metadata = json.loads(source.get("metadata_json") or "{}")
     reply_kind = "premarket_chat" if source["kind"] == "pre_m0_submission" else "ai_chat"
     engine.chat_ready(
-        cycle["cycle_id"], reply, reply_to_batch_id=source_metadata.get("batch_id"), kind=reply_kind
+        cycle["cycle_id"], reply, reply_to_batch_id=source_metadata.get("batch_id"),
+        reply_to_batch_ids=reply_to_batch_ids or None, kind=reply_kind,
     )
     return evidence
 
@@ -2063,7 +2067,10 @@ def run_unified_cognition(
         "propositions_recorded": outcome.propositions_recorded,
     })
     if outcome.needs_fresh_search and outcome.public_search_request:
-        store.queue_research_job(cycle_id, source["artifact_id"], outcome.public_search_request)
+        store.queue_research_job(cycle_id, source["artifact_id"], {
+            **outcome.public_search_request,
+            "_reply_to_batch_ids": list(batch_ids),
+        })
     if outcome.answer:
         if cancelled and cancelled():
             raise MemoryResearchError("memory research was terminated by the user")

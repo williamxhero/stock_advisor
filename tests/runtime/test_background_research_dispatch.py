@@ -141,3 +141,55 @@ def test_fresh_research_reply_is_the_artifact_that_completes_the_batch(tmp_path)
     final = store.latest_artifact(job["cycle_id"], "ai_chat")
     assert batch == {"state": "completed", "response_artifact_id": final["artifact_id"]}
     assert final["body_markdown"] == "今天的盘后回顾已经完成。"
+
+
+def test_fresh_research_reply_completes_every_batch_frozen_into_the_job(tmp_path) -> None:
+    store = CompanionStore(tmp_path / "runtime.sqlite3")
+    engine = CompanionEngine(store)
+    _, old_job, old_batch_id = _queued_research(store, day="2026-09-03", text="第一次盘后回顾")
+    conversation = store.get_cycle(old_job["cycle_id"])
+    message = store.stage_message(conversation["cycle_id"], "请继续完成", "conversation")
+    current_batch_id, _ = store.commit_staged_messages(conversation["cycle_id"], "conversation")
+    source = store.append_artifact(
+        conversation["cycle_id"], "chat_human", "human", "请继续完成", conversation["as_of"],
+        {"batch_id": current_batch_id, "message_ids": [message["message_id"]]},
+    )
+    current_job = store.queue_research_job(
+        conversation["cycle_id"], source["artifact_id"],
+        {
+            "topics": ["A股盘后"], "questions": ["今天收盘后发生了什么？"],
+            "_reply_to_batch_ids": [old_batch_id, current_batch_id],
+        },
+    )
+    evidence = {
+        "as_of": "2026-09-03T14:30:00Z", "spoken_summary": "收盘数据已经核对。",
+        "sources": [], "critical_gaps": [],
+    }
+    followup = {
+        "answer": {"points": ["今天的盘后回顾已经完成。"], "material_ids": []},
+        "needs_fresh_search": False, "public_search_request": None,
+        "judgment_revision": None,
+    }
+
+    class Builder:
+        seen_context = None
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def build(self, *_args, **kwargs):
+            Builder.seen_context = kwargs.get("context")
+            return {"sha256": "frozen"}
+
+    with patch("ai_trading_companion.__main__.RuntimePacketBuilder", Builder), patch(
+        "ai_trading_companion.__main__._call_stage", side_effect=[(evidence, None), (followup, None)],
+    ):
+        run_chat_research(engine, store, current_job, True)
+
+    with store.connection() as connection:
+        states = dict(connection.execute(
+            "SELECT batch_id,state FROM companion_message_batch WHERE batch_id IN (?,?)",
+            (old_batch_id, current_batch_id),
+        ).fetchall())
+    assert states == {old_batch_id: "completed", current_batch_id: "completed"}
+    assert "_reply_to_batch_ids" not in Builder.seen_context

@@ -590,6 +590,7 @@ class UnifiedCognitionTests(unittest.TestCase):
         jobs = self.store.pending_research_jobs(limit=4)
         self.assertEqual([batch_id], [item["batch_id"] for item in batch])
         self.assertEqual(source["artifact_id"], jobs[0]["source_artifact_id"])
+        self.assertEqual([batch_id], json.loads(jobs[0]["public_scope_json"])["_reply_to_batch_ids"])
 
     def test_ambiguous_analysis_intent_needs_clarification_without_creating_a_cycle(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-08-27")

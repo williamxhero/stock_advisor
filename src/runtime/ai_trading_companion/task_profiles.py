@@ -153,10 +153,12 @@ class ManualAnalysisProfileResolver:
         folded = time_scope.casefold()
         completed_close_terms = (
             "已收盘交易日", "最近交易日收盘", "最近一个交易日收盘", "今日收盘", "当天收盘", "盘后",
+            "收盘至下一交易日", "收盘到下一交易日",
         )
         completed_close_english = (
             "latest completed trading day", "most recent completed trading day",
             "latest completed close", "post-close", "post close",
+            "close through next trading session", "close to next trading session",
         )
         if any(term in time_scope for term in completed_close_terms) or any(
             term in folded for term in completed_close_english

@@ -202,6 +202,17 @@ class PortfolioServiceTests(unittest.TestCase):
         self.assertEqual("needs_input", result["state"])
         self.assertEqual({"603179", "603993"}, {item["code"] for item in self.service.snapshot()["positions"]})
 
+    def test_analysis_request_for_all_holdings_cannot_clear_the_portfolio(self):
+        result = self.service.replace_complete_snapshot(
+            "请做收盘复盘并覆盖我的全部持仓、风险、来源和资料时点。",
+            [],
+            "cycle",
+            "analysis-query",
+        )
+
+        self.assertEqual("needs_input", result["state"])
+        self.assertEqual({"603179", "603993"}, {item["code"] for item in self.service.snapshot()["positions"]})
+
     def test_asset_correction_can_be_reverted_from_a_later_conversation(self):
         extraction = {"statement_type": "current_state", "changes": [{"action": "asset_correction", "code": None, "name": None, "shares": None, "price": None, "total_assets": 240000, "occurred_at": None, "evidence": {"instrument": None, "action": "总资产", "shares": None, "price": None, "total_assets": "24万元"}}]}
         self.service.apply_extraction("现在总资产是24万元", extraction, "cycle-a", "asset-a")

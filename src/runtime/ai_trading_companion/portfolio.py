@@ -227,7 +227,7 @@ class PortfolioService:
         source_artifact_id: str | None,
     ) -> dict[str, Any]:
         """Atomically replace positions only when the user explicitly says the scope is complete."""
-        if not has_complete_portfolio_scope(source_text):
+        if not is_complete_portfolio_snapshot_statement(source_text):
             return self._record_needs_input(
                 source_text, {"statement_type": "current_state", "changes": changes},
                 cycle_id, source_artifact_id, ["明确的完整账户或全部持仓范围"],

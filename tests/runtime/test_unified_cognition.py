@@ -117,6 +117,27 @@ class UnifiedCognitionTests(unittest.TestCase):
 
         self.assertEqual({"passed": True, "problems": []}, verdict)
 
+    def test_complete_holdings_query_rejects_a_destructive_snapshot_action(self) -> None:
+        text = (
+            "请做一次今天15:20收盘复盘，给出市场宽度、全部持仓、风险判断、"
+            "后续条件、来源和资料时点。"
+        )
+        result = {
+            "answer": {"points": ["我会先核验数据。"]},
+            "actions": [{
+                "action_type": "portfolio.replace_complete_snapshot",
+                "changes": [],
+                "source_span": {"message_id": "review", "start": 0, "end": len(text), "quote": text},
+            }],
+        }
+
+        verdict = verify_cognition_result(
+            [{"message_id": "review", "body_text": text}], result,
+        )
+
+        self.assertFalse(verdict["passed"])
+        self.assertIn("snapshot_action_without_complete_portfolio_statement:review", verdict["problems"])
+
     def test_active_provider_call_graph_is_semantic_and_never_writes_legacy_markdown_fields(self):
         schema_path = PROJECT_ROOT / "resources" / "contracts" / "companion-cognition-result-v2.schema.json"
         self.assertTrue(schema_path.is_file())

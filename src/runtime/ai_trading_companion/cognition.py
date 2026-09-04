@@ -11,7 +11,6 @@ from .learning import WorkflowEvolution
 from .cognition_compat import adapt_legacy_cognition_result
 from .portfolio import (
     explicit_fixture_extraction,
-    has_complete_portfolio_scope,
     is_complete_portfolio_snapshot_statement,
     is_portfolio_statement,
 )
@@ -43,15 +42,14 @@ def verify_cognition_result(messages: list[dict[str, Any]], result: dict[str, An
         for message in messages
         if is_complete_portfolio_snapshot_statement(str(message.get("body_text") or ""))
     }
-    if not complete_message_ids:
-        return {"passed": True, "problems": []}
-
     problems: list[str] = []
     snapshot_message_ids = {
         str((action.get("source_span") or {}).get("message_id") or "")
         for action in result.get("actions") or []
         if action.get("action_type") == "portfolio.replace_complete_snapshot"
     }
+    for message_id in sorted(snapshot_message_ids - complete_message_ids):
+        problems.append(f"snapshot_action_without_complete_portfolio_statement:{message_id}")
     for message_id in sorted(complete_message_ids - snapshot_message_ids):
         problems.append(f"complete_portfolio_requires_snapshot_action:{message_id}")
 
@@ -79,8 +77,10 @@ class UnifiedCognition:
             "混合句按命题拆开，歧义只阻塞依赖它的动作。一次输出自然回复、可长期记住的命题和受控动作。"
             "动作只能是 portfolio.apply、portfolio.replace_complete_snapshot、workflow.propose 或 analysis.request。"
             "analysis.request 只表达明确的 subject、time_scope 和 goal；不得指定任务键、日程、证据策略或内部 ID。持仓表默认是局部更新；"
-            "只有原文明确说明这是完整账户/全部持仓快照时，才能使用 replace_complete_snapshot；否则绝不能把缺失股票推成零。"
-            "用户明确说完整、全部或所有持仓时，持仓范围本身也是用户权威事实，必须使用 replace_complete_snapshot；"
+            "只有原文明确陈述这是完整账户/全部持仓快照，并实际给出带股数的持仓明细或明确说当前空仓时，"
+            "才能使用 replace_complete_snapshot；否则绝不能把缺失股票推成零。"
+            "‘查看、分析、覆盖、给出全部持仓’是读取或分析要求，不是用户在提供完整快照，绝不能生成任何持仓写动作。"
+            "用户明确陈述‘以下是我的完整/全部/所有持仓’并提供明细时，持仓范围本身才是用户权威事实，必须使用 replace_complete_snapshot；"
             "不得因总资产与持仓市值有差额就改称‘当前披露’、猜测另有基金或其他持仓，或拒绝清零遗漏的旧持仓。"
             "账户总资产可以包含现金，这不否定证券持仓范围的完整性。"
             "普通聊天绝不修订正式 M1/M2。"
@@ -132,7 +132,7 @@ class UnifiedCognition:
                     "evidence": {key: evidence.get(key) for key in ("instrument", "action", "shares", "price", "average_cost", "total_assets")},
                 })
             action = {
-                "action_type": "portfolio.replace_complete_snapshot" if has_complete_portfolio_scope(text) else "portfolio.apply",
+                "action_type": "portfolio.replace_complete_snapshot" if is_complete_portfolio_snapshot_statement(text) else "portfolio.apply",
                 "changes": changes,
                 "source_span": {"message_id": message["message_id"], "start": 0, "end": len(text), "quote": text},
             }

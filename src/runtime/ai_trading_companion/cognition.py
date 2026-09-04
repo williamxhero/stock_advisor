@@ -33,6 +33,9 @@ _COMPLETE_PORTFOLIO_ANSWER_CONTRADICTION = re.compile(
     r"当前披露|不把(?:缺失|未披露).{0,12}(?:资产|持仓).{0,12}推定为零|"
     r"(?:还|仍|也)?可能(?:还)?(?:包含|存在|有).{0,48}(?:基金|其他(?:非股票)?资产|其他(?:股票|证券|持仓))"
 )
+_CLOSE_REVIEW_REQUEST = re.compile(r"(?:收盘|盘后).{0,8}(?:复盘|回顾)|(?:复盘|回顾).{0,8}(?:收盘|盘后)")
+_NEGATED_CLOSE_REVIEW_REQUEST = re.compile(r"(?:不要|不用|取消|不需要).{0,16}(?:收盘|盘后).{0,8}(?:复盘|回顾)")
+_FORMAL_CLOSE_REVIEW_DETAIL = re.compile(r"(?:15:20|成交额|三大指数|市场宽度|领涨|领跌|资料时点)")
 
 
 def verify_cognition_result(messages: list[dict[str, Any]], result: dict[str, Any]) -> dict[str, Any]:
@@ -58,6 +61,45 @@ def verify_cognition_result(messages: list[dict[str, Any]], result: dict[str, An
     if _COMPLETE_PORTFOLIO_ANSWER_CONTRADICTION.search(answer_text):
         problems.append("answer_contradicts_authoritative_complete_portfolio")
     return {"passed": not problems, "problems": problems}
+
+
+def _explicit_close_review_action(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Recover an unambiguous formal close-review request without inferring portfolio writes."""
+    text = str(message.get("body_text") or "").strip()
+    if (
+        not text
+        or not _CLOSE_REVIEW_REQUEST.search(text)
+        or not _FORMAL_CLOSE_REVIEW_DETAIL.search(text)
+        or _NEGATED_CLOSE_REVIEW_REQUEST.search(text)
+    ):
+        return None
+    time_scope_match = re.search(
+        r"(?:\d{4}年\d{1,2}月\d{1,2}日|今天|今日|当天)[^，。；]{0,16}收盘", text,
+    )
+    time_scope = time_scope_match.group(0) if time_scope_match else "盘后"
+    message_id = str(message.get("message_id") or "")
+    return {
+        "action_type": "analysis.request",
+        "subject": "A股收盘市场及当前账户持仓",
+        "time_scope": time_scope,
+        "goal": text,
+        "source_span": {"message_id": message_id, "start": 0, "end": len(text), "quote": text},
+    }
+
+
+def _recover_explicit_analysis_actions(
+    messages: list[dict[str, Any]], actions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    result = list(actions)
+    covered = {
+        str((action.get("source_span") or {}).get("message_id") or "")
+        for action in result if action.get("action_type") == "analysis.request"
+    }
+    for message in messages:
+        action = _explicit_close_review_action(message)
+        if action is not None and str(message.get("message_id") or "") not in covered:
+            result.append(action)
+    return result
 
 
 class UnifiedCognition:
@@ -139,6 +181,7 @@ class UnifiedCognition:
             if action["action_type"] == "portfolio.apply":
                 action["statement_type"] = extraction.get("statement_type", "none")
             actions.append(action)
+        actions = _recover_explicit_analysis_actions(messages, actions)
         return {
             "answer": None if mode == "h0" else {"points": ["已收到这批消息。我会把你说的个人事实作为最新口径；涉及市场的判断仍由我独立核验。"], "material_ids": []},
             "needs_fresh_search": False, "public_search_request": None,
@@ -159,6 +202,9 @@ class UnifiedCognition:
             )
 
         result = adapt_legacy_cognition_result(result)
+        result["actions"] = _recover_explicit_analysis_actions(
+            messages, [item for item in result.get("actions") or [] if isinstance(item, dict)],
+        )
         by_id = {item["message_id"]: item for item in messages}
         propositions_recorded = 0
         for index, proposition in enumerate(result.get("propositions") or []):

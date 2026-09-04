@@ -213,6 +213,19 @@ class PortfolioServiceTests(unittest.TestCase):
         self.assertEqual("needs_input", result["state"])
         self.assertEqual({"603179", "603993"}, {item["code"] for item in self.service.snapshot()["positions"]})
 
+    def test_analysis_request_cannot_create_a_portfolio_change_proposal(self):
+        text = "请做15:20收盘复盘并给出成交额、当前账户全部实有持仓、风险和资料时点。"
+
+        result = self.service.apply_extraction(
+            text,
+            {"statement_type": "current_state", "changes": []},
+            "cycle",
+            "analysis-query-apply",
+        )
+
+        self.assertEqual("rejected", result["state"])
+        self.assertEqual([], self.service.snapshot()["pending_proposals"])
+
     def test_asset_correction_can_be_reverted_from_a_later_conversation(self):
         extraction = {"statement_type": "current_state", "changes": [{"action": "asset_correction", "code": None, "name": None, "shares": None, "price": None, "total_assets": 240000, "occurred_at": None, "evidence": {"instrument": None, "action": "总资产", "shares": None, "price": None, "total_assets": "24万元"}}]}
         self.service.apply_extraction("现在总资产是24万元", extraction, "cycle-a", "asset-a")

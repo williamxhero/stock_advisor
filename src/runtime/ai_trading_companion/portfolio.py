@@ -22,6 +22,11 @@ INCOMPLETE_PORTFOLIO_SCOPE = re.compile(
 COMPLETE_PORTFOLIO_FACT = re.compile(
     r"(?:\d+(?:\.\d+)?\s*股)|(?:空仓|没有持仓|无持仓)"
 )
+PORTFOLIO_WRITE_FACT = re.compile(
+    r"(?:\d+(?:\.\d+)?\s*股)|"
+    r"(?:成本|总资产|股票资产)\s*(?:是|为|约|[:：])?\s*\d+(?:\.\d+)?\s*(?:元|万|万元)?|"
+    r"(?:空仓|没有持仓|无持仓)"
+)
 
 
 def is_portfolio_statement(text: str) -> bool:
@@ -31,6 +36,14 @@ def is_portfolio_statement(text: str) -> bool:
 def is_future_action_statement(text: str) -> bool:
     action = re.search(r"买入|卖出|加仓|减仓|清仓", text)
     return bool(action and FUTURE_TERMS.search(text[:action.start()]))
+
+
+def is_portfolio_write_statement(text: str) -> bool:
+    """Require an asserted transaction or a concrete account fact before writing."""
+    action = re.search(r"买入|卖出|加仓|减仓|清仓", text)
+    if action:
+        return not is_future_action_statement(text)
+    return bool(PORTFOLIO_WRITE_FACT.search(text))
 
 
 def has_complete_portfolio_scope(text: str) -> bool:
@@ -136,6 +149,8 @@ class PortfolioService:
         source_artifact_id: str | None,
     ) -> dict[str, Any]:
         proposals = extraction.get("changes") or []
+        if not is_portfolio_write_statement(source_text):
+            return self._record_non_action(source_text, extraction, cycle_id, source_artifact_id)
         if is_future_action_statement(source_text) or extraction.get("statement_type") not in {"executed", "current_state"}:
             return self._record_non_action(source_text, extraction, cycle_id, source_artifact_id)
         if not proposals:

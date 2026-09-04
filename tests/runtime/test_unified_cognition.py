@@ -138,6 +138,30 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.assertFalse(verdict["passed"])
         self.assertIn("snapshot_action_without_complete_portfolio_statement:review", verdict["problems"])
 
+    def test_close_review_query_rejects_a_portfolio_apply_action(self) -> None:
+        text = (
+            "请做一次今天15:20收盘复盘。请给出成交额比较、领涨领跌题材、"
+            "当前账户全部实有持仓、风险和后续条件，并标明来源与资料时点。"
+        )
+        result = {
+            "answer": {"points": ["我会先核验数据。"]},
+            "actions": [{
+                "action_type": "portfolio.apply",
+                "statement_type": "none",
+                "changes": [],
+                "source_span": {
+                    "message_id": "review", "start": 0, "end": len(text), "quote": text,
+                },
+            }],
+        }
+
+        verdict = verify_cognition_result(
+            [{"message_id": "review", "body_text": text}], result,
+        )
+
+        self.assertFalse(verdict["passed"])
+        self.assertIn("portfolio_action_without_write_statement:review", verdict["problems"])
+
     def test_active_provider_call_graph_is_semantic_and_never_writes_legacy_markdown_fields(self):
         schema_path = PROJECT_ROOT / "resources" / "contracts" / "companion-cognition-result-v2.schema.json"
         self.assertTrue(schema_path.is_file())

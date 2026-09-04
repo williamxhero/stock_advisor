@@ -13,6 +13,7 @@ from .portfolio import (
     explicit_fixture_extraction,
     is_complete_portfolio_snapshot_statement,
     is_portfolio_statement,
+    is_portfolio_write_statement,
 )
 from .store import digest
 from .task_profiles import AnalysisClarificationRequired
@@ -55,6 +56,18 @@ def verify_cognition_result(messages: list[dict[str, Any]], result: dict[str, An
         problems.append(f"snapshot_action_without_complete_portfolio_statement:{message_id}")
     for message_id in sorted(complete_message_ids - snapshot_message_ids):
         problems.append(f"complete_portfolio_requires_snapshot_action:{message_id}")
+    apply_message_ids = {
+        str((action.get("source_span") or {}).get("message_id") or "")
+        for action in result.get("actions") or []
+        if action.get("action_type") == "portfolio.apply"
+    }
+    messages_by_id = {
+        str(message.get("message_id") or ""): str(message.get("body_text") or "")
+        for message in messages
+    }
+    for message_id in sorted(apply_message_ids):
+        if not is_portfolio_write_statement(messages_by_id.get(message_id, "")):
+            problems.append(f"portfolio_action_without_write_statement:{message_id}")
 
     answer = result.get("answer")
     answer_text = "\n".join(str(point) for point in (answer.get("points") or [])) if isinstance(answer, dict) else ""

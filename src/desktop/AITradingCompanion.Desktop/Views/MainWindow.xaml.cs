@@ -27,6 +27,7 @@ public partial class MainWindow : Window, IDisposable
     private readonly MainViewModel _viewModel;
     private readonly AppPaths _paths;
     private readonly DispatcherTimer _saveSizeTimer;
+    private readonly DispatcherTimer _draftSaveTimer;
     private readonly TextToSpeechService _speech;
     private readonly CompanionExchangeService _companionExchange;
     private readonly VoiceRecordingService _companionRecorder = new();
@@ -40,6 +41,8 @@ public partial class MainWindow : Window, IDisposable
     private readonly Dictionary<string, CompanionAiTimelineEntry> _localAiNoticesByCycle = new(StringComparer.Ordinal);
     private readonly List<FlowDocumentScrollViewer> _messageTextViewers = [];
     private readonly Queue<double> _waveformLevels = new();
+    private readonly TimelineRenderGate _aiTimelineRenderGate = new();
+    private readonly TimelineRenderGate _userTimelineRenderGate = new();
     private CompanionWorkspaceProjection? _companionProjection;
     private PortfolioWorkspaceProjection? _portfolioProjection;
     private PortfolioWindow? _portfolioWindow;
@@ -68,6 +71,8 @@ public partial class MainWindow : Window, IDisposable
         _companionExchange = new CompanionExchangeService(paths);
         _saveSizeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(400) };
         _saveSizeTimer.Tick += OnSaveSizeTimerTick;
+        _draftSaveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(350) };
+        _draftSaveTimer.Tick += OnDraftSaveTimerTick;
         _companionTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _companionTimer.Tick += (_, _) => RefreshCompanionWorkspace();
         _companionTimer.Start();
@@ -119,6 +124,8 @@ public partial class MainWindow : Window, IDisposable
         _disposed = true;
         _saveSizeTimer.Stop();
         _saveSizeTimer.Tick -= OnSaveSizeTimerTick;
+        _draftSaveTimer.Stop();
+        _draftSaveTimer.Tick -= OnDraftSaveTimerTick;
         _companionTimer.Stop();
         _speech.StateChanged -= OnSpeechStateChanged;
         _companionRecorder.LevelChanged -= OnVoiceLevelChanged;
@@ -420,11 +427,13 @@ public partial class MainWindow : Window, IDisposable
     private void RenderAiMessages(IReadOnlyList<CompanionAiTimelineEntry> messages)
     {
         if (HasMessageTextSelection()) return;
+        var orderedMessages = messages.OrderBy(item => item.At).ToArray();
+        if (!_aiTimelineRenderGate.ShouldRender(AiTimelineRenderKeys(orderedMessages))) return;
         var wasAtBottom = AiTimelineScrollViewer.ScrollableHeight <= 0
             || AiTimelineScrollViewer.VerticalOffset >= AiTimelineScrollViewer.ScrollableHeight - 36;
         _messageTextViewers.RemoveAll(viewer => AiTimelinePanel.IsAncestorOf(viewer));
         AiTimelinePanel.Children.Clear();
-        foreach (var message in messages.OrderBy(item => item.At))
+        foreach (var message in orderedMessages)
         {
             if (message.Kind is "chat_pending" or "action_pending")
             {
@@ -475,7 +484,7 @@ public partial class MainWindow : Window, IDisposable
             };
             AiTimelinePanel.Children.Add(card);
         }
-        if (messages.Count == 0)
+        if (orderedMessages.Length == 0)
         {
             AiTimelinePanel.Children.Add(new TextBlock
             {
@@ -484,7 +493,7 @@ public partial class MainWindow : Window, IDisposable
             });
             _activeAiMarkdown = null;
         }
-        else _activeAiMarkdown = messages.LastOrDefault(message => message.Kind is not ("chat_pending" or "action_pending"))?.Text;
+        else _activeAiMarkdown = orderedMessages.LastOrDefault(message => message.Kind is not ("chat_pending" or "action_pending"))?.Text;
         ReadAloudButton.IsEnabled = !string.IsNullOrWhiteSpace(_activeAiMarkdown);
         if (wasAtBottom) Dispatcher.BeginInvoke(() => AiTimelineScrollViewer.ScrollToEnd(), DispatcherPriority.Loaded);
     }
@@ -520,9 +529,10 @@ public partial class MainWindow : Window, IDisposable
     private void RenderUserMessages()
     {
         if (HasMessageTextSelection()) return;
+        var messages = CombinedUserMessages().OrderBy(message => message.At).ToArray();
+        if (!_userTimelineRenderGate.ShouldRender(UserTimelineRenderKeys(messages))) return;
         _messageTextViewers.RemoveAll(viewer => MainJudgmentTimelinePanel.IsAncestorOf(viewer));
         MainJudgmentTimelinePanel.Children.Clear();
-        var messages = CombinedUserMessages().OrderBy(message => message.At).ToArray();
         foreach (var entry in messages)
         {
             var isStaged = entry.State == "staged";
@@ -578,6 +588,34 @@ public partial class MainWindow : Window, IDisposable
         }
         if (messages.Length == 0)
             MainJudgmentTimelinePanel.Children.Add(new TextBlock { Text = "当前判断还没有你的消息。", Foreground = (Brush)FindResource("SecondaryTextBrush") });
+    }
+
+    private IEnumerable<string> AiTimelineRenderKeys(IEnumerable<CompanionAiTimelineEntry> messages)
+    {
+        yield return $"cycle:{_companionProjection?.CycleId ?? _viewModel.SelectedMessage?.SourceRunId}";
+        foreach (var message in messages)
+        {
+            var parts = message.Parts is null
+                ? string.Empty
+                : string.Join('\u001d', message.Parts.Select(part => string.Join('\u001c',
+                    part.Kind, part.Text, part.SourceTitle, part.SourceUrl, part.MaterialId)));
+            yield return string.Join('\u001f', message.ArtifactId, message.Kind, message.At.UtcTicks,
+                message.Text, message.StartedAt?.UtcTicks, message.CompletedAt?.UtcTicks, parts);
+        }
+    }
+
+    private IEnumerable<string> UserTimelineRenderKeys(IEnumerable<CompanionTimelineEntry> messages)
+    {
+        yield return $"cycle:{_companionProjection?.CycleId}";
+        foreach (var message in messages)
+        {
+            var portfolioStatus = message.ArtifactId is { Length: > 0 } artifactId
+                && _portfolioProjection?.StatusByArtifactId.TryGetValue(artifactId, out var status) == true
+                ? status
+                : null;
+            yield return string.Join('\u001f', message.At.UtcTicks, message.Text, message.CountsForM1,
+                message.ArtifactId, message.MessageId, message.State, message.Phase, portfolioStatus);
+        }
     }
 
     private UIElement CreatePublishedMessageViewer(CompanionAiTimelineEntry message)
@@ -725,7 +763,8 @@ public partial class MainWindow : Window, IDisposable
         if (!_suppressDraftUpdate && _displayedDraftCycleId is not null)
         {
             _judgmentDrafts[_displayedDraftCycleId] = MainJudgmentInputBox.Text;
-            CompanionDraftStore.Save(_paths, _judgmentDrafts);
+            _draftSaveTimer.Stop();
+            _draftSaveTimer.Start();
         }
         if (!_suppressDraftUpdate
             && !string.IsNullOrWhiteSpace(MainJudgmentInputBox.Text)
@@ -983,6 +1022,7 @@ public partial class MainWindow : Window, IDisposable
     private void OnSizeChanged(object sender, SizeChangedEventArgs e) { _saveSizeTimer.Stop(); _saveSizeTimer.Start(); }
     private void OnLocationChanged(object? sender, EventArgs e) { _saveSizeTimer.Stop(); _saveSizeTimer.Start(); }
     private void OnSaveSizeTimerTick(object? sender, EventArgs e) { _saveSizeTimer.Stop(); SaveCurrentSize(); }
+    private void OnDraftSaveTimerTick(object? sender, EventArgs e) { _draftSaveTimer.Stop(); CompanionDraftStore.Save(_paths, _judgmentDrafts); }
 
     private void SaveCurrentSize()
     {

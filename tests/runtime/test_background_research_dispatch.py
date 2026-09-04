@@ -24,10 +24,12 @@ def test_background_dispatcher_never_blocks_or_overlaps_foreground_ticks() -> No
         finished.set()
 
     dispatcher = _BackgroundDispatcher(slow_background)
+    overlapping_recovery = threading.Event()
 
     assert dispatcher.submit()
     assert started.wait(1)
-    assert not dispatcher.submit()
+    assert not dispatcher.submit(overlapping_recovery.set)
+    assert not overlapping_recovery.is_set()
     assert calls == 1
     release.set()
     assert finished.wait(1)

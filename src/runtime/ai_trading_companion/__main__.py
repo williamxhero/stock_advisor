@@ -407,19 +407,20 @@ class _BackgroundDispatcher:
         self._idle = threading.Event()
         self._idle.set()
 
-    def submit(self) -> bool:
+    def submit(self, action: Callable[[], Any] | None = None) -> bool:
         with self._state_lock:
             if not self._idle.is_set():
                 return False
             self._idle.clear()
             threading.Thread(
-                target=self._run, name="companion-background", daemon=True,
+                target=self._run, args=(action or self._action,),
+                name="companion-background", daemon=True,
             ).start()
             return True
 
-    def _run(self) -> None:
+    def _run(self, action: Callable[[], Any]) -> None:
         try:
-            self._action()
+            action()
         except Exception:
             # Optional maintenance records its own actionable failures.  An
             # unexpected failure must still release the single-worker slot.
@@ -529,9 +530,9 @@ def run_gateway(execute: bool = False) -> None:
         stale_before = iso(datetime.now(timezone.utc) - timedelta(minutes=10))
         store.recover_stale_cognition_jobs(before=stale_before)
         retry_before = iso(datetime.now(timezone.utc) - timedelta(minutes=1))
-        _run_recoverable_conversations(
+        conversation_dispatcher.submit(lambda: _run_recoverable_conversations(
             engine, store, exchange, portfolio, execute, before=retry_before,
-        )
+        ))
         background_dispatcher.submit()
         flush(store, exchange)
     import asyncio

@@ -94,6 +94,54 @@ class ManualAnalysisProfileResolverTests(TestCase):
         self.assertEqual("post_close", profile["analysis"]["time_scope"])
         self.assertEqual(raw_scope, profile["analysis"]["requested_time_scope"])
 
+    def test_normalizes_explicit_completed_close_with_comparison_details(self) -> None:
+        raw_scope = "2026\u5e749\u67084\u65e515:20\u6536\u76d8\uff0c\u6bd4\u8f832026\u5e749\u67083\u65e5\u6536\u76d8\uff0c\u5e76\u6807\u6ce8\u5404\u8d44\u6599\u5b9e\u9645\u65f6\u70b9"
+
+        profile = self.resolver.resolve("2026-09-04T20:17:23+08:00", {
+            "subject": "A\u80a115:20\u6536\u76d8\u590d\u76d8",
+            "time_scope": raw_scope,
+            "goal": "\u5b8c\u6210\u6536\u76d8\u590d\u76d8",
+        })
+
+        self.assertEqual("post_close_review", profile["profile_id"])
+        self.assertEqual("post_close", profile["analysis"]["time_scope"])
+        self.assertEqual(raw_scope, profile["analysis"]["requested_time_scope"])
+
+    def test_rejects_an_explicit_future_close_as_not_completed(self) -> None:
+        with self.assertRaisesRegex(AnalysisClarificationRequired, "does not match"):
+            self.resolver.resolve("2026-09-04T20:17:23+08:00", {
+                "subject": "A\u80a1\u6536\u76d8\u590d\u76d8",
+                "time_scope": "2026\u5e749\u67087\u65e515:20\u6536\u76d8",
+                "goal": "\u5b8c\u6210\u6536\u76d8\u590d\u76d8",
+            })
+
+    def test_normalizes_same_day_deictic_close_only_after_market_close(self) -> None:
+        raw_scope = "\u4eca\u5929\u5317\u4eac\u65f6\u95f415:20\u6536\u76d8\uff0c\u53ca\u4e0e\u524d\u4e00\u4ea4\u6613\u65e5\u6bd4\u8f83"
+        analysis = {
+            "subject": "A\u80a115:20\u6536\u76d8\u590d\u76d8",
+            "time_scope": raw_scope,
+            "goal": "\u5b8c\u6210\u6536\u76d8\u590d\u76d8",
+        }
+
+        profile = self.resolver.resolve("2026-09-04T20:26:36+08:00", analysis)
+
+        self.assertEqual("post_close_review", profile["profile_id"])
+        self.assertEqual("post_close", profile["analysis"]["time_scope"])
+        with self.assertRaisesRegex(AnalysisClarificationRequired, "does not match"):
+            self.resolver.resolve("2026-09-04T14:59:59+08:00", analysis)
+
+    def test_normalizes_an_explicit_completed_post_close_timestamp(self) -> None:
+        raw_scope = "2026\u5e749\u67084\u65e515:20\uff08\u5317\u4eac\u65f6\u95f4\uff09"
+
+        profile = self.resolver.resolve("2026-09-04T20:33:54+08:00", {
+            "subject": "A\u80a115:20\u6536\u76d8\u590d\u76d8",
+            "time_scope": raw_scope,
+            "goal": "\u5b8c\u6210\u6536\u76d8\u590d\u76d8",
+        })
+
+        self.assertEqual("post_close_review", profile["profile_id"])
+        self.assertEqual("post_close", profile["analysis"]["time_scope"])
+
     def test_normalizes_completed_close_through_next_session_scope_before_market(self) -> None:
         for raw_scope in (
             "2026年9月3日收盘至下一交易日",

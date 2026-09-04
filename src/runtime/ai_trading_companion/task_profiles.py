@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -76,7 +76,7 @@ class ManualAnalysisProfileResolver:
         self._require_analysis(analysis)
         requested = self._aware(requested_at).astimezone(_SHANGHAI)
         requested_time_scope = str(analysis["time_scope"]).strip()
-        time_scope = self._normalize_time_scope(requested_time_scope)
+        time_scope = self._normalize_time_scope(requested_time_scope, requested)
         profile_id = self._profile_id(requested, time_scope)
         definition = self._PROFILES[profile_id]
         return {
@@ -148,10 +148,57 @@ class ManualAnalysisProfileResolver:
             )
         return actual
 
-    @staticmethod
-    def _normalize_time_scope(time_scope: str) -> str:
+    def _normalize_time_scope(self, time_scope: str, requested: datetime) -> str:
         """Map unambiguous user-facing session phrases to canonical scopes."""
         folded = time_scope.casefold()
+        dated_session = re.search(
+            r"(?P<year>\d{4})" + "\u5e74" + r"(?P<month>\d{1,2})" + "\u6708"
+            + r"(?P<day>\d{1,2})" + "\u65e5"
+            + r"(?:\s*(?P<hour>\d{1,2}):(?P<minute>\d{2}))?",
+            time_scope,
+        )
+        if dated_session:
+            try:
+                target = date(
+                    int(dated_session.group("year")),
+                    int(dated_session.group("month")),
+                    int(dated_session.group("day")),
+                )
+            except ValueError:
+                target = None
+            explicit_hour = dated_session.group("hour")
+            explicit_minute = dated_session.group("minute")
+            explicit_clock = (
+                time(int(explicit_hour), int(explicit_minute))
+                if explicit_hour is not None and explicit_minute is not None
+                and 0 <= int(explicit_hour) <= 23 and 0 <= int(explicit_minute) <= 59
+                else None
+            )
+            is_close_endpoint = "\u6536\u76d8" in time_scope or (
+                explicit_clock is not None and explicit_clock >= time(15, 0)
+            )
+            latest = requested.date()
+            if requested.timetz().replace(tzinfo=None) < time(15, 0):
+                latest -= timedelta(days=1)
+            while not self.calendar.is_trading_day(latest):
+                latest -= timedelta(days=1)
+            if (
+                target is not None
+                and is_close_endpoint
+                and target <= latest
+                and self.calendar.is_trading_day(target)
+            ):
+                return "post_close"
+        same_day_close = (
+            "\u6536\u76d8" in time_scope
+            and any(anchor in time_scope for anchor in ("\u4eca\u5929", "\u4eca\u65e5", "\u5f53\u5929"))
+        )
+        if (
+            same_day_close
+            and self.calendar.is_trading_day(requested.date())
+            and requested.timetz().replace(tzinfo=None) >= time(15, 0)
+        ):
+            return "post_close"
         completed_close_terms = (
             "已收盘交易日", "最近交易日收盘", "最近一个交易日收盘", "今日收盘", "当天收盘", "盘后",
             "收盘至下一交易日", "收盘到下一交易日",

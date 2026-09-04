@@ -316,7 +316,10 @@ class EvaluationObservatory:
         delivery_state, failure_category, failure_reason = self._delivery_state(
             cycle, attempts, observed, window_end, qualified_at,
         )
-        timeline = self._project_timeline(attempts, artifacts, events)
+        timeline = self._project_timeline(
+            attempts, artifacts, events,
+            tolerate_legacy_conflicts=request.legacy_incomplete,
+        )
         research_quality = self._research_quality(attempts)
         shared_evidence = self._shared_evidence_attributions(evidence, actual_start_at)
         if shared_evidence:
@@ -489,6 +492,7 @@ class EvaluationObservatory:
     @staticmethod
     def _project_timeline(
         attempts: list[dict[str, Any]], artifacts: list[dict[str, Any]], events: list[dict[str, Any]],
+        *, tolerate_legacy_conflicts: bool = False,
     ) -> tuple[TimelineEvent, ...]:
         projected: dict[str, TimelineEvent] = {}
 
@@ -498,6 +502,8 @@ class EvaluationObservatory:
                 projected[event.event_id] = event
                 return
             if existing != event:
+                if tolerate_legacy_conflicts:
+                    return
                 raise ValueError(f"runtime event id conflict: {event.event_id}")
 
         for event in events:

@@ -360,6 +360,27 @@ class EvaluationObservatoryTests(unittest.TestCase):
         self.assertEqual(1, replay_report["evaluation_snapshots"])
         self.assertEqual(first_summary.snapshot_id, replay_summary.snapshot_id)
 
+    def test_legacy_timeline_deduplicates_conflicting_old_tool_event_ids(self) -> None:
+        attempts = [{
+            "attempt_id": "attempt-1", "stage": "m0_research",
+            "started_at": "2026-08-27T09:45:00+08:00",
+            "completed_at": None, "status": "running",
+            "tool_trace_json": json.dumps([
+                {"event_id": "old-event", "tool": "search", "status": "failed"},
+                {"event_id": "old-event", "tool": "browser", "status": "succeeded"},
+            ]),
+        }]
+
+        with self.assertRaisesRegex(ValueError, "runtime event id conflict"):
+            self.observatory._project_timeline(attempts, [], [])
+
+        timeline = self.observatory._project_timeline(
+            attempts, [], [], tolerate_legacy_conflicts=True,
+        )
+
+        self.assertEqual(2, len(timeline))
+        self.assertEqual("search", timeline[1].phase)
+
     def test_judgment_outcomes_preserve_the_original_conditions_at_each_horizon(self) -> None:
         scheduled = "2026-08-28T09:45:00+08:00"
         with patch("ai_trading_companion.store.now", return_value=scheduled):

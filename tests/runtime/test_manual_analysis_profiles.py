@@ -169,6 +169,19 @@ class ManualAnalysisProfileResolverTests(TestCase):
         }, requirements["current_market_state"]["window"])
         self.assertEqual("official_close", requirements["market_breadth"]["finality"])
 
+    def test_daily_conversation_followup_uses_the_default_chat_protocol(self) -> None:
+        with TemporaryDirectory() as temporary:
+            store = CompanionStore(Path(temporary) / "runtime.sqlite3")
+            conversation = store.ensure_daily_conversation("2026-09-04")
+
+            packet = RuntimePacketBuilder(Path("resources"), store).build(
+                conversation, "chat", as_of="2026-09-04T00:40:00Z",
+                evidence={"as_of": "2026-09-03T07:00:00Z", "sources": []},
+                message_batch="做一次晚间盘后回顾",
+            )
+
+        self.assertEqual("daily_execution", packet["protocol"]["protocol_id"])
+
     def test_lunch_contract_accepts_late_published_morning_close_and_checks_events_since_1030(self) -> None:
         profile = self.resolver.resolve("2026-08-31T12:51:12.238+08:00", {
             **self.analysis, "time_scope": "lunch_break",

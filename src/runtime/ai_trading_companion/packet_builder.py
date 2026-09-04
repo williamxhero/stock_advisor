@@ -359,7 +359,13 @@ class RuntimePacketBuilder:
         }
 
     def _protocol(self, cycle: dict[str, Any], stage: str) -> dict[str, Any]:
-        protocol_id = TASK_POLICIES[cycle["task_key"]].protocol_id
+        task_key = str(cycle["task_key"])
+        policy = (
+            TASK_POLICIES["daily.execution.0945"]
+            if task_key == "conversation.daily" and stage == "chat"
+            else TASK_POLICIES[task_key]
+        )
+        protocol_id = policy.protocol_id
         if stage == "m0_compose":
             return {
                 "protocol_id": protocol_id,

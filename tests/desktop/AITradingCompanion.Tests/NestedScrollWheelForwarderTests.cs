@@ -64,4 +64,53 @@ public sealed class NestedScrollWheelForwarderTests
         thread.Join();
         if (failure is not null) throw failure;
     }
+
+    [Fact]
+    public void HighResolutionMarkdownWheelMovesTheOuterTimelineOnEveryIncrement()
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            Window? window = null;
+            try
+            {
+                var markdown = new FlowDocumentScrollViewer
+                {
+                    Height = 600,
+                    VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
+                    HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                };
+                NestedScrollWheelForwarder.Attach(markdown);
+                var timeline = new ScrollViewer
+                {
+                    Width = 360,
+                    Height = 180,
+                    VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                    Content = new StackPanel { Children = { markdown, new Border { Height = 600 } } },
+                };
+                window = new Window { Width = 400, Height = 240, ShowInTaskbar = false, WindowStyle = WindowStyle.None, Content = timeline };
+                window.Show();
+                window.UpdateLayout();
+                timeline.ScrollToVerticalOffset(100);
+                window.UpdateLayout();
+                var before = timeline.VerticalOffset;
+
+                markdown.RaiseEvent(new MouseWheelEventArgs(Mouse.PrimaryDevice, Environment.TickCount, -40)
+                {
+                    RoutedEvent = Mouse.PreviewMouseWheelEvent,
+                    Source = markdown,
+                });
+                window.UpdateLayout();
+
+                Assert.True(timeline.VerticalOffset > before,
+                    $"Expected one high-resolution increment to move the outer timeline beyond {before}, but it stayed at {timeline.VerticalOffset}.");
+            }
+            catch (Exception exception) { failure = exception; }
+            finally { window?.Close(); }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        if (failure is not null) throw failure;
+    }
 }

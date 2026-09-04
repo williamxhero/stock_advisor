@@ -83,6 +83,8 @@ class VerifiedStageResult:
 M1_MAX_JUDGMENT_ATTEMPTS = 4
 M1_MIN_RETRY_WINDOW_SECONDS = 30
 FORMAL_MEMORY_MAX_ACTIONS = 4
+CHAT_MEMORY_MAX_ACTIONS = 4
+OPTIONAL_SHADOW_MAX_SECONDS = 60
 
 
 def _m1_should_retry(exc: Exception, *, attempt_number: int, remaining_seconds: int) -> bool:
@@ -124,7 +126,7 @@ def _save_safe_stage_fallback(
     store: CompanionStore, cycle: dict[str, Any], stage: str, packet: dict[str, Any], *, horizon: str,
 ) -> tuple[dict[str, Any], str]:
     """Seal a local conservative reply after a provider candidate has failed closed."""
-    output = safe_stage_output(stage, horizon=horizon)
+    output = safe_stage_output(stage, horizon=horizon, packet=packet)
     attempt = store.begin_attempt(
         cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), str(packet.get("sha256") or "local-fallback"),
         model="runtime-safe-fallback", reasoning_effort="deterministic", search_enabled=False,
@@ -805,7 +807,9 @@ def run_router_shadow(store: CompanionStore, job: dict[str, Any], execute: bool)
             intellect=str(candidate["intellect"]), effort=str(candidate["reasoning_effort"]),
             schema=json.loads((SCHEMAS / job["schema_name"]).read_text(encoding="utf-8")),
             visible_stream=False,
-            absolute_deadline=time.monotonic() + int(candidate["timeout_seconds"]),
+            absolute_deadline=time.monotonic() + min(
+                int(candidate["timeout_seconds"]), OPTIONAL_SHADOW_MAX_SECONDS,
+            ),
             verifier_name=f"router-shadow/{job['stage']}",
             verifier=lambda output: router.verify(job["stage"], packet, output),
             h0_forbidden=job["stage"] == "m1_judgment",
@@ -1583,6 +1587,12 @@ def _foreground_busy(store: CompanionStore) -> bool:
                SELECT 1 FROM companion_cycle
                 WHERE state='queued'
                   AND julianday(COALESCE(work_start_at,scheduled_for)) <= julianday(?)
+               UNION ALL
+               SELECT 1 FROM companion_cognition_job
+                WHERE state IN ('queued','running')
+               UNION ALL
+               SELECT 1 FROM companion_stream_message
+                WHERE state='streaming'
                LIMIT 1""",
             (due_at,),
         ).fetchone())
@@ -2152,6 +2162,7 @@ def run_chat(
                 engine.memory_space_id,
                 lambda state: _next_memory_research_action(store, cycle, state, deadline),
                 discover_external=lambda action, snapshot: _discover_chat_external_evidence(engine, action, snapshot),
+                max_actions=CHAT_MEMORY_MAX_ACTIONS,
             ).collect(
                 cycle_id, messages, deadline=deadline,
                 resume=resumed.get("checkpoint") if resumed else None,

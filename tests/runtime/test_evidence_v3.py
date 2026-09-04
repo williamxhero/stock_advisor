@@ -21,11 +21,43 @@ from ai_trading_companion.evidence_gate import EvidenceGate
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.local_research import BrokerResearchPlanner
 from ai_trading_companion.router import CognitiveRouter
+from ai_trading_companion.stage_expression import safe_stage_output
 from ai_trading_companion.runtime_strategy_policy import RuntimeStrategyControls
 from ai_trading_companion.store import CompanionStore
 
 
 class EvidenceV3Tests(TestCase):
+    def test_m0_safe_fallback_uses_complete_verified_close_instead_of_claiming_a_gap(self):
+        packet = {
+            "stage": "m0_compose",
+            "evidence_contract": {"requirements": [{
+                "key": "portfolio_market_state", "required_entities": ["300378", "300421", "603861"],
+            }]},
+            "verified_fact_digest": [
+                {"excerpt": json.dumps({"indices": [
+                    {"name": "上证指数", "price": 3942.09, "change_percent": 0.0178},
+                    {"name": "深证成指", "price": 13625.12, "change_percent": 0.0997},
+                    {"name": "创业板指", "price": 3312.54, "change_percent": 0.0091},
+                ]}, ensure_ascii=False)},
+                {"excerpt": json.dumps({"breadth": {
+                    "up": 1805, "down": 3275, "flat": 130, "limit_up": 57, "limit_down": 23,
+                }}, ensure_ascii=False)},
+                {"excerpt": json.dumps({"quotes": [
+                    {"symbol": "300378", "name": "鼎捷数智", "price": 38.38, "change_percent": -0.8781},
+                    {"symbol": "300421", "name": "力星股份", "price": 16.78, "change_percent": -0.119},
+                    {"symbol": "603861", "name": "白云电器", "price": 11.73, "change_percent": 0.6867},
+                ]}, ensure_ascii=False)},
+            ],
+        }
+
+        output = safe_stage_output("m0_compose", packet=packet)
+        rendered = " ".join([output["semantic"]["summary"], *output["semantic"]["observations"]])
+
+        self.assertIn("3942.09", rendered)
+        self.assertIn("上涨1805家、下跌3275家", rendered)
+        self.assertNotIn("信息还在核对", rendered)
+        self.assertTrue(CognitiveRouter().verify("m0_compose", packet, output)["passed"])
+
     def test_official_index_close_accepts_complete_structured_tool_facts(self):
         close = "2026-09-03T07:00:00Z"
         rows = [

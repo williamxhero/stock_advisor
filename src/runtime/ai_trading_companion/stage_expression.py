@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 from typing import Any
 
@@ -139,9 +140,73 @@ def _v4_judgment_expression(semantic: dict[str, Any]) -> str:
     return "\n\n".join(paragraphs)
 
 
-def safe_stage_output(stage: str, *, horizon: str = "当前") -> dict[str, Any]:
+def _verified_close_summary(packet: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Build a useful M0 fallback only from the packet's frozen verified facts."""
+    facts: list[dict[str, Any]] = []
+    for item in (packet or {}).get("verified_fact_digest") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            value = json.loads(str(item.get("excerpt") or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            facts.append(value)
+    indices = [row for fact in facts for row in fact.get("indices") or [] if isinstance(row, dict)]
+    breadth = next((fact.get("breadth") for fact in facts if isinstance(fact.get("breadth"), dict)), None)
+    quotes = [row for fact in facts for row in fact.get("quotes") or [] if isinstance(row, dict)]
+    if not indices or not breadth:
+        return None
+
+    def number(value: Any) -> str:
+        return format(value, ".15g") if isinstance(value, float) else str(value)
+
+    index_text = "，".join(
+        f"{row.get('name') or row.get('symbol')}收于{number(row.get('price'))}（{number(row.get('change_percent'))}%）"
+        for row in indices[:3]
+        if row.get("price") is not None and row.get("change_percent") is not None
+    )
+    if not index_text:
+        return None
+    if any(breadth.get(key) is None for key in ("up", "down", "flat")):
+        return None
+    breadth_parts = [
+        f"上涨{number(breadth['up'])}家", f"下跌{number(breadth['down'])}家",
+        f"平盘{number(breadth['flat'])}家",
+    ]
+    if breadth.get("limit_up") is not None:
+        breadth_parts.append(f"涨停候选{number(breadth['limit_up'])}家")
+    if breadth.get("limit_down") is not None:
+        breadth_parts.append(f"跌停候选{number(breadth['limit_down'])}家")
+    observations = ["市场广度偏弱：" + "、".join(breadth_parts) + "。"]
+    selected_quotes = sorted(
+        (row for row in quotes if row.get("price") is not None and row.get("change_percent") is not None),
+        key=lambda row: abs(float(row.get("change_percent") or 0)), reverse=True,
+    )[:2]
+    if selected_quotes:
+        observations.append("持仓表现有分化：" + "，".join(
+            f"{row.get('name') or row.get('symbol')}收于{number(row.get('price'))}（{number(row.get('change_percent'))}%）"
+            for row in selected_quotes
+        ) + "。")
+    return {
+        "result_version": 3,
+        "semantic": {
+            "summary": f"收盘后看，三大指数接近平盘，{index_text}。",
+            "observations": observations,
+            "risks": ["指数平稳但下跌家数明显多于上涨家数，个股承压程度高于指数表面。"],
+            "unknowns": ["指数近乎横盘与个股普跌的背离能否在下一交易日收敛。"],
+        },
+    }
+
+
+def safe_stage_output(
+    stage: str, *, horizon: str = "当前", packet: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return a conservative, auditable local fallback without inventing market facts."""
     if stage == "m0_compose":
+        verified = _verified_close_summary(packet)
+        if verified is not None:
+            return verified
         return {
             "result_version": 3,
             "semantic": {

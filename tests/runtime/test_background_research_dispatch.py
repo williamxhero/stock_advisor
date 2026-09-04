@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 from unittest.mock import patch
 
-from ai_trading_companion.__main__ import run_background, run_chat_research
+from ai_trading_companion.__main__ import _foreground_busy, run_background, run_chat_research
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.store import CompanionStore
 
@@ -85,6 +85,20 @@ def test_live_worker_claim_still_defers_background_research(tmp_path) -> None:
         result = run_background(engine, store, True)
 
     assert result == {"action": "deferred", "reason": "foreground_cycle_has_priority"}
+
+
+def test_running_conversation_cognition_defers_optional_background_work(tmp_path) -> None:
+    store = CompanionStore(tmp_path / "runtime.sqlite3")
+    conversation = store.ensure_daily_conversation("2026-09-03")
+    source = store.append_artifact(
+        conversation["cycle_id"], "chat_human", "human", "做一次晚间盘后回顾", conversation["as_of"], {},
+    )
+    job = store.start_cognition_job(
+        conversation["cycle_id"], source["artifact_id"], "conversation", "做一次晚间盘后回顾",
+    )
+    store.claim_cognition_job(job["job_id"])
+
+    assert _foreground_busy(store)
 
 
 def test_research_for_an_unanswered_batch_precedes_orphaned_backlog(tmp_path) -> None:

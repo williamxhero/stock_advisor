@@ -11,12 +11,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from .acquisition import AcquisitionBoundary
 from .evidence_gate import EvidenceGate
 from .broker_client import BrokerError, BrokerRequest, ProviderBrokerClient, canonical_packet_hash
-from .tooling import FactRequest, ToolRunner
+from .tooling import FactRequest, ToolRunner, validate_capability_data
 
 
 class ResearchPlanError(ValueError):
@@ -251,11 +252,13 @@ class ToolCatalogResearchBackend:
 class ToolCatalogMarketBackend:
     """Resolve public market facts through promoted tools and expose evidence-shaped results."""
 
-    def __init__(self, runner: ToolRunner, *, contract: dict[str, Any], deadline: Callable[[], float], cycle_id: str = "") -> None:
+    def __init__(self, runner: ToolRunner, *, contract: dict[str, Any], deadline: Callable[[], float],
+                 cycle_id: str = "", daily_ledger: list[dict[str, Any]] | None = None) -> None:
         self.runner = runner
         self.contract = contract
         self.deadline = deadline
         self.cycle_id = cycle_id
+        self.daily_ledger = json.loads(json.dumps(daily_ledger or [], ensure_ascii=False))
         self.requirements = {
             str(row.get("key") or ""): row
             for row in contract.get("requirements") or [] if isinstance(row, dict)
@@ -292,13 +295,17 @@ class ToolCatalogMarketBackend:
             cached = self._cached_breadth(required_at, str(window.get("start") or ""), finality)
             if cached is not None:
                 return cached
-        resolution = self.runner.resolve_with_fallback(FactRequest(
+        request = FactRequest(
             contract_version=1, capability=capability, required_at=required_at,
             deadline_seconds=max(0.1, min(25.0, float(self.deadline()))), inputs=inputs,
             context={"window_start": str(window.get("start") or required_at), "cycle_id": self.cycle_id},
             freshness_seconds=900.0 if finality == "intraday" else 0.0, finality=finality,
-        ))
+        )
+        resolution = self.runner.resolve_with_fallback(request)
         if not resolution.succeeded or resolution.data is None:
+            ledger = self._exact_close_ledger_result(request, requirement, operation)
+            if ledger is not None:
+                return ledger
             raise ToolResolutionError(capability, resolution)
         source_rows = [row for row in resolution.data.get("source_evidence") or []
                        if isinstance(row, dict) and str(row.get("url") or "").startswith(("http://", "https://"))]
@@ -317,6 +324,141 @@ class ToolCatalogMarketBackend:
         return {
             "url": results[0]["url"], "text": results[0]["excerpt_text"],
             "raw_artifact_ref": resolution.raw_artifact_ref, "results": results,
+        }
+
+    def _exact_close_ledger_result(
+        self, request: FactRequest, requirement: dict[str, Any], operation: str,
+    ) -> dict[str, Any] | None:
+        """Revalidate qualified ledger JSON through the same contract as a live tool result."""
+        if operation not in {"market_snapshot", "market_breadth", "holding_snapshot"} or request.finality != "official_close":
+            return None
+        window = requirement.get("window") if isinstance(requirement.get("window"), dict) else {}
+        if (
+            window.get("mode") != "exact"
+            or str(window.get("start") or "") != request.required_at
+            or str(window.get("end") or "") != request.required_at
+        ):
+            return None
+        try:
+            packet_as_of = datetime.fromisoformat(str(self.contract.get("as_of") or "").replace("Z", "+00:00"))
+            if packet_as_of.tzinfo is None:
+                return None
+        except ValueError:
+            return None
+        if operation == "market_breadth":
+            return self._exact_close_breadth_ledger_result(request, packet_as_of)
+        field = "indices" if operation == "market_snapshot" else "quotes"
+        expected = {str(value) for value in request.inputs.get("symbols") or [] if str(value)}
+        if not expected:
+            return None
+
+        variants: dict[str, dict[str, dict[str, Any]]] = {symbol: {} for symbol in expected}
+        candidates: list[tuple[dict[str, Any], str, str, list[dict[str, Any]]]] = []
+        for entry in self.daily_ledger:
+            if not isinstance(entry, dict) or entry.get("coverage_state") != "observed":
+                continue
+            url = str(entry.get("url") or "")
+            parsed_url = urlsplit(url)
+            if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname or parsed_url.username or parsed_url.password:
+                continue
+            try:
+                known_at = datetime.fromisoformat(str(entry.get("known_at") or "").replace("Z", "+00:00"))
+                payload = json.loads(str(entry.get("text") or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if known_at.tzinfo is None or known_at > packet_as_of or not isinstance(payload, dict):
+                continue
+            if payload.get("finality") != request.finality or not isinstance(payload.get(field), list):
+                continue
+            selected: list[dict[str, Any]] = []
+            for value in payload[field]:
+                if not isinstance(value, dict) or str(value.get("symbol") or "") not in expected:
+                    continue
+                row = json.loads(json.dumps(value, ensure_ascii=False, sort_keys=True))
+                symbol = str(row["symbol"])
+                signature = json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                variants[symbol][signature] = row
+                selected.append(row)
+            if selected:
+                candidates.append((entry, url, str(entry.get("title") or "daily evidence ledger"), selected))
+        if any(len(rows) != 1 for rows in variants.values()):
+            return None
+
+        rows = [next(iter(variants[symbol].values())) for symbol in request.inputs["symbols"]]
+        data = {
+            field: rows, "finality": request.finality, "source": "daily_evidence_ledger",
+            "source_urls": list(dict.fromkeys(url for _, url, _, _ in candidates)),
+        }
+        if validate_capability_data(request, request.required_at, data) is not None:
+            return None
+        selected_signatures = {
+            json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) for row in rows
+        }
+        results = []
+        for _, url, title, source_rows in candidates:
+            source_rows = [
+                row for row in source_rows
+                if json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) in selected_signatures
+            ]
+            if not source_rows:
+                continue
+            excerpt = json.dumps({field: source_rows, "finality": request.finality}, ensure_ascii=False, sort_keys=True)
+            results.append({
+                "url": url, "title": title, "excerpt_text": excerpt,
+                "fact_as_of": request.required_at, "raw_artifact_ref": None,
+            })
+        if not results:
+            return None
+        return {
+            "url": results[0]["url"], "text": results[0]["excerpt_text"],
+            "source": "daily_evidence_ledger", "raw_artifact_ref": None, "results": results,
+        }
+
+    def _exact_close_breadth_ledger_result(
+        self, request: FactRequest, packet_as_of: datetime,
+    ) -> dict[str, Any] | None:
+        variants: dict[str, dict[str, Any]] = {}
+        candidates: list[tuple[str, str, dict[str, Any]]] = []
+        for entry in self.daily_ledger:
+            if not isinstance(entry, dict) or entry.get("coverage_state") != "observed":
+                continue
+            url = str(entry.get("url") or "")
+            parsed_url = urlsplit(url)
+            if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname or parsed_url.username or parsed_url.password:
+                continue
+            try:
+                known_at = datetime.fromisoformat(str(entry.get("known_at") or "").replace("Z", "+00:00"))
+                payload = json.loads(str(entry.get("text") or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if known_at.tzinfo is None or known_at > packet_as_of or not isinstance(payload, dict):
+                continue
+            core = {
+                "trading_date": payload.get("trading_date"), "breadth": payload.get("breadth"),
+                "finality": payload.get("finality"),
+            }
+            if core["finality"] != request.finality or not isinstance(core["breadth"], dict):
+                continue
+            signature = json.dumps(core, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            variants[signature] = core
+            candidates.append((url, str(entry.get("title") or "daily evidence ledger"), core))
+        if len(variants) != 1:
+            return None
+        core = next(iter(variants.values()))
+        data = {
+            **core, "source": "daily_evidence_ledger",
+            "source_urls": list(dict.fromkeys(url for url, _, _ in candidates)),
+        }
+        if validate_capability_data(request, request.required_at, data) is not None:
+            return None
+        results = [{
+            "url": url, "title": title,
+            "excerpt_text": json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            "fact_as_of": request.required_at, "raw_artifact_ref": None,
+        } for url, title, payload in candidates]
+        return {
+            "url": results[0]["url"], "text": results[0]["excerpt_text"],
+            "source": "daily_evidence_ledger", "raw_artifact_ref": None, "results": results,
         }
 
     def _cached_breadth(self, required_at: str, window_start: str, finality: str) -> dict[str, Any] | None:

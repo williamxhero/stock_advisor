@@ -641,6 +641,7 @@ def _call_stage(
                     else ToolCatalogMarketBackend(
                         tool_runner, contract=contract, deadline=lambda: deadline - time.monotonic(),
                         cycle_id=str(cycle["cycle_id"]),
+                        daily_ledger=list((packet.get("public_research_scope") or {}).get("daily_ledger") or []),
                     )
                 )
             executor = ReadOnlyResearchExecutor(backends, max_operations=controls.max_operations)

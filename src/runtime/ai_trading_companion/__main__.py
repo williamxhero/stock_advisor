@@ -431,6 +431,56 @@ class _BackgroundDispatcher:
         return self._idle.wait(timeout)
 
 
+def _run_recoverable_conversations(
+    engine: CompanionEngine,
+    store: CompanionStore,
+    exchange: LocalExchange,
+    portfolio: PortfolioService,
+    execute: bool,
+    *,
+    before: str,
+) -> None:
+    """Run each durable conversation recovery candidate at most once."""
+    for retry in store.recoverable_conversation_jobs(before=before):
+        try:
+            run_chat(
+                engine, store, portfolio, retry["cycle_id"], retry["batch_id"], execute,
+                source_kind=retry["source_kind"],
+                reply_kind="premarket_chat" if retry["source_kind"] == "pre_m0_submission" else "ai_chat",
+                on_progress=lambda: flush(store, exchange),
+            )
+        except Exception:
+            # run_unified_cognition records the durable failure.  The periodic
+            # gateway recovery observes the retry cooldown/attempt ceiling.
+            pass
+
+
+def _gateway_command(
+    engine: CompanionEngine,
+    store: CompanionStore,
+    exchange: LocalExchange,
+    portfolio: PortfolioService,
+    payload: dict[str, Any],
+    conversation_dispatcher: _BackgroundDispatcher,
+) -> dict[str, Any]:
+    """Apply one HTTP command and promptly dispatch durable chat cognition."""
+    contract = payload.get("contract")
+    if contract == "schedule-user-command/v1":
+        result = _schedule_command(store, payload)
+    elif contract == "portfolio-user-command/v1":
+        result = _portfolio_command(store, portfolio, payload)
+    elif contract == "ai-trading-tool-manager-command/v1":
+        result = ToolManagerRuntime(store, PATHS.tools, exchange_root()).command(payload)
+    else:
+        result = engine.command(payload)
+    flush(store, exchange)
+    if payload.get("type") in {"commit_chat_batch", "commit_conversation_batch"}:
+        # HTTP receipts must stay fast; the durable job claim inside run_chat
+        # prevents this prompt dispatch from competing with periodic recovery.
+        conversation_dispatcher.submit()
+    return result
+
+
 def run_gateway(execute: bool = False) -> None:
     """Serve desktop requests without granting the desktop database access."""
     engine, store, exchange, portfolio = runtime()
@@ -447,18 +497,14 @@ def run_gateway(execute: bool = False) -> None:
     )
     breadth_prefetcher.start()
     background_dispatcher = _BackgroundDispatcher(lambda: run_background(engine, store, execute))
+    conversation_dispatcher = _BackgroundDispatcher(lambda: _run_recoverable_conversations(
+        engine, store, exchange, portfolio, execute,
+        before=iso(datetime.now(timezone.utc)),
+    ))
     def command(payload: dict[str, Any]) -> dict[str, Any]:
-        contract = payload.get("contract")
-        if contract == "schedule-user-command/v1":
-            result = _schedule_command(store, payload)
-        elif contract == "portfolio-user-command/v1":
-            result = _portfolio_command(store, portfolio, payload)
-        elif contract == "ai-trading-tool-manager-command/v1":
-            result = ToolManagerRuntime(store, PATHS.tools, exchange_root()).command(payload)
-        else:
-            result = engine.command(payload)
-        flush(store, exchange)
-        return result
+        return _gateway_command(
+            engine, store, exchange, portfolio, payload, conversation_dispatcher,
+        )
     def snapshot(kind: str, request: Any) -> dict[str, Any]:
         return _gateway_snapshot(engine, store, portfolio, kind, dict(request.query))
     def tick() -> None:
@@ -483,18 +529,9 @@ def run_gateway(execute: bool = False) -> None:
         stale_before = iso(datetime.now(timezone.utc) - timedelta(minutes=10))
         store.recover_stale_cognition_jobs(before=stale_before)
         retry_before = iso(datetime.now(timezone.utc) - timedelta(minutes=1))
-        for retry in store.recoverable_conversation_jobs(before=retry_before):
-            try:
-                run_chat(
-                    engine, store, portfolio, retry["cycle_id"], retry["batch_id"], execute,
-                    source_kind=retry["source_kind"],
-                    reply_kind="premarket_chat" if retry["source_kind"] == "pre_m0_submission" else "ai_chat",
-                    on_progress=lambda: flush(store, exchange),
-                )
-            except Exception:
-                # run_unified_cognition records the durable failure and the next
-                # gateway tick observes the retry cooldown/attempt ceiling.
-                pass
+        _run_recoverable_conversations(
+            engine, store, exchange, portfolio, execute, before=retry_before,
+        )
         background_dispatcher.submit()
         flush(store, exchange)
     import asyncio

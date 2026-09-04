@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ai_trading_companion.__main__ import consume
+from ai_trading_companion.__main__ import _gateway_command, consume
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.exchange import LocalExchange
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
@@ -15,6 +15,36 @@ from ai_trading_companion.store import CompanionStore
 
 
 class CompanionExchangeTests(unittest.TestCase):
+    def test_gateway_commit_dispatches_conversation_cognition_without_blocking_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = CompanionStore(root / "runtime.sqlite3")
+            engine = CompanionEngine(
+                store, memory=InMemoryMemoryAdapter(), memory_space_id="test-space",
+            )
+            portfolio = PortfolioService(root, store)
+            exchange = LocalExchange(root / "exchange")
+            cycle = store.ensure_daily_conversation("2026-09-04")
+            store.stage_message(
+                cycle["cycle_id"], "复盘今天14:30的执行", "conversation", message_id="message-1",
+            )
+            dispatcher = unittest.mock.Mock()
+
+            with patch("ai_trading_companion.__main__.flush", return_value=0):
+                result = _gateway_command(
+                    engine, store, exchange, portfolio,
+                    {
+                        "contract": "companion-user-command/v1",
+                        "command_id": "gateway-commit-1",
+                        "cycle_id": cycle["cycle_id"],
+                        "type": "commit_conversation_batch",
+                    },
+                    dispatcher,
+                )
+
+            self.assertTrue(result["committed_batch_id"])
+            dispatcher.submit.assert_called_once_with()
+
     def test_receive_accepts_utf8_bom_command(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             exchange = LocalExchange(Path(directory))

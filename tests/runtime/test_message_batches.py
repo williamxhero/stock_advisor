@@ -89,6 +89,28 @@ class MessageBatchTests(TestCase):
 
         self.assertEqual([], self.store.recoverable_conversation_jobs(before=future))
 
+    def test_locally_rejected_broker_output_gets_one_bounded_smart_retry(self):
+        message = self.store.stage_message(self.cycle["cycle_id"], "复盘14:30", "chat", message_id="message")
+        batch_id, _ = self.store.commit_staged_messages(self.cycle["cycle_id"], "chat")
+        artifact = self.store.append_artifact(
+            self.cycle["cycle_id"], "chat_human", "human", message["body_text"],
+            "2026-08-26T01:45:00Z",
+        )
+        job = self.store.start_cognition_job(
+            self.cycle["cycle_id"], artifact["artifact_id"], "conversation", message["body_text"],
+        )
+        self.store.claim_cognition_job(job["job_id"])
+        self.store.finish_cognition_job(job["job_id"], error="Broker output did not pass local verification")
+        future = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
+
+        recoverable = self.store.recoverable_conversation_jobs(before=future)
+
+        self.assertEqual([batch_id], [item["batch_id"] for item in recoverable])
+        retry = self.store.claim_cognition_job(job["job_id"])
+        self.assertEqual(2, retry["attempt_count"])
+        self.store.finish_cognition_job(job["job_id"], error="Broker output did not pass local verification")
+        self.assertEqual([], self.store.recoverable_conversation_jobs(before=future))
+
     def test_transient_conversation_has_a_bounded_smart_fallback_attempt(self):
         message = self.store.stage_message(self.cycle["cycle_id"], "外围消息？", "chat", message_id="message")
         self.store.commit_staged_messages(self.cycle["cycle_id"], "chat")

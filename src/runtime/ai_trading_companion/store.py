@@ -1420,7 +1420,9 @@ class CompanionStore:
                        AND j.attempt_count<? AND j.completed_at<=?
                        AND (j.error LIKE '%broker_unavailable%' OR j.error LIKE '%Broker HTTP 503%'
                             OR j.error LIKE '%connection%' OR j.error LIKE '%timed out%'
-                            OR j.error LIKE '%lease expired%')
+                            OR j.error LIKE '%lease expired%'
+                            OR (j.error LIKE '%Broker output did not pass local verification%'
+                                AND j.attempt_count<2))
                      ORDER BY j.completed_at,j.job_id,b.submitted_at,b.batch_id""",
                 (max_attempts, before),
             )]

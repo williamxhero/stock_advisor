@@ -231,3 +231,111 @@ def test_fresh_research_reply_completes_every_batch_frozen_into_the_job(tmp_path
         ).fetchall())
     assert states == {old_batch_id: "completed", current_batch_id: "completed"}
     assert "_reply_to_batch_ids" not in Builder.seen_context
+
+
+def test_research_job_stops_when_formal_analysis_already_completed_its_batches(tmp_path) -> None:
+    store = CompanionStore(tmp_path / "runtime.sqlite3")
+    engine = CompanionEngine(store)
+    _, job, batch_id = _queued_research(store, day="2026-09-03", text="做一次晚间盘后回顾")
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE companion_research_job SET public_scope_json=? WHERE job_id=?",
+            ('{"_reply_to_batch_ids":["' + batch_id + '"],"questions":[],"topics":[]}', job["job_id"]),
+        )
+    store.mark_batches_responded([batch_id], "formal-analysis-artifact")
+    job = store.pending_research_jobs(limit=1)[0]
+
+    with patch("ai_trading_companion.__main__._call_stage") as call_stage:
+        result = run_chat_research(engine, store, job, True)
+
+    call_stage.assert_not_called()
+    assert result["superseded_by_completed_batch"] is True
+    with store.connection() as connection:
+        state = connection.execute(
+            "SELECT state,error FROM companion_research_job WHERE job_id=?", (job["job_id"],),
+        ).fetchone()
+    assert tuple(state) == ("complete", None)
+
+
+def test_research_job_does_not_publish_after_formal_analysis_completes_during_search(tmp_path) -> None:
+    store = CompanionStore(tmp_path / "runtime.sqlite3")
+    engine = CompanionEngine(store)
+    _, job, batch_id = _queued_research(store, day="2026-09-03", text="做一次晚间盘后回顾")
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE companion_research_job SET public_scope_json=? WHERE job_id=?",
+            ('{"_reply_to_batch_ids":["' + batch_id + '"],"questions":[],"topics":[]}', job["job_id"]),
+        )
+    job = store.pending_research_jobs(limit=1)[0]
+    evidence = {
+        "as_of": "2026-09-03T14:30:00Z", "spoken_summary": "收盘数据已经核对。",
+        "sources": [], "critical_gaps": [],
+    }
+
+    class Builder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def build(self, *_args, **_kwargs):
+            return {"sha256": "frozen"}
+
+    def complete_during_search(*_args, **_kwargs):
+        store.mark_batches_responded([batch_id], "formal-analysis-artifact")
+        return evidence, None
+
+    with patch("ai_trading_companion.__main__.RuntimePacketBuilder", Builder), patch(
+        "ai_trading_companion.__main__._call_stage", side_effect=complete_during_search,
+    ) as call_stage:
+        result = run_chat_research(engine, store, job, True)
+
+    assert call_stage.call_count == 1
+    assert result["superseded_by_completed_batch"] is True
+    assert store.latest_artifact(job["cycle_id"], "ai_chat") is None
+    with store.connection() as connection:
+        state = connection.execute(
+            "SELECT state,error FROM companion_research_job WHERE job_id=?", (job["job_id"],),
+        ).fetchone()
+    assert tuple(state) == ("complete", None)
+
+
+def test_fresh_research_can_publish_materials_from_its_verified_evidence(tmp_path) -> None:
+    store = CompanionStore(tmp_path / "runtime.sqlite3")
+    engine = CompanionEngine(store)
+    _, job, batch_id = _queued_research(store, day="2026-09-03", text="做一次晚间盘后回顾")
+    evidence = {
+        "as_of": "2026-09-03T14:30:00Z",
+        "spoken_summary": "收盘数据已经核对。",
+        "critical_gaps": [],
+        "sources": [{
+            "evidence_ref": "ev_verified_close",
+            "title": "交易所收盘数据",
+            "url": "https://example.test/official-close",
+            "excerpt_text": "上证指数正式收盘数据。",
+        }],
+    }
+    followup = {
+        "answer": {"points": ["今天的盘后回顾已经完成。"], "material_ids": ["ev_verified_close"]},
+        "needs_fresh_search": False, "public_search_request": None, "judgment_revision": None,
+    }
+
+    class Builder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def build(self, *_args, **_kwargs):
+            return {"sha256": "frozen"}
+
+    with patch("ai_trading_companion.__main__.RuntimePacketBuilder", Builder), patch(
+        "ai_trading_companion.__main__._call_stage", side_effect=[(evidence, None), (followup, None)],
+    ):
+        run_chat_research(engine, store, job, True)
+
+    final = store.latest_artifact(job["cycle_id"], "ai_chat")
+    assert "今天的盘后回顾已经完成。" in final["body_markdown"]
+    assert "交易所收盘数据" in final["body_markdown"]
+    assert "https://example.test/official-close" in final["body_markdown"]
+    with store.connection() as connection:
+        state = connection.execute(
+            "SELECT state,response_artifact_id FROM companion_message_batch WHERE batch_id=?", (batch_id,),
+        ).fetchone()
+    assert tuple(state) == ("completed", final["artifact_id"])

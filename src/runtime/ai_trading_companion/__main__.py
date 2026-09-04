@@ -1480,10 +1480,19 @@ def run_chat_research(
     )
     if not source:
         raise RuntimeError("chat research source artifact is missing")
+    reply_kind = "premarket_chat" if source["kind"] == "pre_m0_submission" else "ai_chat"
     public_scope = json.loads(job["public_scope_json"])
     reply_to_batch_ids = [
         str(value) for value in public_scope.pop("_reply_to_batch_ids", []) if str(value)
     ]
+    if reply_to_batch_ids and not store.has_pending_message_batches(reply_to_batch_ids):
+        store.finish_research_job(job["job_id"])
+        return {
+            "as_of": iso(datetime.now(timezone.utc)),
+            "spoken_summary": "来源消息已由正式分析完整回答，无需重复补查。",
+            "sources": [], "critical_gaps": [],
+            "superseded_by_completed_batch": True,
+        }
     if not execute:
         evidence = {
             "as_of": iso(datetime.now(timezone.utc)), "spoken_summary": "Fixture 模式：公开补查尚未执行。",
@@ -1502,6 +1511,9 @@ def run_chat_research(
             search=True, timeout=300,
         )
         store.record_evidence(cycle, "chat_research", evidence)
+        if reply_to_batch_ids and not store.has_pending_message_batches(reply_to_batch_ids):
+            store.finish_research_job(job["job_id"])
+            return {**evidence, "superseded_by_completed_batch": True}
         local_packet = builder.build(
             cycle, "chat", evidence=evidence, message_batch=source["body_markdown"],
             context={"fresh_search_completed": True}, as_of=str(evidence.get("as_of") or iso(datetime.now(timezone.utc))),
@@ -1513,6 +1525,20 @@ def run_chat_research(
             ).m1_timeout.total_seconds()),
         )
         reply = express_cognition_answer(data["answer"])
+        material_registry = _frozen_material_registry([
+            {
+                "material_id": source_row.get("evidence_ref"),
+                "title": source_row.get("title"),
+                "url": source_row.get("url"),
+                "markdown": source_row.get("excerpt_text") or source_row.get("excerpt"),
+            }
+            for source_row in evidence.get("sources") or []
+            if isinstance(source_row, dict)
+        ])
+        presented = engine.present_for_publication(
+            reply, str(evidence.get("as_of") or iso(datetime.now(timezone.utc))), reply_kind,
+            material_registry=material_registry,
+        )
         revision = data.get("judgment_revision")
         if isinstance(revision, dict):
             engine.judgment_revision_ready(
@@ -1523,10 +1549,10 @@ def run_chat_research(
     # a published M1/M2.  A formal rerun remains an explicit user action.
     store.finish_research_job(job["job_id"])
     source_metadata = json.loads(source.get("metadata_json") or "{}")
-    reply_kind = "premarket_chat" if source["kind"] == "pre_m0_submission" else "ai_chat"
     engine.chat_ready(
         cycle["cycle_id"], reply, reply_to_batch_id=source_metadata.get("batch_id"),
         reply_to_batch_ids=reply_to_batch_ids or None, kind=reply_kind,
+        presented=presented if execute else None,
     )
     return evidence
 

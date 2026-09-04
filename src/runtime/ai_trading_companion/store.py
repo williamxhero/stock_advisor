@@ -1374,6 +1374,18 @@ class CompanionStore:
                 (cycle_id, phase),
             )]
 
+    def has_pending_message_batches(self, batch_ids: list[str]) -> bool:
+        normalized = sorted({str(value) for value in batch_ids if str(value)})
+        if not normalized:
+            return False
+        placeholders = ",".join("?" for _ in normalized)
+        with self.connection() as c:
+            row = c.execute(
+                f"SELECT 1 FROM companion_message_batch WHERE batch_id IN ({placeholders}) AND state='pending' LIMIT 1",
+                normalized,
+            ).fetchone()
+        return row is not None
+
     def recoverable_conversation_jobs(self, *, before: str, max_attempts: int = 9, limit: int = 2) -> list[dict[str, Any]]:
         """Return interrupted or transiently failed conversations that still need a reply."""
         with self.connection() as c:

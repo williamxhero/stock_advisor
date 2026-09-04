@@ -171,3 +171,32 @@ class MessageBatchTests(TestCase):
         self.assertEqual(9, claimed["attempt_count"])
         self.store.finish_cognition_job(job["job_id"], error="Broker HTTP 503")
         self.assertEqual([], self.store.recoverable_conversation_jobs(before=future))
+
+    def test_older_failed_source_cannot_bypass_latest_source_retry_ceiling(self):
+        jobs = []
+        for index in range(2):
+            message = self.store.stage_message(
+                self.cycle["cycle_id"], f"消息{index}", "chat", message_id=f"message-{index}",
+            )
+            batch_id, _ = self.store.commit_staged_messages(self.cycle["cycle_id"], "chat")
+            artifact = self.store.append_artifact(
+                self.cycle["cycle_id"], "chat_human", "human", message["body_text"],
+                f"2026-08-26T01:4{index}:00Z", {"batch_id": batch_id},
+            )
+            with self.store.connection() as connection:
+                connection.execute(
+                    "UPDATE companion_message SET source_artifact_id=? WHERE message_id=?",
+                    (artifact["artifact_id"], message["message_id"]),
+                )
+            jobs.append(self.store.start_cognition_job(
+                self.cycle["cycle_id"], artifact["artifact_id"], "conversation", message["body_text"],
+            ))
+
+        self.store.claim_cognition_job(jobs[0]["job_id"])
+        self.store.finish_cognition_job(jobs[0]["job_id"], error="Broker HTTP 503")
+        for _ in range(9):
+            self.store.claim_cognition_job(jobs[1]["job_id"])
+            self.store.finish_cognition_job(jobs[1]["job_id"], error="Broker HTTP 503")
+        future = (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat().replace("+00:00", "Z")
+
+        self.assertEqual([], self.store.recoverable_conversation_jobs(before=future))

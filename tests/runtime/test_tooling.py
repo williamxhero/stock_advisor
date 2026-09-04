@@ -376,7 +376,7 @@ class ToolRunnerTests(unittest.TestCase):
                 runner = ToolRunner(ToolCatalog(root))
                 json_result = runner.resolve(FactRequest(1, "generic_http_json", "2026-09-01T01:30:00Z", 2.0, {"url": f"{base}/json"}))
                 web_result = runner.resolve(FactRequest(1, "generic_web_read", "2026-09-01T01:30:00Z", 2.0, {"url": f"{base}/page"}))
-                capture_result = runner.resolve(FactRequest(1, "generic_browser_capture", "2026-09-01T01:30:00Z", 2.0, {"url": f"{base}/page"}))
+                capture_result = runner.resolve(FactRequest(1, "generic_browser_capture", "2026-09-01T01:30:00Z", 8.0, {"url": f"{base}/page"}))
                 disclosures = runner.resolve(FactRequest(1, "cninfo_search", "2026-09-01T01:30:00Z", 2.0, {"base_url": base, "q": "600000"}))
                 articles = runner.resolve(FactRequest(1, "article_range", "2026-09-01T01:30:00Z", 2.0, {
                     "base_url": base, "source": "cninfo_disclosure", "start_date": "2026-08-31", "end_date": "2026-09-01",

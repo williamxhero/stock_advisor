@@ -1418,6 +1418,11 @@ class CompanionStore:
                        )
                      WHERE j.mode='conversation' AND j.state='failed'
                        AND j.attempt_count<? AND j.completed_at<=?
+                       AND a.artifact_id=(
+                           SELECT latest.artifact_id FROM narrative_artifact latest
+                            WHERE latest.cycle_id=j.cycle_id AND latest.kind=a.kind
+                            ORDER BY latest.revision DESC LIMIT 1
+                       )
                        AND (j.error LIKE '%broker_unavailable%' OR j.error LIKE '%Broker HTTP 503%'
                             OR j.error LIKE '%connection%' OR j.error LIKE '%timed out%'
                             OR j.error LIKE '%lease expired%' OR j.error LIKE '%response deadline%'

@@ -160,7 +160,10 @@ class ManualAnalysisProfileResolver:
             "latest completed close", "post-close", "post close",
             "close through next trading session", "close to next trading session",
         )
-        if any(term in time_scope for term in completed_close_terms) or any(
+        close_to_next_session = (
+            "收盘" in time_scope and any(term in time_scope for term in ("下一交易日", "下一个交易日"))
+        ) or ("close" in folded and "next trading" in folded)
+        if close_to_next_session or any(term in time_scope for term in completed_close_terms) or any(
             term in folded for term in completed_close_english
         ):
             return "post_close"

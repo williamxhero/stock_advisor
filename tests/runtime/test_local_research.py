@@ -21,6 +21,208 @@ def row(operation: str, *, query: str | None = None, url: str | None = None) -> 
     return {"requirement_key": "market", "backend": "gateway", "operation": operation, "arguments": {"query": query, "categories": "news", "url": url, "symbol": None, "render": "auto", "session_id": None, "actions": None}, "fallback_backends": []}
 
 class LocalResearchTests(unittest.TestCase):
+    def test_close_review_mandatory_research_attempts_turnover_themes_and_forum_sentiment(self) -> None:
+        contract = {
+            "version": 4,
+            "as_of": "2026-09-04T07:20:00Z",
+            "requirements": [
+                {
+                    "key": "turnover_compare", "blocking": True,
+                    "allowed_coverage": ["covered"], "finality": "official_close",
+                    "window": {"mode": "exact", "start": "2026-09-04T07:00:00Z", "end": "2026-09-04T07:00:00Z"},
+                },
+                {
+                    "key": "themes_and_capacity_cores", "blocking": True,
+                    "allowed_coverage": ["covered"], "finality": "official_close",
+                    "window": {"mode": "after_start_to_end", "start": "2026-09-04T07:00:00Z", "end": "2026-09-04T07:20:00Z"},
+                },
+                {
+                    "key": "forum_and_sentiment", "blocking": True,
+                    "allowed_coverage": ["covered"],
+                    "window": {"mode": "after_start_to_end", "start": "2026-09-03T07:00:00Z", "end": "2026-09-04T07:20:00Z"},
+                },
+            ],
+        }
+        calls: list[tuple[str, str, str]] = []
+
+        def backend(operation: str, arguments: dict) -> dict:
+            calls.append((str(arguments["_requirement_key"]), operation, str(arguments.get("query") or "")))
+            return {"results": []}
+
+        class AlwaysMissing:
+            def evaluate(self, *_args, **_kwargs):
+                return {"passed": False, "problems": ["needs_repair"], "missing_requirements": ["needs_repair"]}
+
+        LocalResearchChain(
+            lambda *_args: {"version": 1, "operations": []},
+            ReadOnlyResearchExecutor({"market": backend, "gateway": backend}),
+            gate=AlwaysMissing(), max_repairs=0,
+        ).run({"task_key": "daily.review.1520", "as_of": contract["as_of"]}, contract, attempt_id="close-review")
+
+        self.assertIn(("turnover_compare", "turnover_compare", ""), calls)
+        self.assertIn(("themes_and_capacity_cores", "sector_snapshot", ""), calls)
+        self.assertIn(("forum_and_sentiment", "sentiment_snapshot", ""), calls)
+        self.assertTrue(any(key == "forum_and_sentiment" and operation == "web_search" for key, operation, _ in calls))
+
+    def test_close_review_market_operations_use_typed_capabilities_and_close_finality(self) -> None:
+        contract = {
+            "version": 4, "as_of": "2026-09-04T07:20:00Z", "requirements": [
+                {"key": "turnover_compare", "blocking": True, "window": {
+                    "mode": "exact", "start": "2026-09-04T07:00:00Z", "end": "2026-09-04T07:00:00Z",
+                }},
+                {"key": "themes_and_capacity_cores", "blocking": True, "window": {
+                    "mode": "after_start_to_end", "start": "2026-09-04T07:00:00Z", "end": "2026-09-04T07:20:00Z",
+                }},
+                {"key": "forum_and_sentiment", "blocking": True, "window": {
+                    "mode": "after_start_to_end", "start": "2026-09-03T07:00:00Z", "end": "2026-09-04T07:20:00Z",
+                }},
+            ],
+        }
+        runner = mock.Mock()
+
+        def resolve(request: FactRequest) -> EvidenceResolution:
+            data = {
+                "source": request.capability, "source_urls": [f"https://example.test/{request.capability}"],
+                "source_evidence": [{
+                    "url": f"https://example.test/{request.capability}",
+                    "fact_as_of": "2026-09-04T07:00:00Z", "data": {"summary": request.capability},
+                }],
+            }
+            return EvidenceResolution(
+                True, request.capability, "1.0.0", "2026-09-04T07:00:00Z",
+                "2026-09-04T07:20:01Z", data, "artifact:sha256:" + "a" * 64,
+                None, ("tool_result_schema_valid",), attempts=("primary:succeeded",),
+            )
+
+        runner.resolve_with_fallback.side_effect = resolve
+        backend = ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0)
+
+        backend("turnover_compare", {"_requirement_key": "turnover_compare"})
+        backend("sector_snapshot", {"_requirement_key": "themes_and_capacity_cores"})
+        backend("sentiment_snapshot", {"_requirement_key": "forum_and_sentiment"})
+
+        requests = [call.args[0] for call in runner.resolve_with_fallback.call_args_list]
+        self.assertEqual(
+            ["cn_market_turnover_compare", "cn_market_sector_snapshot", "cn_market_breadth"],
+            [request.capability for request in requests],
+        )
+        self.assertEqual(["official_close"] * 3, [request.finality for request in requests])
+        self.assertEqual("2026-09-04T07:00:00Z", requests[0].required_at)
+        self.assertEqual("2026-09-04T07:20:00Z", requests[1].required_at)
+
+    def test_forum_failure_keeps_technical_classification_and_has_a_bounded_retry(self) -> None:
+        contract = {
+            "version": 4, "as_of": "2026-09-04T07:20:00Z", "requirements": [{
+                "key": "forum_and_sentiment", "blocking": True, "allowed_coverage": ["covered"],
+                "window": {"mode": "after_start_to_end", "start": "2026-09-03T07:00:00Z", "end": "2026-09-04T07:20:00Z"},
+            }],
+        }
+        runner = mock.Mock()
+        runner.resolve_with_fallback.return_value = EvidenceResolution.failed(
+            "generic_web_search", "tool_network_transient",
+        )
+        gateway = ToolCatalogResearchBackend(
+            runner, as_of=contract["as_of"], deadline=lambda: 10.0, contract=contract,
+        )
+        market_calls: list[str] = []
+
+        def market(operation: str, _arguments: dict) -> dict:
+            market_calls.append(operation)
+            return {"results": [{
+                "url": "https://example.test/sentiment", "title": "市场情绪替代源",
+                "excerpt_text": "2026-09-04 收盘市场情绪，上涨1000家，下跌4000家",
+                "fact_as_of": "2026-09-04T07:00:00Z",
+            }]}
+
+        class AlwaysMissing:
+            def evaluate(self, *_args, **_kwargs):
+                return {"passed": False, "problems": ["needs_repair"], "missing_requirements": ["needs_repair"]}
+
+        result = LocalResearchChain(
+            lambda *_args: {"version": 1, "operations": []},
+            ReadOnlyResearchExecutor({"market": market, "gateway": gateway}),
+            gate=AlwaysMissing(), max_repairs=4,
+        ).run({"task_key": "daily.review.1520", "as_of": contract["as_of"]}, contract, attempt_id="forum-failure")
+
+        forum_failures = [row for row in result.observations if row.get("operation") == "web_search"]
+        self.assertEqual(2, runner.resolve_with_fallback.call_count)
+        self.assertEqual(["tool_network_transient", "tool_network_transient"], [
+            row.get("tool_error_code") for row in forum_failures
+        ])
+        self.assertEqual(["sentiment_snapshot"], market_calls)
+        coverage = next(row for row in result.evidence["coverage"] if row["requirement_key"] == "forum_and_sentiment")
+        self.assertEqual("covered", coverage["status"])
+
+    def test_close_review_typed_facts_qualify_all_three_requirements_without_broker_planning(self) -> None:
+        contract = {
+            "version": 4, "as_of": "2026-09-04T07:20:00Z", "requirements": [
+                {"key": "turnover_compare", "blocking": True, "allowed_coverage": ["covered"],
+                 "window": {"mode": "exact", "start": "2026-09-04T07:00:00Z", "end": "2026-09-04T07:00:00Z"},
+                 "evidence_terms": [["成交额"], ["亿元"], ["上一交易日"]], "minimum_numeric_facts": 2},
+                {"key": "themes_and_capacity_cores", "blocking": True, "allowed_coverage": ["covered"],
+                 "window": {"mode": "after_start_to_end", "start": "2026-09-04T07:00:00Z", "end": "2026-09-04T07:20:00Z"},
+                 "evidence_terms": [["板块"], ["领涨"], ["领跌"]], "minimum_named_entities": 2},
+                {"key": "forum_and_sentiment", "blocking": True, "allowed_coverage": ["covered"],
+                 "window": {"mode": "after_start_to_end", "start": "2026-09-03T07:00:00Z", "end": "2026-09-04T07:20:00Z"}},
+            ],
+        }
+        runner = mock.Mock()
+
+        def resolution(request: FactRequest) -> EvidenceResolution:
+            if request.capability == "cn_market_turnover_compare":
+                summary = "2026-09-04两市成交额25000.00亿元，上一交易日成交额24000.00亿元，较前一交易日+1000.00亿元（+4.17%）"
+            elif request.capability == "cn_market_sector_snapshot":
+                summary = "2026-09-04半导体板块领涨，容量核心中芯国际；房地产板块领跌，容量核心万科A"
+            else:
+                summary = "2026-09-04收盘市场情绪：上涨1500家，下跌3500家，涨停60只，跌停12只"
+            url = f"https://example.test/{request.capability}"
+            fact_as_of = (
+                "2026-09-04T07:00:01Z"
+                if request.capability == "cn_market_sector_snapshot" else "2026-09-04T07:00:00Z"
+            )
+            return EvidenceResolution(
+                True, request.capability, "1.0.0", fact_as_of, "2026-09-04T07:20:01Z",
+                {"source": request.capability, "source_urls": [url], "source_evidence": [{
+                    "url": url, "fact_as_of": fact_as_of, "data": {"summary": summary},
+                }]}, "artifact:sha256:" + "b" * 64, None, ("tool_result_schema_valid",),
+            )
+
+        runner.resolve_with_fallback.side_effect = resolution
+        backend = ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0)
+        result = LocalResearchChain(
+            lambda *_args: {"version": 1, "operations": []},
+            ReadOnlyResearchExecutor({"market": backend, "gateway": lambda *_args: {"results": []}}),
+            max_repairs=0,
+        ).run({"task_key": "daily.review.1520", "as_of": contract["as_of"]}, contract, attempt_id="typed-close")
+
+        self.assertTrue(result.qualified, result.verifier["problems"])
+        self.assertEqual(
+            {"turnover_compare": "covered", "themes_and_capacity_cores": "covered", "forum_and_sentiment": "covered"},
+            {row["requirement_key"]: row["status"] for row in result.evidence["coverage"]},
+        )
+
+    def test_empty_forum_search_cannot_claim_checked_no_change(self) -> None:
+        contract = {
+            "version": 4, "as_of": "2026-09-04T07:20:00Z", "requirements": [{
+                "key": "forum_and_sentiment", "blocking": True,
+                "allowed_coverage": ["covered", "checked_no_change"],
+                "window": {"mode": "after_start_to_end", "start": "2026-09-03T07:00:00Z", "end": "2026-09-04T07:20:00Z"},
+            }],
+        }
+
+        def market(_operation: str, _arguments: dict) -> dict:
+            raise RuntimeError("sentiment provider unavailable")
+
+        result = LocalResearchChain(
+            lambda *_args: {"version": 1, "operations": []},
+            ReadOnlyResearchExecutor({"market": market, "gateway": lambda *_args: {"results": []}}),
+            max_repairs=0,
+        ).run({"task_key": "daily.review.1520", "as_of": contract["as_of"]}, contract, attempt_id="no-fake-no-change")
+
+        self.assertFalse(result.qualified)
+        coverage = next(row for row in result.evidence["coverage"] if row["requirement_key"] == "forum_and_sentiment")
+        self.assertEqual("missing", coverage["status"])
+
     def test_circuit_broken_current_bar_is_not_reinserted_by_repair(self) -> None:
         contract = {
             "version": 4, "requirements": [{

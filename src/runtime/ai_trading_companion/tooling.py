@@ -6,6 +6,7 @@ import gzip
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -15,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from .secret_guard import find_secrets
 
@@ -565,6 +567,10 @@ class ToolRunner:
 
 def _validate_capability_result(request: FactRequest, output: dict[str, Any]) -> str | None:
     """Reject quote data whose identity, session date, or finality cannot meet the request."""
+    if request.capability == "cn_market_turnover_compare":
+        return _validate_market_turnover_compare(request, output["data"], str(output["fact_as_of"]))
+    if request.capability == "cn_market_sector_snapshot":
+        return _validate_market_sector_snapshot(request, output["data"], str(output["fact_as_of"]))
     if request.capability == "cn_market_index_batch":
         return _validate_market_indices(request, output["data"])
     if request.capability == "cn_market_snapshot":
@@ -630,6 +636,104 @@ def _validate_capability_result(request: FactRequest, output: dict[str, Any]) ->
 def validate_capability_data(request: FactRequest, fact_as_of: str, data: dict[str, Any]) -> str | None:
     """Apply the promoted-tool result contract to an alternate structured evidence source."""
     return _validate_capability_result(request, {"fact_as_of": fact_as_of, "data": data})
+
+
+def _validate_market_turnover_compare(
+    request: FactRequest, data: dict[str, Any], fact_as_of: str,
+) -> str | None:
+    expected_date = _parse_timestamp(request.required_at).astimezone(_SHANGHAI).date().isoformat()
+    try:
+        observed = _parse_timestamp(fact_as_of)
+        previous_date = datetime.fromisoformat(str(data.get("previous_trading_date") or "")).date()
+        current_amount = float(data.get("current_amount"))
+        previous_amount = float(data.get("previous_amount"))
+        change_amount = float(data.get("change_amount"))
+        change_ratio = float(data.get("change_ratio"))
+    except (TypeError, ValueError):
+        return "tool_market_turnover_result_invalid"
+    if (
+        data.get("trading_date") != expected_date
+        or observed.astimezone(_SHANGHAI).date().isoformat() != expected_date
+        or observed > _parse_timestamp(request.required_at)
+        or previous_date >= datetime.fromisoformat(expected_date).date()
+    ):
+        return "tool_market_turnover_trading_date_mismatch"
+    if request.finality in {"close", "official_close"} and observed.astimezone(_SHANGHAI).time().hour < 15:
+        return "tool_market_turnover_finality_invalid"
+    if data.get("finality") != request.finality:
+        return "tool_market_turnover_finality_invalid"
+    if data.get("scope") != "SSE+SZSE" or data.get("unit") != "CNY":
+        return "tool_market_turnover_scope_invalid"
+    if current_amount < 0 or previous_amount <= 0:
+        return "tool_market_turnover_result_invalid"
+    if not math.isclose(change_amount, current_amount - previous_amount, rel_tol=1e-9, abs_tol=0.01):
+        return "tool_market_turnover_calculation_invalid"
+    if not math.isclose(change_ratio, change_amount / previous_amount, rel_tol=1e-9, abs_tol=1e-9):
+        return "tool_market_turnover_calculation_invalid"
+    if not str(data.get("source") or "").strip() or not _valid_public_source_urls(data.get("source_urls")):
+        return "tool_market_source_urls_invalid"
+    return None
+
+
+def _validate_market_sector_snapshot(
+    request: FactRequest, data: dict[str, Any], fact_as_of: str,
+) -> str | None:
+    expected_date = _parse_timestamp(request.required_at).astimezone(_SHANGHAI).date().isoformat()
+    try:
+        observed = _parse_timestamp(fact_as_of)
+    except ValueError:
+        return "tool_market_sector_result_invalid"
+    if (
+        data.get("trading_date") != expected_date
+        or observed.astimezone(_SHANGHAI).date().isoformat() != expected_date
+        or observed > _parse_timestamp(request.required_at)
+    ):
+        return "tool_market_sector_trading_date_mismatch"
+    if request.finality in {"close", "official_close"} and observed.astimezone(_SHANGHAI).time().hour < 15:
+        return "tool_market_sector_finality_invalid"
+    if data.get("finality") != request.finality:
+        return "tool_market_sector_finality_invalid"
+    if not str(data.get("source") or "").strip() or not _valid_public_source_urls(data.get("source_urls")):
+        return "tool_market_source_urls_invalid"
+    leaders, laggards = data.get("leaders"), data.get("laggards")
+    if not isinstance(leaders, list) or not leaders or not isinstance(laggards, list) or not laggards:
+        return "tool_market_sector_result_invalid"
+    seen: set[str] = set()
+    for row in [*leaders, *laggards]:
+        if not isinstance(row, dict):
+            return "tool_market_sector_result_invalid"
+        board_id = str(row.get("board_id") or "").strip()
+        name = str(row.get("name") or "").strip()
+        core = row.get("core")
+        if not board_id or board_id in seen or not name or row.get("kind") not in {"industry", "theme"}:
+            return "tool_market_sector_identity_invalid"
+        seen.add(board_id)
+        if not isinstance(core, dict) or not re.fullmatch(r"\d{6}", str(core.get("symbol") or "")):
+            return "tool_market_sector_core_invalid"
+        if not str(core.get("name") or "").strip():
+            return "tool_market_sector_core_invalid"
+        try:
+            float(row.get("change_percent"))
+            amount = float(core.get("amount"))
+            float(core.get("change_percent"))
+        except (TypeError, ValueError):
+            return "tool_market_sector_result_invalid"
+        if amount < 0:
+            return "tool_market_sector_result_invalid"
+    return None
+
+
+def _valid_public_source_urls(value: Any) -> bool:
+    if not isinstance(value, list) or not value:
+        return False
+    for url in value:
+        try:
+            parsed = urlsplit(str(url or ""))
+        except ValueError:
+            return False
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            return False
+    return True
 
 
 def _validate_current_equity_bars(request: FactRequest, data: dict[str, Any]) -> str | None:

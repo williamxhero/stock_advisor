@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from ai_trading_companion.builtin_tools import ensure_builtin_tools
 from ai_trading_companion.tooling import FactRequest, ToolCatalog, ToolRunner
@@ -32,7 +33,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.8", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.9", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
 
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
@@ -982,6 +983,297 @@ class ToolRunnerTests(unittest.TestCase):
 
             self.assertFalse(result.succeeded)
             self.assertEqual("tool_market_non_trading_day", result.error_code)
+
+    def test_turnover_compare_rejects_an_inconsistent_difference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            self.publish_tool(root, "cn_market_turnover_compare", """
+                import json
+                print(json.dumps({
+                    "contract": "ai-trading-tool-result/v1", "fact_as_of": "2026-09-01T07:00:00Z",
+                    "data": {
+                        "trading_date": "2026-09-01", "previous_trading_date": "2026-08-31",
+                        "scope": "SSE+SZSE", "unit": "CNY", "current_amount": 100.0,
+                        "previous_amount": 80.0, "change_amount": 19.0, "change_ratio": 0.25,
+                        "source": "test", "source_urls": ["https://example.test/turnover"],
+                        "finality": "official_close"
+                    },
+                }))
+            """)
+
+            result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                1, "cn_market_turnover_compare", "2026-09-01T07:00:00Z", 2.0, {},
+                finality="official_close",
+            ))
+
+            self.assertFalse(result.succeeded)
+            self.assertEqual("tool_market_turnover_calculation_invalid", result.error_code)
+
+    def test_builtin_turnover_compare_uses_two_complete_sessions_with_one_scope(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                amount_rows = (
+                    ("100000000000", "110000000000")
+                    if "secid=1.000001" in self.path else
+                    ("200000000000", "240000000000")
+                )
+                body = json.dumps({"data": {"klines": [
+                    f"2026-08-31,1,1,1,1,1,{amount_rows[0]},1,1,1,1",
+                    f"2026-09-01,1,1,1,1,1,{amount_rows[1]},1,1,1,1",
+                ]}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                    1, "cn_market_turnover_compare", "2026-09-01T07:00:00Z", 4.0,
+                    {"eastmoney_kline_url": f"http://127.0.0.1:{server.server_port}/kline"},
+                    finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("2026-09-01", result.data["trading_date"])
+                self.assertEqual("2026-08-31", result.data["previous_trading_date"])
+                self.assertEqual("SSE+SZSE", result.data["scope"])
+                self.assertEqual(350_000_000_000.0, result.data["current_amount"])
+                self.assertEqual(300_000_000_000.0, result.data["previous_amount"])
+                self.assertEqual(50_000_000_000.0, result.data["change_amount"])
+                self.assertAlmostEqual(1 / 6, result.data["change_ratio"])
+                self.assertEqual("2026-09-01T07:00:00Z", result.fact_as_of)
+                self.assertEqual(2, len(result.data["source_urls"]))
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_sector_snapshot_rejects_non_http_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            self.publish_tool(root, "cn_market_sector_snapshot", """
+                import json
+                print(json.dumps({
+                    "contract": "ai-trading-tool-result/v1", "fact_as_of": "2026-09-01T07:00:00Z",
+                    "data": {
+                        "trading_date": "2026-09-01", "finality": "official_close", "source": "test",
+                        "source_urls": ["file:///tmp/sector.json"],
+                        "leaders": [{"board_id": "BK1", "name": "半导体", "kind": "industry",
+                                     "change_percent": 3.2, "core": {"symbol": "600000", "name": "核心A",
+                                     "amount": 1000000.0, "change_percent": 4.1}}],
+                        "laggards": [{"board_id": "BK2", "name": "地产", "kind": "industry",
+                                      "change_percent": -2.2, "core": {"symbol": "000001", "name": "核心B",
+                                      "amount": 900000.0, "change_percent": -2.8}}]
+                    },
+                }))
+            """)
+
+            result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                1, "cn_market_sector_snapshot", "2026-09-01T07:20:00Z", 2.0, {},
+                finality="official_close",
+            ))
+
+            self.assertFalse(result.succeeded)
+            self.assertEqual("tool_market_source_urls_invalid", result.error_code)
+
+    def test_builtin_sector_snapshot_returns_leaders_laggards_and_capacity_cores(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                query = parse_qs(urlsplit(self.path).query)
+                if self.path.startswith("/boards"):
+                    kind = "theme" if "t:3" in query.get("fs", [""])[0] else "industry"
+                    descending = query.get("po", [""])[0] == "1"
+                    values = {
+                        ("industry", True): ("BK100", "半导体", 3.2),
+                        ("theme", True): ("BK200", "机器人", 4.5),
+                        ("industry", False): ("BK300", "房地产", -2.1),
+                        ("theme", False): ("BK400", "白酒", -3.0),
+                    }[kind, descending]
+                    body = json.dumps({"data": {"diff": [{
+                        "f12": values[0], "f14": values[1], "f3": values[2], "f124": 1788246000,
+                    }]}}).encode("utf-8")
+                else:
+                    board = query.get("fs", ["b:BK000"])[0].split(":", 1)[-1]
+                    symbols = {"BK100": "600100", "BK200": "300200", "BK300": "600300", "BK400": "000400"}
+                    body = json.dumps({"data": {"diff": [{
+                        "f12": symbols[board], "f14": "容量核心" + board[-1],
+                        "f3": 2.5 if board in {"BK100", "BK200"} else -2.5,
+                        "f6": 12_000_000_000, "f124": 1788246000,
+                    }]}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                    1, "cn_market_sector_snapshot", "2026-09-01T07:20:00Z", 8.0,
+                    {"eastmoney_board_url": base + "/boards", "eastmoney_constituent_url": base + "/cores"},
+                    finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual(["半导体", "机器人"], [row["name"] for row in result.data["leaders"]])
+                self.assertEqual(["房地产", "白酒"], [row["name"] for row in result.data["laggards"]])
+                self.assertEqual(
+                    ["600100", "300200", "600300", "000400"],
+                    [row["core"]["symbol"] for row in [*result.data["leaders"], *result.data["laggards"]]],
+                )
+                self.assertEqual("2026-09-01T07:00:01Z", result.fact_as_of)
+                self.assertGreaterEqual(len(result.data["source_urls"]), 8)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_close_market_capabilities_fall_back_after_primary_source_outage(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith(("/kline", "/boards", "/cores")):
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                if self.path.startswith("/turnover"):
+                    payload = {
+                        "contract": "markethub-cn-market-turnover-compare-v1",
+                        "trading_date": "2026-09-01", "previous_trading_date": "2026-08-31",
+                        "fact_as_of": "2026-09-01T15:00:00+08:00", "scope": "SSE+SZSE",
+                        "unit": "CNY", "current_amount": 350_000_000_000.0,
+                        "previous_amount": 300_000_000_000.0, "change_amount": 50_000_000_000.0,
+                        "change_ratio": 1 / 6, "source": "markethub_test",
+                    }
+                else:
+                    payload = {
+                        "contract": "markethub-cn-market-sector-snapshot-v1",
+                        "trading_date": "2026-09-01", "fact_as_of": "2026-09-01T15:00:00+08:00",
+                        "source": "markethub_test",
+                        "leaders": [{"board_id": "BK1", "name": "半导体", "kind": "industry",
+                                     "change_percent": 3.2, "core": {"symbol": "600000", "name": "核心A",
+                                     "amount": 1_000_000.0, "change_percent": 4.1}}],
+                        "laggards": [{"board_id": "BK2", "name": "房地产", "kind": "industry",
+                                      "change_percent": -2.2, "core": {"symbol": "000001", "name": "核心B",
+                                      "amount": 900_000.0, "change_percent": -2.8}}],
+                    }
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                runner = ToolRunner(ToolCatalog(root))
+                turnover = runner.resolve_with_fallback(FactRequest(
+                    1, "cn_market_turnover_compare", "2026-09-01T07:00:00Z", 5.0,
+                    {"eastmoney_kline_url": base + "/kline", "markethub_turnover_url": base + "/turnover"},
+                    finality="official_close",
+                ))
+                sectors = runner.resolve_with_fallback(FactRequest(
+                    1, "cn_market_sector_snapshot", "2026-09-01T07:20:00Z", 5.0,
+                    {"eastmoney_board_url": base + "/boards", "eastmoney_constituent_url": base + "/cores",
+                     "markethub_sector_url": base + "/sectors"}, finality="official_close",
+                ))
+
+                self.assertTrue(turnover.succeeded, turnover.error_code)
+                self.assertEqual(("eastmoney:tool_process_failed", "markethub:succeeded"), turnover.attempts)
+                self.assertTrue(sectors.succeeded, sectors.error_code)
+                self.assertEqual(("eastmoney:tool_process_failed", "markethub:succeeded"), sectors.attempts)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_turnover_fallback_rejects_partial_days_and_accepts_complete_snapshot_scope(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            previous_count = 1000
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/kline"):
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                query = parse_qs(urlsplit(self.path).query)
+                if self.path.startswith("/spot"):
+                    page = int(query.get("pn", ["1"])[0])
+                    start = (page - 1) * 100
+                    rows = [{
+                        "f12": f"{600000 + index:06d}", "f6": 1_000_000.0, "f124": 1788505200,
+                    } for index in range(start, min(start + 100, 1000))]
+                    payload = {"data": {"total": 1000, "diff": rows}}
+                else:
+                    payload = [{
+                        "code": f"{600000 + index:06d}", "trade_time": "2026-09-03",
+                        "amount": 900_000.0,
+                    } for index in range(self.previous_count)]
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                request = FactRequest(
+                    1, "cn_market_turnover_compare", "2026-09-04T07:00:00Z", 8.0,
+                    {"eastmoney_kline_url": base + "/kline", "eastmoney_spot_url": base + "/spot",
+                     "markethub_snapshot_url": base + "/snapshot"}, finality="official_close",
+                )
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(request)
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual(("eastmoney:tool_process_failed", "markethub:succeeded"), result.attempts)
+                self.assertEqual(1_000_000_000.0, result.data["current_amount"])
+                self.assertEqual(900_000_000.0, result.data["previous_amount"])
+                self.assertEqual({"current_security_count": 1000, "previous_security_count": 1000}, result.data["coverage"])
+
+                Handler.previous_count = 100
+                partial_runner = ToolRunner(ToolCatalog(root))
+                partial = partial_runner.resolve_with_fallback(request)
+                self.assertFalse(partial.succeeded)
+                self.assertEqual("tool_process_failed", partial.error_code)
+                self.assertEqual(
+                    ("eastmoney:tool_process_failed", "markethub:tool_process_failed"), partial.attempts,
+                )
+                self.assertIsNotNone(partial.diagnostic_artifact_ref)
+                diagnostic = partial_runner.artifacts.read(partial.diagnostic_artifact_ref).decode("utf-8")
+                self.assertIn("previous turnover snapshot is incomplete", diagnostic)
+            finally:
+                server.shutdown()
+                server.server_close()
 
     def test_market_breadth_rejects_a_snapshot_without_a_matching_trade_date(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

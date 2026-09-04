@@ -36,7 +36,8 @@ RESEARCH_PLAN_SCHEMA: dict[str, Any] = {
                 "requirement_key": {"type": "string", "minLength": 1},
                 "backend": {"type": "string", "enum": ["market", "gateway"]},
                 "operation": {"type": "string", "enum": [
-                    "market_snapshot", "market_breadth", "sector_snapshot", "holding_snapshot", "current_bar",
+                    "market_snapshot", "market_breadth", "turnover_compare", "sector_snapshot",
+                    "sentiment_snapshot", "holding_snapshot", "current_bar",
                     "web_search", "web_read", "web_browser",
                 ]},
                 "arguments": {
@@ -88,7 +89,10 @@ def _research_plan_schema(evidence_contract: dict[str, Any]) -> dict[str, Any]:
 
 
 _OPERATIONS = {
-    "market": {"market_snapshot", "market_breadth", "sector_snapshot", "holding_snapshot", "current_bar"},
+    "market": {
+        "market_snapshot", "market_breadth", "turnover_compare", "sector_snapshot",
+        "sentiment_snapshot", "holding_snapshot", "current_bar",
+    },
     "gateway": {"web_search", "web_read", "web_browser"},
 }
 _BACKEND_ORDER = {"market": 0, "gateway": 1}
@@ -212,7 +216,7 @@ class ToolCatalogResearchBackend:
             context={}, freshness_seconds=0.0, finality="observed",
         ))
         if not resolution.succeeded or resolution.data is None:
-            raise RuntimeError(f"tool resolution failed: {capability}:{resolution.error_code}")
+            raise ToolResolutionError(capability, resolution)
         return self._project(operation, resolution)
 
     @staticmethod
@@ -271,6 +275,9 @@ class ToolCatalogMarketBackend:
         capability = {
             "market_snapshot": "cn_market_index_batch",
             "market_breadth": "cn_market_breadth",
+            "turnover_compare": "cn_market_turnover_compare",
+            "sector_snapshot": "cn_market_sector_snapshot",
+            "sentiment_snapshot": "cn_market_breadth",
             "holding_snapshot": "cn_equity_quote_batch",
             "current_bar": "cn_equity_current_bar",
         }.get(operation)
@@ -281,7 +288,10 @@ class ToolCatalogMarketBackend:
         mode = str(window.get("mode") or "")
         declared_finality = str(requirement.get("finality") or "")
         finality = declared_finality or (
-            "official_close" if mode == "exact" and required_at[11:16] == "07:00" else "intraday"
+            "official_close"
+            if (mode == "exact" and required_at[11:16] == "07:00")
+            or operation in {"sector_snapshot", "sentiment_snapshot"}
+            else "intraday"
         )
         if operation in {"holding_snapshot", "current_bar"}:
             symbols = [str(value) for value in requirement.get("required_entities") or [] if str(value)]
@@ -561,6 +571,7 @@ class ReadOnlyResearchExecutor:
     def execute(self, row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         candidates = [row["backend"], *[item for item in row["fallback_backends"] if item != row["backend"]]]
         failures: list[str] = []
+        resolution_failure: ToolResolutionError | None = None
         for backend in candidates:
             adapter = self.backends.get(backend)
             if adapter is None:
@@ -574,6 +585,10 @@ class ReadOnlyResearchExecutor:
                 return backend, {**result, "backend": backend}
             except Exception as exc:
                 failures.append(f"{backend}:{type(exc).__name__}")
+                if isinstance(exc, ToolResolutionError):
+                    resolution_failure = exc
+        if resolution_failure is not None:
+            raise resolution_failure
         raise RuntimeError("all research backends failed: " + ",".join(failures))
 
 
@@ -1115,6 +1130,18 @@ def _merge_mandatory_operations(
         required.append(_operation("indices_close", "market", "market_snapshot"))
     if "market_breadth" in requirements:
         required.append(_operation("market_breadth", "market", "market_breadth"))
+    if "turnover_compare" in requirements:
+        required.append(_operation("turnover_compare", "market", "turnover_compare"))
+    if "themes_and_capacity_cores" in requirements:
+        required.append(_operation("themes_and_capacity_cores", "market", "sector_snapshot"))
+    if "forum_and_sentiment" in requirements:
+        required.extend((
+            _operation("forum_and_sentiment", "market", "sentiment_snapshot"),
+            _operation(
+                "forum_and_sentiment", "gateway", "web_search",
+                query="A股 收盘 论坛 股吧 市场情绪",
+            ),
+        ))
     if requirements.get("portfolio_market_state", {}).get("required_entities"):
         required.append(_operation("portfolio_market_state", "market", "holding_snapshot"))
     if requirements.get("portfolio_current_bar", {}).get("required_entities"):
@@ -1148,6 +1175,18 @@ def _merge_mandatory_operations(
             str((item.get("arguments") or {}).get("query") or "") if item["operation"] == "web_search" else "",
         )
         if identity not in completed:
+            failed_attempts = sum(
+                1 for observation in observations or []
+                if observation.get("status") == "failed"
+                and str((observation.get("arguments") or {}).get("requirement_key") or "") == key
+                and observation.get("operation") == identity[1]
+                and (
+                    identity[1] != "web_search"
+                    or str((observation.get("arguments") or {}).get("query") or "") == identity[2]
+                )
+            )
+            if failed_attempts >= 2:
+                return False
             if any(
                 item.get("status") == "failed"
                 and str((item.get("arguments") or {}).get("requirement_key") or "") == key

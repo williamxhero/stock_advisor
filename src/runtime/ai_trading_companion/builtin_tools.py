@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.8"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7"}
+_VERSION = "1.1.9"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -21,12 +21,22 @@ _CAPABILITIES = {
     "cn_market_index_batch": "cn_market_index_batch",
     "cn_market_snapshot": "cn_market_snapshot",
     "cn_market_breadth": "cn_market_breadth",
+    "cn_market_turnover_compare": "cn_market_turnover_compare",
+    "cn_market_sector_snapshot": "cn_market_sector_snapshot",
 }
 _ADAPTERS = {
     "cn_equity_quote_batch": {"tencent": "cn_equity_quote_tencent", "sina": "cn_equity_quote_sina"},
     "cn_equity_current_bar": {"markethub": "cn_equity_current_bar", "tencent": "cn_equity_current_bar_tencent"},
     "cn_market_index_batch": {"tencent": "cn_market_index_tencent", "sina": "cn_market_index_sina"},
     "cn_market_breadth": {"markethub": "cn_market_breadth_markethub", "eastmoney": "cn_market_breadth_eastmoney"},
+    "cn_market_turnover_compare": {
+        "eastmoney": "cn_market_turnover_compare_eastmoney",
+        "markethub": "cn_market_turnover_compare_markethub",
+    },
+    "cn_market_sector_snapshot": {
+        "eastmoney": "cn_market_sector_snapshot_eastmoney",
+        "markethub": "cn_market_sector_snapshot_markethub",
+    },
 }
 
 
@@ -139,8 +149,14 @@ def safe_url(value: object) -> str:
     return url
 
 
-def fetch(url: str) -> tuple[str, str]:
-    request = Request(url, headers={"User-Agent": "AITradingCompanion-ReadOnly/1"})
+def fetch(url: str, *, referer: str | None = None) -> tuple[str, str]:
+    headers = {"User-Agent": (
+        "Mozilla/5.0"
+        if referer else "AITradingCompanion-ReadOnly/1"
+    )}
+    if referer:
+        headers["Referer"] = referer
+    request = Request(url, headers=headers)
     try:
         with urlopen(request, timeout=15) as response:
             status = getattr(response, "status", 200)
@@ -753,6 +769,375 @@ def market_breadth_payload(endpoint: str, finality: str) -> tuple[dict[str, obje
     return data, fact_as_of
 
 
+def turnover_summary(data: dict[str, object]) -> str:
+    current = float(data["current_amount"]) / 100_000_000
+    previous = float(data["previous_amount"]) / 100_000_000
+    change = float(data["change_amount"]) / 100_000_000
+    ratio = float(data["change_ratio"]) * 100
+    return (
+        f"{data['trading_date']}两市成交额{current:.2f}亿元，"
+        f"上一交易日{data['previous_trading_date']}成交额{previous:.2f}亿元，"
+        f"较前一交易日{change:+.2f}亿元（{ratio:+.2f}%）；统一口径为SSE+SZSE、单位CNY。"
+    )
+
+
+def eastmoney_turnover_payload(
+    endpoint: str, required_at: str, finality: str,
+) -> tuple[dict[str, object], str]:
+    try:
+        required = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(
+            dt.timezone(dt.timedelta(hours=8)))
+    except ValueError:
+        fail(64, "required_at must be an ISO timestamp")
+    target_date = required.date().isoformat()
+    base = safe_url(endpoint)
+    sources: list[str] = []
+    by_exchange: dict[str, dict[str, float]] = {}
+    for exchange, secid in (("SSE", "1.000001"), ("SZSE", "0.399106")):
+        separator = "&" if "?" in base else "?"
+        url, body = fetch(
+            base + separator + "secid=" + quote_plus(secid)
+            + "&ut=fa5fd1943c7b386f172d6893dbfba10b&klt=101&fqt=0&lmt=10&end=" + required.strftime("%Y%m%d")
+            + "&fields1=f1%2Cf2%2Cf3%2Cf4%2Cf5%2Cf6"
+            + "&fields2=f51%2Cf52%2Cf53%2Cf54%2Cf55%2Cf56%2Cf57%2Cf58%2Cf59%2Cf60%2Cf61",
+            referer="https://quote.eastmoney.com/",
+        )
+        try:
+            rows = json.loads(body)["data"]["klines"]
+        except (KeyError, TypeError, json.JSONDecodeError):
+            fail(75, "turnover history response is invalid")
+        parsed: dict[str, float] = {}
+        for row in rows if isinstance(rows, list) else []:
+            fields = str(row).split(",")
+            if len(fields) < 7:
+                continue
+            try:
+                parsed[fields[0]] = float(fields[6])
+            except ValueError:
+                continue
+        if target_date not in parsed:
+            fail(75, "turnover history has no target trading session")
+        sources.append(url)
+        by_exchange[exchange] = parsed
+    common_dates = sorted(set(by_exchange["SSE"]) & set(by_exchange["SZSE"]))
+    previous_dates = [value for value in common_dates if value < target_date]
+    if not previous_dates:
+        fail(75, "turnover history has no previous common trading session")
+    previous_date = previous_dates[-1]
+    current_amount = sum(values[target_date] for values in by_exchange.values())
+    previous_amount = sum(values[previous_date] for values in by_exchange.values())
+    if current_amount < 0 or previous_amount <= 0:
+        fail(75, "turnover amounts are invalid")
+    data: dict[str, object] = {
+        "trading_date": target_date, "previous_trading_date": previous_date,
+        "scope": "SSE+SZSE", "unit": "CNY", "current_amount": current_amount,
+        "previous_amount": previous_amount, "change_amount": current_amount - previous_amount,
+        "change_ratio": (current_amount - previous_amount) / previous_amount,
+        "source": "eastmoney_index_daily_turnover", "source_urls": sources,
+        "finality": finality,
+    }
+    fact_as_of = dt.datetime.combine(
+        required.date(), dt.time(15, 0), required.tzinfo,
+    ).astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    summary = turnover_summary(data)
+    data["source_evidence"] = [{
+        "url": url, "fact_as_of": fact_as_of,
+        "data": {"summary": summary, "exchange": exchange,
+                 "current_amount": by_exchange[exchange][target_date],
+                 "previous_amount": by_exchange[exchange][previous_date],
+                 "scope": "SSE+SZSE", "unit": "CNY", "finality": finality},
+    } for exchange, url in zip(("SSE", "SZSE"), sources)]
+    return data, fact_as_of
+
+
+def markethub_turnover_payload(
+    endpoint: str, required_at: str, finality: str,
+) -> tuple[dict[str, object], str]:
+    try:
+        required = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(
+            dt.timezone(dt.timedelta(hours=8)))
+    except ValueError:
+        fail(64, "required_at must be an ISO timestamp")
+    separator = "&" if "?" in endpoint else "?"
+    source_url, body = fetch(endpoint + separator + "trade_date=" + quote_plus(required.date().isoformat()))
+    try:
+        payload = json.loads(body)
+        data = {
+            "trading_date": str(payload["trading_date"]),
+            "previous_trading_date": str(payload["previous_trading_date"]),
+            "scope": str(payload["scope"]), "unit": str(payload["unit"]),
+            "current_amount": float(payload["current_amount"]),
+            "previous_amount": float(payload["previous_amount"]),
+            "change_amount": float(payload["change_amount"]),
+            "change_ratio": float(payload["change_ratio"]),
+            "source": str(payload["source"]), "source_urls": [source_url],
+            "finality": finality,
+        }
+        observed = dt.datetime.fromisoformat(str(payload["fact_as_of"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        fail(75, "MarketHub turnover response is invalid")
+    if payload.get("contract") != "markethub-cn-market-turnover-compare-v1" or observed.tzinfo is None:
+        fail(75, "MarketHub turnover response is invalid")
+    fact_as_of = observed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    data["source_evidence"] = [{
+        "url": source_url, "fact_as_of": fact_as_of,
+        "data": {"summary": turnover_summary(data), "scope": data["scope"],
+                 "unit": data["unit"], "finality": finality},
+    }]
+    return data, fact_as_of
+
+
+def turnover_page_url(endpoint: str, page: int) -> str:
+    separator = "&" if "?" in endpoint else "?"
+    return (
+        endpoint + separator + "pn=" + str(page)
+        + "&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+        + "&fltt=2&invt=2&fid=f3"
+        + "&fs=m%3A0%2Bt%3A6%2Cm%3A0%2Bt%3A80%2Cm%3A1%2Bt%3A2%2Cm%3A1%2Bt%3A23"
+        + "&fields=f12%2Cf6%2Cf124"
+    )
+
+
+def snapshot_turnover_payload(
+    spot_endpoint: str, snapshot_endpoint: str, required_at: str, finality: str,
+) -> tuple[dict[str, object], str]:
+    try:
+        required = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(
+            dt.timezone(dt.timedelta(hours=8)))
+    except ValueError:
+        fail(64, "required_at must be an ISO timestamp")
+    first_url, first_body = fetch(turnover_page_url(spot_endpoint, 1))
+    try:
+        first_data = json.loads(first_body)["data"]
+        total = int(first_data["total"])
+        current_rows = list(first_data["diff"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        fail(75, "current turnover snapshot is invalid")
+    pages = min(64, (total + 99) // 100)
+    page_urls = [first_url]
+    if pages > 1:
+        def read_page(page: int) -> tuple[str, list[object]]:
+            url, body = fetch(turnover_page_url(spot_endpoint, page))
+            try:
+                values = json.loads(body)["data"]["diff"]
+            except (KeyError, TypeError, json.JSONDecodeError):
+                fail(75, "current turnover page is invalid")
+            return url, values if isinstance(values, list) else []
+        with ThreadPoolExecutor(max_workers=min(8, pages - 1)) as pool:
+            for url, rows in pool.map(read_page, range(2, pages + 1)):
+                page_urls.append(url)
+                current_rows.extend(row for row in rows if isinstance(row, dict))
+    if total <= 0 or len(current_rows) < total:
+        fail(75, "current turnover snapshot is incomplete")
+    current_amount = 0.0
+    moments: list[dt.datetime] = []
+    seen: set[str] = set()
+    for row in current_rows[:total]:
+        try:
+            code = str(row["f12"])
+            amount = float(row["f6"])
+            moment = dt.datetime.fromtimestamp(int(row["f124"]), tz=dt.timezone.utc)
+        except (KeyError, TypeError, ValueError, OSError):
+            # Suspended rows can be unpriced; they contribute zero turnover.
+            continue
+        if not re.fullmatch(r"\d{6}", code) or code in seen or amount < 0:
+            fail(75, "current turnover row is invalid")
+        seen.add(code)
+        current_amount += amount
+        moments.append(moment)
+    if len(seen) < 1000 or not moments:
+        fail(75, "current turnover scope is incomplete")
+    if any(moment.astimezone(required.tzinfo).date() != required.date() for moment in moments):
+        fail(75, "current turnover trading date is invalid")
+
+    previous_rows: list[dict[str, object]] = []
+    previous_date = ""
+    snapshot_url = ""
+    checked_urls: list[str] = []
+    for days in range(1, 11):
+        candidate = required.date() - dt.timedelta(days=days)
+        separator = "&" if "?" in snapshot_endpoint else "?"
+        requested_url = (
+            snapshot_endpoint + separator + "trade_date=" + candidate.isoformat()
+            + "&limit=10000&skip_suspended=false"
+        )
+        resolved_url, body = fetch(requested_url)
+        checked_urls.append(resolved_url)
+        try:
+            rows = json.loads(body)
+        except json.JSONDecodeError:
+            fail(75, "previous turnover snapshot is invalid")
+        if not isinstance(rows, list):
+            fail(75, "previous turnover snapshot is invalid")
+        selected = [row for row in rows if isinstance(row, dict)]
+        if selected:
+            previous_rows = selected
+            previous_date = candidate.isoformat()
+            snapshot_url = resolved_url
+            break
+    if len(previous_rows) < 1000 or not previous_date:
+        fail(75, "previous turnover snapshot is incomplete")
+    previous_amount = 0.0
+    previous_seen: set[str] = set()
+    for row in previous_rows:
+        code = str(row.get("code") or "")
+        # MarketHub's stock snapshot contains CN equities from all exchanges;
+        # the SSE+SZSE scope excludes BSE codes (4/8/9 prefixes).
+        if not re.fullmatch(r"[036]\d{5}", code):
+            continue
+        if code in previous_seen or str(row.get("trade_time") or "")[:10] != previous_date:
+            fail(75, "previous turnover row is invalid")
+        try:
+            amount = float(row.get("amount"))
+        except (TypeError, ValueError):
+            fail(75, "previous turnover row is invalid")
+        if amount < 0:
+            fail(75, "previous turnover row is invalid")
+        previous_seen.add(code)
+        previous_amount += amount
+    if len(previous_seen) < 1000 or previous_amount <= 0:
+        fail(75, "previous turnover scope is incomplete")
+    data: dict[str, object] = {
+        "trading_date": required.date().isoformat(), "previous_trading_date": previous_date,
+        "scope": "SSE+SZSE", "unit": "CNY", "current_amount": current_amount,
+        "previous_amount": previous_amount, "change_amount": current_amount - previous_amount,
+        "change_ratio": (current_amount - previous_amount) / previous_amount,
+        "source": "eastmoney_spot+markethub_daily_snapshot",
+        "source_urls": [*page_urls, *checked_urls], "finality": finality,
+        "coverage": {"current_security_count": len(seen), "previous_security_count": len(previous_seen)},
+    }
+    fact_as_of = dt.datetime.combine(
+        required.date(), dt.time(15, 0), required.tzinfo,
+    ).astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    summary = turnover_summary(data)
+    data["source_evidence"] = [
+        {"url": first_url, "fact_as_of": fact_as_of,
+         "data": {"summary": summary, "current_security_count": len(seen), "finality": finality}},
+        {"url": snapshot_url, "fact_as_of": fact_as_of,
+         "data": {"summary": summary, "previous_security_count": len(previous_seen), "finality": finality}},
+    ]
+    return data, fact_as_of
+
+
+def eastmoney_sector_snapshot_payload(
+    board_endpoint: str, constituent_endpoint: str, required_at: str, finality: str,
+) -> tuple[dict[str, object], str]:
+    try:
+        required = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(
+            dt.timezone(dt.timedelta(hours=8)))
+    except ValueError:
+        fail(64, "required_at must be an ISO timestamp")
+    source_urls: list[str] = []
+    selected: list[tuple[str, dict[str, object]]] = []
+    moments: list[dt.datetime] = []
+    for group, fs in (("industry", "m:90+t:2"), ("theme", "m:90+t:3")):
+        for direction, po in (("leaders", "1"), ("laggards", "0")):
+            separator = "&" if "?" in board_endpoint else "?"
+            url, body = fetch(
+                board_endpoint + separator + "pn=1&pz=1&np=1&fltt=2&invt=2&fid=f3&po=" + po
+                + "&fs=" + quote_plus(fs) + "&fields=f12%2Cf14%2Cf3%2Cf124"
+            )
+            try:
+                row = json.loads(body)["data"]["diff"][0]
+                board = {
+                    "board_id": str(row["f12"]), "name": clean_text(row["f14"]).strip(),
+                    "kind": group, "change_percent": float(row["f3"]),
+                }
+                moment = dt.datetime.fromtimestamp(int(row["f124"]), tz=dt.timezone.utc)
+            except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, OSError):
+                fail(75, "sector board response is invalid")
+            if not board["board_id"] or not board["name"]:
+                fail(75, "sector board identity is invalid")
+            source_urls.append(url)
+            moments.append(moment)
+            selected.append((direction, board))
+    leaders: list[dict[str, object]] = []
+    laggards: list[dict[str, object]] = []
+    for direction, board in selected:
+        separator = "&" if "?" in constituent_endpoint else "?"
+        url, body = fetch(
+            constituent_endpoint + separator + "pn=1&pz=1&np=1&fltt=2&invt=2&fid=f6&po=1"
+            + "&fs=" + quote_plus("b:" + str(board["board_id"]))
+            + "&fields=f12%2Cf14%2Cf3%2Cf6%2Cf124"
+        )
+        try:
+            row = json.loads(body)["data"]["diff"][0]
+            core = {
+                "symbol": str(row["f12"]), "name": clean_text(row["f14"]).strip(),
+                "amount": float(row["f6"]), "change_percent": float(row["f3"]),
+            }
+            moment = dt.datetime.fromtimestamp(int(row["f124"]), tz=dt.timezone.utc)
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, OSError):
+            fail(75, "sector constituent response is invalid")
+        board["core"] = core
+        source_urls.append(url)
+        moments.append(moment)
+        (leaders if direction == "leaders" else laggards).append(board)
+    local_moments = [value.astimezone(required.tzinfo) for value in moments]
+    if any(value.date() != required.date() for value in local_moments):
+        fail(75, "sector snapshot trading date is invalid")
+    if finality in {"close", "official_close"} and any(value.time() < dt.time(15, 0) for value in local_moments):
+        fail(75, "sector snapshot does not meet close finality")
+    data: dict[str, object] = {
+        "trading_date": required.date().isoformat(), "leaders": leaders, "laggards": laggards,
+        "source": "eastmoney_board_and_constituent_snapshot", "source_urls": source_urls,
+        "finality": finality,
+    }
+    fact_as_of = dt.datetime.combine(
+        required.date(), dt.time(15, 0, 1), required.tzinfo,
+    ).astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    summary = "；".join(
+        [f"{row['name']}板块领涨，容量核心{row['core']['name']}({row['core']['symbol']})成交额{float(row['core']['amount']) / 100_000_000:.2f}亿元"
+         for row in leaders]
+        + [f"{row['name']}板块领跌，容量核心{row['core']['name']}({row['core']['symbol']})成交额{float(row['core']['amount']) / 100_000_000:.2f}亿元"
+           for row in laggards]
+    )
+    data["source_evidence"] = [{
+        "url": url, "fact_as_of": fact_as_of,
+        "data": {"summary": f"{data['trading_date']} {summary}", "leaders": leaders,
+                 "laggards": laggards, "finality": finality},
+    } for url in source_urls]
+    return data, fact_as_of
+
+
+def markethub_sector_snapshot_payload(
+    endpoint: str, required_at: str, finality: str,
+) -> tuple[dict[str, object], str]:
+    try:
+        required = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(
+            dt.timezone(dt.timedelta(hours=8)))
+    except ValueError:
+        fail(64, "required_at must be an ISO timestamp")
+    separator = "&" if "?" in endpoint else "?"
+    source_url, body = fetch(endpoint + separator + "trade_date=" + quote_plus(required.date().isoformat()))
+    try:
+        payload = json.loads(body)
+        leaders = list(payload["leaders"])
+        laggards = list(payload["laggards"])
+        observed = dt.datetime.fromisoformat(str(payload["fact_as_of"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        fail(75, "MarketHub sector response is invalid")
+    if payload.get("contract") != "markethub-cn-market-sector-snapshot-v1" or observed.tzinfo is None:
+        fail(75, "MarketHub sector response is invalid")
+    data: dict[str, object] = {
+        "trading_date": str(payload["trading_date"]), "leaders": leaders, "laggards": laggards,
+        "source": str(payload["source"]), "source_urls": [source_url], "finality": finality,
+    }
+    fact_as_of = observed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    summary = "；".join(
+        [f"{row['name']}板块领涨，容量核心{row['core']['name']}({row['core']['symbol']})成交额{float(row['core']['amount']) / 100_000_000:.2f}亿元"
+         for row in leaders]
+        + [f"{row['name']}板块领跌，容量核心{row['core']['name']}({row['core']['symbol']})成交额{float(row['core']['amount']) / 100_000_000:.2f}亿元"
+           for row in laggards]
+    )
+    data["source_evidence"] = [{
+        "url": source_url, "fact_as_of": fact_as_of,
+        "data": {"summary": f"{data['trading_date']} {summary}", "leaders": leaders,
+                 "laggards": laggards, "finality": finality},
+    }]
+    return data, fact_as_of
+
+
 def default_market_snapshot(inputs: dict[str, object], finality: str) -> tuple[dict[str, object], str]:
     normalized = [index_identity(symbol) for symbol in ("000001", "399001", "399006")]
     index_url = safe_url(inputs.get("index_url") or "https://qt.gtimg.cn/q=")
@@ -895,6 +1280,53 @@ def main() -> None:
         else:
             payload, fact_as_of = market_breadth_payload(
                 safe_url(inputs.get("breadth_url") or "https://push2delay.eastmoney.com/api/qt/clist/get"), finality,
+            )
+        result(payload, fact_as_of=fact_as_of)
+        return
+    if mode in {
+        "cn_market_turnover_compare", "cn_market_turnover_compare_eastmoney",
+        "cn_market_turnover_compare_markethub",
+    }:
+        finality = str(request.get("finality") or "observed")
+        if finality not in {"close", "official_close"}:
+            fail(64, "turnover comparison requires close finality")
+        required_at = str(request.get("required_at") or "")
+        if mode == "cn_market_turnover_compare_markethub":
+            if inputs.get("markethub_turnover_url"):
+                payload, fact_as_of = markethub_turnover_payload(
+                    safe_url(inputs.get("markethub_turnover_url")), required_at, finality,
+                )
+            else:
+                payload, fact_as_of = snapshot_turnover_payload(
+                    safe_url(inputs.get("eastmoney_spot_url") or "https://push2delay.eastmoney.com/api/qt/clist/get"),
+                    safe_url(inputs.get("markethub_snapshot_url") or "http://yosef-server:8803/api/stocks/quotes/daily-snapshot"),
+                    required_at, finality,
+                )
+        else:
+            payload, fact_as_of = eastmoney_turnover_payload(
+                safe_url(inputs.get("eastmoney_kline_url") or "http://push2his.eastmoney.com/api/qt/stock/kline/get"),
+                required_at, finality,
+            )
+        result(payload, fact_as_of=fact_as_of)
+        return
+    if mode in {
+        "cn_market_sector_snapshot", "cn_market_sector_snapshot_eastmoney",
+        "cn_market_sector_snapshot_markethub",
+    }:
+        finality = str(request.get("finality") or "observed")
+        if finality not in {"close", "official_close"}:
+            fail(64, "sector snapshot requires close finality")
+        required_at = str(request.get("required_at") or "")
+        if mode == "cn_market_sector_snapshot_markethub":
+            payload, fact_as_of = markethub_sector_snapshot_payload(
+                safe_url(inputs.get("markethub_sector_url") or "http://yosef-server:8803/api/stocks/market-sectors"),
+                required_at, finality,
+            )
+        else:
+            payload, fact_as_of = eastmoney_sector_snapshot_payload(
+                safe_url(inputs.get("eastmoney_board_url") or "https://push2delay.eastmoney.com/api/qt/clist/get"),
+                safe_url(inputs.get("eastmoney_constituent_url") or "https://push2delay.eastmoney.com/api/qt/clist/get"),
+                required_at, finality,
             )
         result(payload, fact_as_of=fact_as_of)
         return

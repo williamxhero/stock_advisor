@@ -89,6 +89,10 @@ def _clean_values(values: Any, limit: int) -> list[str]:
     ))[:limit]
 
 
+def _sentence_piece(value: Any) -> str:
+    return str(value or "").strip().rstrip("。！？；，,.!?; ")
+
+
 def _action_label(action: str) -> str:
     return {
         "observe": "继续观察，不追涨也不仓促改变判断",
@@ -116,7 +120,7 @@ def _v4_judgment_expression(semantic: dict[str, Any]) -> str:
         paragraphs.append("，".join(evidence) + "。")
     conditions = [item for item in semantic.get("transition_conditions") or [] if isinstance(item, dict)]
     for condition in conditions:
-        text = _condition_text(condition)
+        text = _sentence_piece(_condition_text(condition))
         if not text:
             continue
         if condition.get("outcome") == "upgrade":
@@ -131,12 +135,12 @@ def _v4_judgment_expression(semantic: dict[str, Any]) -> str:
         parts = []
         for item in positions:
             symbol = str(item.get("symbol") or "这只持仓").strip()
-            reason = str(item.get("reason") or "相对结构需要继续确认").strip()
+            reason = _sentence_piece(item.get("reason") or "相对结构需要继续确认")
             parts.append(f"优先盯{symbol}，{reason}")
         paragraphs.append("。".join(parts) + "。")
     unknowns = _clean_values(semantic.get("unknowns"), 1)
     if unknowns:
-        paragraphs.append(f"真正还需要确认的是{unknowns[0]}。")
+        paragraphs.append(f"真正还需要确认的是{_sentence_piece(unknowns[0])}。")
     return "\n\n".join(paragraphs)
 
 
@@ -248,11 +252,11 @@ def express_stage_semantics(stage: str, semantic: dict[str, Any]) -> str:
         risks = [str(value).strip() for value in semantic.get("risks") or [] if str(value).strip()][:1]
         unknowns = [str(value).strip() for value in semantic.get("unknowns") or [] if str(value).strip()][:1]
         if observations:
-            paragraphs.append("。".join(observations) + "。")
+            paragraphs.append("。".join(_sentence_piece(value) for value in observations) + "。")
         if risks:
-            paragraphs.append("要留意" + risks[0] + "。")
+            paragraphs.append("要留意" + _sentence_piece(risks[0]) + "。")
         if unknowns:
-            paragraphs.append("还需要确认" + unknowns[0] + "。")
+            paragraphs.append("还需要确认" + _sentence_piece(unknowns[0]) + "。")
         return "\n\n".join(paragraphs)
     if stage in {"m1", "m2"}:
         direction = str(semantic.get("direction") or "").strip()

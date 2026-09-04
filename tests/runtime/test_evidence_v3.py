@@ -21,7 +21,7 @@ from ai_trading_companion.evidence_gate import EvidenceGate
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.local_research import BrokerResearchPlanner
 from ai_trading_companion.router import CognitiveRouter
-from ai_trading_companion.stage_expression import safe_stage_output
+from ai_trading_companion.stage_expression import express_stage_semantics, safe_stage_output
 from ai_trading_companion.runtime_strategy_policy import RuntimeStrategyControls
 from ai_trading_companion.store import CompanionStore
 
@@ -57,6 +57,18 @@ class EvidenceV3Tests(TestCase):
         self.assertIn("上涨1805家、下跌3275家", rendered)
         self.assertNotIn("信息还在核对", rendered)
         self.assertTrue(CognitiveRouter().verify("m0_compose", packet, output)["passed"])
+
+    def test_stage_expression_does_not_double_terminal_punctuation(self):
+        output = safe_stage_output("m0_compose", packet={
+            "verified_fact_digest": [
+                {"excerpt": json.dumps({"indices": [{"name": "上证指数", "price": 1.0, "change_percent": 0.0}]})},
+                {"excerpt": json.dumps({"breadth": {"up": 1, "down": 2, "flat": 3}})},
+            ],
+        })
+
+        rendered = express_stage_semantics("m0", output["semantic"])
+
+        self.assertNotIn("。。", rendered)
 
     def test_official_index_close_accepts_complete_structured_tool_facts(self):
         close = "2026-09-03T07:00:00Z"

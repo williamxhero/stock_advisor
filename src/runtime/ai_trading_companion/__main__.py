@@ -473,6 +473,12 @@ def run_gateway(execute: bool = False) -> None:
             process_h0_cognition(engine, store, portfolio, cycle_id, execute)
         run_pending_m1(engine, store, portfolio, execute)
         consume(engine, store, exchange, portfolio, execute)
+        try:
+            engine.recover_manual_analysis_completions()
+        except Exception:
+            # A committed formal result remains durable and will be retried on
+            # the next tick; conversation delivery must not stop the gateway.
+            pass
         stale_before = iso(datetime.now(timezone.utc) - timedelta(minutes=10))
         store.recover_stale_cognition_jobs(before=stale_before)
         retry_before = iso(datetime.now(timezone.utc) - timedelta(minutes=1))

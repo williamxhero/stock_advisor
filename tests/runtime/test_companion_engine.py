@@ -1055,6 +1055,92 @@ Protocol: OpportunityDiscovery-v1.3
             {item["cycle"]["cycle_id"] for item in today["projections"]},
         )
 
+    def test_completed_manual_analysis_closes_its_originating_conversation_batch(self):
+        conversation = self.engine.ensure_daily_conversation(datetime(2026, 8, 29, 2, 0, tzinfo=timezone.utc))
+        self.engine.command({
+            "command_id": "stage-evening-review", "cycle_id": conversation["cycle_id"],
+            "type": "stage_message", "message_id": "evening-review", "text": "做一次晚间盘后回顾",
+        })
+        committed = self.engine.command({
+            "command_id": "commit-evening-review", "cycle_id": conversation["cycle_id"],
+            "type": "commit_conversation_batch",
+        })
+        batch_id = committed["committed_batch_id"]
+        formal = self.engine.command({
+            "command_id": "formal-evening-review", "type": "request_formal_analysis",
+            "request_id": "formal-evening-review", "task_key": "daily.review.1520",
+            "requested_at": "2026-08-29T10:00:00+08:00",
+            "source": {"conversation_cycle_id": conversation["cycle_id"], "batch_id": batch_id},
+            "task_profile": {"profile_id": "post_close_review", "version": 1},
+        })
+        formal_cycle_id = formal["receipt"]["cycle_id"]
+        evidence = {"sources": [
+            {"excerpt_text": json.dumps({"indices": [
+                {"symbol": "000001", "name": "上证指数", "price": 3942.09,
+                 "change_percent": 0.0178, "trading_date": "2026-09-03"},
+            ]}, ensure_ascii=False)},
+            {"excerpt_text": json.dumps({"breadth": {
+                "up": 1805, "down": 3275, "flat": 130, "limit_up": 57, "limit_down": 23,
+            }}, ensure_ascii=False)},
+            {"excerpt_text": json.dumps({"quotes": [
+                {"symbol": "300421", "name": "力星股份", "price": 16.78,
+                 "change_percent": -0.119, "trading_date": "2026-09-03"},
+            ]}, ensure_ascii=False)},
+        ]}
+        self.store.append_artifact(
+            formal_cycle_id, "evidence", "model", json.dumps(evidence, ensure_ascii=False),
+            "2026-09-03T07:00:00Z", {},
+        )
+
+        self.engine._publish_manual_analysis_completion(
+            self.store.get_cycle(formal_cycle_id), "下一交易日维持中性观察。",
+        )
+
+        with self.store.connection() as connection:
+            batch = dict(connection.execute(
+                "SELECT state,response_artifact_id FROM companion_message_batch WHERE batch_id=?", (batch_id,),
+            ).fetchone())
+        reply = self.store.latest_artifact(conversation["cycle_id"], "ai_chat")
+        self.assertEqual("completed", batch["state"])
+        self.assertEqual(reply["artifact_id"], batch["response_artifact_id"])
+        self.assertIn("力星股份（300421）收于16.78", reply["body_markdown"])
+        self.assertIn("下一交易日维持中性观察", reply["body_markdown"])
+
+    def test_completed_manual_analysis_delivery_recovers_idempotently_after_restart(self):
+        conversation = self.engine.ensure_daily_conversation(datetime(2026, 8, 29, 2, 0, tzinfo=timezone.utc))
+        self.engine.command({
+            "command_id": "stage-recovery-review", "cycle_id": conversation["cycle_id"],
+            "type": "stage_message", "message_id": "recovery-review", "text": "做一次晚间盘后回顾",
+        })
+        committed = self.engine.command({
+            "command_id": "commit-recovery-review", "cycle_id": conversation["cycle_id"],
+            "type": "commit_conversation_batch",
+        })
+        batch_id = committed["committed_batch_id"]
+        formal = self.engine.command({
+            "command_id": "formal-recovery-review", "type": "request_formal_analysis",
+            "request_id": "formal-recovery-review", "task_key": "daily.review.1520",
+            "requested_at": "2026-08-29T10:00:00+08:00",
+            "source": {"conversation_cycle_id": conversation["cycle_id"], "batch_id": batch_id},
+            "task_profile": {"profile_id": "post_close_review", "version": 1},
+        })
+        formal_cycle_id = formal["receipt"]["cycle_id"]
+        self.store.append_artifact(
+            formal_cycle_id, "m1", "model", "恢复后的最终判断。", "2026-09-03T07:00:00Z", {},
+        )
+        self.store.transition(formal_cycle_id, "complete")
+
+        reopened = CompanionEngine(CompanionStore(self.store.database), memory=InMemoryMemoryAdapter())
+        first = reopened.recover_manual_analysis_completions()
+        second = reopened.recover_manual_analysis_completions()
+
+        self.assertEqual([formal_cycle_id], first)
+        self.assertEqual([], second)
+        with reopened.store.connection() as connection:
+            self.assertEqual("completed", connection.execute(
+                "SELECT state FROM companion_message_batch WHERE batch_id=?", (batch_id,),
+            ).fetchone()[0])
+
     def test_dismiss_manual_analyses_hides_every_matching_cycle_without_deleting_audit_history(self):
         cycle_ids = []
         for index in range(2):

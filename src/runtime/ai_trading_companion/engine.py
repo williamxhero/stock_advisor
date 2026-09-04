@@ -707,7 +707,127 @@ class CompanionEngine:
                 "message": recovery.message(),
                 "source_artifact_id": recovery_artifact["artifact_id"],
             })
+        try:
+            self._publish_manual_analysis_completion(cycle, presented.markdown)
+        except Exception:
+            # The formal result is already committed.  Gateway recovery retries
+            # the idempotent conversation delivery instead of corrupting M1.
+            pass
         return cycle
+
+    def recover_manual_analysis_completions(self) -> list[str]:
+        """Finish conversation delivery after a crash between M1 and chat publication."""
+        with self.store.connection() as connection:
+            cycles = [dict(row) for row in connection.execute(
+                """SELECT c.* FROM companion_cycle c
+                     WHERE c.trigger='manual_chat' AND c.state='complete'
+                       AND json_valid(COALESCE(c.request_source_json,'{}'))
+                       AND EXISTS (
+                         SELECT 1 FROM narrative_artifact a
+                          WHERE a.cycle_id=c.cycle_id AND a.kind='m1'
+                       )
+                       AND EXISTS (
+                         SELECT 1 FROM companion_message_batch b
+                          WHERE b.batch_id=json_extract(c.request_source_json,'$.batch_id')
+                            AND b.cycle_id=json_extract(c.request_source_json,'$.conversation_cycle_id')
+                            AND b.state='pending'
+                       )
+                     ORDER BY c.updated_at LIMIT 8"""
+            )]
+        completed: list[str] = []
+        for cycle in cycles:
+            m1 = self.store.latest_artifact(cycle["cycle_id"], "m1")
+            if not m1:
+                continue
+            self._publish_manual_analysis_completion(cycle, str(m1["body_markdown"]))
+            completed.append(str(cycle["cycle_id"]))
+        return completed
+
+    def _publish_manual_analysis_completion(self, cycle: dict[str, Any], judgment: str) -> None:
+        """Close the originating conversation with the completed formal result."""
+        if cycle.get("trigger") != "manual_chat":
+            return
+        try:
+            source = json.loads(cycle.get("request_source_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        conversation_cycle_id = str(source.get("conversation_cycle_id") or "")
+        batch_id = str(source.get("batch_id") or "")
+        if not conversation_cycle_id or not batch_id:
+            return
+        with self.store.connection() as connection:
+            pending = connection.execute(
+                "SELECT 1 FROM companion_message_batch WHERE batch_id=? AND cycle_id=? AND state='pending'",
+                (batch_id, conversation_cycle_id),
+            ).fetchone()
+        if not pending:
+            return
+        text = self._manual_analysis_completion_text(cycle, judgment)
+        self.chat_ready(
+            conversation_cycle_id, text, reply_to_batch_id=batch_id,
+            reply_to_batch_ids=[batch_id], kind="ai_chat",
+        )
+
+    def _manual_analysis_completion_text(self, cycle: dict[str, Any], judgment: str) -> str:
+        evidence_artifact = self.store.latest_artifact(cycle["cycle_id"], "evidence")
+        try:
+            evidence = json.loads(evidence_artifact["body_markdown"]) if evidence_artifact else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            evidence = {}
+        facts: list[dict[str, Any]] = []
+        for item in evidence.get("sources") or []:
+            try:
+                value = json.loads(str(item.get("excerpt_text") or item.get("excerpt") or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                facts.append(value)
+
+        def number(value: Any, *, signed: bool = False) -> str:
+            text = format(value, ".15g") if isinstance(value, float) else str(value)
+            return "+" + text if signed and isinstance(value, (int, float)) and value > 0 else text
+
+        indices = [row for fact in facts for row in fact.get("indices") or [] if isinstance(row, dict)]
+        indices.sort(key=lambda row: {"000001": 0, "399001": 1, "399006": 2}.get(str(row.get("symbol")), 9))
+        quotes = [row for fact in facts for row in fact.get("quotes") or [] if isinstance(row, dict)]
+        try:
+            evidence_contract = json.loads(cycle.get("evidence_contract_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            evidence_contract = {}
+        required = next((
+            item.get("required_entities") or [] for item in evidence_contract.get("requirements") or []
+            if item.get("key") == "portfolio_market_state"
+        ), [])
+        order = {str(symbol): index for index, symbol in enumerate(required)}
+        quotes.sort(key=lambda row: order.get(str(row.get("symbol")), 99))
+        breadth = next((fact.get("breadth") for fact in facts if isinstance(fact.get("breadth"), dict)), {})
+        trading_date = next((str(row.get("trading_date")) for row in [*indices, *quotes] if row.get("trading_date")), "")
+        date_label = trading_date.replace("-", "年", 1).replace("-", "月", 1) + "日" if trading_date else "本次"
+        sections = [f"{date_label}晚间盘后回顾已经完成。"]
+        if indices:
+            sections.append("三大指数：" + "；".join(
+                f"{row.get('name') or row.get('symbol')} {number(row.get('price'))}（{number(row.get('change_percent'), signed=True)}%）"
+                for row in indices if row.get("price") is not None and row.get("change_percent") is not None
+            ) + "。")
+        if all(breadth.get(key) is not None for key in ("up", "down", "flat")):
+            breadth_text = (
+                f"市场广度：上涨{number(breadth['up'])}家，下跌{number(breadth['down'])}家，"
+                f"平盘{number(breadth['flat'])}家"
+            )
+            if breadth.get("limit_up") is not None and breadth.get("limit_down") is not None:
+                breadth_text += (
+                    f"；涨停候选{number(breadth['limit_up'])}家，"
+                    f"跌停候选{number(breadth['limit_down'])}家"
+                )
+            sections.append(breadth_text + "。")
+        if quotes:
+            sections.append("当前持仓：" + "；".join(
+                f"{row.get('name') or row.get('symbol')}（{row.get('symbol')}）收于{number(row.get('price'))}，"
+                f"涨跌幅{number(row.get('change_percent'), signed=True)}%"
+                for row in quotes if row.get("price") is not None and row.get("change_percent") is not None
+            ) + "。")
+        sections.append("我的判断：\n" + judgment.strip())
+        return "\n\n".join(sections)
 
     def m1_failed(self, cycle_id: str, reason: str, *, retryable: bool, details: dict[str, Any] | None = None) -> dict[str, Any]:
         diagnostic_code = self._verifier_diagnostic_code(details) or self._diagnostic_code(str(reason))

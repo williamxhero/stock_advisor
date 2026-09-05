@@ -1111,6 +1111,52 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertIn("力星股份（300421）收于16.78", reply["body_markdown"])
         self.assertIn("下一交易日维持中性观察", reply["body_markdown"])
 
+    def test_completed_manual_analysis_also_closes_an_identical_dismissed_retry_batch(self):
+        conversation = self.engine.ensure_daily_conversation(datetime(2026, 8, 29, 2, 0, tzinfo=timezone.utc))
+
+        def submit(message_id: str, command_suffix: str) -> str:
+            self.engine.command({
+                "command_id": f"stage-{command_suffix}", "cycle_id": conversation["cycle_id"],
+                "type": "stage_message", "message_id": message_id, "text": "做一次周末复盘",
+            })
+            return str(self.engine.command({
+                "command_id": f"commit-{command_suffix}", "cycle_id": conversation["cycle_id"],
+                "type": "commit_conversation_batch",
+            })["committed_batch_id"])
+
+        old_batch = submit("old-weekend-review", "old-weekend-review")
+        old_formal = self.engine.command({
+            "command_id": "formal-old-weekend-review", "type": "request_formal_analysis",
+            "request_id": "formal-old-weekend-review", "task_key": "manual.non_trading_outlook",
+            "requested_at": "2026-08-29T10:00:00+08:00",
+            "source": {"conversation_cycle_id": conversation["cycle_id"], "batch_id": old_batch},
+            "task_profile": {"profile_id": "weekend_review", "version": 4},
+        })
+        self.engine.command({
+            "command_id": "dismiss-old-weekend-review", "type": "dismiss_cycles",
+            "cycle_ids": [old_formal["receipt"]["cycle_id"]], "reason": "verification_cleanup",
+        })
+
+        current_batch = submit("current-weekend-review", "current-weekend-review")
+        current_formal = self.engine.command({
+            "command_id": "formal-current-weekend-review", "type": "request_formal_analysis",
+            "request_id": "formal-current-weekend-review", "task_key": "manual.non_trading_outlook",
+            "requested_at": "2026-08-29T10:05:00+08:00",
+            "source": {"conversation_cycle_id": conversation["cycle_id"], "batch_id": current_batch},
+            "task_profile": {"profile_id": "weekend_review", "version": 4},
+        })
+        self.engine._publish_manual_analysis_completion(
+            self.store.get_cycle(current_formal["receipt"]["cycle_id"]), "下周初维持中性观察。",
+        )
+
+        with self.store.connection() as connection:
+            batches = [dict(row) for row in connection.execute(
+                "SELECT batch_id,state,response_artifact_id FROM companion_message_batch WHERE batch_id IN (?,?)",
+                (old_batch, current_batch),
+            )]
+        self.assertEqual({"completed"}, {item["state"] for item in batches})
+        self.assertEqual(1, len({item["response_artifact_id"] for item in batches}))
+
     def test_completed_manual_analysis_delivery_recovers_idempotently_after_restart(self):
         conversation = self.engine.ensure_daily_conversation(datetime(2026, 8, 29, 2, 0, tzinfo=timezone.utc))
         self.engine.command({

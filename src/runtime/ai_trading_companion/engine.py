@@ -762,10 +762,37 @@ class CompanionEngine:
             ).fetchone()
         if not pending:
             return
+        batch_ids = [batch_id]
+        source_messages = [
+            str(item.get("body_text") or "") for item in self.store.messages_for_batches([batch_id])
+        ]
+        task_profile_id = str(cycle.get("task_profile_id") or "")
+        if source_messages and task_profile_id:
+            with self.store.connection() as connection:
+                candidates = [str(row[0]) for row in connection.execute(
+                    """SELECT DISTINCT b.batch_id
+                         FROM companion_message_batch b
+                         JOIN companion_cycle prior
+                           ON prior.trigger='manual_chat'
+                          AND prior.task_profile_id=?
+                          AND json_extract(prior.request_source_json,'$.batch_id')=b.batch_id
+                         JOIN companion_cycle_visibility visibility
+                           ON visibility.cycle_id=prior.cycle_id
+                        WHERE b.cycle_id=? AND b.state='pending' AND b.batch_id<>?
+                        ORDER BY b.submitted_at,b.batch_id""",
+                    (task_profile_id, conversation_cycle_id, batch_id),
+                )]
+            for candidate in candidates:
+                candidate_messages = [
+                    str(item.get("body_text") or "")
+                    for item in self.store.messages_for_batches([candidate])
+                ]
+                if candidate_messages == source_messages:
+                    batch_ids.append(candidate)
         text = self._manual_analysis_completion_text(cycle, judgment)
         self.chat_ready(
             conversation_cycle_id, text, reply_to_batch_id=batch_id,
-            reply_to_batch_ids=[batch_id], kind="ai_chat",
+            reply_to_batch_ids=batch_ids, kind="ai_chat",
         )
 
     def _manual_analysis_completion_text(self, cycle: dict[str, Any], judgment: str) -> str:

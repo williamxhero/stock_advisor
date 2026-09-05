@@ -378,6 +378,49 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertIn("judgment_transition_lacks_joint_confirmation", weak_condition["problems"])
         self.assertIn("judgment_position_priority_is_cost_anchored", cost_anchored["problems"])
 
+    def test_weekend_m1_requires_an_explicit_completed_week_comparison(self):
+        sources = []
+        for symbol, end in (("sh000001", 98.0), ("sz399001", 97.0), ("sz399006", 96.0)):
+            sources.append({"excerpt": json.dumps({
+                "symbol": symbol, "start": "2026-08-31", "end": "2026-09-04",
+                "series": [
+                    {"date": "2026-08-31", "close": 100.0},
+                    {"date": "2026-09-04", "close": end},
+                ],
+            })})
+        packet = {
+            "stage": "m1_judgment", "task_key": "manual.non_trading_outlook",
+            "task_profile": {"evidence_family": "completed_trading_week"},
+            "evidence": {"sources": sources},
+        }
+        semantic = {
+            "summary": "9月4日三大指数收跌，市场偏弱。", "direction": "neutral", "qualified": True,
+            "horizon": "下周初", "current_action": "observe", "key_evidence": ["广度偏弱"],
+            "transition_conditions": [{
+                "outcome": "upgrade", "price": "三大指数收盘转强",
+                "breadth": "上涨家数超过下跌家数", "persistence": "至少持续一个交易日",
+            }, {
+                "outcome": "downgrade", "price": "三大指数继续下跌",
+                "breadth": "下跌家数继续扩大", "persistence": "连续两个交易日",
+            }],
+            "position_focus": [], "risks": [], "unknowns": [],
+        }
+
+        single_day = CognitiveRouter().verify(
+            "m1_judgment", packet, {"result_version": 4, "semantic": semantic},
+        )
+        completed_week = CognitiveRouter().verify("m1_judgment", packet, {
+            "result_version": 4,
+            "semantic": {
+                **semantic,
+                "summary": "本周8月31日至9月4日，上证周跌2%，深成指周跌3%，创业板指周跌4%。",
+            },
+        })
+
+        self.assertIn("weekend_review_lacks_completed_week_comparison", single_day["problems"])
+        self.assertTrue(completed_week["passed"], completed_week["problems"])
+        self.assertIn("整周", _RuntimePacketBuilder.prompt(packet))
+
     def test_safe_formal_fallback_is_natural_and_conservative(self):
         m0 = normalize_stage_output("m0_compose", safe_stage_output("m0_compose"))
         m1 = normalize_stage_output("m1_judgment", safe_stage_output("m1_judgment", horizon="午后"))

@@ -478,6 +478,13 @@ class RuntimePacketBuilder:
             "reflection": "根据冻结判断和结果复盘过程、运气、遗漏与校准。错误观点同样保留并用于反证。只有证据确实指向可复用改进时才填写 workflow_proposal，否则为 null；不得修改代码、权限、自动化或数据。",
             "workflow_feedback": "用户在冻结 H0 中提出了对搜索、信息覆盖或工作方式的反馈。像搭档一样直接回应；如果确实存在可执行改进，填写 workflow_proposal，否则为 null。提案只能修改允许的研究策略字段，不能修改代码、权限、自动化、安全规则或自行扩大调用。",
         }[packet["stage"]]
+        task_profile = packet.get("task_profile") if isinstance(packet.get("task_profile"), dict) else {}
+        if packet["stage"] == "m1_judgment" and task_profile.get("evidence_family") == "completed_trading_week":
+            instruction += (
+                "这是整周复盘，不是最后一个交易日复盘。summary 或 key_evidence 必须明确写出完成交易周的起止日期，"
+                "并根据 weekly_market_history 对上证、深成指、创业板逐一给出从周初收盘到周末收盘的周涨跌幅；"
+                "随后再解释周末单日、成交、广度、主题和持仓对下周判断的影响。不得只列9月4日单日涨跌。"
+            )
         if packet["stage"] not in PUBLIC_STAGES:
             instruction += display_contract
         return instruction + "\n\nStage Packet:\n" + json.dumps(packet, ensure_ascii=False, indent=2)

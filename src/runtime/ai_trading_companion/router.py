@@ -263,6 +263,7 @@ class CognitiveRouter:
                 problems.append("judgment_position_priority_is_cost_anchored")
             if stage == "m1_judgment":
                 problems.extend(_close_review_coverage_problems(packet, semantic))
+                problems.extend(_weekend_review_coverage_problems(packet, semantic))
         return {"passed": not problems, "problems": problems, "profile": profile.as_json()}
 
 
@@ -325,6 +326,60 @@ def _close_review_coverage_problems(packet: dict[str, Any], semantic: dict[str, 
             if not ((code and code in compact) or (name and name in compact)):
                 problems.append("close_review_omits_active_position:" + (code or name))
     return problems
+
+
+def _weekend_review_coverage_problems(packet: dict[str, Any], semantic: dict[str, Any]) -> list[str]:
+    task_profile = packet.get("task_profile") if isinstance(packet.get("task_profile"), dict) else {}
+    if task_profile.get("evidence_family") != "completed_trading_week":
+        return []
+
+    fields = [
+        semantic.get("summary"), *(semantic.get("key_evidence") or []),
+        *(semantic.get("risks") or []), *(semantic.get("unknowns") or []),
+    ]
+    body = " ".join(str(value or "") for value in fields)
+    compact = "".join(body.split())
+    expected = {
+        "sh000001": "上证", "sz399001": "深成指", "sz399006": "创业板",
+    }
+    weekly: dict[str, tuple[str, str, float]] = {}
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    for source in evidence.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        try:
+            payload = json.loads(str(source.get("excerpt") or ""))
+            symbol = str(payload.get("symbol") or "")
+            series = payload.get("series")
+            first, last = series[0], series[-1]
+            first_close, last_close = float(first["close"]), float(last["close"])
+            start, end = str(first["date"]), str(last["date"])
+        except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if symbol in expected and len(series) >= 2 and first_close > 0:
+            weekly[symbol] = (start, end, (last_close - first_close) / first_close * 100)
+    if set(weekly) != set(expected):
+        return ["weekend_review_lacks_completed_week_comparison"]
+
+    start, end, _ = weekly["sh000001"]
+    try:
+        start_date, end_date = datetime.fromisoformat(start), datetime.fromisoformat(end)
+    except ValueError:
+        return ["weekend_review_lacks_completed_week_comparison"]
+    if not (
+        any(term in compact for term in ("本周", "整周", "周内", "全周"))
+        and f"{start_date.month}月{start_date.day}日" in compact
+        and f"{end_date.month}月{end_date.day}日" in compact
+    ):
+        return ["weekend_review_lacks_completed_week_comparison"]
+
+    for symbol, name in expected.items():
+        change = weekly[symbol][2]
+        direction = "跌" if change < -0.005 else "涨" if change > 0.005 else "平"
+        number = re.escape(_number_text(round(abs(change), 2)))
+        if not re.search(rf"{name}[^。；]{{0,24}}(?:周)?{direction}[^。；]{{0,8}}{number}(?:%|％)", compact):
+            return ["weekend_review_lacks_completed_week_comparison"]
+    return []
 
 
 def _frozen_portfolio_quotes(value: Any) -> dict[str, dict[str, Any]]:

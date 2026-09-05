@@ -352,6 +352,11 @@ class EvidenceContractFactory:
         completed_week_window = {
             "start": week_start_text, "end": close_text, "mode": "after_start_to_end",
         }
+        completed_week_theme_window = {
+            "start": week_start_text,
+            "end": self._iso(close + timedelta(minutes=30)),
+            "mode": "after_start_to_end",
+        }
         events_window = {
             "start": week_start_text, "end": self._iso(as_of), "mode": "after_start_to_end",
         }
@@ -383,7 +388,7 @@ class EvidenceContractFactory:
             },
             {
                 "key": "themes_and_capacity_cores", "blocking": True,
-                "allowed_coverage": ["covered"], "window": completed_week_window,
+                "allowed_coverage": ["covered"], "window": completed_week_theme_window,
                 "minimum_named_entities": 2,
             },
             {

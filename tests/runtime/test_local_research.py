@@ -650,6 +650,41 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual({}, first_request.context)
         self.assertEqual(CONTRACT["as_of"], second_request.required_at)
 
+    def test_tool_catalog_adapter_normalizes_weekly_tencent_history_before_evidence(self) -> None:
+        url = (
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
+            "param=sh000001,day,2026-08-31,2026-09-04,10,qfq"
+        )
+        body = json.dumps({"code": 0, "data": {"sh000001": {
+            "day": [
+                ["2026-08-31", "3926.53", "3986.30", "3986.30", "3926.50", "576656606"],
+                ["2026-09-04", "3955.55", "3930.12", "3980.20", "3915.22", "537286161"],
+            ],
+            "qt": {"sh000001": ["current", "20260905191449"]},
+        }}})
+        contract = {"version": 4, "as_of": "2026-09-05T10:00:00Z", "requirements": [{
+            "key": "weekly_market_history", "blocking": True, "allowed_coverage": ["covered"],
+            "window": {"mode": "after_start_to_end", "start": "2026-08-31T07:00:00Z", "end": "2026-09-04T07:00:00Z"},
+        }]}
+        runner = mock.Mock()
+        runner.resolve_with_fallback.return_value = EvidenceResolution(
+            True, "generic_web_read", "1.0.0", "2026-09-05T10:00:00Z", "2026-09-05T10:00:01Z",
+            {"url": url, "text": body}, "artifact:sha256:" + "c" * 64, None,
+            ("tool_result_schema_valid",),
+        )
+        backend = ToolCatalogResearchBackend(
+            runner, as_of=contract["as_of"], deadline=lambda: 30.0, contract=contract,
+        )
+
+        result = backend("web_read", {
+            **row("web_read", url=url)["arguments"], "_requirement_key": "weekly_market_history",
+        })
+
+        payload = json.loads(result["results"][0]["excerpt_text"])
+        self.assertEqual(["2026-08-31", "2026-09-04"], [item["date"] for item in payload["series"]])
+        self.assertEqual("2026-09-04T07:00:00Z", result["results"][0]["fact_as_of"])
+        self.assertEqual("2026-09-04T07:00:00Z", runner.resolve_with_fallback.call_args.args[0].required_at)
+
     def test_market_tool_adapter_freezes_a_live_intraday_snapshot_as_qualified_evidence(self) -> None:
         contract = {
             "version": 3, "as_of": "2026-09-01T06:30:00Z", "requirements": [{

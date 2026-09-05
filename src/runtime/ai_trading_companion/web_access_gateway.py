@@ -58,7 +58,7 @@ class WebAccessGatewayClient:
                 "published_at": None,
                 "primary": False,
             }]}
-        frozen_market = _frozen_public_market_row(url, body, not_after)
+        frozen_market = frozen_public_market_row(url, body, not_after)
         if frozen_market is not None:
             return {"trace_id": _text(value, "trace_id"), "results": [{
                 "url": _text(value, "url") or url,
@@ -176,12 +176,12 @@ def _fact_as_of(text: str, *, not_after: str | None = None) -> str | None:
     return max(candidates).isoformat().replace("+00:00", "Z")
 
 
-def _frozen_public_market_row(url: str, body: str, not_after: str | None) -> dict[str, str] | None:
-    """Reduce Tencent's mixed historical/current payload to one frozen daily row.
+def frozen_public_market_row(url: str, body: str, not_after: str | None) -> dict[str, str] | None:
+    """Reduce Tencent's mixed historical/current payload to frozen daily rows.
 
     The endpoint includes a current quote beside the requested historical row.
     Persisting that whole response would leak information after a historical
-    replay cutoff, so only the requested completed daily bar crosses the
+    replay cutoff, so only the requested completed daily bars cross the
     acquisition boundary.
     """
     parsed = urlsplit(url)

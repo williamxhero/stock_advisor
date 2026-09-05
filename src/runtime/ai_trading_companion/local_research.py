@@ -19,6 +19,7 @@ from .evidence_gate import EvidenceGate
 from .broker_client import BrokerError, BrokerRequest, ProviderBrokerClient, canonical_packet_hash
 from .market_breadth_cache import MarketBreadthSnapshotCache
 from .tooling import FactRequest, ToolRunner, validate_capability_data
+from .web_access_gateway import frozen_public_market_row
 
 
 class ResearchPlanError(ValueError):
@@ -217,7 +218,7 @@ class ToolCatalogResearchBackend:
         ))
         if not resolution.succeeded or resolution.data is None:
             raise ToolResolutionError(capability, resolution)
-        return self._project(operation, resolution)
+        return self._project(operation, resolution, not_after=required_at)
 
     @staticmethod
     def _request_for(operation: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -235,7 +236,7 @@ class ToolCatalogResearchBackend:
         raise ValueError(f"unsupported ToolCatalog research operation: {operation}")
 
     @staticmethod
-    def _project(operation: str, resolution: Any) -> dict[str, Any]:
+    def _project(operation: str, resolution: Any, *, not_after: str | None = None) -> dict[str, Any]:
         data = resolution.data
         artifact = resolution.raw_artifact_ref
         if operation == "web_search":
@@ -247,6 +248,16 @@ class ToolCatalogResearchBackend:
             ]
             return {"url": data.get("url"), "results": results, "raw_artifact_ref": artifact}
         url, text = str(data.get("url") or ""), str(data.get("text") or "")
+        frozen_market = frozen_public_market_row(url, text, not_after) if operation == "web_read" else None
+        if frozen_market is not None:
+            return {
+                "url": url, "text": frozen_market["excerpt_text"], "raw_artifact_ref": artifact,
+                "results": [{
+                    "url": url, "title": frozen_market["title"],
+                    "excerpt_text": frozen_market["excerpt_text"],
+                    "fact_as_of": frozen_market["fact_as_of"], "raw_artifact_ref": artifact,
+                }],
+            }
         return {
             "url": url, "text": text, "raw_artifact_ref": artifact,
             "results": [{"url": url, "title": url, "excerpt_text": text, "fact_as_of": resolution.fact_as_of,

@@ -573,6 +573,8 @@ def _validate_capability_result(request: FactRequest, output: dict[str, Any]) ->
         return _validate_market_sector_snapshot(request, output["data"], str(output["fact_as_of"]))
     if request.capability == "cn_market_fund_flow_snapshot":
         return _validate_market_fund_flow_snapshot(request, output["data"], str(output["fact_as_of"]))
+    if request.capability == "cn_market_event_snapshot":
+        return _validate_market_event_snapshot(request, output["data"], str(output["fact_as_of"]))
     if request.capability == "cn_equity_announcement_snapshot":
         return _validate_equity_announcement_snapshot(request, output["data"], str(output["fact_as_of"]))
     if request.capability == "cn_market_index_batch":
@@ -846,6 +848,54 @@ def _validate_equity_announcement_snapshot(
             return "tool_announcement_result_invalid"
         if not start <= announcement_date <= end or not str(row.get("title") or "").strip():
             return "tool_announcement_result_invalid"
+    return None
+
+
+def _validate_market_event_snapshot(
+    request: FactRequest, data: dict[str, Any], fact_as_of: str,
+) -> str | None:
+    expected_sources = [
+        "eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news",
+    ]
+    start_text = str(request.inputs.get("start_at") or "")
+    end_text = str(request.inputs.get("end_at") or "")
+    try:
+        start = _parse_timestamp(start_text)
+        end = _parse_timestamp(end_text)
+        observed = _parse_timestamp(fact_as_of)
+    except ValueError:
+        return "tool_market_event_window_invalid"
+    if (
+        start >= end or data.get("start_at") != start_text or data.get("end_at") != end_text
+        or observed != end or observed > _parse_timestamp(request.required_at)
+    ):
+        return "tool_market_event_window_invalid"
+    if data.get("checked_sources") != expected_sources:
+        return "tool_market_event_sources_invalid"
+    checks = data.get("source_checks")
+    if (
+        not isinstance(checks, list)
+        or [row.get("source") for row in checks if isinstance(row, dict)] != expected_sources
+    ):
+        return "tool_market_event_sources_invalid"
+    if not str(data.get("source") or "").strip() or not _valid_public_source_urls(data.get("source_urls")):
+        return "tool_market_source_urls_invalid"
+    articles = data.get("articles")
+    if not isinstance(articles, list) or data.get("matched_count") != sum(
+        int(row.get("matched_count") or 0) for row in checks if isinstance(row, dict)
+    ):
+        return "tool_market_event_result_invalid"
+    for row in articles:
+        if not isinstance(row, dict) or row.get("source") not in expected_sources:
+            return "tool_market_event_result_invalid"
+        try:
+            published = _parse_timestamp(str(row.get("published_at") or ""))
+        except ValueError:
+            return "tool_market_event_result_invalid"
+        if not start < published <= end or not str(row.get("title") or "").strip():
+            return "tool_market_event_result_invalid"
+        if not _valid_public_source_urls([row.get("source_url")]):
+            return "tool_market_source_urls_invalid"
     return None
 
 

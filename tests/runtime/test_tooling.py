@@ -42,7 +42,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.11", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.12", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
             routing = json.loads(turnover_routing.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -51,7 +51,7 @@ class ToolRunnerTests(unittest.TestCase):
             )
             official_manifest = json.loads((
                 root / "cn_market_turnover_compare" / "adapters" / "official_exchanges"
-                / "versions" / "1.1.11" / "manifest.json"
+                / "versions" / "1.1.12" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual({
                 "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
@@ -1189,6 +1189,90 @@ class ToolRunnerTests(unittest.TestCase):
                 self.assertTrue(result.succeeded, result.error_code)
                 self.assertEqual(-300.0, result.data["combined"]["main_net_inflow"])
                 self.assertEqual({"SSE", "SZSE"}, {row["exchange"] for row in result.data["markets"]})
+            finally:
+                server.shutdown(); server.server_close()
+
+    def test_builtin_fund_flow_retries_a_transient_disconnect(self) -> None:
+        calls: dict[str, int] = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                secid = parse_qs(urlsplit(self.path).query).get("secid", [""])[0]
+                calls[secid] = calls.get(secid, 0) + 1
+                if calls[secid] <= 2:
+                    self.close_connection = True
+                    return
+                body = json.dumps({
+                    "data": {"klines": ["2026-09-04,-100,30,40,50,60"]},
+                }).encode("utf-8")
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"; ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                endpoint = f"http://127.0.0.1:{server.server_port}/flow"
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_market_fund_flow_snapshot", "2026-09-04T07:00:00Z", 5.0,
+                    {"eastmoney_history_url": endpoint}, finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual({"1.000001": 3, "0.399001": 3}, calls)
+            finally:
+                server.shutdown(); server.server_close()
+
+    def test_builtin_market_event_snapshot_checks_each_source_and_freezes_the_window(self) -> None:
+        requested_sources: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                query = parse_qs(urlsplit(self.path).query)
+                source = query.get("source", [""])[0]
+                requested_sources.append(source)
+                payload = {
+                    "source": source, "start_date": "2026-08-31", "end_date": "2026-09-05",
+                    "groups": [{"source_key": source, "count": 2, "articles": [
+                        {"article_id": source + ":1", "published_at": "2026-09-04 15:30",
+                         "title": "A股收盘政策观察", "content": "市场风险与政策变化。",
+                         "source_url": f"https://example.test/{source}/1"},
+                        {"article_id": source + ":future", "published_at": "2026-09-05 12:30",
+                         "title": "冻结时点之后", "content": "不得进入证据。",
+                         "source_url": f"https://example.test/{source}/future"},
+                    ]}],
+                }
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"; ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_market_event_snapshot", "2026-09-05T02:00:00Z", 8.0, {
+                        "base_url": f"http://127.0.0.1:{server.server_port}",
+                        "start_at": "2026-08-31T07:00:00Z", "end_at": "2026-09-05T02:00:00Z",
+                    }, finality="observed",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual(
+                    ["eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news"],
+                    requested_sources,
+                )
+                self.assertEqual(3, result.data["matched_count"])
+                self.assertTrue(all("future" not in row["article_id"] for row in result.data["articles"]))
+                self.assertEqual("2026-09-05T02:00:00Z", result.fact_as_of)
             finally:
                 server.shutdown(); server.server_close()
 

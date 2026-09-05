@@ -39,7 +39,7 @@ RESEARCH_PLAN_SCHEMA: dict[str, Any] = {
                 "operation": {"type": "string", "enum": [
                     "market_snapshot", "market_breadth", "turnover_compare", "sector_snapshot",
                     "fund_flow_snapshot", "sentiment_snapshot", "holding_snapshot", "current_bar",
-                    "announcement_snapshot",
+                    "market_event_snapshot", "announcement_snapshot",
                     "web_search", "web_read", "web_browser",
                 ]},
                 "arguments": {
@@ -94,7 +94,7 @@ _OPERATIONS = {
     "market": {
         "market_snapshot", "market_breadth", "turnover_compare", "sector_snapshot",
         "fund_flow_snapshot", "sentiment_snapshot", "holding_snapshot", "current_bar",
-        "announcement_snapshot",
+        "market_event_snapshot", "announcement_snapshot",
     },
     "gateway": {"web_search", "web_read", "web_browser"},
 }
@@ -291,6 +291,7 @@ class ToolCatalogMarketBackend:
             "turnover_compare": "cn_market_turnover_compare",
             "sector_snapshot": "cn_market_sector_snapshot",
             "fund_flow_snapshot": "cn_market_fund_flow_snapshot",
+            "market_event_snapshot": "cn_market_event_snapshot",
             "sentiment_snapshot": "cn_market_breadth",
             "holding_snapshot": "cn_equity_quote_batch",
             "current_bar": "cn_equity_current_bar",
@@ -318,6 +319,11 @@ class ToolCatalogMarketBackend:
                     "start_date": str(window.get("start") or "")[:10],
                     "end_date": str(window.get("end") or "")[:10],
                 })
+        elif operation == "market_event_snapshot":
+            inputs = {
+                "start_at": str(window.get("start") or ""),
+                "end_at": str(window.get("end") or ""),
+            }
         elif operation == "market_snapshot":
             inputs = {"symbols": ["000001", "399001", "399006"]}
         elif operation == "sector_snapshot":
@@ -1171,8 +1177,7 @@ def _merge_mandatory_operations(
     material_events = requirements.get("material_events_and_counterevidence") or {}
     if "checked_no_change" in set(material_events.get("allowed_coverage") or []):
         required.append(_operation(
-            "material_events_and_counterevidence", "gateway", "web_search",
-            query="A股 公告 政策 风险",
+            "material_events_and_counterevidence", "market", "market_event_snapshot",
         ))
     event_requirement = requirements.get("portfolio_events_and_counterevidence") or {}
     if [str(value) for value in event_requirement.get("required_entities") or [] if str(value)]:

@@ -374,6 +374,7 @@ class EvidenceContractFactory:
                 "allowed_coverage": ["covered"], "finality": "official_close",
                 "window": completed_week_window,
                 "source_urls": weekly_urls,
+                "required_entities": ["sh000001", "sz399001", "sz399006"],
                 "minimum_numeric_facts": 9,
             },
             {

@@ -148,7 +148,13 @@ class EvidenceGate:
                     missing.append(key)
                     continue
             minimum_numeric = int(requirement.get("minimum_numeric_facts") or 0)
-            if key == "portfolio_market_state":
+            if key == "weekly_market_history":
+                weekly_facts = self._weekly_market_history_facts(
+                    [source_by_url[url] for url in urls if url in source_by_url],
+                    [str(value) for value in requirement.get("required_entities") or [] if str(value)],
+                )
+                numeric_count = sum(len(values) for values in weekly_facts.values())
+            elif key == "portfolio_market_state":
                 # Quote tools deliberately return typed JSON rather than prose
                 # with currency suffixes. Count the four required numeric quote
                 # facts across all held symbols; do not require one source to
@@ -164,6 +170,15 @@ class EvidenceGate:
                 problems.append(f"blocking_requirement_lacks_numeric_facts:{key}")
                 missing.append(key)
                 continue
+            if key == "weekly_market_history":
+                absent = [
+                    str(value) for value in requirement.get("required_entities") or []
+                    if str(value) and str(value) not in weekly_facts
+                ]
+                if absent:
+                    problems.append(f"blocking_requirement_missing_entities:{key}")
+                    missing.append(key)
+                    continue
             minimum_entities = int(requirement.get("minimum_named_entities") or 0)
             entities = {
                 name for name in re.findall(r"([\u4e00-\u9fffA-Za-z0-9]{2,12})(?:板块|概念|题材)", support)
@@ -350,6 +365,15 @@ class _EvidenceGateV3:
                 if len(breadth_facts) < int(requirement.get("minimum_numeric_facts") or 0):
                     problems.append(f"blocking_requirement_lacks_numeric_facts:{key}"); missing.append(key)
                 continue
+            if key == "weekly_market_history":
+                weekly_facts = self._weekly_market_history_facts(bound, required_entities)
+                numeric_count = sum(len(values) for values in weekly_facts.values())
+                if numeric_count < int(requirement.get("minimum_numeric_facts") or 0):
+                    problems.append(f"blocking_requirement_lacks_numeric_facts:{key}"); missing.append(key); continue
+                absent_entities = [entity for entity in required_entities if entity not in weekly_facts]
+                if absent_entities:
+                    problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
+                continue
             support = " ".join(EvidenceGate._normalize_text(item.get("excerpt")) for item in bound)
             term_groups = requirement.get("evidence_terms") or []
             if any(not any(str(term) in support for term in group) for group in term_groups):
@@ -447,6 +471,52 @@ class _EvidenceGateV3:
                 }
                 if symbol in required and valid == fields and quote.get("quote_at") and quote.get("trading_date") and quote.get("status"):
                     complete[symbol] = valid
+        return complete
+
+    @staticmethod
+    def _weekly_market_history_facts(
+        sources: list[dict[str, Any]], required_entities: list[str],
+    ) -> dict[str, set[tuple[str, str]]]:
+        """Return typed OHLCV facts from bounded multi-day index series."""
+        required = set(required_entities)
+        fields = {"open", "close", "high", "low", "volume"}
+        complete: dict[str, set[tuple[str, str]]] = {}
+        for source in sources:
+            try:
+                payload = json.loads(str(source.get("excerpt") or ""))
+                fact_date = datetime.fromisoformat(
+                    str(source.get("fact_as_of") or "").replace("Z", "+00:00")
+                ).date().isoformat()
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            symbol = str(payload.get("symbol") or "")
+            series = payload.get("series")
+            if (required and symbol not in required) or not isinstance(series, list) or len(series) < 2:
+                continue
+            dates: list[str] = []
+            facts: set[tuple[str, str]] = set()
+            valid = True
+            for bar in series:
+                if not isinstance(bar, dict):
+                    valid = False
+                    break
+                try:
+                    date = datetime.fromisoformat(str(bar.get("date") or "")).date().isoformat()
+                except ValueError:
+                    valid = False
+                    break
+                if any(not isinstance(bar.get(field), (int, float)) or isinstance(bar.get(field), bool) for field in fields):
+                    valid = False
+                    break
+                dates.append(date)
+                facts.update((date, field) for field in fields)
+            if (
+                not valid or dates != sorted(set(dates))
+                or payload.get("start") != dates[0] or payload.get("end") != dates[-1]
+                or fact_date != dates[-1]
+            ):
+                continue
+            complete.setdefault(symbol, set()).update(facts)
         return complete
 
     @staticmethod

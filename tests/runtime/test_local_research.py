@@ -665,6 +665,7 @@ class LocalResearchTests(unittest.TestCase):
         contract = {"version": 4, "as_of": "2026-09-05T10:00:00Z", "requirements": [{
             "key": "weekly_market_history", "blocking": True, "allowed_coverage": ["covered"],
             "window": {"mode": "after_start_to_end", "start": "2026-08-31T07:00:00Z", "end": "2026-09-04T07:00:00Z"},
+            "required_entities": ["sh000001"], "minimum_numeric_facts": 9,
         }]}
         runner = mock.Mock()
         runner.resolve_with_fallback.return_value = EvidenceResolution(
@@ -686,6 +687,15 @@ class LocalResearchTests(unittest.TestCase):
         self.assertIsInstance(payload["series"][-1]["volume"], float)
         self.assertEqual("2026-09-04T07:00:00Z", result["results"][0]["fact_as_of"])
         self.assertEqual("2026-09-04T07:00:00Z", runner.resolve_with_fallback.call_args.args[0].required_at)
+
+        plan = {"version": 1, "operations": [{
+            "requirement_key": "weekly_market_history", "backend": "gateway", "operation": "web_read",
+            "arguments": row("web_read", url=url)["arguments"], "fallback_backends": [],
+        }]}
+        qualified = LocalResearchChain(
+            lambda *_: plan, ReadOnlyResearchExecutor({"gateway": backend}), max_repairs=0,
+        ).run({"as_of": contract["as_of"]}, contract, attempt_id="weekly-typed")
+        self.assertTrue(qualified.qualified, qualified.verifier["problems"])
 
     def test_market_tool_adapter_freezes_a_live_intraday_snapshot_as_qualified_evidence(self) -> None:
         contract = {

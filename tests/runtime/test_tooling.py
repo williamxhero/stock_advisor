@@ -266,7 +266,9 @@ class ToolRunnerTests(unittest.TestCase):
                 contract_version=1,
                 capability="cn_equity_identity",
                 required_at="2026-09-01T01:30:00Z",
-                deadline_seconds=0.05,
+                # Leave enough time for a fresh interpreter to start and emit
+                # both streams while remaining far below the 5-second sleep.
+                deadline_seconds=0.5,
                 inputs={},
             ))
 

@@ -1697,9 +1697,10 @@ def _foreground_busy(store: CompanionStore) -> bool:
         return bool(connection.execute(
             """SELECT 1 FROM schedule_worker_claim
                UNION ALL
-               SELECT 1 FROM companion_cycle
-                WHERE state='queued'
-                  AND julianday(COALESCE(work_start_at,scheduled_for)) <= julianday(?)
+               SELECT 1 FROM companion_cycle cycle
+                LEFT JOIN companion_cycle_visibility visibility ON visibility.cycle_id=cycle.cycle_id
+                WHERE cycle.state='queued' AND visibility.cycle_id IS NULL
+                  AND julianday(COALESCE(cycle.work_start_at,cycle.scheduled_for)) <= julianday(?)
                UNION ALL
                SELECT 1 FROM companion_cognition_job
                 WHERE state IN ('queued','running')

@@ -101,6 +101,16 @@ def test_live_worker_claim_still_defers_background_research(tmp_path) -> None:
     assert result == {"action": "deferred", "reason": "foreground_cycle_has_priority"}
 
 
+def test_dismissed_queued_cycle_does_not_defer_background_research(tmp_path) -> None:
+    store = CompanionStore(tmp_path / "runtime.sqlite3")
+    hidden = store.create_cycle(
+        "daily.review.1520", "2026-09-03T15:20:00+08:00", "2026-09-03T07:20:00Z",
+    )
+    store.dismiss_cycles([hidden["cycle_id"]], "verification_cleanup")
+
+    assert not _foreground_busy(store)
+
+
 def test_running_conversation_cognition_defers_optional_background_work(tmp_path) -> None:
     store = CompanionStore(tmp_path / "runtime.sqlite3")
     conversation = store.ensure_daily_conversation("2026-09-03")

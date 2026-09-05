@@ -191,16 +191,23 @@ def _frozen_public_market_row(url: str, body: str, not_after: str | None) -> dic
     if len(param) < 5 or param[1] != "day":
         return None
     symbol = param[0]
-    day_start = body.find('"day":')
-    qt_match = re.search(r',\s*"qt"', body[day_start:]) if day_start >= 0 else None
-    if day_start < 0 or qt_match is None:
-        return None
-    day_end = day_start + qt_match.start()
-    row_pattern = re.compile(
-        r'"(20\d{2}-\d{2}-\d{2})"\s*,\s*"([^"\\]+)"\s*,\s*"([^"\\]+)"\s*,\s*'
-        r'"([^"\\]+)"\s*,\s*"([^"\\]+)"\s*,\s*"([^"\\]+)"'
-    )
-    series = [list(match.groups()) for match in row_pattern.finditer(body[day_start:day_end])]
+    normalized_body = body.replace("\\[", "[").replace("\\]", "]")
+    try:
+        payload = json.loads(normalized_body)
+        symbol_payload = (payload.get("data") or {}).get(symbol) or {}
+        parsed_series = symbol_payload.get("day") or symbol_payload.get("qfqday") or []
+        series = [row for row in parsed_series if isinstance(row, list)]
+    except (AttributeError, json.JSONDecodeError):
+        day_start = body.find('"day":')
+        if day_start < 0:
+            return None
+        qt_match = re.search(r',\s*"qt"', body[day_start:])
+        day_end = day_start + qt_match.start() if qt_match is not None else len(body)
+        row_pattern = re.compile(
+            r'"(20\d{2}-\d{2}-\d{2})"\s*,\s*"([^"\\]+)"\s*,\s*"([^"\\]+)"\s*,\s*'
+            r'"([^"\\]+)"\s*,\s*"([^"\\]+)"\s*,\s*"([^"\\]+)"'
+        )
+        series = [list(match.groups()) for match in row_pattern.finditer(body[day_start:day_end])]
     cutoff = _aware_utc(not_after)
     candidates: list[tuple[datetime, list[Any]]] = []
     for row in series:

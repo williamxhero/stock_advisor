@@ -349,6 +349,9 @@ class EvidenceContractFactory:
         close_text = self._iso(close)
         week_start_text = self._iso(week_start)
         market_window = {"start": close_text, "end": close_text, "mode": "exact"}
+        completed_week_window = {
+            "start": week_start_text, "end": close_text, "mode": "after_start_to_end",
+        }
         events_window = {
             "start": week_start_text, "end": self._iso(as_of), "mode": "after_start_to_end",
         }
@@ -364,9 +367,7 @@ class EvidenceContractFactory:
             {
                 "key": "weekly_market_history", "blocking": True,
                 "allowed_coverage": ["covered"], "finality": "official_close",
-                "window": {
-                    "start": week_start_text, "end": close_text, "mode": "after_start_to_end",
-                },
+                "window": completed_week_window,
                 "source_urls": weekly_urls,
                 "minimum_numeric_facts": 9,
             },
@@ -382,7 +383,7 @@ class EvidenceContractFactory:
             },
             {
                 "key": "themes_and_capacity_cores", "blocking": True,
-                "allowed_coverage": ["covered"], "window": events_window,
+                "allowed_coverage": ["covered"], "window": completed_week_window,
                 "minimum_named_entities": 2,
             },
             {

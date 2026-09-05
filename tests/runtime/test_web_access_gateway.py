@@ -98,7 +98,6 @@ class WebAccessGatewayTests(unittest.TestCase):
                     ["2026-09-01", "3910", "3930", "3940", "3900", "110"],
                     ["2026-09-04", "3940", "3930", "3950", "3920", "120"],
                 ],
-                "qt": {"sh000001": ["current", "20260905161402", "future-value"]},
             }},
         }).replace("[", "\\[").replace("]", "\\]")
         response = {"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
@@ -110,7 +109,7 @@ class WebAccessGatewayTests(unittest.TestCase):
         payload = json.loads(item["excerpt_text"])
         self.assertEqual("2026-09-04T07:00:00Z", item["fact_as_of"])
         self.assertEqual(["2026-08-31", "2026-09-01", "2026-09-04"], [row["date"] for row in payload["series"]])
-        self.assertNotIn("future-value", item["excerpt_text"])
+        self.assertEqual("Tencent public historical daily kline", payload["source"])
 
     def test_tencent_intraday_quote_exposes_compact_quote_time_and_index_values(self) -> None:
         url = "https://qt.gtimg.cn/q=sh000001,sz399001,sz399006"

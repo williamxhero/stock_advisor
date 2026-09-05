@@ -285,7 +285,14 @@ class ManualAnalysisProfileResolverTests(TestCase):
         self.assertEqual("official_close", requirements["portfolio_market_state"]["finality"])
         self.assertIn("turnover_compare", requirements)
         self.assertIn("themes_and_capacity_cores", requirements)
+        self.assertTrue(requirements["themes_and_capacity_cores"]["requires_distribution"])
         self.assertEqual("2026-09-04T07:30:00Z", requirements["themes_and_capacity_cores"]["window"]["end"])
+        self.assertEqual("official_close", requirements["market_fund_flow"]["finality"])
+        self.assertEqual({
+            "start": "2026-09-04T07:00:00Z", "end": "2026-09-04T07:00:00Z",
+            "mode": "exact",
+        }, requirements["market_fund_flow"]["window"])
+        self.assertEqual(["covered"], requirements["market_fund_flow"]["allowed_coverage"])
 
     def test_chat_research_close_questions_freeze_the_latest_completed_close(self) -> None:
         with TemporaryDirectory() as temporary:

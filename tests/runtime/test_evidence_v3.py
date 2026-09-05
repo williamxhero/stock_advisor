@@ -572,6 +572,29 @@ class EvidenceV3Tests(TestCase):
         self.assertIn("错误价格99", text)
         self.assertIn("m0_contains_unverified_numeric_claim:99", verdict["problems"])
 
+    def test_m0_verifier_rejects_gap_claims_that_conflict_with_frozen_coverage(self):
+        packet = {
+            "stage": "m0_compose",
+            "evidence": {
+                "coverage": [
+                    {"requirement_key": "themes_and_capacity_cores", "status": "covered"},
+                    {"requirement_key": "market_fund_flow", "status": "covered"},
+                    {"requirement_key": "portfolio_events_and_counterevidence", "status": "covered"},
+                ],
+                "critical_gaps": [],
+            },
+        }
+        output = {"semantic": {
+            "summary": "本周市场偏弱。", "observations": [], "risks": [],
+            "unknowns": ["现有证据未提供行业涨跌分布、资金流向及个股层面的公告影响，无法判断具体驱动。"],
+        }}
+
+        verdict = CognitiveRouter().verify("m0_compose", packet, output)
+
+        self.assertIn("m0_claims_covered_evidence_gap:themes_and_capacity_cores", verdict["problems"])
+        self.assertIn("m0_claims_covered_evidence_gap:market_fund_flow", verdict["problems"])
+        self.assertIn("m0_claims_covered_evidence_gap:portfolio_events_and_counterevidence", verdict["problems"])
+
     def test_m0_verifier_keeps_the_useful_observation_primary_and_uses_only_brief_fact_support(self):
         packet = {"stage": "m0_compose", "verified_fact_digest": [{"excerpt": json.dumps({
             "indices": [
@@ -710,6 +733,19 @@ class EvidenceV3Tests(TestCase):
 
     def test_checked_no_change_with_matching_query_is_allowed(self):
         self.assertTrue(EvidenceGate().evaluate(self._evidence(status="checked_no_change"), self.contract, self.observations, self.as_of, attempt_id="attempt-1")["passed"])
+
+    def test_checked_no_change_without_traceable_results_is_rejected_even_when_query_matches(self):
+        evidence = self._evidence(status="checked_no_change")
+        evidence["coverage"][1]["evidence_refs"] = []
+
+        result = EvidenceGate().evaluate(
+            evidence, self.contract, self.observations, self.as_of, attempt_id="attempt-1",
+        )
+
+        self.assertIn(
+            "checked_no_change_untraceable:material_events_and_counterevidence",
+            result["problems"],
+        )
 
     def test_high_impact_fact_needs_primary_or_independent_corroboration(self):
         evidence = self._evidence()

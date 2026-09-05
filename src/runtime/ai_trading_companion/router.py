@@ -191,6 +191,7 @@ class CognitiveRouter:
                 if _numeric_comparison_key(value) not in verified_numbers
             })
             problems.extend(f"m0_contains_unverified_numeric_claim:{value}" for value in unknown_numbers)
+            problems.extend(_m0_covered_gap_problems(packet, body))
         if stage == "m0_compose":
             contract = packet.get("evidence_contract") if isinstance(packet.get("evidence_contract"), dict) else {}
             portfolio_requirement = next((
@@ -462,6 +463,39 @@ def _china_quote_time(value: Any) -> str | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
     except ValueError:
         return None
+
+
+def _m0_covered_gap_problems(packet: dict[str, Any], body: str) -> list[str]:
+    """Reject absence claims that contradict the frozen evidence ledger."""
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    coverage = {
+        str(row.get("requirement_key") or ""): str(row.get("status") or "")
+        for row in evidence.get("coverage") or [] if isinstance(row, dict)
+    }
+    topic_markers = {
+        "themes_and_capacity_cores": ("行业", "板块", "题材", "涨跌分布"),
+        "market_fund_flow": ("资金流", "主力资金", "资金流向"),
+        "portfolio_events_and_counterevidence": ("个股公告", "公告影响", "持仓公告", "公告"),
+        "material_events_and_counterevidence": ("市场事件", "政策", "市场公告"),
+        "events_and_counterevidence": ("市场事件", "政策", "市场公告"),
+    }
+    gap_markers = ("未提供", "缺少", "未取得", "未获取", "无法获取", "没有数据", "没有证据", "没有信息")
+    if not any(marker in body for marker in gap_markers):
+        return []
+    problems: list[str] = []
+    for key, markers in topic_markers.items():
+        if coverage.get(key) not in {"covered", "checked_no_change"}:
+            continue
+        if any(
+            re.search(
+                rf"(?:{'|'.join(map(re.escape, gap_markers))})[^。；]{{0,40}}{re.escape(marker)}"
+                rf"|{re.escape(marker)}[^。；]{{0,40}}(?:{'|'.join(map(re.escape, gap_markers))})",
+                body,
+            )
+            for marker in markers
+        ):
+            problems.append(f"m0_claims_covered_evidence_gap:{key}")
+    return problems
 
 
 def _m0_has_status(body: str, status: str) -> bool:

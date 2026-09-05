@@ -338,14 +338,10 @@ class _EvidenceGateV3:
             refs = [str(ref) for ref in row.get("evidence_refs") or []]
             bound = [sources[ref] for ref in refs if ref in sources]
             if row.get("status") == "checked_no_change" and not refs:
-                if not self._matching_negative_observation(
-                    observations, key, requirement.get("negative_query_terms") or [], attempt_id,
-                ):
-                    problems.append(f"checked_no_change_query_not_matched:{key}"); missing.append(key)
-                elif required_entities and not self._negative_queries_cover_entities(
-                    observations, key, required_entities, requirement.get("negative_query_terms") or [], attempt_id,
-                ):
-                    problems.append(f"checked_no_change_query_missing_entities:{key}"); missing.append(key)
+                # A query proves only that discovery was attempted.  A negative
+                # conclusion must remain traceable to a result that identifies
+                # the checked source/window (for example a normalized disclosure snapshot).
+                problems.append(f"checked_no_change_untraceable:{key}"); missing.append(key)
                 continue
             if not refs or len(bound) != len(refs):
                 problems.append(f"blocking_requirement_untraceable:{key}"); missing.append(key); continue
@@ -363,6 +359,11 @@ class _EvidenceGateV3:
             if key == "market_breadth":
                 breadth_facts = self._market_breadth_facts(bound)
                 if len(breadth_facts) < int(requirement.get("minimum_numeric_facts") or 0):
+                    problems.append(f"blocking_requirement_lacks_numeric_facts:{key}"); missing.append(key)
+                continue
+            if key == "market_fund_flow":
+                flow_facts = self._market_fund_flow_facts(bound)
+                if len(flow_facts) < int(requirement.get("minimum_numeric_facts") or 0):
                     problems.append(f"blocking_requirement_lacks_numeric_facts:{key}"); missing.append(key)
                 continue
             if key == "weekly_market_history":
@@ -396,6 +397,9 @@ class _EvidenceGateV3:
                 if absent_entities:
                     problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
                 continue
+            if key == "themes_and_capacity_cores" and requirement.get("requires_distribution") is True:
+                if not self._sector_distribution_complete(bound):
+                    problems.append(f"blocking_requirement_lacks_distribution:{key}"); missing.append(key); continue
             numeric_facts = set(re.findall(
                 r"(?<![\d.])\d+(?:\.\d+)?\s*(?:%|％|万亿元|亿元|万亿|亿|万家|家|只|股|元)", support,
             ))
@@ -596,43 +600,59 @@ class _EvidenceGateV3:
         return found
 
     @staticmethod
+    def _market_fund_flow_facts(sources: list[dict[str, Any]]) -> set[str]:
+        required = {
+            "main_net_inflow", "small_net_inflow", "medium_net_inflow",
+            "large_net_inflow", "super_large_net_inflow",
+        }
+        found: set[str] = set()
+        for source in sources:
+            try:
+                payload = json.loads(str(source.get("excerpt") or ""))
+            except (TypeError, ValueError):
+                continue
+            combined = payload.get("combined") if isinstance(payload, dict) else None
+            if isinstance(combined, dict):
+                found.update(
+                    field for field in required
+                    if isinstance(combined.get(field), (int, float)) and not isinstance(combined.get(field), bool)
+                )
+        return found
+
+    @staticmethod
+    def _sector_distribution_complete(sources: list[dict[str, Any]]) -> bool:
+        for source in sources:
+            try:
+                payload = json.loads(str(source.get("excerpt") or ""))
+            except (TypeError, ValueError):
+                continue
+            distribution = payload.get("distribution") if isinstance(payload, dict) else None
+            if not isinstance(distribution, dict):
+                continue
+            complete = True
+            for kind in ("industry", "theme"):
+                row = distribution.get(kind)
+                if not isinstance(row, dict):
+                    complete = False
+                    break
+                total = row.get("total")
+                counts = (row.get("up"), row.get("down"), row.get("flat"))
+                if (
+                    not isinstance(total, int) or isinstance(total, bool) or total <= 0
+                    or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in counts)
+                    or sum(counts) != total
+                ):
+                    complete = False
+                    break
+            if complete:
+                return True
+        return False
+
+    @staticmethod
     def _matching_negative_query(sources: list[dict[str, Any]], terms: list[str]) -> bool:
         if not terms:
             return True
         return any(all(term.casefold() in str(item.get("tool_arguments", {}).get("query") or "").casefold() for term in terms) for item in sources)
-
-    @staticmethod
-    def _matching_negative_observation(
-        observations: list[dict[str, Any]], requirement_key: str, terms: list[str], attempt_id: str | None,
-    ) -> bool:
-        if not terms:
-            return False
-        return any(
-            item.get("operation") == "web_search"
-            and item.get("status") == "succeeded"
-            and (not attempt_id or item.get("attempt_id") == attempt_id)
-            and str((item.get("arguments") or {}).get("requirement_key") or "") == requirement_key
-            and all(
-                str(term).casefold() in str((item.get("arguments") or {}).get("query") or "").casefold()
-                for term in terms
-            )
-            for item in observations
-        )
-
-    @staticmethod
-    def _negative_queries_cover_entities(
-        observations: list[dict[str, Any]], requirement_key: str, entities: list[str], terms: list[str], attempt_id: str | None,
-    ) -> bool:
-        queries = [
-            str((item.get("arguments") or {}).get("query") or "").casefold()
-            for item in observations
-            if item.get("operation") == "web_search"
-            and item.get("status") == "succeeded"
-            and (not attempt_id or item.get("attempt_id") == attempt_id)
-            and str((item.get("arguments") or {}).get("requirement_key") or "") == requirement_key
-            and all(str(term).casefold() in str((item.get("arguments") or {}).get("query") or "").casefold() for term in terms)
-        ]
-        return all(any(entity.casefold() in query for query in queries) for entity in entities)
 
     @staticmethod
     def _normalized(evidence: dict[str, Any], sources: dict[str, dict[str, Any]]) -> dict[str, Any]:

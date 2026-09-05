@@ -390,7 +390,12 @@ class EvidenceContractFactory:
             {
                 "key": "themes_and_capacity_cores", "blocking": True,
                 "allowed_coverage": ["covered"], "window": completed_week_theme_window,
-                "minimum_named_entities": 2,
+                "minimum_named_entities": 2, "requires_distribution": True,
+            },
+            {
+                "key": "market_fund_flow", "blocking": True,
+                "allowed_coverage": ["covered"], "finality": "official_close",
+                "window": market_window, "minimum_numeric_facts": 3,
             },
             {
                 "key": "material_events_and_counterevidence", "blocking": True,

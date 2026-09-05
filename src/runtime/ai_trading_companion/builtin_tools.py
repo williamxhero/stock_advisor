@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.10"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9"}
+_VERSION = "1.1.11"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -23,6 +23,8 @@ _CAPABILITIES = {
     "cn_market_breadth": "cn_market_breadth",
     "cn_market_turnover_compare": "cn_market_turnover_compare",
     "cn_market_sector_snapshot": "cn_market_sector_snapshot",
+    "cn_market_fund_flow_snapshot": "cn_market_fund_flow_snapshot_eastmoney_history",
+    "cn_equity_announcement_snapshot": "cn_equity_announcement_snapshot",
 }
 _ADAPTERS = {
     "cn_equity_quote_batch": {"tencent": "cn_equity_quote_tencent", "sina": "cn_equity_quote_sina"},
@@ -38,6 +40,10 @@ _ADAPTERS = {
     "cn_market_sector_snapshot": {
         "eastmoney": "cn_market_sector_snapshot_eastmoney",
         "markethub": "cn_market_sector_snapshot_markethub",
+    },
+    "cn_market_fund_flow_snapshot": {
+        "eastmoney_history": "cn_market_fund_flow_snapshot_eastmoney_history",
+        "eastmoney_live": "cn_market_fund_flow_snapshot_eastmoney_live",
     },
 }
 
@@ -1277,28 +1283,43 @@ def eastmoney_sector_snapshot_payload(
         fail(64, "required_at must be an ISO timestamp")
     source_urls: list[str] = []
     selected: list[tuple[str, dict[str, object]]] = []
+    distributions: dict[str, dict[str, dict[str, object]]] = {"industry": {}, "theme": {}}
     moments: list[dt.datetime] = []
     for group, fs in (("industry", "m:90+t:2"), ("theme", "m:90+t:3")):
-        for direction, po in (("leaders", "1"), ("laggards", "0")):
+        ordered: list[dict[str, object]] = []
+        expected_total: int | None = None
+        page = 1
+        while expected_total is None or len(distributions[group]) < expected_total:
             separator = "&" if "?" in board_endpoint else "?"
             url, body = fetch(
-                board_endpoint + separator + "pn=1&pz=1&np=1&fltt=2&invt=2&fid=f3&po=" + po
+                board_endpoint + separator + "pn=" + str(page) + "&pz=100&np=1&fltt=2&invt=2&fid=f3&po=1"
                 + "&fs=" + quote_plus(fs) + "&fields=f12%2Cf14%2Cf3%2Cf124"
             )
             try:
-                row = json.loads(body)["data"]["diff"][0]
-                board = {
+                response_data = json.loads(body)["data"]
+                rows = response_data["diff"]
+                total = int(response_data.get("total") or len(rows))
+                boards = [{
                     "board_id": str(row["f12"]), "name": clean_text(row["f14"]).strip(),
                     "kind": group, "change_percent": float(row["f3"]),
-                }
-                moment = dt.datetime.fromtimestamp(int(row["f124"]), tz=dt.timezone.utc)
+                } for row in rows]
+                row_moments = [dt.datetime.fromtimestamp(int(row["f124"]), tz=dt.timezone.utc) for row in rows]
             except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, OSError):
                 fail(75, "sector board response is invalid")
-            if not board["board_id"] or not board["name"]:
+            if not boards or any(not board["board_id"] or not board["name"] for board in boards):
                 fail(75, "sector board identity is invalid")
             source_urls.append(url)
-            moments.append(moment)
-            selected.append((direction, board))
+            moments.extend(row_moments)
+            for board in boards:
+                distributions[group][str(board["board_id"])] = board
+            ordered.extend(boards)
+            expected_total = total
+            page += 1
+            if page > 20 or not rows:
+                break
+        if expected_total is None or len(distributions[group]) != expected_total:
+            fail(75, "sector board distribution is incomplete")
+        selected.extend((("leaders", ordered[0]), ("laggards", ordered[-1])))
     leaders: list[dict[str, object]] = []
     laggards: list[dict[str, object]] = []
     for direction, board in selected:
@@ -1326,8 +1347,19 @@ def eastmoney_sector_snapshot_payload(
         fail(75, "sector snapshot trading date is invalid")
     if finality in {"close", "official_close"} and any(value.time() < dt.time(15, 0) for value in local_moments):
         fail(75, "sector snapshot does not meet close finality")
+    distribution = {}
+    for group, board_map in distributions.items():
+        changes = sorted(float(row["change_percent"]) for row in board_map.values())
+        midpoint = len(changes) // 2
+        median = changes[midpoint] if len(changes) % 2 else (changes[midpoint - 1] + changes[midpoint]) / 2
+        distribution[group] = {
+            "total": len(changes), "up": sum(value > 0 for value in changes),
+            "down": sum(value < 0 for value in changes), "flat": sum(value == 0 for value in changes),
+            "median_change_percent": round(median, 4),
+        }
     data: dict[str, object] = {
         "trading_date": required.date().isoformat(), "leaders": leaders, "laggards": laggards,
+        "distribution": distribution,
         "source": "eastmoney_board_and_constituent_snapshot", "source_urls": source_urls,
         "finality": finality,
     }
@@ -1343,9 +1375,118 @@ def eastmoney_sector_snapshot_payload(
     data["source_evidence"] = [{
         "url": url, "fact_as_of": fact_as_of,
         "data": {"summary": f"{data['trading_date']} {summary}", "leaders": leaders,
-                 "laggards": laggards, "finality": finality},
+                 "laggards": laggards, "distribution": distribution, "finality": finality},
     } for url in source_urls]
     return data, fact_as_of
+
+
+def eastmoney_fund_flow_payload(
+    endpoint: str, required_at: str, finality: str,
+) -> tuple[dict[str, object], str]:
+    try:
+        required = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(
+            dt.timezone(dt.timedelta(hours=8)))
+    except ValueError:
+        fail(64, "required_at must be an ISO timestamp")
+    expected_date = required.date().isoformat()
+    markets: list[dict[str, object]] = []
+    source_urls: list[str] = []
+    fields = ("main_net_inflow", "small_net_inflow", "medium_net_inflow", "large_net_inflow", "super_large_net_inflow")
+    for exchange, secid in (("SSE", "1.000001"), ("SZSE", "0.399001")):
+        separator = "&" if "?" in endpoint else "?"
+        url, body = fetch(
+            endpoint + separator + "lmt=0&klt=101&fields1=f1&fields2=f51%2Cf52%2Cf53%2Cf54%2Cf55%2Cf56"
+            + "&secid=" + quote_plus(secid)
+        )
+        try:
+            rows = json.loads(body)["data"]["klines"]
+            values = next(str(row).split(",") for row in rows if str(row).split(",", 1)[0] == expected_date)
+            numbers = [float(value) for value in values[1:6]]
+        except (KeyError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
+            fail(75, "fund flow response does not contain the requested trading date")
+        if len(numbers) != 5:
+            fail(75, "fund flow response is invalid")
+        markets.append({"exchange": exchange, "index_secid": secid, **dict(zip(fields, numbers))})
+        source_urls.append(url)
+    combined = {field: sum(float(row[field]) for row in markets) for field in fields}
+    fact_as_of = dt.datetime.combine(
+        required.date(), dt.time(15, 0), required.tzinfo,
+    ).astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    summary = (
+        f"{expected_date} 沪深两市主力资金净流入{combined['main_net_inflow'] / 100_000_000:.2f}亿元，"
+        f"超大单{combined['super_large_net_inflow'] / 100_000_000:.2f}亿元，"
+        f"大单{combined['large_net_inflow'] / 100_000_000:.2f}亿元"
+    )
+    data: dict[str, object] = {
+        "trading_date": expected_date, "scope": "SSE+SZSE", "unit": "CNY",
+        "markets": markets, "combined": combined, "finality": finality,
+        "source": "eastmoney_index_fund_flow", "source_urls": source_urls,
+    }
+    data["source_evidence"] = [{
+        "url": url, "fact_as_of": fact_as_of,
+        "data": {"summary": summary, "market": market, "combined": combined, "finality": finality},
+    } for url, market in zip(source_urls, markets)]
+    return data, fact_as_of
+
+
+def announcement_snapshot_payload(
+    base: str, symbols: list[dict[str, str]], start_date: str, end_date: str, required_at: str,
+) -> tuple[dict[str, object], str]:
+    try:
+        start = dt.date.fromisoformat(start_date)
+        end = dt.date.fromisoformat(end_date)
+        observed = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00"))
+    except ValueError:
+        fail(64, "announcement window must use ISO dates and timestamp")
+    if observed.tzinfo is None or start > end:
+        fail(64, "announcement window is invalid")
+    announcements: list[dict[str, object]] = []
+    source_urls: list[str] = []
+    source_evidence: list[dict[str, object]] = []
+    for item in symbols:
+        url, body = fetch(base.rstrip("/") + "/api/cninfo/search?q=" + quote_plus(item["symbol"]))
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            fail(75, "announcement service response is not JSON")
+        rows = payload.get("公告") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            rows = payload.get("announcements") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            fail(75, "announcement service response is invalid")
+        normalized: list[dict[str, object]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("代码") or row.get("symbol") or "").strip()
+            date_text = str(row.get("公告日期") or row.get("announcement_date") or row.get("date") or "")[:10]
+            try:
+                announcement_date = dt.date.fromisoformat(date_text)
+            except ValueError:
+                continue
+            if symbol != item["symbol"] or not (start <= announcement_date <= end):
+                continue
+            normalized.append({
+                "symbol": symbol, "name": clean_text(row.get("简称") or row.get("name")).strip(),
+                "title": clean_text(row.get("公告标题") or row.get("title")).strip()[:300],
+                "content": clean_text(row.get("公告内容") or row.get("content")).strip()[:1200],
+                "announcement_date": announcement_date.isoformat(),
+            })
+            if len(normalized) >= 10:
+                break
+        announcements.extend(normalized)
+        source_urls.append(url)
+        source_evidence.append({
+            "url": url, "fact_as_of": observed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "data": {"summary": f"已核查{item['symbol']}在{start_date}至{end_date}的公告，共{len(normalized)}条",
+                     "checked_symbol": item["symbol"], "announcements": normalized},
+        })
+    fact_as_of = observed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "checked_symbols": [item["symbol"] for item in symbols], "start_date": start_date,
+        "end_date": end_date, "announcements": announcements, "source": "cninfo_disclosure_search",
+        "source_urls": source_urls, "source_evidence": source_evidence,
+    }, fact_as_of
 
 
 def markethub_sector_snapshot_payload(
@@ -1371,6 +1512,8 @@ def markethub_sector_snapshot_payload(
         "trading_date": str(payload["trading_date"]), "leaders": leaders, "laggards": laggards,
         "source": str(payload["source"]), "source_urls": [source_url], "finality": finality,
     }
+    if isinstance(payload.get("distribution"), dict):
+        data["distribution"] = payload["distribution"]
     fact_as_of = observed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     summary = "；".join(
         [f"{row['name']}板块领涨，容量核心{row['core']['name']}({row['core']['symbol']})成交额{float(row['core']['amount']) / 100_000_000:.2f}亿元"
@@ -1381,7 +1524,7 @@ def markethub_sector_snapshot_payload(
     data["source_evidence"] = [{
         "url": source_url, "fact_as_of": fact_as_of,
         "data": {"summary": f"{data['trading_date']} {summary}", "leaders": leaders,
-                 "laggards": laggards, "finality": finality},
+                 "laggards": laggards, "distribution": data.get("distribution"), "finality": finality},
     }]
     return data, fact_as_of
 
@@ -1604,6 +1747,37 @@ def main() -> None:
                 safe_url(inputs.get("eastmoney_constituent_url") or "https://push2delay.eastmoney.com/api/qt/clist/get"),
                 required_at, finality,
             )
+        result(payload, fact_as_of=fact_as_of)
+        return
+    if mode in {
+        "cn_market_fund_flow_snapshot_eastmoney_history",
+        "cn_market_fund_flow_snapshot_eastmoney_live",
+    }:
+        finality = str(request.get("finality") or "observed")
+        if finality not in {"close", "official_close"}:
+            fail(64, "fund flow snapshot requires close finality")
+        if mode.endswith("_live"):
+            endpoint = inputs.get("eastmoney_live_url") or "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+        else:
+            endpoint = inputs.get("eastmoney_history_url") or "https://push2his.eastmoney.com/api/qt/stock/fflow/kline/get"
+        payload, fact_as_of = eastmoney_fund_flow_payload(
+            safe_url(endpoint), str(request.get("required_at") or ""), finality,
+        )
+        result(payload, fact_as_of=fact_as_of)
+        return
+    if mode == "cn_equity_announcement_snapshot":
+        raw_symbols = inputs.get("symbols")
+        if not isinstance(raw_symbols, list) or not raw_symbols:
+            fail(64, "symbols must be a non-empty array")
+        symbols = [identity(symbol) for symbol in raw_symbols]
+        start_date = str(inputs.get("start_date") or "")
+        end_date = str(inputs.get("end_date") or "")
+        if not start_date or not end_date:
+            fail(64, "start_date and end_date are required")
+        payload, fact_as_of = announcement_snapshot_payload(
+            safe_url(inputs.get("base_url") or "http://yosef-server:8815"), symbols,
+            start_date, end_date, str(request.get("required_at") or ""),
+        )
         result(payload, fact_as_of=fact_as_of)
         return
     if mode == "cn_market_snapshot":

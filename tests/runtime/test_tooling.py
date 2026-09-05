@@ -42,7 +42,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.10", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.11", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
             routing = json.loads(turnover_routing.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -51,7 +51,7 @@ class ToolRunnerTests(unittest.TestCase):
             )
             official_manifest = json.loads((
                 root / "cn_market_turnover_compare" / "adapters" / "official_exchanges"
-                / "versions" / "1.1.10" / "manifest.json"
+                / "versions" / "1.1.11" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual({
                 "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
@@ -1111,16 +1111,13 @@ class ToolRunnerTests(unittest.TestCase):
                 query = parse_qs(urlsplit(self.path).query)
                 if self.path.startswith("/boards"):
                     kind = "theme" if "t:3" in query.get("fs", [""])[0] else "industry"
-                    descending = query.get("po", [""])[0] == "1"
                     values = {
-                        ("industry", True): ("BK100", "半导体", 3.2),
-                        ("theme", True): ("BK200", "机器人", 4.5),
-                        ("industry", False): ("BK300", "房地产", -2.1),
-                        ("theme", False): ("BK400", "白酒", -3.0),
-                    }[kind, descending]
-                    body = json.dumps({"data": {"diff": [{
-                        "f12": values[0], "f14": values[1], "f3": values[2], "f124": 1788246000,
-                    }]}}).encode("utf-8")
+                        "industry": [("BK100", "半导体", 3.2), ("BK300", "房地产", -2.1)],
+                        "theme": [("BK200", "机器人", 4.5), ("BK400", "白酒", -3.0)],
+                    }[kind]
+                    body = json.dumps({"data": {"total": 2, "diff": [{
+                        "f12": row[0], "f14": row[1], "f3": row[2], "f124": 1788246000,
+                    } for row in values]}}).encode("utf-8")
                 else:
                     board = query.get("fs", ["b:BK000"])[0].split(":", 1)[-1]
                     symbols = {"BK100": "600100", "BK200": "300200", "BK300": "600300", "BK400": "000400"}
@@ -1159,10 +1156,75 @@ class ToolRunnerTests(unittest.TestCase):
                     [row["core"]["symbol"] for row in [*result.data["leaders"], *result.data["laggards"]]],
                 )
                 self.assertEqual("2026-09-01T07:00:01Z", result.fact_as_of)
-                self.assertGreaterEqual(len(result.data["source_urls"]), 8)
+                self.assertGreaterEqual(len(result.data["source_urls"]), 6)
+                self.assertEqual(2, result.data["distribution"]["industry"]["total"])
+                self.assertEqual(2, result.data["distribution"]["theme"]["total"])
             finally:
                 server.shutdown()
                 server.server_close()
+
+    def test_builtin_fund_flow_snapshot_sums_both_markets_for_the_frozen_close(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                secid = parse_qs(urlsplit(self.path).query).get("secid", [""])[0]
+                main = -100.0 if secid == "1.000001" else -200.0
+                payload = {"data": {"klines": [f"2026-09-04,{main},30,40,50,60"]}}
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"; ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                endpoint = f"http://127.0.0.1:{server.server_port}/flow"
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                    1, "cn_market_fund_flow_snapshot", "2026-09-04T07:00:00Z", 5.0,
+                    {"eastmoney_history_url": endpoint}, finality="official_close",
+                ))
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual(-300.0, result.data["combined"]["main_net_inflow"])
+                self.assertEqual({"SSE", "SZSE"}, {row["exchange"] for row in result.data["markets"]})
+            finally:
+                server.shutdown(); server.server_close()
+
+    def test_builtin_announcement_snapshot_filters_and_normalizes_the_frozen_window(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                symbol = parse_qs(urlsplit(self.path).query).get("q", [""])[0]
+                payload = {"公告": [
+                    {"代码": symbol, "简称": "白云电器", "公告标题": "回购进展公告",
+                     "公告内容": "截至本公告日，公司已完成本月回购进展披露。", "公告日期": "2026-09-02"},
+                    {"代码": symbol, "简称": "白云电器", "公告标题": "旧公告",
+                     "公告内容": "窗口外", "公告日期": "2026-08-01"},
+                ]}
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"; ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_equity_announcement_snapshot", "2026-09-05T02:00:00Z", 5.0,
+                    {"symbols": ["603861"], "start_date": "2026-08-31", "end_date": "2026-09-05",
+                     "base_url": f"http://127.0.0.1:{server.server_port}"}, finality="observed",
+                ))
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual(["603861"], result.data["checked_symbols"])
+                self.assertEqual(["回购进展公告"], [row["title"] for row in result.data["announcements"]])
+                self.assertEqual("2026-09-02", result.data["announcements"][0]["announcement_date"])
+            finally:
+                server.shutdown(); server.server_close()
 
     def test_close_market_capabilities_fall_back_after_primary_source_outage(self) -> None:
         class Handler(BaseHTTPRequestHandler):

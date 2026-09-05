@@ -38,7 +38,8 @@ RESEARCH_PLAN_SCHEMA: dict[str, Any] = {
                 "backend": {"type": "string", "enum": ["market", "gateway"]},
                 "operation": {"type": "string", "enum": [
                     "market_snapshot", "market_breadth", "turnover_compare", "sector_snapshot",
-                    "sentiment_snapshot", "holding_snapshot", "current_bar",
+                    "fund_flow_snapshot", "sentiment_snapshot", "holding_snapshot", "current_bar",
+                    "announcement_snapshot",
                     "web_search", "web_read", "web_browser",
                 ]},
                 "arguments": {
@@ -92,7 +93,8 @@ def _research_plan_schema(evidence_contract: dict[str, Any]) -> dict[str, Any]:
 _OPERATIONS = {
     "market": {
         "market_snapshot", "market_breadth", "turnover_compare", "sector_snapshot",
-        "sentiment_snapshot", "holding_snapshot", "current_bar",
+        "fund_flow_snapshot", "sentiment_snapshot", "holding_snapshot", "current_bar",
+        "announcement_snapshot",
     },
     "gateway": {"web_search", "web_read", "web_browser"},
 }
@@ -288,9 +290,11 @@ class ToolCatalogMarketBackend:
             "market_breadth": "cn_market_breadth",
             "turnover_compare": "cn_market_turnover_compare",
             "sector_snapshot": "cn_market_sector_snapshot",
+            "fund_flow_snapshot": "cn_market_fund_flow_snapshot",
             "sentiment_snapshot": "cn_market_breadth",
             "holding_snapshot": "cn_equity_quote_batch",
             "current_bar": "cn_equity_current_bar",
+            "announcement_snapshot": "cn_equity_announcement_snapshot",
         }.get(operation)
         if capability is None:
             raise ValueError(f"unsupported live market operation: {operation}")
@@ -304,13 +308,20 @@ class ToolCatalogMarketBackend:
             or operation in {"sector_snapshot", "sentiment_snapshot"}
             else "intraday"
         )
-        if operation in {"holding_snapshot", "current_bar"}:
+        if operation in {"holding_snapshot", "current_bar", "announcement_snapshot"}:
             symbols = [str(value) for value in requirement.get("required_entities") or [] if str(value)]
             if not symbols:
                 raise ValueError(f"{operation} requires frozen portfolio entities")
             inputs = {"symbols": symbols, **({"freq": "1m"} if operation == "current_bar" else {})}
+            if operation == "announcement_snapshot":
+                inputs.update({
+                    "start_date": str(window.get("start") or "")[:10],
+                    "end_date": str(window.get("end") or "")[:10],
+                })
         elif operation == "market_snapshot":
             inputs = {"symbols": ["000001", "399001", "399006"]}
+        elif operation == "sector_snapshot":
+            inputs = {"require_distribution": requirement.get("requires_distribution") is True}
         else:
             inputs = {}
         if operation == "market_breadth":
@@ -1092,8 +1103,6 @@ def _compile_evidence(packet: dict[str, Any], contract: dict[str, Any], observat
             status = "checked_no_change"
         elif refs:
             status = "covered"
-        elif "checked_no_change" in allowed and _has_matching_negative_search(observations, requirement):
-            status = "checked_no_change"
         else:
             status = "missing"
         coverage.append({"requirement_key": key, "status": status, "evidence_refs": refs})
@@ -1103,31 +1112,6 @@ def _compile_evidence(packet: dict[str, Any], contract: dict[str, Any], observat
         "critical_gaps": [row["requirement_key"] for row in coverage if row["status"] == "missing"],
         "conflicts": [], "high_impact_events": [],
     }
-
-
-def _has_matching_negative_search(observations: list[dict[str, Any]], requirement: dict[str, Any]) -> bool:
-    key = str(requirement.get("key") or "")
-    terms = [str(term).casefold() for term in requirement.get("negative_query_terms") or []]
-    if not terms:
-        return False
-    queries = [
-        str((observation.get("arguments") or {}).get("query") or "").casefold()
-        for observation in observations
-        if observation.get("operation") == "web_search"
-        and observation.get("status") == "succeeded"
-        and str((observation.get("arguments") or {}).get("requirement_key") or "") == key
-        and all(term in str((observation.get("arguments") or {}).get("query") or "").casefold() for term in terms)
-    ]
-    return bool(queries) and all(
-        any(entity.casefold() in query for query in queries)
-        for entity in [str(value) for value in requirement.get("required_entities") or [] if str(value)]
-    ) and any(
-        observation.get("operation") == "web_search"
-        and observation.get("status") == "succeeded"
-        and str((observation.get("arguments") or {}).get("requirement_key") or "") == key
-        and all(term in str((observation.get("arguments") or {}).get("query") or "").casefold() for term in terms)
-        for observation in observations
-    )
 
 
 def _operation(
@@ -1170,6 +1154,8 @@ def _merge_mandatory_operations(
         required.append(_operation("turnover_compare", "market", "turnover_compare"))
     if "themes_and_capacity_cores" in requirements:
         required.append(_operation("themes_and_capacity_cores", "market", "sector_snapshot"))
+    if "market_fund_flow" in requirements:
+        required.append(_operation("market_fund_flow", "market", "fund_flow_snapshot"))
     if "forum_and_sentiment" in requirements:
         required.extend((
             _operation("forum_and_sentiment", "market", "sentiment_snapshot"),
@@ -1189,10 +1175,9 @@ def _merge_mandatory_operations(
             query="A股 公告 政策 风险",
         ))
     event_requirement = requirements.get("portfolio_events_and_counterevidence") or {}
-    for entity in [str(value) for value in event_requirement.get("required_entities") or [] if str(value)]:
+    if [str(value) for value in event_requirement.get("required_entities") or [] if str(value)]:
         required.append(_operation(
-            "portfolio_events_and_counterevidence", "gateway", "web_search",
-            query=f"{entity} 公告 停复牌 财报 风险",
+            "portfolio_events_and_counterevidence", "market", "announcement_snapshot",
         ))
     completed = {
         (
@@ -1266,7 +1251,8 @@ def _deterministic_requirement_keys(contract: dict[str, Any]) -> list[str]:
     keys = {str(item.get("key") or "") for item in contract.get("requirements") or [] if isinstance(item, dict)}
     return sorted(keys.intersection({
         "current_market_state", "indices_close", "market_breadth", "portfolio_market_state",
-        "portfolio_current_bar", "portfolio_events_and_counterevidence",
+        "portfolio_current_bar", "portfolio_events_and_counterevidence", "market_fund_flow",
+        "themes_and_capacity_cores",
     }))
 
 

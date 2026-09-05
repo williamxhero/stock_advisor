@@ -571,6 +571,10 @@ def _validate_capability_result(request: FactRequest, output: dict[str, Any]) ->
         return _validate_market_turnover_compare(request, output["data"], str(output["fact_as_of"]))
     if request.capability == "cn_market_sector_snapshot":
         return _validate_market_sector_snapshot(request, output["data"], str(output["fact_as_of"]))
+    if request.capability == "cn_market_fund_flow_snapshot":
+        return _validate_market_fund_flow_snapshot(request, output["data"], str(output["fact_as_of"]))
+    if request.capability == "cn_equity_announcement_snapshot":
+        return _validate_equity_announcement_snapshot(request, output["data"], str(output["fact_as_of"]))
     if request.capability == "cn_market_index_batch":
         return _validate_market_indices(request, output["data"])
     if request.capability == "cn_market_snapshot":
@@ -749,6 +753,99 @@ def _validate_market_sector_snapshot(
             return "tool_market_sector_result_invalid"
         if amount < 0:
             return "tool_market_sector_result_invalid"
+    if request.inputs.get("require_distribution") is True:
+        distribution = data.get("distribution")
+        if not isinstance(distribution, dict):
+            return "tool_market_sector_distribution_missing"
+        for kind in ("industry", "theme"):
+            row = distribution.get(kind)
+            if not isinstance(row, dict):
+                return "tool_market_sector_distribution_missing"
+            total = row.get("total")
+            counts = [row.get("up"), row.get("down"), row.get("flat")]
+            if (
+                not isinstance(total, int) or isinstance(total, bool) or total <= 0
+                or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in counts)
+                or sum(counts) != total
+            ):
+                return "tool_market_sector_distribution_invalid"
+            try:
+                float(row.get("median_change_percent"))
+            except (TypeError, ValueError):
+                return "tool_market_sector_distribution_invalid"
+    return None
+
+
+def _validate_market_fund_flow_snapshot(
+    request: FactRequest, data: dict[str, Any], fact_as_of: str,
+) -> str | None:
+    expected_date = _parse_timestamp(request.required_at).astimezone(_SHANGHAI).date().isoformat()
+    try:
+        observed = _parse_timestamp(fact_as_of)
+    except ValueError:
+        return "tool_market_fund_flow_time_invalid"
+    if (
+        data.get("trading_date") != expected_date
+        or observed.astimezone(_SHANGHAI).date().isoformat() != expected_date
+        or data.get("finality") != request.finality
+        or data.get("scope") != "SSE+SZSE"
+        or data.get("unit") != "CNY"
+    ):
+        return "tool_market_fund_flow_identity_invalid"
+    if request.finality in {"close", "official_close"} and observed.astimezone(_SHANGHAI).time().hour < 15:
+        return "tool_market_fund_flow_finality_invalid"
+    if not str(data.get("source") or "").strip() or not _valid_public_source_urls(data.get("source_urls")):
+        return "tool_market_source_urls_invalid"
+    markets = data.get("markets")
+    combined = data.get("combined")
+    fields = ("main_net_inflow", "small_net_inflow", "medium_net_inflow", "large_net_inflow", "super_large_net_inflow")
+    if not isinstance(markets, list) or len(markets) != 2 or not isinstance(combined, dict):
+        return "tool_market_fund_flow_result_invalid"
+    if {str(row.get("exchange") or "") for row in markets if isinstance(row, dict)} != {"SSE", "SZSE"}:
+        return "tool_market_fund_flow_result_invalid"
+    try:
+        for field in fields:
+            values = [float(row[field]) for row in markets]
+            if abs(float(combined[field]) - sum(values)) > 0.01:
+                return "tool_market_fund_flow_total_mismatch"
+    except (KeyError, TypeError, ValueError):
+        return "tool_market_fund_flow_result_invalid"
+    return None
+
+
+def _validate_equity_announcement_snapshot(
+    request: FactRequest, data: dict[str, Any], fact_as_of: str,
+) -> str | None:
+    expected = [str(value).strip() for value in request.inputs.get("symbols") or []]
+    checked = data.get("checked_symbols")
+    if not expected or len(set(expected)) != len(expected) or checked != expected:
+        return "tool_announcement_symbols_invalid"
+    start_text = str(request.inputs.get("start_date") or "")
+    end_text = str(request.inputs.get("end_date") or "")
+    try:
+        start = datetime.fromisoformat(start_text).date()
+        end = datetime.fromisoformat(end_text).date()
+        observed = _parse_timestamp(fact_as_of)
+    except ValueError:
+        return "tool_announcement_window_invalid"
+    if start > end or data.get("start_date") != start_text or data.get("end_date") != end_text:
+        return "tool_announcement_window_invalid"
+    if observed > _parse_timestamp(request.required_at):
+        return "tool_announcement_time_invalid"
+    if not str(data.get("source") or "").strip() or not _valid_public_source_urls(data.get("source_urls")):
+        return "tool_market_source_urls_invalid"
+    rows = data.get("announcements")
+    if not isinstance(rows, list):
+        return "tool_announcement_result_invalid"
+    for row in rows:
+        if not isinstance(row, dict) or str(row.get("symbol") or "") not in expected:
+            return "tool_announcement_result_invalid"
+        try:
+            announcement_date = datetime.fromisoformat(str(row.get("announcement_date") or "")).date()
+        except ValueError:
+            return "tool_announcement_result_invalid"
+        if not start <= announcement_date <= end or not str(row.get("title") or "").strip():
+            return "tool_announcement_result_invalid"
     return None
 
 

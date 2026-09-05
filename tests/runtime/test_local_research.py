@@ -40,6 +40,36 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual(urls, [row["arguments"]["url"] for row in reads])
         self.assertTrue(all(row["requirement_key"] == "weekly_market_history" for row in reads))
 
+    def test_weekend_driver_and_announcement_facts_are_mandatory_typed_reads(self) -> None:
+        contract = {
+            "version": 4,
+            "requirements": [
+                {"key": "market_fund_flow", "blocking": True, "window": {
+                    "mode": "exact", "start": "2026-09-04T07:00:00Z", "end": "2026-09-04T07:00:00Z",
+                }},
+                {"key": "themes_and_capacity_cores", "blocking": True, "requires_distribution": True,
+                 "window": {"mode": "after_start_to_end", "start": "2026-08-31T07:00:00Z", "end": "2026-09-04T07:30:00Z"}},
+                {"key": "portfolio_events_and_counterevidence", "blocking": True,
+                 "required_entities": ["603861", "300421"], "window": {
+                     "mode": "after_start_to_end", "start": "2026-08-31T07:00:00Z", "end": "2026-09-05T02:00:00Z",
+                 }},
+            ],
+        }
+
+        plan = _merge_mandatory_operations(
+            {"version": 1, "operations": []}, contract, max_operations=24,
+        )
+
+        typed = {(row["requirement_key"], row["operation"]) for row in plan["operations"]}
+        self.assertIn(("market_fund_flow", "fund_flow_snapshot"), typed)
+        self.assertIn(("themes_and_capacity_cores", "sector_snapshot"), typed)
+        self.assertIn(("portfolio_events_and_counterevidence", "announcement_snapshot"), typed)
+        self.assertFalse(any(
+            row["requirement_key"] == "portfolio_events_and_counterevidence"
+            and row["operation"] == "web_search"
+            for row in plan["operations"]
+        ))
+
     def test_close_review_mandatory_research_attempts_turnover_themes_and_forum_sentiment(self) -> None:
         contract = {
             "version": 4,
@@ -128,6 +158,41 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual(["official_close"] * 3, [request.finality for request in requests])
         self.assertEqual("2026-09-04T07:00:00Z", requests[0].required_at)
         self.assertEqual("2026-09-04T07:20:00Z", requests[1].required_at)
+
+    def test_weekend_driver_operations_use_typed_capabilities_and_frozen_inputs(self) -> None:
+        contract = {"version": 4, "as_of": "2026-09-05T02:00:00Z", "requirements": [
+            {"key": "market_fund_flow", "finality": "official_close", "window": {
+                "mode": "exact", "start": "2026-09-04T07:00:00Z", "end": "2026-09-04T07:00:00Z",
+            }},
+            {"key": "themes_and_capacity_cores", "requires_distribution": True, "window": {
+                "mode": "after_start_to_end", "start": "2026-08-31T07:00:00Z", "end": "2026-09-04T07:30:00Z",
+            }},
+            {"key": "portfolio_events_and_counterevidence", "required_entities": ["603861"], "window": {
+                "mode": "after_start_to_end", "start": "2026-08-31T07:00:00Z", "end": "2026-09-05T02:00:00Z",
+            }},
+        ]}
+        runner = mock.Mock()
+        runner.resolve_with_fallback.return_value = EvidenceResolution(
+            True, "test", "1.0.0", "2026-09-04T07:00:00Z", "2026-09-05T02:00:01Z",
+            {"source": "test", "source_urls": ["https://example.test/source"], "source_evidence": [{
+                "url": "https://example.test/source", "fact_as_of": "2026-09-04T07:00:00Z", "data": {"summary": "test"},
+            }]}, "artifact:sha256:" + "d" * 64, None, ("tool_result_schema_valid",),
+        )
+        backend = ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0)
+
+        backend("fund_flow_snapshot", {"_requirement_key": "market_fund_flow"})
+        backend("sector_snapshot", {"_requirement_key": "themes_and_capacity_cores"})
+        backend("announcement_snapshot", {"_requirement_key": "portfolio_events_and_counterevidence"})
+
+        requests = [call.args[0] for call in runner.resolve_with_fallback.call_args_list]
+        self.assertEqual(
+            ["cn_market_fund_flow_snapshot", "cn_market_sector_snapshot", "cn_equity_announcement_snapshot"],
+            [request.capability for request in requests],
+        )
+        self.assertTrue(requests[1].inputs["require_distribution"])
+        self.assertEqual(["603861"], requests[2].inputs["symbols"])
+        self.assertEqual("2026-08-31", requests[2].inputs["start_date"])
+        self.assertEqual("2026-09-05", requests[2].inputs["end_date"])
 
     def test_forum_failure_keeps_technical_classification_and_has_a_bounded_retry(self) -> None:
         contract = {
@@ -331,7 +396,7 @@ class LocalResearchTests(unittest.TestCase):
                 ("current_market_state", "market_snapshot"),
                 ("market_breadth", "market_breadth"),
                 ("portfolio_market_state", "holding_snapshot"),
-                ("portfolio_events_and_counterevidence", "web_search"),
+                ("portfolio_events_and_counterevidence", "announcement_snapshot"),
             },
             {(key, operation) for key, operation, _query in calls},
         )
@@ -1221,7 +1286,7 @@ print(json.dumps({'contract':'ai-trading-tool-result/v1','fact_as_of':'2026-08-2
         result = LocalResearchChain(lambda *_: plan, ReadOnlyResearchExecutor({"gateway": lambda *_: search}), max_repairs=0).run({"as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="x")
         self.assertFalse(result.qualified); self.assertEqual([], result.evidence["sources"])
 
-    def test_successful_negative_event_query_can_record_checked_no_change_without_promoting_search_results(self) -> None:
+    def test_successful_negative_event_query_cannot_record_checked_no_change_without_traceable_results(self) -> None:
         contract = {
             **CONTRACT,
             "requirements": [
@@ -1255,9 +1320,9 @@ print(json.dumps({'contract':'ai-trading-tool-result/v1','fact_as_of':'2026-08-2
             lambda *_: plan, ReadOnlyResearchExecutor({"gateway": backend}), max_repairs=0,
         ).run({"as_of": CONTRACT["as_of"]}, contract, attempt_id="x")
 
-        self.assertTrue(result.qualified, result.verifier["problems"])
+        self.assertFalse(result.qualified)
         events = next(row for row in result.evidence["coverage"] if row["requirement_key"] == "events")
-        self.assertEqual("checked_no_change", events["status"])
+        self.assertEqual("missing", events["status"])
         self.assertEqual([], events["evidence_refs"])
         self.assertEqual(1, len(result.evidence["sources"]))
 

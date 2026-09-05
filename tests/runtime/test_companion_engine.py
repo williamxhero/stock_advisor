@@ -1247,6 +1247,10 @@ Protocol: OpportunityDiscovery-v1.3
             [item["cycle_id"] for item in self.store.latest_cycles_for_date("2026-08-29")],
         )
         self.assertEqual(hidden["cycle_id"], self.store.get_cycle(hidden["cycle_id"])["cycle_id"])
+        claimed = self.store.claim_scheduled_workers(limit=100, at=datetime(2026, 8, 29, 8, 0, tzinfo=timezone.utc))
+        claimed_ids = {item["cycle_id"] for item in claimed}
+        self.assertNotIn(hidden["cycle_id"], claimed_ids)
+        self.assertIn(preserved["cycle_id"], claimed_ids)
 
     def test_manual_analysis_request_never_consumes_a_scheduled_occurrence(self):
         manual = self.engine.command({

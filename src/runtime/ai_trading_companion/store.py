@@ -733,8 +733,10 @@ class CompanionStore:
             available = max(0, limit - int(active))
             due_at = (at or datetime.now(timezone.utc)).astimezone(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
             rows = c.execute(
-                """SELECT c.* FROM companion_cycle c LEFT JOIN schedule_worker_claim w ON w.cycle_id=c.cycle_id
-                   WHERE c.state='queued' AND w.cycle_id IS NULL
+                """SELECT c.* FROM companion_cycle c
+                   LEFT JOIN schedule_worker_claim w ON w.cycle_id=c.cycle_id
+                   LEFT JOIN companion_cycle_visibility visibility ON visibility.cycle_id=c.cycle_id
+                   WHERE c.state='queued' AND w.cycle_id IS NULL AND visibility.cycle_id IS NULL
                      AND COALESCE(c.work_start_at,c.scheduled_for) <= ?
                    ORDER BY COALESCE(c.work_start_at,c.scheduled_for),c.created_at LIMIT ?""", (due_at, available)
             ).fetchall()

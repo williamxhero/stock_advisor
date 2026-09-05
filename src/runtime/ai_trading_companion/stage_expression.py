@@ -141,6 +141,12 @@ def _v4_judgment_expression(semantic: dict[str, Any]) -> str:
             reason = _sentence_piece(item.get("reason") or "相对结构需要继续确认")
             parts.append(f"优先盯{symbol}，{reason}")
         paragraphs.append("。".join(parts) + "。")
+    risks = _clean_values(semantic.get("risks"), 2)
+    if risks:
+        paragraphs.append("风险与事件方面，" + " ".join(
+            item if item.endswith(("。", "！", "？")) else item + "。"
+            for item in risks
+        ))
     unknowns = _clean_values(semantic.get("unknowns"), 1)
     if unknowns:
         paragraphs.append(f"真正还需要确认的是{_sentence_piece(unknowns[0])}。")
@@ -371,7 +377,82 @@ def _verified_close_judgment(
         if weekly is None:
             return None
         result["semantic"]["summary"] = weekly["text"] + result["semantic"]["summary"]
+        fund_flow = _verified_fund_flow_summary(parsed)
+        event_impact = _verified_market_event_impact(parsed)
+        announcements = _verified_portfolio_announcement_summary(parsed, private)
+        result["semantic"]["key_evidence"] = [
+            market_evidence, theme_and_sentiment, announcements,
+        ]
+        result["semantic"]["risks"] = [fund_flow, event_impact]
     return result
+
+
+def _verified_fund_flow_summary(parsed: list[dict[str, Any]]) -> str:
+    inflows = [
+        row for item in parsed for row in item.get("sector_inflow_leaders") or []
+        if isinstance(row, dict) and row.get("net_inflow") is not None
+    ]
+    outflows = [
+        row for item in parsed for row in item.get("sector_outflow_leaders") or []
+        if isinstance(row, dict)
+    ]
+    if not inflows or not outflows:
+        return ""
+
+    def billions(value: Any) -> str:
+        return f"{float(value) / 100_000_000:.2f}".rstrip("0").rstrip(".")
+
+    leaders = "、".join(
+        f"{row.get('name')}净流入{billions(row.get('net_inflow'))}亿元" for row in inflows[:3]
+    )
+    laggards = "、".join(str(row.get("name") or "") for row in outflows[:2] if row.get("name"))
+    return (
+        f"主力资金方向：{leaders}，{laggards}为净流出领先方向；"
+        "当前只覆盖板块方向，全市场净额及大中小单拆分仍未取得。"
+    )
+
+
+def _verified_market_event_impact(parsed: list[dict[str, Any]]) -> str:
+    for item in parsed:
+        content = str(item.get("content") or "")
+        for sentence in re.split(r"[。；\n]", content):
+            compact = "".join(sentence.split())
+            if "风险偏好" in compact and any(term in compact for term in ("压制", "支撑", "影响", "扰动")):
+                return "政策与风险事件：" + compact + "。"
+    for item in parsed:
+        title = str(item.get("title") or "").strip()
+        content = str(item.get("content") or "")
+        if title and any(term in title + content for term in ("政策", "监管", "风险")):
+            return f"政策与风险事件核查到《{title}》，其对下周风险偏好的影响仍需继续验证。"
+    return ""
+
+
+def _verified_portfolio_announcement_summary(
+    parsed: list[dict[str, Any]], private: dict[str, Any],
+) -> str:
+    disclosures = {
+        str(item.get("checked_symbol") or ""): item
+        for item in parsed if item.get("checked_symbol")
+    }
+    active = [
+        item for item in private.get("positions") or []
+        if isinstance(item, dict) and float(item.get("shares") or 0) > 0
+    ]
+    if not active or any(str(item.get("code") or "") not in disclosures for item in active):
+        return ""
+    parts = []
+    for position in sorted(active, key=lambda item: str(item.get("code") or "")):
+        code = str(position.get("code") or "")
+        name = str(position.get("name") or code)
+        announcements = [
+            item for item in disclosures[code].get("announcements") or [] if isinstance(item, dict)
+        ]
+        if not announcements:
+            parts.append(f"{name}({code})未发现新增公告")
+            continue
+        titles = "、".join(f"《{item.get('title')}》" for item in announcements[:1] if item.get("title"))
+        parts.append(f"{name}({code})检出{titles or '窗口内公告'}，暂不据标题单独改变判断")
+    return "逐股公告核查：" + "；".join(parts) + "。"
 
 
 def safe_stage_output(

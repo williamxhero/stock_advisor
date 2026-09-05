@@ -454,6 +454,43 @@ class CompanionLearningTests(unittest.TestCase):
             })}
             for symbol, end in (("sh000001", 98.0), ("sz399001", 97.0), ("sz399006", 96.0))
         ]
+        sources.extend([
+            {"excerpt": json.dumps({"indices": [
+                {"symbol": "000001", "name": "上证指数", "price": 98.0,
+                 "change_percent": -0.2, "trading_date": "2026-09-04"},
+                {"symbol": "399001", "name": "深证成指", "price": 97.0,
+                 "change_percent": -0.3, "trading_date": "2026-09-04"},
+                {"symbol": "399006", "name": "创业板指", "price": 96.0,
+                 "change_percent": -0.4, "trading_date": "2026-09-04"},
+            ]})},
+            {"excerpt": json.dumps({"breadth": {"up": 2000, "down": 3000, "flat": 100}})},
+            {"excerpt": json.dumps({"summary": "两市成交额2万亿元，较前一交易日增加1000亿元。"})},
+            {"excerpt": json.dumps({
+                "leaders": [{"name": "消费", "change_percent": 2.0,
+                             "core": {"name": "甲", "symbol": "000001", "change_percent": 5.0}}],
+                "laggards": [{"name": "科技", "change_percent": -2.0,
+                              "core": {"name": "乙", "symbol": "000002", "change_percent": -5.0}}],
+            })},
+            {"excerpt": json.dumps({"quotes": [
+                {"symbol": "000997", "name": "新大陆", "price": 21.6,
+                 "change_percent": 2.4, "trading_date": "2026-09-04"},
+                {"symbol": "002891", "name": "中宠股份", "price": 28.61,
+                 "change_percent": 2.7, "trading_date": "2026-09-04"},
+            ]})},
+            {"excerpt": json.dumps({
+                "coverage_level": "directional_sector",
+                "sector_inflow_leaders": [{"name": "数字人", "net_inflow": 5_281_000_000.0}],
+                "sector_outflow_leaders": [{"name": "电子"}],
+            })},
+            {"excerpt": json.dumps({
+                "title": "政策组合拳密集落地",
+                "content": "海外政策扰动对全球风险偏好形成一定压制。",
+            })},
+            {"excerpt": json.dumps({"checked_symbol": "000997", "announcements": []})},
+            {"excerpt": json.dumps({
+                "checked_symbol": "002891", "announcements": [{"title": "回购公司股份的进展公告"}],
+            })},
+        ])
         packet = {
             "stage": "m1_judgment", "task_key": "manual.non_trading_outlook",
             "task_profile": {"evidence_family": "completed_trading_week"},
@@ -462,8 +499,8 @@ class CompanionLearningTests(unittest.TestCase):
                 "required_entities": ["000997", "002891"],
             }]},
             "business_context": {"private_context_before_h0": {"positions": [
-                {"code": "000997", "name": "新大陆"},
-                {"code": "002891", "name": "中宠股份"},
+                {"code": "000997", "name": "新大陆", "shares": 100},
+                {"code": "002891", "name": "中宠股份", "shares": 100},
             ]}},
             "evidence": {
                 "sources": sources,
@@ -492,21 +529,36 @@ class CompanionLearningTests(unittest.TestCase):
         omitted = CognitiveRouter().verify(
             "m1_judgment", packet, {"result_version": 4, "semantic": base},
         )
-        complete = CognitiveRouter().verify("m1_judgment", packet, {
+        complete_output = {
             "result_version": 4,
             "semantic": {**base, "key_evidence": [
                 "行业分布上，消费板块领涨、科技板块领跌。",
                 "主力资金方向显示数字人净流入52.81亿元，电子板块净流出。",
-                "政策与风险事件核查后，相关变化对下周风险偏好有压制影响。",
                 "逐股公告核查：000997新大陆、002891中宠股份均未发现改变判断的披露。",
-            ]},
-        })
+            ], "risks": ["政策与风险事件核查后，相关变化对下周风险偏好有压制影响。"]},
+        }
+        complete = CognitiveRouter().verify("m1_judgment", packet, complete_output)
 
         self.assertIn("weekend_review_lacks_sector_distribution", omitted["problems"])
         self.assertIn("weekend_review_lacks_fund_flow_direction", omitted["problems"])
         self.assertIn("weekend_review_lacks_market_event_impact", omitted["problems"])
         self.assertIn("weekend_review_lacks_portfolio_announcement_checks", omitted["problems"])
         self.assertTrue(complete["passed"], complete["problems"])
+        complete_text = normalize_stage_output("m1_judgment", complete_output).text
+        self.assertIn("主力资金方向", complete_text)
+        self.assertIn("政策与风险事件", complete_text)
+        self.assertIn("000997", complete_text)
+        self.assertIn("002891", complete_text)
+
+        fallback = safe_stage_output("m1_judgment", horizon="下周初", packet=packet)
+        fallback_check = CognitiveRouter().verify("m1_judgment", packet, fallback)
+        fallback_text = normalize_stage_output("m1_judgment", fallback).text
+        self.assertTrue(fallback_check["passed"], fallback_check["problems"])
+        self.assertIn("主力资金方向", fallback_text)
+        self.assertIn("全市场净额及大中小单拆分仍未取得", fallback_text)
+        self.assertIn("政策与风险事件", fallback_text)
+        self.assertIn("新大陆(000997)未发现新增公告", fallback_text)
+        self.assertIn("中宠股份(002891)检出《回购公司股份的进展公告》", fallback_text)
 
     def test_safe_formal_fallback_is_natural_and_conservative(self):
         m0 = normalize_stage_output("m0_compose", safe_stage_output("m0_compose"))

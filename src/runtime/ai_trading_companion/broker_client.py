@@ -117,7 +117,6 @@ class ProviderBrokerClient:
         }
 
     def _post(self, path: str, payload: dict[str, Any], deadline: float) -> dict[str, Any]:
-        timeout = _timeout(deadline)
         request = Request(
             self.base_url + path,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -125,8 +124,8 @@ class ProviderBrokerClient:
             headers={"Content-Type": "application/json", "Accept": "application/json"},
         )
         try:
-            with urlopen(request, timeout=timeout) as response:
-                raw = response.read().decode("utf-8")
+            with urlopen(request, timeout=_timeout(deadline)) as response:
+                raw = b"".join(_response_chunks(response, deadline)).decode("utf-8")
         except HTTPError as exc:
             raise _http_error(exc) from exc
         except TimeoutError as exc:
@@ -151,8 +150,7 @@ class ProviderBrokerClient:
         event, data, chunks, final = None, [], [], None
         try:
             with urlopen(raw_request, timeout=_timeout(request.absolute_deadline)) as response:
-                for raw_line in response:
-                    line = raw_line.decode("utf-8", errors="strict").rstrip("\r\n")
+                for line in _response_lines(response, request.absolute_deadline):
                     if not line:
                         if event == "delta":
                             value = _event_json(data)
@@ -238,6 +236,40 @@ def _timeout(deadline: float) -> float:
     if remaining <= 0:
         raise BrokerError("Broker request deadline expired", category="broker_timeout")
     return max(0.1, remaining)
+
+
+def _response_chunks(response: Any, deadline: float):
+    """Read an HTTP response without allowing trickle traffic to extend its deadline."""
+    reader = getattr(response, "read1", None)
+    if not callable(reader):
+        reader = response.read
+    while True:
+        timeout = _timeout(deadline)
+        _set_response_timeout(response, timeout)
+        chunk = reader(64 * 1024)
+        _timeout(deadline)
+        if not chunk:
+            return
+        yield chunk
+
+
+def _response_lines(response: Any, deadline: float):
+    pending = b""
+    for chunk in _response_chunks(response, deadline):
+        pending += chunk
+        while b"\n" in pending:
+            raw_line, pending = pending.split(b"\n", 1)
+            yield raw_line.rstrip(b"\r").decode("utf-8", errors="strict")
+    if pending:
+        yield pending.rstrip(b"\r").decode("utf-8", errors="strict")
+
+
+def _set_response_timeout(response: Any, timeout: float) -> None:
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    socket = getattr(raw, "_sock", None)
+    if socket is not None:
+        socket.settimeout(timeout)
 
 
 def _http_error(error: HTTPError) -> BrokerError:

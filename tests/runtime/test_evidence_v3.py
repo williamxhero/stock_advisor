@@ -811,6 +811,29 @@ class EvidenceV3Tests(TestCase):
             self.assertEqual("failed", attempt["status"])
             self.assertEqual(trace, json.loads(attempt["tool_trace_json"]))
 
+    def test_broker_absolute_timeout_is_persisted_as_timed_out(self):
+        with TemporaryDirectory() as temporary:
+            store = CompanionStore(Path(temporary) / "companion.sqlite3")
+            cycle = CompanionEngine(store).start_cycle(
+                "daily.review.1520", "2026-08-26T15:20:00+08:00", self.as_of,
+            )
+            broker = Mock()
+            broker.invoke.side_effect = BrokerError(
+                "Broker request deadline expired", category="broker_timeout",
+            )
+            settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
+            packet = {"task_key": cycle["task_key"], "stage": "m1_judgment", "as_of": self.as_of}
+
+            with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
+                "ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker,
+            ), self.assertRaisesRegex(BrokerError, "deadline expired"):
+                _call_stage(
+                    store, cycle, "m1_judgment", packet,
+                    "companion-m1-result-v4.schema.json", search=False, timeout=60,
+                )
+
+            self.assertEqual("timed_out", store.attempts(cycle["cycle_id"])[0]["status"])
+
     def test_qualified_deterministic_research_needs_no_synthetic_broker_call(self):
         evidence = {
             "schema_version": 3, "as_of": self.as_of, "spoken_summary": "verified",

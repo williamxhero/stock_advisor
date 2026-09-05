@@ -30,6 +30,23 @@ class _BrokerHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"error":"unsupported effort xhigh"}'); return
         if self.mode == "invalid":
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(b"not-json"); return
+        if self.mode == "trickle_json":
+            body = b'{"status":"completed","output_text":"{\\"answer\\":\\"ok\\"}","actual_model":"chosen","provider":"broker-upstream","request_id":"req-1","fulfilled_intellect":"smart"}'
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+            try:
+                for byte in body:
+                    self.wfile.write(bytes([byte])); self.wfile.flush(); time.sleep(0.01)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+            return
+        if self.mode == "trickle_stream":
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            try:
+                for byte in b'event: delta\ndata: {"text":"x"}\n\n':
+                    self.wfile.write(bytes([byte])); self.wfile.flush(); time.sleep(0.01)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+            return
         if self.path.endswith("/stream"):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
             events = [
@@ -99,6 +116,26 @@ class BrokerClientTests(unittest.TestCase):
             self.client.invoke(self.request())
         self.assertEqual("broker_effort_unsupported", raised.exception.category)
         self.assertEqual({"capability": "effort"}, raised.exception.metadata)
+
+    def test_non_stream_enforces_absolute_deadline_while_body_trickles(self) -> None:
+        _BrokerHandler.mode = "trickle_json"
+        request = self.request()
+        object.__setattr__(request, "absolute_deadline", time.monotonic() + 0.15)
+        started = time.monotonic()
+        with self.assertRaises(BrokerError) as raised:
+            self.client.invoke(request)
+        self.assertEqual("broker_timeout", raised.exception.category)
+        self.assertLess(time.monotonic() - started, 0.6)
+
+    def test_stream_enforces_absolute_deadline_while_sse_trickles(self) -> None:
+        _BrokerHandler.mode = "trickle_stream"
+        request = self.request(stream=True)
+        object.__setattr__(request, "absolute_deadline", time.monotonic() + 0.15)
+        started = time.monotonic()
+        with self.assertRaises(BrokerError) as raised:
+            self.client.invoke(request)
+        self.assertEqual("broker_timeout", raised.exception.category)
+        self.assertLess(time.monotonic() - started, 0.6)
 
     def test_runtime_has_no_direct_provider_protocol_or_token_dependency(self) -> None:
         runtime = Path(__file__).resolve().parents[2] / "src" / "runtime" / "ai_trading_companion"

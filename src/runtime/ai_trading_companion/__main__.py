@@ -808,7 +808,10 @@ def _call_stage(
                     item for item in _broker_call_trace(planner.outcomes)
                     if str(item.get("request_id")) not in known_requests
                 )
-            status = "timed_out" if isinstance(exc, TimeoutError) else "failed"
+            status = "timed_out" if (
+                isinstance(exc, TimeoutError)
+                or isinstance(exc, BrokerError) and exc.category == "broker_timeout"
+            ) else "failed"
             store.finish_attempt(
                 attempt["attempt_id"], status, error=str(exc),
                 verifier=getattr(exc, "verifier", None),

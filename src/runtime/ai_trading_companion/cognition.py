@@ -117,13 +117,29 @@ def _recover_explicit_analysis_actions(
     messages: list[dict[str, Any]], actions: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     result = list(actions)
-    covered = {
-        str((action.get("source_span") or {}).get("message_id") or "")
-        for action in result if action.get("action_type") == "analysis.request"
-    }
     for message in messages:
         action = _explicit_close_review_action(message)
-        if action is not None and str(message.get("message_id") or "") not in covered:
+        if action is None:
+            continue
+        message_id = str(message.get("message_id") or "")
+        covered = any(
+            item.get("action_type") == "analysis.request"
+            and str((item.get("source_span") or {}).get("message_id") or "") == message_id
+            for item in result
+        )
+        if action["time_scope"] == "weekend":
+            # The explicit period in the user's own text is authoritative. A
+            # model-authored action may enrich the wording, but must not shrink
+            # an entire-week review into the latest completed close.
+            result = [
+                item for item in result
+                if not (
+                    item.get("action_type") == "analysis.request"
+                    and str((item.get("source_span") or {}).get("message_id") or "") == message_id
+                )
+            ]
+            result.append(action)
+        elif not covered:
             result.append(action)
     return result
 

@@ -712,6 +712,40 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.assertEqual(text, command["analysis"]["goal"])
         self.assertEqual("weekend-review", command["source"]["message_id"])
 
+    def test_explicit_weekend_scope_replaces_a_model_action_that_shrinks_it_to_close(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-09-05")
+        text = "做一次周末复盘"
+        self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="weekend-scope")
+        batch_id, messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        artifact = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text, conversation["as_of"], {"batch_id": batch_id},
+        )
+        self.engine.request_formal_analysis = Mock(return_value={
+            "receipt": {"state": "created", "request_id": "analysis:weekend-scope", "cycle_id": "formal-weekend-scope"},
+        })
+
+        outcome = UnifiedCognition(self.store, self.portfolio, self.engine).apply(
+            conversation, artifact, messages, "conversation",
+            {
+                "answer": {"points": ["我先核验本周数据。"], "material_ids": []},
+                "needs_fresh_search": False,
+                "public_search_request": None,
+                "propositions": [],
+                "actions": [{
+                    "action_type": "analysis.request",
+                    "subject": "本周A股市场与用户已记录持仓",
+                    "time_scope": "截至2026年9月4日收盘的本周交易日，并展望下一交易周初",
+                    "goal": "复盘本周市场表现",
+                    "source_span": {"message_id": "weekend-scope", "start": 0, "end": len(text), "quote": text},
+                }],
+            },
+        )
+
+        self.assertEqual("created", outcome.receipts[0]["state"])
+        command = self.engine.request_formal_analysis.call_args.args[0]
+        self.assertEqual("weekend", command["analysis"]["time_scope"])
+        self.assertEqual(text, command["analysis"]["goal"])
+
     def test_progress_reply_does_not_complete_batch_before_fresh_research(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-09-03")
         text = "做一次晚间盘后回顾"

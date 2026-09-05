@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.12"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11"}
+_VERSION = "1.1.13"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -1578,10 +1578,21 @@ def market_event_snapshot_payload(
                 "source": source, "article_id": clean_text(row.get("article_id")).strip()[:200],
                 "published_at": published.isoformat().replace("+00:00", "Z"),
                 "title": title,
-                "content": clean_text(row.get("content") or row.get("subtitle")).strip()[:1200],
+                "content": clean_text(row.get("content") or row.get("subtitle")).strip()[:600],
                 "source_url": article_url,
             })
-        selected = matched[:30]
+        relevance_terms = (
+            "A股", "沪指", "深证", "创业板", "市场", "收盘", "资金", "政策",
+            "证监会", "央行", "风险", "行业", "板块", "交易所",
+        )
+        matched.sort(
+            key=lambda item: sum(
+                term in (str(item["title"]) + str(item["content"]))
+                for term in relevance_terms
+            ),
+            reverse=True,
+        )
+        selected = matched[:5]
         normalized.extend(selected)
         source_urls.append(url)
         source_checks.append({

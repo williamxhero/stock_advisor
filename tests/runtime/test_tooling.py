@@ -42,7 +42,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.12", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.13", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
             routing = json.loads(turnover_routing.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -51,7 +51,7 @@ class ToolRunnerTests(unittest.TestCase):
             )
             official_manifest = json.loads((
                 root / "cn_market_turnover_compare" / "adapters" / "official_exchanges"
-                / "versions" / "1.1.12" / "manifest.json"
+                / "versions" / "1.1.13" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual({
                 "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
@@ -1235,16 +1235,19 @@ class ToolRunnerTests(unittest.TestCase):
                 query = parse_qs(urlsplit(self.path).query)
                 source = query.get("source", [""])[0]
                 requested_sources.append(source)
+                articles = [{
+                    "article_id": source + f":{index}", "published_at": "2026-09-04 15:30",
+                    "title": f"A股收盘政策观察 {index}", "content": "市场风险与政策变化。" * 100,
+                    "source_url": f"https://example.test/{source}/{index}",
+                } for index in range(40)]
+                articles.append({
+                    "article_id": source + ":future", "published_at": "2026-09-05 12:30",
+                    "title": "冻结时点之后", "content": "不得进入证据。",
+                    "source_url": f"https://example.test/{source}/future",
+                })
                 payload = {
                     "source": source, "start_date": "2026-08-31", "end_date": "2026-09-05",
-                    "groups": [{"source_key": source, "count": 2, "articles": [
-                        {"article_id": source + ":1", "published_at": "2026-09-04 15:30",
-                         "title": "A股收盘政策观察", "content": "市场风险与政策变化。",
-                         "source_url": f"https://example.test/{source}/1"},
-                        {"article_id": source + ":future", "published_at": "2026-09-05 12:30",
-                         "title": "冻结时点之后", "content": "不得进入证据。",
-                         "source_url": f"https://example.test/{source}/future"},
-                    ]}],
+                    "groups": [{"source_key": source, "count": len(articles), "articles": articles}],
                 }
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1270,7 +1273,9 @@ class ToolRunnerTests(unittest.TestCase):
                     ["eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news"],
                     requested_sources,
                 )
-                self.assertEqual(3, result.data["matched_count"])
+                self.assertEqual(120, result.data["matched_count"])
+                self.assertEqual(15, len(result.data["articles"]))
+                self.assertTrue(all(len(row["content"]) <= 600 for row in result.data["articles"]))
                 self.assertTrue(all("future" not in row["article_id"] for row in result.data["articles"]))
                 self.assertEqual("2026-09-05T02:00:00Z", result.fact_as_of)
             finally:

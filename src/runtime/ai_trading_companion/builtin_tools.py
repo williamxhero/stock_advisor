@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.13"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12"}
+_VERSION = "1.1.14"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -44,7 +44,7 @@ _ADAPTERS = {
     },
     "cn_market_fund_flow_snapshot": {
         "eastmoney_history": "cn_market_fund_flow_snapshot_eastmoney_history",
-        "eastmoney_live": "cn_market_fund_flow_snapshot_eastmoney_live",
+        "eastmoney_history_alt": "cn_market_fund_flow_snapshot_eastmoney_history_alt",
     },
 }
 
@@ -88,7 +88,10 @@ def ensure_builtin_tools(root: Path) -> None:
         routing = root / capability / "routing.json"
         legacy_adapter_sets = (
             ({"eastmoney", "markethub"},)
-            if capability == "cn_market_turnover_compare" else ()
+            if capability == "cn_market_turnover_compare"
+            else ({"eastmoney_history", "eastmoney_live"},)
+            if capability == "cn_market_fund_flow_snapshot"
+            else ()
         )
         if _routing_is_managed_builtin(routing, set(adapters), legacy_adapter_sets):
             routing.write_text(json.dumps({
@@ -214,8 +217,17 @@ def fetch(
         except (OSError, subprocess.TimeoutExpired) as exc:
             last_error = exc
         else:
-            if completed.returncode == 0 and len(completed.stdout) <= 1_000_000:
-                return url, completed.stdout.decode("utf-8", errors="replace")
+            decoded = completed.stdout.decode("utf-8", errors="replace")
+            if len(completed.stdout) <= 1_000_000:
+                try:
+                    complete_json = json.loads(decoded)
+                except json.JSONDecodeError:
+                    complete_json = None
+                if completed.returncode == 0 or (
+                    curl_fallback and isinstance(complete_json, dict)
+                    and isinstance(complete_json.get("data"), dict)
+                ):
+                    return url, decoded
             last_error = RuntimeError(f"curl_exit_{completed.returncode}")
     fail(75, f"network read failed after retry: {type(last_error).__name__}")
 
@@ -1417,7 +1429,9 @@ def eastmoney_fund_flow_payload(
     for exchange, secid in (("SSE", "1.000001"), ("SZSE", "0.399001")):
         separator = "&" if "?" in endpoint else "?"
         url, body = fetch(
-            endpoint + separator + "lmt=0&klt=101&fields1=f1&fields2=f51%2Cf52%2Cf53%2Cf54%2Cf55%2Cf56"
+            endpoint + separator + "lmt=120&klt=101&fields1=f1%2Cf2%2Cf3%2Cf7"
+            + "&fields2=f51%2Cf52%2Cf53%2Cf54%2Cf55%2Cf56%2Cf57"
+            + "&ut=b2884a393a59ad64002292a3e90d46a5"
             + "&secid=" + quote_plus(secid),
             referer="https://data.eastmoney.com/zjlx/dpzjlx.html",
             curl_fallback=True,
@@ -1887,15 +1901,15 @@ def main() -> None:
         return
     if mode in {
         "cn_market_fund_flow_snapshot_eastmoney_history",
-        "cn_market_fund_flow_snapshot_eastmoney_live",
+        "cn_market_fund_flow_snapshot_eastmoney_history_alt",
     }:
         finality = str(request.get("finality") or "observed")
         if finality not in {"close", "official_close"}:
             fail(64, "fund flow snapshot requires close finality")
-        if mode.endswith("_live"):
-            endpoint = inputs.get("eastmoney_live_url") or "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+        if mode.endswith("_alt"):
+            endpoint = inputs.get("eastmoney_history_alt_url") or "https://33.push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
         else:
-            endpoint = inputs.get("eastmoney_history_url") or "https://push2his.eastmoney.com/api/qt/stock/fflow/kline/get"
+            endpoint = inputs.get("eastmoney_history_url") or "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
         payload, fact_as_of = eastmoney_fund_flow_payload(
             safe_url(endpoint), str(request.get("required_at") or ""), finality,
         )

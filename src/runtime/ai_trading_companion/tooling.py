@@ -798,6 +798,30 @@ def _validate_market_fund_flow_snapshot(
         return "tool_market_fund_flow_finality_invalid"
     if not str(data.get("source") or "").strip() or not _valid_public_source_urls(data.get("source_urls")):
         return "tool_market_source_urls_invalid"
+    if data.get("coverage_level") == "directional_sector":
+        inflows = data.get("sector_inflow_leaders")
+        outflows = data.get("sector_outflow_leaders")
+        if not isinstance(inflows, list) or len(inflows) < 3 or not isinstance(outflows, list) or not outflows:
+            return "tool_market_fund_flow_result_invalid"
+        try:
+            if any(
+                not isinstance(row, dict)
+                or not str(row.get("name") or "").strip()
+                or isinstance(row.get("net_inflow"), bool)
+                or float(row["net_inflow"]) <= 0
+                for row in inflows
+            ):
+                return "tool_market_fund_flow_result_invalid"
+        except (KeyError, TypeError, ValueError):
+            return "tool_market_fund_flow_result_invalid"
+        if any(not isinstance(row, dict) or not str(row.get("name") or "").strip() for row in outflows):
+            return "tool_market_fund_flow_result_invalid"
+        limitations = data.get("limitations")
+        if not isinstance(limitations, list) or not {
+            "full_market_net_flow_unavailable", "order_size_breakdown_unavailable",
+        }.issubset({str(value) for value in limitations}):
+            return "tool_market_fund_flow_result_invalid"
+        return None
     markets = data.get("markets")
     combined = data.get("combined")
     fields = ("main_net_inflow", "small_net_inflow", "medium_net_inflow", "large_net_inflow", "super_large_net_inflow")

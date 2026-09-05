@@ -42,7 +42,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.14", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.15", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
             routing = json.loads(turnover_routing.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -51,7 +51,7 @@ class ToolRunnerTests(unittest.TestCase):
             )
             official_manifest = json.loads((
                 root / "cn_market_turnover_compare" / "adapters" / "official_exchanges"
-                / "versions" / "1.1.14" / "manifest.json"
+                / "versions" / "1.1.15" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual({
                 "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
@@ -1237,6 +1237,88 @@ class ToolRunnerTests(unittest.TestCase):
 
                 self.assertTrue(result.succeeded, result.error_code)
                 self.assertEqual({"1.000001": 3, "0.399001": 3}, calls)
+            finally:
+                server.shutdown(); server.server_close()
+
+    def test_builtin_fund_flow_falls_back_to_verified_close_article_directions(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith(("/flow-primary", "/flow-alt")):
+                    self.close_connection = True
+                    return
+                payload = {
+                    "source": "all",
+                    "start_date": "2026-09-04",
+                    "end_date": "2026-09-04",
+                    "groups": [
+                        {
+                            "source_key": "ths_important_news",
+                            "articles": [
+                                {
+                                    "article_id": "important:noon",
+                                    "published_at": "2026-09-04 11:30",
+                                    "title": "A股午评",
+                                    "content": "NO.1 【午间样本】获主力资金净流入99.99亿。",
+                                    "source_url": "https://news.10jqka.com.cn/20260904/noon.shtml",
+                                },
+                                {
+                                    "article_id": "important:close",
+                                    "published_at": "2026-09-04 15:01",
+                                    "title": "A股收评",
+                                    "content": (
+                                        "NO.1 【虚拟数字人】获主力资金净流入52.81亿。"
+                                        "NO.2 【AI应用】获主力资金净流入51.63亿。"
+                                        "NO.3 【文化传媒概念】获主力资金净流入42.08亿。"
+                                    ),
+                                    "source_url": "https://news.10jqka.com.cn/20260904/close.shtml",
+                                },
+                            ],
+                        },
+                        {
+                            "source_key": "cls_depth_article",
+                            "articles": [{
+                                "article_id": "depth:close",
+                                "published_at": "2026-09-04 17:41",
+                                "title": "数据看盘",
+                                "content": (
+                                    "文化传媒板块主力资金净流入居首。"
+                                    "电子板块主力资金净流出居首。"
+                                ),
+                                "source_url": "https://www.cls.cn/detail/close",
+                            }],
+                        },
+                    ],
+                }
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"; ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                    1, "cn_market_fund_flow_snapshot", "2026-09-04T07:00:00Z", 8.0,
+                    {
+                        "eastmoney_history_url": base + "/flow-primary",
+                        "eastmoney_history_alt_url": base + "/flow-alt",
+                        "article_base_url": base,
+                    },
+                    finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("directional_sector", result.data["coverage_level"])
+                self.assertEqual(3, len(result.data["sector_inflow_leaders"]))
+                self.assertEqual("电子", result.data["sector_outflow_leaders"][0]["name"])
+                self.assertEqual(52.81 * 100_000_000, result.data["sector_inflow_leaders"][0]["net_inflow"])
+                self.assertNotIn("午间样本", {row["name"] for row in result.data["sector_inflow_leaders"]})
+                self.assertEqual(2, len(result.data["source_urls"]))
             finally:
                 server.shutdown(); server.server_close()
 

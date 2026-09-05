@@ -541,6 +541,52 @@ class EvidenceV3Tests(TestCase):
 
         self.assertTrue(result["passed"], result["problems"])
 
+    def test_v4_directional_sector_fund_flow_counts_only_verified_numeric_leaders(self):
+        close = "2026-09-04T07:00:00Z"
+        contract = {"version": 4, "as_of": "2026-09-05T02:00:00Z", "requirements": [{
+            "key": "market_fund_flow", "blocking": True, "allowed_coverage": ["covered"],
+            "minimum_numeric_facts": 3,
+            "window": {"mode": "exact", "start": close, "end": close},
+        }]}
+        payload = {
+            "trading_date": "2026-09-04",
+            "coverage_level": "directional_sector",
+            "sector_inflow_leaders": [
+                {"name": "虚拟数字人", "net_inflow": 5_281_000_000.0},
+                {"name": "AI应用", "net_inflow": 5_163_000_000.0},
+                {"name": "文化传媒概念", "net_inflow": 4_208_000_000.0},
+            ],
+            "sector_outflow_leaders": [{"name": "电子"}],
+        }
+        excerpt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        evidence = {
+            "schema_version": 3, "as_of": contract["as_of"],
+            "sources": [{"evidence_ref": "flow", "excerpt": excerpt}],
+            "coverage": [{"requirement_key": "market_fund_flow", "status": "covered",
+                          "evidence_refs": ["flow"]}],
+            "high_impact_events": [],
+        }
+        observations = [{
+            "attempt_id": "attempt", "backend": "market", "status": "succeeded", "non_empty": True,
+            "evidence_items": [{"evidence_ref": "flow", "excerpt_text": excerpt,
+                                "fact_as_of": close, "published_at": None,
+                                "acquired_at": contract["as_of"]}],
+        }]
+
+        passed = EvidenceGate().evaluate(
+            evidence, contract, observations, contract["as_of"], attempt_id="attempt",
+        )
+        self.assertTrue(passed["passed"], passed["problems"])
+
+        payload["sector_inflow_leaders"][2].pop("net_inflow")
+        excerpt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        evidence["sources"][0]["excerpt"] = excerpt
+        observations[0]["evidence_items"][0]["excerpt_text"] = excerpt
+        failed = EvidenceGate().evaluate(
+            evidence, contract, observations, contract["as_of"], attempt_id="attempt",
+        )
+        self.assertIn("blocking_requirement_lacks_numeric_facts:market_fund_flow", failed["problems"])
+
     def test_m0_rejects_utc_clock_and_requires_local_quote_time_and_status(self):
         packet = {
             "calendar_context": {},

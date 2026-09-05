@@ -617,6 +617,16 @@ class _EvidenceGateV3:
                     field for field in required
                     if isinstance(combined.get(field), (int, float)) and not isinstance(combined.get(field), bool)
                 )
+            if isinstance(payload, dict) and payload.get("coverage_level") == "directional_sector":
+                leaders = payload.get("sector_inflow_leaders")
+                if isinstance(leaders, list):
+                    found.update(
+                        f"sector_net_inflow:{index}"
+                        for index, row in enumerate(leaders)
+                        if isinstance(row, dict)
+                        and isinstance(row.get("net_inflow"), (int, float))
+                        and not isinstance(row.get("net_inflow"), bool)
+                    )
         return found
 
     @staticmethod

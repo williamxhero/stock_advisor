@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.14"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13"}
+_VERSION = "1.1.15"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -45,6 +45,7 @@ _ADAPTERS = {
     "cn_market_fund_flow_snapshot": {
         "eastmoney_history": "cn_market_fund_flow_snapshot_eastmoney_history",
         "eastmoney_history_alt": "cn_market_fund_flow_snapshot_eastmoney_history_alt",
+        "article_digest": "cn_market_fund_flow_snapshot_article_digest",
     },
 }
 
@@ -89,7 +90,10 @@ def ensure_builtin_tools(root: Path) -> None:
         legacy_adapter_sets = (
             ({"eastmoney", "markethub"},)
             if capability == "cn_market_turnover_compare"
-            else ({"eastmoney_history", "eastmoney_live"},)
+            else (
+                {"eastmoney_history", "eastmoney_history_alt"},
+                {"eastmoney_history", "eastmoney_live"},
+            )
             if capability == "cn_market_fund_flow_snapshot"
             else ()
         )
@@ -1467,6 +1471,123 @@ def eastmoney_fund_flow_payload(
     return data, fact_as_of
 
 
+def article_fund_flow_payload(
+    base: str, required_at: str, finality: str,
+) -> tuple[dict[str, object], str]:
+    try:
+        required = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(
+            dt.timezone(dt.timedelta(hours=8)))
+    except ValueError:
+        fail(64, "required_at must be an ISO timestamp")
+    expected_date = required.date().isoformat()
+    inflow_by_name: dict[str, dict[str, object]] = {}
+    outflow_by_name: dict[str, dict[str, object]] = {}
+    selected_articles: list[dict[str, object]] = []
+    for source_key in ("ths_important_news", "cls_depth_article"):
+        _url, body = fetch(
+            base.rstrip("/") + "/api/articles/range?source=" + quote_plus(source_key)
+            + "&start_date=" + quote_plus(expected_date)
+            + "&end_date=" + quote_plus(expected_date)
+        )
+        try:
+            payload = json.loads(body)
+            groups = payload["groups"]
+            group = next(
+                row for row in groups
+                if isinstance(row, dict) and str(row.get("source_key") or "") == source_key
+            )
+        except (KeyError, StopIteration, TypeError, json.JSONDecodeError):
+            fail(75, "fund flow article response is invalid")
+        rows = group.get("articles")
+        if not isinstance(rows, list):
+            fail(75, "fund flow article response is invalid")
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            published_text = str(row.get("published_at") or "").strip()
+            try:
+                published = dt.datetime.fromisoformat(published_text.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if published.tzinfo is None:
+                published = published.replace(tzinfo=required.tzinfo)
+            published = published.astimezone(required.tzinfo)
+            if published.date() != required.date() or published.time() < dt.time(15, 0):
+                continue
+            article_url = str(row.get("source_url") or "").strip()
+            parsed = urlparse(article_url)
+            hostname = str(parsed.hostname or "").lower()
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not (hostname.endswith("10jqka.com.cn") or hostname.endswith("cls.cn"))
+            ):
+                continue
+            content = clean_text(row.get("content") or row.get("subtitle"))
+            article_inflows: list[dict[str, object]] = []
+            article_outflows: list[dict[str, object]] = []
+            for match in re.finditer(
+                r"【([^】\r\n]{1,40})】获主力资金净流入([+-]?\d+(?:\.\d+)?)亿", content,
+            ):
+                name = match.group(1).strip()
+                value = float(match.group(2)) * 100_000_000
+                item = {"name": name, "net_inflow": value, "unit": "CNY"}
+                inflow_by_name[name] = item
+                article_inflows.append(item)
+            for match in re.finditer(
+                r"([\u4e00-\u9fffA-Za-z0-9Ⅱ]+)板块主力资金净流出居首", content,
+            ):
+                name = match.group(1).strip()
+                item = {"name": name}
+                outflow_by_name[name] = item
+                article_outflows.append(item)
+            if article_inflows or article_outflows:
+                selected_articles.append({
+                    "source": source_key,
+                    "source_url": article_url,
+                    "published_at": published.isoformat(),
+                    "title": clean_text(row.get("title")).strip()[:300],
+                    "sector_inflow_leaders": article_inflows,
+                    "sector_outflow_leaders": article_outflows,
+                })
+    inflows = sorted(inflow_by_name.values(), key=lambda item: float(item["net_inflow"]), reverse=True)
+    outflows = list(outflow_by_name.values())
+    source_urls = list(dict.fromkeys(str(row["source_url"]) for row in selected_articles))
+    if len(inflows) < 3 or not outflows or len(source_urls) < 2:
+        fail(75, "fund flow articles lack quantified directional coverage")
+
+    fact_as_of = dt.datetime.combine(
+        required.date(), dt.time(15, 0), required.tzinfo,
+    ).astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    data: dict[str, object] = {
+        "trading_date": expected_date,
+        "scope": "SSE+SZSE",
+        "unit": "CNY",
+        "coverage_level": "directional_sector",
+        "sector_inflow_leaders": inflows[:10],
+        "sector_outflow_leaders": outflows[:10],
+        "limitations": ["full_market_net_flow_unavailable", "order_size_breakdown_unavailable"],
+        "finality": finality,
+        "source": "verified_close_article_fund_flow",
+        "source_urls": source_urls,
+    }
+    data["source_evidence"] = [{
+        "url": row["source_url"],
+        "fact_as_of": fact_as_of,
+        "data": {
+            "summary": (
+                f"{expected_date} close article checked for quantified sector inflows "
+                "and the leading sector outflow; full-market and order-size totals remain unavailable"
+            ),
+            "coverage_level": "directional_sector",
+            "title": row["title"],
+            "published_at": row["published_at"],
+            "sector_inflow_leaders": row["sector_inflow_leaders"],
+            "sector_outflow_leaders": row["sector_outflow_leaders"],
+        },
+    } for row in selected_articles]
+    return data, fact_as_of
+
+
 def announcement_snapshot_payload(
     base: str, symbols: list[dict[str, str]], start_date: str, end_date: str, required_at: str,
 ) -> tuple[dict[str, object], str]:
@@ -1902,10 +2023,18 @@ def main() -> None:
     if mode in {
         "cn_market_fund_flow_snapshot_eastmoney_history",
         "cn_market_fund_flow_snapshot_eastmoney_history_alt",
+        "cn_market_fund_flow_snapshot_article_digest",
     }:
         finality = str(request.get("finality") or "observed")
         if finality not in {"close", "official_close"}:
             fail(64, "fund flow snapshot requires close finality")
+        if mode.endswith("_article_digest"):
+            payload, fact_as_of = article_fund_flow_payload(
+                safe_url(inputs.get("article_base_url") or "http://yosef-server:8815"),
+                str(request.get("required_at") or ""), finality,
+            )
+            result(payload, fact_as_of=fact_as_of)
+            return
         if mode.endswith("_alt"):
             endpoint = inputs.get("eastmoney_history_alt_url") or "https://33.push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
         else:

@@ -58,6 +58,18 @@ class ManualAnalysisProfileResolverTests(TestCase):
             self.assertEqual("manual.non_trading_outlook", profile["task_key"])
             self.assertEqual("非交易日市场环境总结与下一交易日预判", profile["display_name"])
 
+    def test_selects_a_distinct_completed_week_profile_for_weekend_review(self) -> None:
+        profile = self.resolver.resolve("2026-09-05T10:00:00+08:00", {
+            "subject": "A股市场及当前账户持仓",
+            "time_scope": "weekend",
+            "goal": "做一次周末复盘",
+        })
+
+        self.assertEqual("weekend_review", profile["profile_id"])
+        self.assertEqual("manual.non_trading_outlook", profile["task_key"])
+        self.assertEqual("completed_trading_week", profile["evidence_family"])
+        self.assertEqual("weekend", profile["analysis"]["time_scope"])
+
     def test_accepts_next_trading_session_during_pre_market(self) -> None:
         profile = self.resolver.resolve("2026-08-31T07:48:00+08:00", {
             "subject": "A股市场",
@@ -247,6 +259,32 @@ class ManualAnalysisProfileResolverTests(TestCase):
         self.assertEqual(["covered"], requirements["themes_and_capacity_cores"]["allowed_coverage"])
         self.assertTrue(requirements["themes_and_capacity_cores"]["blocking"])
         self.assertTrue(requirements["forum_and_sentiment"]["blocking"])
+
+    def test_weekend_contract_freezes_the_completed_trading_week_and_latest_close(self) -> None:
+        profile = self.resolver.resolve("2026-09-05T10:00:00+08:00", {
+            "subject": "A股市场及当前账户持仓",
+            "time_scope": "weekend",
+            "goal": "做一次周末复盘",
+        })
+        contract = EvidenceContractFactory(_Calendar()).build(
+            task_key=profile["task_key"], stage="m0_research",
+            as_of="2026-09-05T10:00:00+08:00", task_profile=profile,
+            internal_context={"portfolio_entities": ["600487"]},
+        )
+        requirements = {row["key"]: row for row in contract["requirements"]}
+
+        self.assertEqual({
+            "start": "2026-08-31T07:00:00Z", "end": "2026-09-04T07:00:00Z",
+            "mode": "after_start_to_end",
+        }, requirements["weekly_market_history"]["window"])
+        self.assertEqual({
+            "start": "2026-09-04T07:00:00Z", "end": "2026-09-04T07:00:00Z",
+            "mode": "exact",
+        }, requirements["current_market_state"]["window"])
+        self.assertEqual("official_close", requirements["current_market_state"]["finality"])
+        self.assertEqual("official_close", requirements["portfolio_market_state"]["finality"])
+        self.assertIn("turnover_compare", requirements)
+        self.assertIn("themes_and_capacity_cores", requirements)
 
     def test_chat_research_close_questions_freeze_the_latest_completed_close(self) -> None:
         with TemporaryDirectory() as temporary:

@@ -21,6 +21,25 @@ def row(operation: str, *, query: str | None = None, url: str | None = None) -> 
     return {"requirement_key": "market", "backend": "gateway", "operation": operation, "arguments": {"query": query, "categories": "news", "url": url, "symbol": None, "render": "auto", "session_id": None, "actions": None}, "fallback_backends": []}
 
 class LocalResearchTests(unittest.TestCase):
+    def test_weekend_history_urls_are_mandatory_reads(self) -> None:
+        urls = [
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh000001,day,2026-08-31,2026-09-04,10,qfq",
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz399001,day,2026-08-31,2026-09-04,10,qfq",
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sz399006,day,2026-08-31,2026-09-04,10,qfq",
+        ]
+        plan = _merge_mandatory_operations({"version": 1, "operations": []}, {
+            "version": 4,
+            "requirements": [{
+                "key": "weekly_market_history", "blocking": True,
+                "source_urls": urls,
+                "window": {"mode": "after_start_to_end", "start": "2026-08-31T07:00:00Z", "end": "2026-09-04T07:00:00Z"},
+            }],
+        }, max_operations=24)
+
+        reads = [row for row in plan["operations"] if row["operation"] == "web_read"]
+        self.assertEqual(urls, [row["arguments"]["url"] for row in reads])
+        self.assertTrue(all(row["requirement_key"] == "weekly_market_history" for row in reads))
+
     def test_close_review_mandatory_research_attempts_turnover_themes_and_forum_sentiment(self) -> None:
         contract = {
             "version": 4,

@@ -37,6 +37,8 @@ _COMPLETE_PORTFOLIO_ANSWER_CONTRADICTION = re.compile(
 _CLOSE_REVIEW_REQUEST = re.compile(r"(?:收盘|盘后).{0,8}(?:复盘|回顾)|(?:复盘|回顾).{0,8}(?:收盘|盘后)")
 _NEGATED_CLOSE_REVIEW_REQUEST = re.compile(r"(?:不要|不用|取消|不需要).{0,16}(?:收盘|盘后).{0,8}(?:复盘|回顾)")
 _FORMAL_CLOSE_REVIEW_DETAIL = re.compile(r"(?:15:20|成交额|三大指数|市场宽度|领涨|领跌|资料时点)")
+_WEEKEND_REVIEW_REQUEST = re.compile(r"(?:周末|本周).{0,8}(?:复盘|回顾|总结)|(?:复盘|回顾|总结).{0,8}(?:周末|本周)")
+_NEGATED_WEEKEND_REVIEW_REQUEST = re.compile(r"(?:不要|不用|取消|不需要).{0,16}(?:周末|本周).{0,8}(?:复盘|回顾|总结)")
 
 
 def verify_cognition_result(messages: list[dict[str, Any]], result: dict[str, Any]) -> dict[str, Any]:
@@ -77,23 +79,34 @@ def verify_cognition_result(messages: list[dict[str, Any]], result: dict[str, An
 
 
 def _explicit_close_review_action(message: dict[str, Any]) -> dict[str, Any] | None:
-    """Recover an unambiguous formal close-review request without inferring portfolio writes."""
+    """Recover an unambiguous close/weekend review without inferring portfolio writes."""
     text = str(message.get("body_text") or "").strip()
-    if (
-        not text
-        or not _CLOSE_REVIEW_REQUEST.search(text)
-        or not _FORMAL_CLOSE_REVIEW_DETAIL.search(text)
-        or _NEGATED_CLOSE_REVIEW_REQUEST.search(text)
-    ):
-        return None
-    time_scope_match = re.search(
-        r"(?:\d{4}年\d{1,2}月\d{1,2}日|今天|今日|当天)[^，。；]{0,16}收盘", text,
+    weekend_review = bool(
+        text
+        and _WEEKEND_REVIEW_REQUEST.search(text)
+        and not _NEGATED_WEEKEND_REVIEW_REQUEST.search(text)
     )
-    time_scope = time_scope_match.group(0) if time_scope_match else "盘后"
+    close_review = bool(
+        text
+        and _CLOSE_REVIEW_REQUEST.search(text)
+        and _FORMAL_CLOSE_REVIEW_DETAIL.search(text)
+        and not _NEGATED_CLOSE_REVIEW_REQUEST.search(text)
+    )
+    if not weekend_review and not close_review:
+        return None
+    if weekend_review:
+        subject = "A股市场及当前账户持仓"
+        time_scope = "weekend"
+    else:
+        subject = "A股收盘市场及当前账户持仓"
+        time_scope_match = re.search(
+            r"(?:\d{4}年\d{1,2}月\d{1,2}日|今天|今日|当天)[^，。；]{0,16}收盘", text,
+        )
+        time_scope = time_scope_match.group(0) if time_scope_match else "盘后"
     message_id = str(message.get("message_id") or "")
     return {
         "action_type": "analysis.request",
-        "subject": "A股收盘市场及当前账户持仓",
+        "subject": subject,
         "time_scope": time_scope,
         "goal": text,
         "source_span": {"message_id": message_id, "start": 0, "end": len(text), "quote": text},

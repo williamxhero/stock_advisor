@@ -95,6 +95,40 @@ class AdaptiveMemoryResearchTests(unittest.TestCase):
             self.assertEqual(1, collect_calls)
             self.assertEqual([{"state": "completed"}], first_result)
 
+    def test_completed_cognition_waiting_for_public_research_is_not_researched_again(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = CompanionStore(root / "runtime.sqlite3")
+            engine = CompanionEngine(store, memory=_RecordingMemory(), memory_space_id="test-space")
+            portfolio = PortfolioService(root, store)
+            conversation = store.ensure_daily_conversation("2026-09-05")
+            message = store.stage_message(
+                conversation["cycle_id"], "做一次周末复盘", "conversation", message_id="weekend",
+            )
+            batch_id, _ = store.commit_staged_messages(conversation["cycle_id"], "conversation")
+            source = store.append_artifact(
+                conversation["cycle_id"], "chat_human", "human", message["body_text"],
+                conversation["as_of"], {"batch_id": batch_id},
+            )
+            job = store.start_cognition_job(
+                conversation["cycle_id"], source["artifact_id"], "conversation", message["body_text"],
+            )
+            store.finish_cognition_job(job["job_id"], {
+                "answer": {"points": ["我先核验本周数据。"], "material_ids": []},
+                "needs_fresh_search": True,
+            })
+
+            with patch.object(
+                AdaptiveMemoryResearch, "collect",
+                return_value=MemoryResearchResult({"snapshot_id": "duplicate"}, (), ()),
+            ) as collect:
+                result = run_chat(
+                    engine, store, portfolio, conversation["cycle_id"], batch_id, True,
+                )
+
+            self.assertEqual("awaiting_research", result["state"])
+            collect.assert_not_called()
+
     def test_action_budget_returns_collected_context_without_an_unbounded_model_loop(self) -> None:
         memory = _RecordingMemory()
         memory.append(_episode("test-space", "prior", "close evidence", "2026-09-01T07:00:00Z"))

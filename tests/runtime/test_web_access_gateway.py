@@ -85,6 +85,33 @@ class WebAccessGatewayTests(unittest.TestCase):
         self.assertNotIn("future-value", item["excerpt_text"])
         self.assertFalse(item["primary"])
 
+    def test_tencent_history_range_keeps_all_completed_week_rows(self) -> None:
+        url = (
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+            "?param=sh000001,day,2026-08-31,2026-09-04,10,qfq"
+        )
+        markdown = json.dumps({
+            "code": 0,
+            "data": {"sh000001": {
+                "day": [
+                    ["2026-08-31", "3900", "3910", "3920", "3890", "100"],
+                    ["2026-09-01", "3910", "3930", "3940", "3900", "110"],
+                    ["2026-09-04", "3940", "3930", "3950", "3920", "120"],
+                ],
+                "qt": {"sh000001": ["current", "20260905161402", "future-value"]},
+            }},
+        }).replace("[", "\\[").replace("]", "\\]")
+        response = {"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": json.dumps({
+            "trace_id": "trace", "url": url, "markdown": markdown,
+        })}]}}
+        with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=_Response(response)):
+            item = self.client.read(url, not_after="2026-09-05T02:00:00Z")["results"][0]
+
+        payload = json.loads(item["excerpt_text"])
+        self.assertEqual("2026-09-04T07:00:00Z", item["fact_as_of"])
+        self.assertEqual(["2026-08-31", "2026-09-01", "2026-09-04"], [row["date"] for row in payload["series"]])
+        self.assertNotIn("future-value", item["excerpt_text"])
+
     def test_tencent_intraday_quote_exposes_compact_quote_time_and_index_values(self) -> None:
         url = "https://qt.gtimg.cn/q=sh000001,sz399001,sz399006"
         markdown = (

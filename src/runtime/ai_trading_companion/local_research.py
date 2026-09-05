@@ -916,27 +916,46 @@ def _public_market_close_discoveries(packet: dict[str, Any]) -> list[dict[str, A
         row for row in context["requirements"]
         if row.get("requirement_key") == "current_market_state" and row.get("is_local_market_close")
     ), None)
-    if not close:
-        return []
-    local_date = str(close["start_local"])[:10]
-    compact = local_date.replace("-", "")
     rows = []
-    for symbol, title in (
-        ("sh000001", "上证指数"), ("sz399001", "深证成指"), ("sz399006", "创业板指"),
-    ):
-        rows.append({
-            "requirement_key": "current_market_state",
-            "url": (
-                "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-                f"?param={symbol},day,{local_date},{local_date},1,qfq"
-            ),
-            "title": f"{title} {local_date} 公开历史日线",
-            "excerpt": f"{title} frozen close {compact}",
-            "fact_as_of": close["start_utc"],
-            "published_at": None,
-            "primary": False,
-            "source_kind": "deterministic_public_market",
-        })
+    symbols = (("sh000001", "上证指数"), ("sz399001", "深证成指"), ("sz399006", "创业板指"))
+    if close:
+        local_date = str(close["start_local"])[:10]
+        compact = local_date.replace("-", "")
+        for symbol, title in symbols:
+            rows.append({
+                "requirement_key": "current_market_state",
+                "url": (
+                    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+                    f"?param={symbol},day,{local_date},{local_date},1,qfq"
+                ),
+                "title": f"{title} {local_date} 公开历史日线",
+                "excerpt": f"{title} frozen close {compact}",
+                "fact_as_of": close["start_utc"],
+                "published_at": None,
+                "primary": False,
+                "source_kind": "deterministic_public_market",
+            })
+    weekly = next((
+        row for row in context["requirements"]
+        if row.get("requirement_key") == "weekly_market_history"
+    ), None)
+    if weekly and weekly.get("start_local") and weekly.get("end_local"):
+        start_date = str(weekly["start_local"])[:10]
+        end_date = str(weekly["end_local"])[:10]
+        for symbol, title in symbols:
+            rows.append({
+                "requirement_key": "weekly_market_history",
+                "url": (
+                    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+                    f"?param={symbol},day,{start_date},{end_date},10,qfq"
+                ),
+                "title": f"{title} {start_date} 至 {end_date} 公开历史日线",
+                "excerpt": f"{title} completed trading-week daily path",
+                "fact_as_of": weekly["end_utc"],
+                "published_at": None,
+                "primary": False,
+                "source_kind": "deterministic_public_market_weekly",
+            })
     return rows
 
 
@@ -1101,12 +1120,13 @@ def _has_matching_negative_search(observations: list[dict[str, Any]], requiremen
 
 
 def _operation(
-    requirement_key: str, backend: str, operation: str, *, query: str | None = None,
+    requirement_key: str, backend: str, operation: str, *,
+    query: str | None = None, url: str | None = None,
 ) -> dict[str, Any]:
     return {
         "requirement_key": requirement_key, "backend": backend, "operation": operation,
         "arguments": {
-            "query": query, "categories": "news" if query else None, "url": None,
+            "query": query, "categories": "news" if query else None, "url": url,
             "symbol": None, "render": None, "session_id": None, "actions": None,
         },
         "fallback_backends": [],
@@ -1124,6 +1144,11 @@ def _merge_mandatory_operations(
         if isinstance(item, dict)
     }
     required: list[dict[str, Any]] = []
+    for url in requirements.get("weekly_market_history", {}).get("source_urls") or []:
+        if str(url).startswith(("http://", "https://")):
+            required.append(_operation(
+                "weekly_market_history", "gateway", "web_read", url=str(url),
+            ))
     if "current_market_state" in requirements:
         required.append(_operation("current_market_state", "market", "market_snapshot"))
     if "indices_close" in requirements:
@@ -1162,7 +1187,9 @@ def _merge_mandatory_operations(
         (
             str((item.get("arguments") or {}).get("requirement_key") or ""),
             str(item.get("operation") or ""),
-            str((item.get("arguments") or {}).get("query") or "") if item.get("operation") == "web_search" else "",
+            str((item.get("arguments") or {}).get(
+                "query" if item.get("operation") == "web_search" else "url"
+            ) or "") if item.get("operation") in {"web_search", "web_read"} else "",
         )
         for item in observations or []
         if item.get("status") == "succeeded"
@@ -1172,7 +1199,9 @@ def _merge_mandatory_operations(
         key = str(item["requirement_key"])
         identity = (
             key, str(item["operation"]),
-            str((item.get("arguments") or {}).get("query") or "") if item["operation"] == "web_search" else "",
+            str((item.get("arguments") or {}).get(
+                "query" if item["operation"] == "web_search" else "url"
+            ) or "") if item["operation"] in {"web_search", "web_read"} else "",
         )
         if identity not in completed:
             failed_attempts = sum(
@@ -1181,8 +1210,10 @@ def _merge_mandatory_operations(
                 and str((observation.get("arguments") or {}).get("requirement_key") or "") == key
                 and observation.get("operation") == identity[1]
                 and (
-                    identity[1] != "web_search"
-                    or str((observation.get("arguments") or {}).get("query") or "") == identity[2]
+                    identity[1] not in {"web_search", "web_read"}
+                    or str((observation.get("arguments") or {}).get(
+                        "query" if identity[1] == "web_search" else "url"
+                    ) or "") == identity[2]
                 )
             )
             if failed_attempts >= 2:

@@ -297,6 +297,8 @@ class EvidenceContractFactory:
     def _manual_requirements(
         self, as_of: datetime, evidence_family: str, internal_context: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        if evidence_family == "completed_trading_week":
+            return self._completed_week_requirements(as_of, internal_context)
         if evidence_family == "intraday_snapshot":
             market_window = {
                 "start": self._iso(as_of - _INTRADAY_MARKET_MAX_AGE),
@@ -332,6 +334,69 @@ class EvidenceContractFactory:
                 "negative_query_terms": ["公告", "政策", "风险"],
             },
         ], market_window=market_window, events_window=events_window, internal_context=internal_context)
+
+    def _completed_week_requirements(
+        self, as_of: datetime, internal_context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        close = self._latest_completed_close(as_of)
+        close_local = close.astimezone(_SHANGHAI)
+        week_start_date = close_local.date() - timedelta(days=close_local.weekday())
+        while not self.calendar.is_trading_day(week_start_date):
+            week_start_date += timedelta(days=1)
+        week_start = datetime.combine(
+            week_start_date, time(15, 0), tzinfo=_SHANGHAI,
+        ).astimezone(ZoneInfo("UTC"))
+        close_text = self._iso(close)
+        week_start_text = self._iso(week_start)
+        market_window = {"start": close_text, "end": close_text, "mode": "exact"}
+        events_window = {
+            "start": week_start_text, "end": self._iso(as_of), "mode": "after_start_to_end",
+        }
+        context = internal_context or {}
+        start_date = week_start.astimezone(_SHANGHAI).date().isoformat()
+        end_date = close_local.date().isoformat()
+        weekly_urls = [
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+            f"?param={symbol},day,{start_date},{end_date},10,qfq"
+            for symbol in ("sh000001", "sz399001", "sz399006")
+        ]
+        return self._with_portfolio_requirements([
+            {
+                "key": "weekly_market_history", "blocking": True,
+                "allowed_coverage": ["covered"], "finality": "official_close",
+                "window": {
+                    "start": week_start_text, "end": close_text, "mode": "after_start_to_end",
+                },
+                "source_urls": weekly_urls,
+                "minimum_numeric_facts": 9,
+            },
+            {
+                "key": "current_market_state", "blocking": True,
+                "allowed_coverage": ["covered"], "finality": "official_close",
+                "window": market_window,
+            },
+            {
+                "key": "turnover_compare", "blocking": True,
+                "allowed_coverage": ["covered"], "window": market_window,
+                "minimum_numeric_facts": 2,
+            },
+            {
+                "key": "themes_and_capacity_cores", "blocking": True,
+                "allowed_coverage": ["covered"], "window": events_window,
+                "minimum_named_entities": 2,
+            },
+            {
+                "key": "material_events_and_counterevidence", "blocking": True,
+                "allowed_coverage": ["covered", "checked_no_change"],
+                "window": events_window, "negative_query_terms": ["公告", "政策", "风险"],
+            },
+            {
+                "key": "prior_judgment_changes", "blocking": True,
+                "allowed_coverage": ["covered", "checked_no_change"],
+                "evidence_class": "internal_runtime",
+                "internal_record_count": int(context.get("prior_judgment_count") or 0),
+            },
+        ], market_window=market_window, events_window=events_window, internal_context=context)
 
     @staticmethod
     def _manual_intraday_anchor(as_of: datetime) -> datetime:

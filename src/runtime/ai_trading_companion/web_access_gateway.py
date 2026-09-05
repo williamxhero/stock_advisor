@@ -215,19 +215,35 @@ def _frozen_public_market_row(url: str, body: str, not_after: str | None) -> dic
             candidates.append((utc_close, row))
     if not candidates:
         return None
-    fact_time, row = max(candidates, key=lambda item: item[0])
-    fields = {
-        "source": "Tencent public historical daily kline",
-        "symbol": symbol,
-        "date": str(row[0]),
-        "open": str(row[1]),
-        "close": str(row[2]),
-        "high": str(row[3]),
-        "low": str(row[4]),
-        "volume": str(row[5]),
-    }
+    candidates.sort(key=lambda item: item[0])
+    fact_time, row = candidates[-1]
+    requested_range = len(param) >= 4 and param[2] != param[3]
+    if requested_range:
+        fields = {
+            "source": "Tencent public historical daily kline",
+            "symbol": symbol,
+            "start": str(candidates[0][1][0]),
+            "end": str(row[0]),
+            "series": [{
+                "date": str(item[0]), "open": str(item[1]), "close": str(item[2]),
+                "high": str(item[3]), "low": str(item[4]), "volume": str(item[5]),
+            } for _, item in candidates],
+        }
+        title = f"腾讯证券公开历史日线 {symbol} {fields['start']} 至 {fields['end']}"
+    else:
+        fields = {
+            "source": "Tencent public historical daily kline",
+            "symbol": symbol,
+            "date": str(row[0]),
+            "open": str(row[1]),
+            "close": str(row[2]),
+            "high": str(row[3]),
+            "low": str(row[4]),
+            "volume": str(row[5]),
+        }
+        title = f"腾讯证券公开历史日线 {symbol} {row[0]}"
     return {
-        "title": f"腾讯证券公开历史日线 {symbol} {row[0]}",
+        "title": title,
         "excerpt_text": json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         "fact_as_of": fact_time.isoformat().replace("+00:00", "Z"),
     }

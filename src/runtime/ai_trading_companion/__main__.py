@@ -2309,6 +2309,19 @@ def run_chat(
     job = store.start_cognition_job(
         cycle_id, source["artifact_id"], "conversation", source["body_markdown"],
     )
+    if job["state"] == "completed":
+        try:
+            completed_result = json.loads(job.get("result_json") or "{}")
+        except json.JSONDecodeError:
+            completed_result = {}
+        if completed_result.get("needs_fresh_search"):
+            # The durable public-research job owns the still-pending batch now.
+            # A periodic conversation recovery may observe that batch before the
+            # research worker publishes; it must not repeat private-memory work.
+            return {
+                "cycle_id": cycle_id, "job_id": job["job_id"],
+                "state": "awaiting_research", "receipts": [],
+            }
     if job["state"] != "completed":
         job = store.claim_cognition_job(job["job_id"])
         if not job["claimed"]:

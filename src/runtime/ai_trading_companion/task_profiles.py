@@ -24,7 +24,7 @@ class ManualAnalysisProfileResolver:
     time even if profile definitions later evolve.
     """
 
-    VERSION = 3
+    VERSION = 4
 
     _PROFILES = {
         "pre_market_opportunity": {
@@ -64,6 +64,14 @@ class ManualAnalysisProfileResolver:
             "display_name": "非交易日市场环境总结与下一交易日预判",
             "evidence_family": "latest_completed_close",
             "stage_strategy": "non_trading_research",
+            "h0_window_minutes": 60,
+            "m1_publish_window_minutes": 120,
+        },
+        "weekend_review": {
+            "task_key": "manual.non_trading_outlook",
+            "display_name": "周末整周市场与持仓复盘",
+            "evidence_family": "completed_trading_week",
+            "stage_strategy": "weekend_review",
             "h0_window_minutes": 60,
             "m1_publish_window_minutes": 120,
         },
@@ -121,6 +129,8 @@ class ManualAnalysisProfileResolver:
             # finished trading session, independent of the wall-clock session
             # in which the user asks for it.
             actual = "post_close_review"
+        elif time_scope == "weekend" and not self.calendar.is_trading_day(requested.date()):
+            actual = "weekend_review"
         elif not self.calendar.is_trading_day(requested.date()):
             actual = "non_trading_outlook"
         else:
@@ -141,6 +151,7 @@ class ManualAnalysisProfileResolver:
             "lunch_break_analysis": {"current_session", "lunch_break"},
             "post_close_review": {"current_session", "post_close"},
             "non_trading_outlook": {"current_session", "non_trading_period", "next_trading_session", "weekend"},
+            "weekend_review": {"weekend"},
         }
         if time_scope not in accepted_scopes[actual]:
             raise AnalysisClarificationRequired(

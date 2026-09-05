@@ -682,6 +682,36 @@ class UnifiedCognitionTests(unittest.TestCase):
         self.assertEqual(text, command["analysis"]["goal"])
         self.assertEqual("close-review", command["source"]["message_id"])
 
+    def test_explicit_weekend_review_request_is_recovered_when_model_omits_the_action(self) -> None:
+        conversation = self.store.ensure_daily_conversation("2026-09-05")
+        text = "做一次周末复盘"
+        self.store.stage_message(conversation["cycle_id"], text, "conversation", message_id="weekend-review")
+        batch_id, messages = self.store.commit_staged_messages(conversation["cycle_id"], "conversation")
+        artifact = self.store.append_artifact(
+            conversation["cycle_id"], "chat_human", "human", text, conversation["as_of"], {"batch_id": batch_id},
+        )
+        self.engine.request_formal_analysis = Mock(return_value={
+            "receipt": {"state": "created", "request_id": "analysis:weekend-review", "cycle_id": "formal-weekend-review"},
+        })
+
+        outcome = UnifiedCognition(self.store, self.portfolio, self.engine).apply(
+            conversation, artifact, messages, "conversation",
+            {
+                "answer": {"points": ["我先核验本周数据。"], "material_ids": []},
+                "needs_fresh_search": False,
+                "public_search_request": None,
+                "propositions": [],
+                "actions": [],
+            },
+        )
+
+        self.assertEqual("created", outcome.receipts[0]["state"])
+        command = self.engine.request_formal_analysis.call_args.args[0]
+        self.assertEqual("weekend", command["analysis"]["time_scope"])
+        self.assertEqual("A股市场及当前账户持仓", command["analysis"]["subject"])
+        self.assertEqual(text, command["analysis"]["goal"])
+        self.assertEqual("weekend-review", command["source"]["message_id"])
+
     def test_progress_reply_does_not_complete_batch_before_fresh_research(self) -> None:
         conversation = self.store.ensure_daily_conversation("2026-09-03")
         text = "做一次晚间盘后回顾"

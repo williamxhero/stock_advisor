@@ -173,6 +173,23 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertLess(len(material["markdown"]), 120)
         self.assertEqual("[查看公告原文](https://example.com/long)", material["markdown"])
 
+    def test_machine_readable_material_becomes_a_link_instead_of_raw_json(self):
+        presented = present_message(
+            "我先说和判断有关的部分。 [[material:market-1]]",
+            as_of="2026-09-05T10:00:00Z",
+            kind="ai_chat",
+            material_registry={"market-1": {
+                "title": "交易所收盘数据",
+                "url": "https://example.com/close",
+                "markdown": '{"finality":"official_close","indices":[{"symbol":"000001","price":3930.12}]}',
+            }},
+        )
+
+        material = presented.parts[1]
+        self.assertEqual("material", material["kind"])
+        self.assertEqual("[查看交易所收盘数据](https://example.com/close)", material["markdown"])
+        self.assertNotIn("official_close", presented.markdown)
+
     def test_unattributed_quote_does_not_get_material_format_privilege(self):
         presented = present_message(
             "我不认可这个说法。\n\n> - 这是没有来源的清单",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -363,6 +364,10 @@ def _spoken_clock(hour: int, minute: int) -> str:
 def _bound_material(markdown: str, title: str, url: str | None, expression_profile: dict[str, Any]) -> str:
     material_preference = expression_profile.get("material_density")
     density = str(material_preference.get("value") if isinstance(material_preference, dict) else expression_profile.get("value") or "")
+    if density != "more_source_excerpt" and _is_machine_readable_material(markdown):
+        if url:
+            return f"[查看{title}]({url})"
+        raise MessageQualificationError(["machine_material_without_source"])
     max_characters = 2_400 if density == "more_source_excerpt" else 600 if density == "summary_and_link" else 1_200
     if len(markdown) <= max_characters:
         if url and url not in markdown:
@@ -371,6 +376,17 @@ def _bound_material(markdown: str, title: str, url: str | None, expression_profi
     if url:
         return f"[查看{title}]({url})"
     raise MessageQualificationError(["long_material_without_source"])
+
+
+def _is_machine_readable_material(markdown: str) -> bool:
+    candidate = str(markdown or "").strip()
+    if not candidate or candidate[0] not in "[{":
+        return False
+    try:
+        value = json.loads(candidate)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(value, (dict, list))
 
 
 def _source_title(markdown: str) -> str:

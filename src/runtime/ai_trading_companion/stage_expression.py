@@ -206,6 +206,61 @@ def _verified_close_summary(packet: dict[str, Any] | None) -> dict[str, Any] | N
     }
 
 
+def verified_weekly_market_comparison(packet: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Calculate the completed-week index comparison from frozen typed evidence."""
+    expected = {
+        "sh000001": "上证", "sz399001": "深成指", "sz399006": "创业板",
+    }
+    weekly: dict[str, tuple[str, str, float]] = {}
+    value = packet or {}
+    evidence = value.get("evidence") if isinstance(value.get("evidence"), dict) else {}
+    for source in evidence.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        try:
+            payload = json.loads(str(source.get("excerpt") or ""))
+            symbol = str(payload.get("symbol") or "")
+            series = payload.get("series")
+            first, last = series[0], series[-1]
+            first_close, last_close = float(first["close"]), float(last["close"])
+            start, end = str(first["date"]), str(last["date"])
+        except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if symbol in expected and len(series) >= 2 and first_close > 0:
+            weekly[symbol] = (start, end, (last_close - first_close) / first_close * 100)
+    if set(weekly) != set(expected):
+        return None
+
+    start, end, _ = weekly["sh000001"]
+    if any(item[0] != start or item[1] != end for item in weekly.values()):
+        return None
+    try:
+        start_parts = [int(value) for value in start.split("-")]
+        end_parts = [int(value) for value in end.split("-")]
+        if len(start_parts) != 3 or len(end_parts) != 3:
+            return None
+    except ValueError:
+        return None
+    start_label = f"{start_parts[1]}月{start_parts[2]}日"
+    end_label = f"{end_parts[1]}月{end_parts[2]}日"
+    entries = []
+    for symbol, name in expected.items():
+        change = weekly[symbol][2]
+        direction = "跌" if change < -0.005 else "涨" if change > 0.005 else "平"
+        number = f"{round(abs(change), 2):.2f}".rstrip("0").rstrip(".")
+        entries.append({
+            "symbol": symbol, "name": name, "change": change,
+            "direction": direction, "number": number,
+        })
+    text = f"本周{start_label}至{end_label}，" + "、".join(
+        f"{item['name']}周{item['direction']}{item['number']}%" for item in entries
+    ) + "。"
+    return {
+        "start": start, "end": end, "start_label": start_label, "end_label": end_label,
+        "entries": entries, "text": text,
+    }
+
+
 def _verified_close_judgment(
     packet: dict[str, Any] | None, *, horizon: str,
 ) -> dict[str, Any] | None:
@@ -286,7 +341,7 @@ def _verified_close_judgment(
     holding_evidence = f"腾讯15:00持仓收盘：{holdings}。"
     if any(len(item) > 240 for item in (market_evidence, theme_and_sentiment, holding_evidence)):
         return None
-    return {
+    result = {
         "result_version": 4,
         "semantic": {
             "summary": (
@@ -310,6 +365,13 @@ def _verified_close_judgment(
             "unknowns": ["下一交易日指数、市场宽度与成交扩散能否同步改善。"],
         },
     }
+    task_profile = value.get("task_profile") if isinstance(value.get("task_profile"), dict) else {}
+    if task_profile.get("evidence_family") == "completed_trading_week":
+        weekly = verified_weekly_market_comparison(value)
+        if weekly is None:
+            return None
+        result["semantic"]["summary"] = weekly["text"] + result["semantic"]["summary"]
+    return result
 
 
 def safe_stage_output(

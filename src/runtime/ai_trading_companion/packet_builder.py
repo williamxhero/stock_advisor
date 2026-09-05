@@ -12,6 +12,7 @@ from .memory_port import MemoryPort, MemoryUnavailable
 from .secret_guard import assert_safe
 from .evidence_contract import EvidenceContractFactory
 from .models import TASK_POLICIES
+from .stage_expression import verified_weekly_market_comparison
 from .trading_calendar import TradingCalendarUnavailable
 
 
@@ -480,10 +481,16 @@ class RuntimePacketBuilder:
         }[packet["stage"]]
         task_profile = packet.get("task_profile") if isinstance(packet.get("task_profile"), dict) else {}
         if packet["stage"] == "m1_judgment" and task_profile.get("evidence_family") == "completed_trading_week":
+            weekly = verified_weekly_market_comparison(packet)
+            weekly_fact = (
+                f"必须原样保留这句由冻结周线计算出的事实：{weekly['text']}"
+                if weekly is not None else
+                "必须根据冻结 weekly_market_history 计算并写出三大指数周涨跌。"
+            )
             instruction += (
                 "这是整周复盘，不是最后一个交易日复盘。summary 或 key_evidence 必须明确写出完成交易周的起止日期，"
                 "并根据 weekly_market_history 对上证、深成指、创业板逐一给出从周初收盘到周末收盘的周涨跌幅；"
-                "随后再解释周末单日、成交、广度、主题和持仓对下周判断的影响。不得只列9月4日单日涨跌。"
+                f"{weekly_fact}随后再解释周末单日、成交、广度、主题和持仓对下周判断的影响。不得只列9月4日单日涨跌。"
             )
         if packet["stage"] not in PUBLIC_STAGES:
             instruction += display_contract

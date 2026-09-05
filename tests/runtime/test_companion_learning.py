@@ -388,6 +388,24 @@ class CompanionLearningTests(unittest.TestCase):
                     {"date": "2026-09-04", "close": end},
                 ],
             })})
+        sources.extend([
+            {"excerpt": json.dumps({"indices": [
+                {"symbol": "000001", "name": "上证指数", "price": 98.0, "change_percent": -0.2,
+                 "trading_date": "2026-09-04"},
+                {"symbol": "399001", "name": "深证成指", "price": 97.0, "change_percent": -0.3,
+                 "trading_date": "2026-09-04"},
+                {"symbol": "399006", "name": "创业板指", "price": 96.0, "change_percent": -0.4,
+                 "trading_date": "2026-09-04"},
+            ]})},
+            {"excerpt": json.dumps({"breadth": {"up": 2000, "down": 3000, "flat": 100}})},
+            {"excerpt": json.dumps({"summary": "两市成交额2万亿元，较前一交易日增加1000亿元。"})},
+            {"excerpt": json.dumps({
+                "leaders": [{"name": "消费", "change_percent": 2.0,
+                             "core": {"name": "甲", "symbol": "000001", "change_percent": 5.0}}],
+                "laggards": [{"name": "科技", "change_percent": -2.0,
+                              "core": {"name": "乙", "symbol": "000002", "change_percent": -5.0}}],
+            })},
+        ])
         packet = {
             "stage": "m1_judgment", "task_key": "manual.non_trading_outlook",
             "task_profile": {"evidence_family": "completed_trading_week"},
@@ -419,7 +437,11 @@ class CompanionLearningTests(unittest.TestCase):
 
         self.assertIn("weekend_review_lacks_completed_week_comparison", single_day["problems"])
         self.assertTrue(completed_week["passed"], completed_week["problems"])
-        self.assertIn("整周", _RuntimePacketBuilder.prompt(packet))
+        prompt = _RuntimePacketBuilder.prompt(packet)
+        fallback = safe_stage_output("m1_judgment", horizon="下周初", packet=packet)
+        fallback_check = CognitiveRouter().verify("m1_judgment", packet, fallback)
+        self.assertIn("本周8月31日至9月4日，上证周跌2%、深成指周跌3%、创业板周跌4%。", prompt)
+        self.assertTrue(fallback_check["passed"], fallback_check["problems"])
 
     def test_safe_formal_fallback_is_natural_and_conservative(self):
         m0 = normalize_stage_output("m0_compose", safe_stage_output("m0_compose"))

@@ -9,7 +9,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .effort_policy import CognitiveEffortPolicy, EffortPolicyFacts
-from .stage_expression import canonical_direction, normalize_stage_output, semantic_snapshot_conflicts
+from .stage_expression import (
+    canonical_direction, normalize_stage_output, semantic_snapshot_conflicts,
+    verified_weekly_market_comparison,
+)
 
 
 RESEARCH_STAGES = frozenset({"m0_research", "m1_research", "outcome_research", "chat_research"})
@@ -339,45 +342,23 @@ def _weekend_review_coverage_problems(packet: dict[str, Any], semantic: dict[str
     ]
     body = " ".join(str(value or "") for value in fields)
     compact = "".join(body.split())
-    expected = {
-        "sh000001": "上证", "sz399001": "深成指", "sz399006": "创业板",
-    }
-    weekly: dict[str, tuple[str, str, float]] = {}
-    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
-    for source in evidence.get("sources") or []:
-        if not isinstance(source, dict):
-            continue
-        try:
-            payload = json.loads(str(source.get("excerpt") or ""))
-            symbol = str(payload.get("symbol") or "")
-            series = payload.get("series")
-            first, last = series[0], series[-1]
-            first_close, last_close = float(first["close"]), float(last["close"])
-            start, end = str(first["date"]), str(last["date"])
-        except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if symbol in expected and len(series) >= 2 and first_close > 0:
-            weekly[symbol] = (start, end, (last_close - first_close) / first_close * 100)
-    if set(weekly) != set(expected):
+    weekly = verified_weekly_market_comparison(packet)
+    if weekly is None:
         return ["weekend_review_lacks_completed_week_comparison"]
 
-    start, end, _ = weekly["sh000001"]
-    try:
-        start_date, end_date = datetime.fromisoformat(start), datetime.fromisoformat(end)
-    except ValueError:
-        return ["weekend_review_lacks_completed_week_comparison"]
     if not (
         any(term in compact for term in ("本周", "整周", "周内", "全周"))
-        and f"{start_date.month}月{start_date.day}日" in compact
-        and f"{end_date.month}月{end_date.day}日" in compact
+        and weekly["start_label"] in compact
+        and weekly["end_label"] in compact
     ):
         return ["weekend_review_lacks_completed_week_comparison"]
 
-    for symbol, name in expected.items():
-        change = weekly[symbol][2]
-        direction = "跌" if change < -0.005 else "涨" if change > 0.005 else "平"
-        number = re.escape(_number_text(round(abs(change), 2)))
-        if not re.search(rf"{name}[^。；]{{0,24}}(?:周)?{direction}[^。；]{{0,8}}{number}(?:%|％)", compact):
+    for item in weekly["entries"]:
+        number = re.escape(str(item["number"]))
+        if not re.search(
+            rf"{item['name']}[^。；]{{0,24}}(?:周)?{item['direction']}[^。；]{{0,8}}{number}(?:%|％)",
+            compact,
+        ):
             return ["weekend_review_lacks_completed_week_comparison"]
     return []
 

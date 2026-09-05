@@ -682,6 +682,8 @@ class LocalResearchTests(unittest.TestCase):
 
         payload = json.loads(result["results"][0]["excerpt_text"])
         self.assertEqual(["2026-08-31", "2026-09-04"], [item["date"] for item in payload["series"]])
+        self.assertEqual(3930.12, payload["series"][-1]["close"])
+        self.assertIsInstance(payload["series"][-1]["volume"], float)
         self.assertEqual("2026-09-04T07:00:00Z", result["results"][0]["fact_as_of"])
         self.assertEqual("2026-09-04T07:00:00Z", runner.resolve_with_fallback.call_args.args[0].required_at)
 

@@ -209,17 +209,21 @@ def frozen_public_market_row(url: str, body: str, not_after: str | None) -> dict
         )
         series = [list(match.groups()) for match in row_pattern.finditer(body[day_start:day_end])]
     cutoff = _aware_utc(not_after)
-    candidates: list[tuple[datetime, list[Any]]] = []
+    candidates: list[tuple[datetime, dict[str, Any]]] = []
     for row in series:
         if not isinstance(row, list) or len(row) < 6:
             continue
         try:
             local_close = datetime.fromisoformat(str(row[0]) + "T15:00:00").replace(tzinfo=ZoneInfo("Asia/Shanghai"))
-        except ValueError:
+            normalized_row = {
+                "date": str(row[0]), "open": float(row[1]), "close": float(row[2]),
+                "high": float(row[3]), "low": float(row[4]), "volume": float(row[5]),
+            }
+        except (TypeError, ValueError):
             continue
         utc_close = local_close.astimezone(timezone.utc)
         if cutoff is None or utc_close <= cutoff:
-            candidates.append((utc_close, row))
+            candidates.append((utc_close, normalized_row))
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0])
@@ -229,26 +233,18 @@ def frozen_public_market_row(url: str, body: str, not_after: str | None) -> dict
         fields = {
             "source": "Tencent public historical daily kline",
             "symbol": symbol,
-            "start": str(candidates[0][1][0]),
-            "end": str(row[0]),
-            "series": [{
-                "date": str(item[0]), "open": str(item[1]), "close": str(item[2]),
-                "high": str(item[3]), "low": str(item[4]), "volume": str(item[5]),
-            } for _, item in candidates],
+            "start": candidates[0][1]["date"],
+            "end": row["date"],
+            "series": [item for _, item in candidates],
         }
         title = f"腾讯证券公开历史日线 {symbol} {fields['start']} 至 {fields['end']}"
     else:
         fields = {
             "source": "Tencent public historical daily kline",
             "symbol": symbol,
-            "date": str(row[0]),
-            "open": str(row[1]),
-            "close": str(row[2]),
-            "high": str(row[3]),
-            "low": str(row[4]),
-            "volume": str(row[5]),
+            **row,
         }
-        title = f"腾讯证券公开历史日线 {symbol} {row[0]}"
+        title = f"腾讯证券公开历史日线 {symbol} {row['date']}"
     return {
         "title": title,
         "excerpt_text": json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")),

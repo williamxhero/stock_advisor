@@ -81,7 +81,7 @@ class WebAccessGatewayTests(unittest.TestCase):
         with mock.patch("ai_trading_companion.web_access_gateway.urlopen", return_value=_Response(response)):
             item = self.client.read(url, not_after="2026-08-27T07:20:00Z")["results"][0]
         self.assertEqual("2026-08-27T07:00:00Z", item["fact_as_of"])
-        self.assertIn('"close":"3956.570"', item["excerpt_text"])
+        self.assertEqual(3956.57, json.loads(item["excerpt_text"])["close"])
         self.assertNotIn("future-value", item["excerpt_text"])
         self.assertFalse(item["primary"])
 

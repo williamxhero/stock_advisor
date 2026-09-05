@@ -443,6 +443,71 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertIn("本周8月31日至9月4日，上证周跌2%、深成指周跌3%、创业板周跌4%。", prompt)
         self.assertTrue(fallback_check["passed"], fallback_check["problems"])
 
+    def test_weekend_m1_must_surface_every_covered_driver_dimension(self):
+        sources = [
+            {"excerpt": json.dumps({
+                "symbol": symbol, "start": "2026-08-31", "end": "2026-09-04",
+                "series": [
+                    {"date": "2026-08-31", "close": 100.0},
+                    {"date": "2026-09-04", "close": end},
+                ],
+            })}
+            for symbol, end in (("sh000001", 98.0), ("sz399001", 97.0), ("sz399006", 96.0))
+        ]
+        packet = {
+            "stage": "m1_judgment", "task_key": "manual.non_trading_outlook",
+            "task_profile": {"evidence_family": "completed_trading_week"},
+            "evidence_contract": {"requirements": [{
+                "key": "portfolio_events_and_counterevidence",
+                "required_entities": ["000997", "002891"],
+            }]},
+            "business_context": {"private_context_before_h0": {"positions": [
+                {"code": "000997", "name": "新大陆"},
+                {"code": "002891", "name": "中宠股份"},
+            ]}},
+            "evidence": {
+                "sources": sources,
+                "coverage": [
+                    {"requirement_key": "themes_and_capacity_cores", "status": "covered"},
+                    {"requirement_key": "market_fund_flow", "status": "covered"},
+                    {"requirement_key": "material_events_and_counterevidence", "status": "covered"},
+                    {"requirement_key": "portfolio_events_and_counterevidence", "status": "checked_no_change"},
+                ],
+            },
+        }
+        base = {
+            "summary": "本周8月31日至9月4日，上证周跌2%，深成指周跌3%，创业板指周跌4%。",
+            "direction": "neutral", "qualified": True, "horizon": "下周初",
+            "current_action": "observe", "key_evidence": ["市场广度偏弱"],
+            "transition_conditions": [{
+                "outcome": "upgrade", "price": "三大指数收盘转强",
+                "breadth": "上涨家数超过下跌家数", "persistence": "至少持续一个交易日",
+            }, {
+                "outcome": "downgrade", "price": "三大指数跌破周低点",
+                "breadth": "下跌家数继续增加", "persistence": "至少持续一个交易日",
+            }],
+            "position_focus": [], "risks": [], "unknowns": [],
+        }
+
+        omitted = CognitiveRouter().verify(
+            "m1_judgment", packet, {"result_version": 4, "semantic": base},
+        )
+        complete = CognitiveRouter().verify("m1_judgment", packet, {
+            "result_version": 4,
+            "semantic": {**base, "key_evidence": [
+                "行业分布上，消费板块领涨、科技板块领跌。",
+                "主力资金方向显示数字人净流入52.81亿元，电子板块净流出。",
+                "政策与风险事件核查后，相关变化对下周风险偏好有压制影响。",
+                "逐股公告核查：000997新大陆、002891中宠股份均未发现改变判断的披露。",
+            ]},
+        })
+
+        self.assertIn("weekend_review_lacks_sector_distribution", omitted["problems"])
+        self.assertIn("weekend_review_lacks_fund_flow_direction", omitted["problems"])
+        self.assertIn("weekend_review_lacks_market_event_impact", omitted["problems"])
+        self.assertIn("weekend_review_lacks_portfolio_announcement_checks", omitted["problems"])
+        self.assertTrue(complete["passed"], complete["problems"])
+
     def test_safe_formal_fallback_is_natural_and_conservative(self):
         m0 = normalize_stage_output("m0_compose", safe_stage_output("m0_compose"))
         m1 = normalize_stage_output("m1_judgment", safe_stage_output("m1_judgment", horizon="午后"))

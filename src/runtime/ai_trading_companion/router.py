@@ -339,29 +339,89 @@ def _weekend_review_coverage_problems(packet: dict[str, Any], semantic: dict[str
 
     fields = [
         semantic.get("summary"), *(semantic.get("key_evidence") or []),
+        *(item.get("reason") for item in semantic.get("position_focus") or [] if isinstance(item, dict)),
         *(semantic.get("risks") or []), *(semantic.get("unknowns") or []),
     ]
     body = " ".join(str(value or "") for value in fields)
     compact = "".join(body.split())
     weekly = verified_weekly_market_comparison(packet)
+    problems: list[str] = []
     if weekly is None:
-        return ["weekend_review_lacks_completed_week_comparison"]
-
-    if not (
+        problems.append("weekend_review_lacks_completed_week_comparison")
+    elif not (
         any(term in compact for term in ("本周", "整周", "周内", "全周"))
         and weekly["start_label"] in compact
         and weekly["end_label"] in compact
     ):
-        return ["weekend_review_lacks_completed_week_comparison"]
-
-    for item in weekly["entries"]:
-        number = re.escape(str(item["number"]))
-        if not re.search(
-            rf"{item['name']}[^。；]{{0,24}}(?:周)?{item['direction']}[^。；]{{0,8}}{number}(?:%|％)",
+        problems.append("weekend_review_lacks_completed_week_comparison")
+    elif any(
+        not re.search(
+            rf"{item['name']}[^。；]{{0,24}}(?:周)?{item['direction']}[^。；]{{0,8}}{re.escape(str(item['number']))}(?:%|％)",
             compact,
-        ):
-            return ["weekend_review_lacks_completed_week_comparison"]
-    return []
+        )
+        for item in weekly["entries"]
+    ):
+        problems.append("weekend_review_lacks_completed_week_comparison")
+
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    coverage = {
+        str(item.get("requirement_key") or ""): str(item.get("status") or "")
+        for item in evidence.get("coverage") or [] if isinstance(item, dict)
+    }
+    available = {key for key, status in coverage.items() if status in {"covered", "checked_no_change"}}
+
+    if "themes_and_capacity_cores" in available and not (
+        any(term in compact for term in ("行业", "板块", "题材", "概念"))
+        and any(term in compact for term in ("领涨", "涨幅", "强势", "净流入"))
+        and any(term in compact for term in ("领跌", "跌幅", "弱势", "净流出"))
+    ):
+        problems.append("weekend_review_lacks_sector_distribution")
+
+    if "market_fund_flow" in available and not (
+        any(term in compact for term in ("资金流", "主力资金", "净流入", "净流出"))
+        and any(term in compact for term in ("净流入", "净流出"))
+        and any(term in compact for term in ("亿元", "万元", "元"))
+    ):
+        problems.append("weekend_review_lacks_fund_flow_direction")
+
+    if "material_events_and_counterevidence" in available and not (
+        any(term in compact for term in ("政策", "市场事件", "风险事件", "市场公告"))
+        and any(term in compact for term in ("影响", "扰动", "催化", "压制", "支撑", "未发现"))
+    ):
+        problems.append("weekend_review_lacks_market_event_impact")
+
+    if "portfolio_events_and_counterevidence" in available:
+        announcement_markers = ("公告", "披露", "停复牌", "财报")
+        announcement_text = "".join(
+            segment for segment in re.split(r"[。；\n]", body)
+            if any(marker in segment for marker in announcement_markers)
+        )
+        announcement_compact = "".join(announcement_text.split())
+        requirement = next((
+            item for item in (packet.get("evidence_contract") or {}).get("requirements") or []
+            if isinstance(item, dict) and item.get("key") == "portfolio_events_and_counterevidence"
+        ), {})
+        aliases = _portfolio_entity_aliases(packet)
+        missing = [
+            entity for entity in requirement.get("required_entities") or []
+            if not any(alias and alias in announcement_compact for alias in aliases.get(str(entity), (str(entity),)))
+        ]
+        if not announcement_text or missing:
+            problems.append("weekend_review_lacks_portfolio_announcement_checks")
+    return problems
+
+
+def _portfolio_entity_aliases(packet: dict[str, Any]) -> dict[str, tuple[str, ...]]:
+    business = packet.get("business_context") if isinstance(packet.get("business_context"), dict) else {}
+    private = business.get("private_context_before_h0") if isinstance(business.get("private_context_before_h0"), dict) else {}
+    aliases: dict[str, tuple[str, ...]] = {}
+    for position in private.get("positions") or []:
+        if not isinstance(position, dict):
+            continue
+        code, name = str(position.get("code") or ""), str(position.get("name") or "")
+        if code:
+            aliases[code] = tuple(value for value in (code, name) if value)
+    return aliases
 
 
 def _frozen_portfolio_quotes(value: Any) -> dict[str, dict[str, Any]]:

@@ -341,7 +341,7 @@ class EvolutionGovernance:
             if action == "approve" and approver == "automatic-governance" and payload.get("source_kind") != "live_paired_shadow" and recommendation != "recommend_rollback":
                 raise ValueError("automatic promotion requires live paired shadow evidence")
             runtime_cell = connection.execute(
-                """SELECT policy_kind,revision,evaluation_profile,applicable_tasks_json
+                """SELECT policy_kind,mode,revision,evaluation_profile,applicable_tasks_json
                      FROM runtime_strategy_cell WHERE cell_key=?""",
                 (payload["experiment_key"],),
             ).fetchone()
@@ -369,15 +369,19 @@ class EvolutionGovernance:
                     replay_gate = payload.get("historical_replay_gate") or {}
                     safety = payload.get("safety_faults") or {}
                     if (
-                        payload.get("source_kind") != "live_paired_shadow"
+                        runtime_cell["mode"] != "shadow"
+                        or payload.get("source_kind") != "live_paired_shadow"
                         or not maturity.get("mature")
                         or not maturity.get("protection_dimensions_stable")
                         or not replay_gate.get("passed")
                         or float(safety.get("candidate_mean") or 0) != 0
                     ):
                         raise ValueError("active research promotion evidence is not mature and protected")
-                if action == "approve" and recommendation == "recommend_rollback" and payload.get("source_kind") != "post_promotion_monitoring":
-                    raise ValueError("active research rollback requires post-promotion evidence")
+                if action == "approve" and recommendation == "recommend_rollback" and (
+                    runtime_cell["mode"] != "promoted"
+                    or payload.get("source_kind") != "post_promotion_monitoring"
+                ):
+                    raise ValueError("active research rollback requires a promoted policy and post-promotion evidence")
             protected_dimensions_json = json.dumps(protected_dimensions, sort_keys=True)
             state = "approved" if action == "approve" else "rejected"
             decision_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"governance|{evidence_snapshot_id}|{state}|{approver}"))
@@ -529,6 +533,10 @@ class ActiveResearchPolicyExecutor:
                 raise ValueError("active research evidence snapshot is unavailable")
             payload = json.loads(snapshot["payload_json"])
             self._validate_snapshot(payload, str(decision["recommendation"]))
+            if decision["recommendation"] == "recommend_promotion" and cell["mode"] != "shadow":
+                raise ValueError("active research promotion requires a shadow policy cell")
+            if decision["recommendation"] == "recommend_rollback" and cell["mode"] != "promoted":
+                raise ValueError("active research rollback requires a promoted policy cell")
             scope_json = str(decision["applicable_scope_json"])
             latest = connection.execute(
                 """SELECT * FROM active_research_policy_version WHERE cell_key=? AND state='active'

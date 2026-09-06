@@ -15,6 +15,7 @@ from ai_trading_companion.__main__ import (
     _m1_retry_feedback,
     _m1_should_retry,
 )
+from ai_trading_companion.acquisition import AcquisitionBoundary
 from ai_trading_companion.broker_client import BrokerError
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.evidence_gate import EvidenceGate
@@ -797,9 +798,190 @@ class EvidenceV3Tests(TestCase):
 
     def test_high_impact_fact_needs_primary_or_independent_corroboration(self):
         evidence = self._evidence()
-        evidence["high_impact_events"] = [{"materiality": "high", "evidence_refs": ["ev_attempt-1_2"]}]
+        self.observations[0]["evidence_items"][1]["market_propagation"] = "observed"
+        evidence["high_impact_events"] = [{
+            "summary": "传闻正在影响市场", "scope": "market", "materiality": "high",
+            "evidence_refs": ["ev_attempt-1_2"], "truth_status": "unverified",
+            "propagation_status": "observed", "truth_evidence_refs": [],
+            "propagation_evidence_refs": ["ev_attempt-1_2"],
+        }]
         result = EvidenceGate().evaluate(evidence, self.contract, self.observations, self.as_of, attempt_id="attempt-1")
+        self.assertNotIn("high_impact_fact_lacks_primary_or_independent_confirmation", result["problems"])
+
+    def test_acquisition_preserves_origin_and_collapses_reposts_into_one_chain(self):
+        boundary = AcquisitionBoundary("attempt-1")
+        observation, _ = boundary.observe("web_read", {}, {"results": [{
+            "url": "https://mirror-a.test/story?utm_source=x", "title": "转载稿",
+            "text": "同一通讯社原稿", "author": "记者甲", "publisher": "媒体甲",
+            "original_source": "https://agency.test/wire/42", "citation_chain": ["agency.test"],
+            "published_at": "2026-08-26T00:30:00Z",
+        }, {
+            "url": "https://mirror-b.test/story", "title": "另一转载",
+            "text": "同一通讯社原稿", "publisher": "媒体乙",
+            "original_source": "https://agency.test/wire/42", "published_at": "2026-08-26T00:31:00Z",
+        }]}, True)
+
+        first, second = observation["evidence_items"]
+        self.assertEqual("https://mirror-a.test/story", first["canonical_url"])
+        self.assertEqual("记者甲", first["author"])
+        self.assertEqual("媒体甲", first["publisher"])
+        self.assertEqual("https://agency.test/wire/42", first["original_source"])
+        self.assertEqual(first["independence_group"], second["independence_group"])
+        self.assertTrue(first["content_fingerprint"].startswith("sha256:"))
+
+    def test_reposts_do_not_satisfy_independent_high_impact_confirmation(self):
+        evidence = self._evidence()
+        copied = dict(self.observations[0]["evidence_items"][1])
+        copied.update({
+            "evidence_ref": "ev_attempt-1_3", "url": "https://mirror.test/events",
+            "canonical_url": "https://mirror.test/events", "source_identity": "mirror.test",
+            "independence_group": "origin:https://agency.test/wire/42",
+            "original_source": "https://agency.test/wire/42",
+        })
+        self.observations[0]["evidence_items"][1].update({
+            "independence_group": "origin:https://agency.test/wire/42",
+            "original_source": "https://agency.test/wire/42",
+        })
+        self.observations[0]["evidence_items"].append(copied)
+        evidence["sources"].append({
+            "evidence_ref": "ev_attempt-1_3", "excerpt": "无新增重大公告", "analysis": "转载确认",
+        })
+        evidence["high_impact_events"] = [{
+            "summary": "重大事件已发生", "scope": "market", "materiality": "high",
+            "evidence_refs": ["ev_attempt-1_2", "ev_attempt-1_3"], "truth_status": "verified",
+            "propagation_status": "unknown", "truth_evidence_refs": ["ev_attempt-1_2", "ev_attempt-1_3"],
+            "propagation_evidence_refs": [],
+        }]
+
+        result = EvidenceGate().evaluate(evidence, self.contract, self.observations, self.as_of, attempt_id="attempt-1")
+
         self.assertIn("high_impact_fact_lacks_primary_or_independent_confirmation", result["problems"])
+
+    def test_two_genuinely_independent_sources_confirm_a_high_impact_fact(self):
+        evidence = self._evidence()
+        independent = dict(self.observations[0]["evidence_items"][1])
+        independent.update({
+            "evidence_ref": "ev_attempt-1_3", "url": "https://independent.test/events",
+            "source_identity": "independent.test", "independence_group": "independent.test",
+        })
+        self.observations[0]["evidence_items"][1]["independence_group"] = "example.test"
+        self.observations[0]["evidence_items"].append(independent)
+        evidence["sources"].append({
+            "evidence_ref": "ev_attempt-1_3", "excerpt": "无新增重大公告", "analysis": "独立确认",
+        })
+        evidence["high_impact_events"] = [{
+            "summary": "重大事件已独立确认", "scope": "market", "materiality": "high",
+            "evidence_refs": ["ev_attempt-1_2", "ev_attempt-1_3"], "truth_status": "verified",
+            "propagation_status": "not_observed",
+            "truth_evidence_refs": ["ev_attempt-1_2", "ev_attempt-1_3"],
+            "propagation_evidence_refs": [],
+        }]
+
+        result = EvidenceGate().evaluate(evidence, self.contract, self.observations, self.as_of, attempt_id="attempt-1")
+
+        self.assertTrue(result["passed"], result["problems"])
+
+    def test_truth_and_market_propagation_are_qualified_independently(self):
+        evidence = self._evidence()
+        self.observations[0]["evidence_items"][1]["market_propagation"] = "observed"
+        evidence["high_impact_events"] = [{
+            "summary": "传闻已被官方否认但仍广泛传播", "scope": "market", "materiality": "high",
+            "evidence_refs": ["ev_attempt-1_1", "ev_attempt-1_2"], "truth_status": "refuted",
+            "propagation_status": "observed", "truth_evidence_refs": ["ev_attempt-1_1"],
+            "propagation_evidence_refs": ["ev_attempt-1_2"],
+        }]
+
+        result = EvidenceGate().evaluate(evidence, self.contract, self.observations, self.as_of, attempt_id="attempt-1")
+
+        self.assertTrue(result["passed"], result["problems"])
+        event = result["normalized_evidence"]["high_impact_events"][0]
+        self.assertEqual("refuted", event["truth_status"])
+        self.assertEqual("observed", event["propagation_status"])
+
+    def test_equal_tier_exact_fact_conflict_blocks_only_dependent_requirement(self):
+        evidence = self._evidence()
+        conflict_ref = "ev_attempt-1_3"
+        for item, value, group in (
+            (self.observations[0]["evidence_items"][1], 123.0, "media-a"),
+            ({
+                "evidence_ref": conflict_ref, "url": "https://media-b.test/flow",
+                "title": "资金数据", "source_identity": "media-b.test", "independence_group": "media-b",
+                "primary": False, "excerpt_text": "净流入124亿元", "fact_as_of": "2026-08-26T00:50:00Z",
+                "published_at": "2026-08-26T00:50:00Z", "acquired_at": "2026-08-26T00:50:00Z",
+            }, 124.0, "media-b"),
+        ):
+            item["independence_group"] = group
+            item["source_tier"] = "secondary"
+            item["claims"] = [{
+                "proposition": "market_fund_flow", "field": "net_inflow", "value": value,
+                "unit": "亿元", "scope": "SSE+SZSE", "fact_as_of": "2026-08-26T00:50:00Z",
+                "precision": "exact", "requirement_key": "material_events_and_counterevidence",
+            }]
+            if item.get("evidence_ref") == conflict_ref:
+                self.observations[0]["evidence_items"].append(item)
+        evidence["sources"].append({"evidence_ref": conflict_ref, "excerpt": "净流入124亿元", "analysis": "资金数据"})
+        evidence["coverage"][1]["evidence_refs"].append(conflict_ref)
+
+        result = EvidenceGate().evaluate(evidence, self.contract, self.observations, self.as_of, attempt_id="attempt-1")
+
+        self.assertIn("blocking_requirement_conflicted:material_events_and_counterevidence", result["problems"])
+        self.assertNotIn("blocking_requirement_conflicted:current_market_state", result["problems"])
+        conflict = result["normalized_evidence"]["conflicts"][0]
+        self.assertEqual("unresolved_equal_tier", conflict["resolution"])
+        self.assertEqual([123.0, 124.0], sorted(row["value"] for row in conflict["observations"]))
+
+    def test_different_numeric_scopes_are_explained_without_averaging(self):
+        evidence = self._evidence()
+        second = dict(self.observations[0]["evidence_items"][1])
+        second.update({
+            "evidence_ref": "ev_attempt-1_3", "url": "https://official-b.test/flow",
+            "source_identity": "official-b.test", "independence_group": "official-b",
+            "primary": True, "source_tier": "primary_structured", "excerpt_text": "沪市净流入80亿元",
+            "claims": [{
+                "proposition": "market_fund_flow", "field": "net_inflow", "value": 80.0,
+                "unit": "亿元", "scope": "SSE", "fact_as_of": "2026-08-26T00:50:00Z",
+                "precision": "exact", "requirement_key": "material_events_and_counterevidence",
+            }],
+        })
+        self.observations[0]["evidence_items"][1].update({
+            "primary": True, "source_tier": "primary_structured", "claims": [{
+                "proposition": "market_fund_flow", "field": "net_inflow", "value": 120.0,
+                "unit": "亿元", "scope": "SSE+SZSE", "fact_as_of": "2026-08-26T00:50:00Z",
+                "precision": "exact", "requirement_key": "material_events_and_counterevidence",
+            }],
+        })
+        self.observations[0]["evidence_items"].append(second)
+        evidence["sources"].append({
+            "evidence_ref": "ev_attempt-1_3", "excerpt": "沪市净流入80亿元", "analysis": "沪市口径",
+        })
+        evidence["coverage"][1]["evidence_refs"].append("ev_attempt-1_3")
+
+        result = EvidenceGate().evaluate(evidence, self.contract, self.observations, self.as_of, attempt_id="attempt-1")
+
+        self.assertTrue(result["passed"], result["problems"])
+        conflict = result["normalized_evidence"]["conflicts"][0]
+        self.assertEqual("scope_difference", conflict["resolution"])
+        self.assertNotIn("average", conflict)
+
+    def test_natural_judgment_must_explain_scope_and_truth_propagation_boundaries(self):
+        packet = {"task_key": "manual.analysis", "evidence": {
+            "conflicts": [{"resolution": "scope_difference", "materiality": "medium"}],
+            "high_impact_events": [{
+                "truth_status": "refuted", "propagation_status": "observed",
+            }],
+        }}
+        omitted = safe_stage_output("m1_judgment")
+
+        rejected = CognitiveRouter().verify("m1_judgment", packet, omitted)
+
+        self.assertIn("judgment_omits_explainable_source_scope_conflict", rejected["problems"])
+        self.assertIn("judgment_omits_observed_market_propagation", rejected["problems"])
+        self.assertIn("judgment_omits_event_refutation", rejected["problems"])
+
+        explained = json.loads(json.dumps(omitted, ensure_ascii=False))
+        explained["semantic"]["summary"] = "两个数字的统计口径不同；相关说法已被否认，但传播影响仍在。"
+        accepted = CognitiveRouter().verify("m1_judgment", packet, explained)
+        self.assertTrue(accepted["passed"], accepted["problems"])
 
     def test_terminal_attempt_cannot_be_finalized_twice(self):
         with TemporaryDirectory() as temporary:

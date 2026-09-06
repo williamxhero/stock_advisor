@@ -227,6 +227,32 @@ class CognitiveRouter:
                     problems.append(f"m0_portfolio_quote_time_conflict:{entity}")
         if stage == "m1_judgment" and not profile.m1_blind:
             problems.append("m1_packet_contains_human_input")
+        if stage in {"m0_compose", "m1_judgment", "m2"}:
+            evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+            body = "".join(normalized.text.split()).casefold()
+            explainable_conflicts = [
+                row for row in evidence.get("conflicts") or []
+                if isinstance(row, dict) and row.get("resolution") in {"scope_difference", "primary_precedence"}
+            ]
+            if explainable_conflicts and "口径" not in body:
+                problems.append("judgment_omits_explainable_source_scope_conflict")
+            unresolved = [
+                row for row in evidence.get("conflicts") or []
+                if isinstance(row, dict) and row.get("resolution") == "unresolved_equal_tier"
+                and row.get("materiality") in {"medium", "high"}
+            ]
+            if unresolved and isinstance(normalized.semantic, dict) and normalized.semantic.get("qualified") is True:
+                problems.append("qualified_judgment_depends_on_unresolved_source_conflict")
+            for event in evidence.get("high_impact_events") or []:
+                if not isinstance(event, dict) or event.get("propagation_status") != "observed":
+                    continue
+                truth = str(event.get("truth_status") or "")
+                if "传播" not in body:
+                    problems.append("judgment_omits_observed_market_propagation")
+                if truth == "unverified" and not any(marker in body for marker in ("未证实", "未经证实", "尚未证实")):
+                    problems.append("judgment_presents_unverified_event_as_fact")
+                if truth == "refuted" and not any(marker in body for marker in ("已否认", "被否认", "已证伪", "被证伪")):
+                    problems.append("judgment_omits_event_refutation")
         snapshot = normalized.snapshot or None
         if stage == "m1_judgment" and snapshot is not None and normalized.qualified != bool(snapshot.get("qualified")):
             problems.append("judgment_qualification_conflicts_with_snapshot")

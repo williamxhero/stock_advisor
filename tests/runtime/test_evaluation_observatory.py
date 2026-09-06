@@ -852,6 +852,10 @@ class ExperimentAssessmentTests(unittest.TestCase):
             self.assertEqual("applied", receipt.result)
             self.assertNotEqual(receipt.old_policy_version, receipt.new_policy_version)
             self.assertEqual(receipt.old_policy_version, receipt.rollback_target_version)
+            with self.assertRaisesRegex(ValueError, "not mature and protected"):
+                EvolutionGovernance(store).decide(
+                    mature.snapshot_id, "approve", approver="stale-second-approval",
+                )
             self.assertEqual(
                 ("gateway", "market"),
                 policy.controls(

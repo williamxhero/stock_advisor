@@ -79,6 +79,9 @@ class AcquisitionBoundary:
             "secret_rejected_items": secret_rejected_items, "arguments": arguments,
             "acquired_at": acquired_at, "evidence_items": evidence_items,
             "content_sha256": result.get("content_sha256") or self._hash(result), "result_sha256": self._hash(result),
+            "prompt_injection_detected": bool(result.get("prompt_injection_detected")),
+            "prompt_injection_blocked": bool(result.get("prompt_injection_blocked")),
+            "prompt_injection_succeeded": bool(result.get("prompt_injection_succeeded")),
         }
         model_result = {"backend": str(result.get("backend") or name), "results": model_rows}
         if not model_rows and result.get("text"):

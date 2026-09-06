@@ -13,6 +13,7 @@ from ai_trading_companion.exchange import LocalExchange
 from ai_trading_companion.governance import EvolutionGovernance, RouterGovernance, StrategyPolicyExecutor
 from ai_trading_companion.observatory import (
     EvaluationObservatory, EvaluationRequest, ExperimentRequest, ForecastRequest, SnapshotQuery,
+    SourceHealthRequest,
 )
 from ai_trading_companion.router import CognitiveRouter
 from ai_trading_companion.runtime_strategy_policy import RuntimeStrategyPolicy
@@ -68,7 +69,96 @@ class EvaluationObservatoryTests(unittest.TestCase):
             name for name, value in inspect.getmembers(EvaluationObservatory, predicate=callable)
             if not name.startswith("_")
         }
-        self.assertEqual({"evaluate", "forecast", "assess_experiment", "get_snapshot", "query"}, methods)
+        self.assertEqual({
+            "evaluate", "forecast", "assess_experiment", "source_health", "get_snapshot", "query",
+        }, methods)
+
+    def test_source_health_snapshot_records_routes_alerts_and_isolated_candidates_without_mutation(self) -> None:
+        for index in range(1, 6):
+            day = f"2026-08-{20 + index:02d}"
+            at = f"{day}T09:45:00+08:00"
+            with patch("ai_trading_companion.store.now", return_value=at):
+                cycle = self.store.create_cycle("daily.execution.0945", at, at)
+                attempt = self.store.begin_attempt(cycle["cycle_id"], "m0_research", at, f"packet-{index}")
+            succeeded = index <= 3
+            trace = {
+                "observation_id": f"browser-{index}", "backend": "gateway", "operation": "web_browser",
+                "status": "succeeded" if succeeded else "failed",
+                "tool_error_code": None if succeeded else "browser_unavailable",
+                "started_at": f"{day}T09:46:00+08:00", "completed_at": f"{day}T09:46:02+08:00",
+                "arguments": {"requirement_key": "forum_and_sentiment"},
+                "coverage_level": "complete" if succeeded else "missing",
+                "evidence_items": [{"source_identity": "example.test"}] if succeeded else [],
+                "prompt_injection_detected": index == 1,
+                "prompt_injection_succeeded": index == 1,
+            }
+            verifier = {"passed": succeeded, "evidence_gate": {
+                "passed": succeeded,
+                "problems": [] if succeeded else ["checked_no_change_untraceable:forum_and_sentiment"],
+                "gap_states": [{
+                    "requirement_key": "forum_and_sentiment",
+                    "coverage_state": "complete" if succeeded else "missing",
+                }],
+            }}
+            with patch("ai_trading_companion.store.now", return_value=f"{day}T09:47:00+08:00"):
+                self.store.finish_attempt(
+                    attempt["attempt_id"], "succeeded" if succeeded else "rejected",
+                    output={"sources": []}, verifier=verifier, tool_trace=[trace],
+                )
+
+        snapshot = self.observatory.source_health(SourceHealthRequest(
+            observed_at="2026-08-30T00:00:00Z", lookback_days=30, request_id="health-1",
+        ))
+
+        self.assertEqual(5, snapshot.sample_count)
+        self.assertEqual(2.0, snapshot.samples[0]["latency_seconds"])
+        self.assertTrue(any(row["kind"] == "prompt_injection_succeeded" for row in snapshot.alerts))
+        self.assertTrue(any(row["kind"] == "false_negative_or_completeness" for row in snapshot.alerts))
+        candidate = next(row for row in snapshot.candidates if row["kind"] == "formal_adapter")
+        self.assertEqual("isolated_candidate", candidate["state"])
+        self.assertFalse(candidate["promotion_allowed"])
+        self.assertEqual("versioned_source_policy_owner", candidate["required_owner"])
+        self.assertFalse(snapshot.policy_mutation_allowed)
+        self.assertEqual(snapshot.snapshot_id, self.observatory.source_health(SourceHealthRequest(
+            observed_at="2026-08-30T00:00:00Z", lookback_days=30, request_id="health-1",
+        )).snapshot_id)
+
+    def test_source_health_samples_success_failure_timeout_rejection_and_browser_unavailable(self) -> None:
+        cases = (
+            ("succeeded", None, True, "web_read"),
+            ("failed", "source_error", False, "web_read"),
+            ("timed_out", "tool_timeout", False, "web_read"),
+            ("failed", "browser_unavailable", False, "web_browser"),
+        )
+        for index, (status, error, qualified, operation) in enumerate(cases, start=1):
+            day = f"2026-08-{index:02d}"
+            at = f"{day}T09:45:00Z"
+            with patch("ai_trading_companion.store.now", return_value=at):
+                cycle = self.store.create_cycle("daily.execution.0945", at, at)
+                attempt = self.store.begin_attempt(cycle["cycle_id"], "m0_research", at, f"case-{index}")
+                self.store.finish_attempt(
+                    attempt["attempt_id"], "succeeded" if qualified else "rejected",
+                    output={"sources": []}, verifier={"passed": qualified, "evidence_gate": {
+                        "passed": qualified, "problems": [] if qualified else ["qualification_rejected"],
+                    }}, tool_trace=[{
+                        "observation_id": f"case-{index}", "backend": "gateway", "operation": operation,
+                        "status": status, "tool_error_code": error,
+                        "started_at": at, "completed_at": f"{day}T09:45:01Z",
+                        "arguments": {"requirement_key": "market_fund_flow"},
+                    }],
+                )
+
+        snapshot = self.observatory.source_health(SourceHealthRequest(
+            observed_at="2026-08-10T00:00:00Z", lookback_days=20,
+        ))
+
+        self.assertEqual({"succeeded", "failed", "timed_out"}, {row["status"] for row in snapshot.samples})
+        self.assertEqual(
+            {"source_error", "tool_timeout", "browser_unavailable"},
+            {row["error_category"] for row in snapshot.samples if row["error_category"]},
+        )
+        self.assertTrue(any(row["qualification_passed"] is False for row in snapshot.samples))
+        self.assertTrue(any(row["browser_used"] for row in snapshot.samples))
 
     def test_timeline_replay_is_ordered_idempotent_and_does_not_invent_failure_duration(self) -> None:
         with patch("ai_trading_companion.store.now", return_value="2026-08-25T09:45:00+08:00"):

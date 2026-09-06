@@ -104,8 +104,13 @@ class WebAccessGatewayClient:
             raise WebAccessGatewayError("browser stopped at access control")
         if find_secrets(snapshot):
             raise WebAccessGatewayError("browser snapshot contained authentication secrets")
+        prompt_injection_detected = _prompt_injection_detected(snapshot)
         snapshot = _sanitize_untrusted_browser_text(snapshot)
-        return {"trace_id": _text(value, "trace_id"), "results": [{
+        return {
+            "trace_id": _text(value, "trace_id"),
+            "prompt_injection_detected": prompt_injection_detected,
+            "prompt_injection_blocked": prompt_injection_detected,
+            "results": [{
             "url": url, "title": _text(value, "title"), "excerpt_text": snapshot[:12000],
             "fact_as_of": _fact_as_of(snapshot + "\n" + url), "primary": bool(value.get("primary")),
             "browser_route": "authorized_edge", **_provenance(value),
@@ -187,12 +192,20 @@ def _provenance(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _sanitize_untrusted_browser_text(value: str) -> str:
-    injection = re.compile(
+def _prompt_injection_pattern() -> re.Pattern[str]:
+    return re.compile(
         r"(?i)(ignore\s+(?:all\s+)?previous\s+instructions?|system\s+prompt|"
         r"upload\s+account\s+data|send\s+(?:a\s+)?message|call\s+(?:the\s+)?tool|"
         r"忽略(?:以上|之前|此前).*指令|系统提示词|上传.*(?:账户|凭据)|发送.*(?:消息|私信))"
     )
+
+
+def _prompt_injection_detected(value: str) -> bool:
+    return any(_prompt_injection_pattern().search(line) for line in value.splitlines())
+
+
+def _sanitize_untrusted_browser_text(value: str) -> str:
+    injection = _prompt_injection_pattern()
     retained = [line for line in value.splitlines() if not injection.search(line)]
     return "[UNTRUSTED_PAGE_TEXT]\n" + "\n".join(retained)
 

@@ -212,6 +212,9 @@ class WebAccessGatewayTests(unittest.TestCase):
             result = self.client.browser(None, [{"type": "snapshot"}])
 
         text = result["results"][0]["excerpt_text"]
+        self.assertTrue(result["prompt_injection_detected"])
+        self.assertTrue(result["prompt_injection_blocked"])
+        self.assertNotIn("prompt_injection_succeeded", result)
         self.assertTrue(text.startswith("[UNTRUSTED_PAGE_TEXT]"))
         self.assertIn("正常事实", text)
         self.assertNotIn("Ignore previous", text)

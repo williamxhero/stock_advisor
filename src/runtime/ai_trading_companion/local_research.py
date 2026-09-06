@@ -702,6 +702,7 @@ class LocalResearchChain:
             if forced_stop_reason or (self.cancelled and self.cancelled()):
                 forced_stop_reason = "user_cancelled"
                 break
+            tool_started_at, tool_started_clock = _start_tool_timing()
             try:
                 backend, result = self.executor.execute(row)
                 observation, _ = boundary.observe(
@@ -710,6 +711,7 @@ class LocalResearchChain:
                 )
                 _normalize_exact_close_fact_time(observation, contract, row["requirement_key"])
                 observation["backend"] = backend
+                _finish_tool_timing(observation, tool_started_at, tool_started_clock)
                 self._register_observation(observation)
                 observations.append(observation)
             except Exception as exc:
@@ -722,6 +724,7 @@ class LocalResearchChain:
                     **_research_failure_fields(exc),
                 }
                 _attach_tool_resolution_failure(failure, exc)
+                _finish_tool_timing(failure, tool_started_at, tool_started_clock)
                 observations.append(failure)
             checkpoint()
         evidence = _compile_evidence(
@@ -830,6 +833,7 @@ class LocalResearchChain:
                     })
                     checkpoint()
                     continue
+                tool_started_at, tool_started_clock = _start_tool_timing()
                 try:
                     backend, result = self.executor.execute(row)
                     observation, _ = boundary.observe(
@@ -838,6 +842,7 @@ class LocalResearchChain:
                     )
                     _normalize_exact_close_fact_time(observation, contract, row["requirement_key"])
                     observation["backend"] = backend
+                    _finish_tool_timing(observation, tool_started_at, tool_started_clock)
                     self._register_observation(observation)
                     observations.append(observation)
                 except Exception as exc:
@@ -850,6 +855,7 @@ class LocalResearchChain:
                         **_research_failure_fields(exc),
                     }
                     _attach_tool_resolution_failure(failure, exc)
+                    _finish_tool_timing(failure, tool_started_at, tool_started_clock)
                     observations.append(failure)
                 checkpoint()
             evidence = _compile_evidence(
@@ -866,6 +872,7 @@ class LocalResearchChain:
                 for item in current_round
             ):
                 for row in _fallback_read_rows(observations, contract, limit=6):
+                    tool_started_at, tool_started_clock = _start_tool_timing()
                     try:
                         backend, result = self.executor.execute(row)
                         observation, _ = boundary.observe(
@@ -874,17 +881,21 @@ class LocalResearchChain:
                         )
                         _normalize_exact_close_fact_time(observation, contract, row["requirement_key"])
                         observation["backend"] = backend
+                        _finish_tool_timing(observation, tool_started_at, tool_started_clock)
                         self._register_observation(observation)
                         observations.append(observation)
                     except Exception as exc:
-                        observations.append({
+                        failure = {
                             "attempt_id": attempt_id, "observation_id": f"failure-{len(observations) + 1}",
                             "tool": "web_read", "backend": "gateway", "operation": "web_read",
                             "status": "failed", "ok": False, "non_empty": False,
                             "arguments": {**row["arguments"], "requirement_key": row["requirement_key"]},
                             "error_category": type(exc).__name__,
                             **_research_failure_fields(exc),
-                        })
+                        }
+                        _attach_tool_resolution_failure(failure, exc)
+                        _finish_tool_timing(failure, tool_started_at, tool_started_clock)
+                        observations.append(failure)
                 evidence = _compile_evidence(
                     packet, contract, observations,
                     require_memory_receipts=self.observation_registrar is not None,
@@ -1962,6 +1973,16 @@ def _attach_tool_resolution_failure(observation: dict[str, Any], exc: Exception)
     observation["tool_attempts"] = list(resolution.attempts)
     observation["tool_exit_code"] = resolution.exit_code
     observation["tool_diagnostic_artifact_ref"] = resolution.diagnostic_artifact_ref
+
+
+def _start_tool_timing() -> tuple[str, float]:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"), time.perf_counter()
+
+
+def _finish_tool_timing(observation: dict[str, Any], started_at: str, started_clock: float) -> None:
+    observation["started_at"] = started_at
+    observation["completed_at"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    observation["latency_ms"] = max(0, round((time.perf_counter() - started_clock) * 1000))
 
 
 def _research_failure_fields(exc: Exception) -> dict[str, str]:

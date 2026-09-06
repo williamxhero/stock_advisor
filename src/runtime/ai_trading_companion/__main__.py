@@ -1396,7 +1396,9 @@ def run_m1(
     for number in range(1, M1_MAX_JUDGMENT_ATTEMPTS + 1):
         try:
             cycle = engine.m1_judgment_started(cycle_id)
-            judgment_timeout = _deadline_timeout(cycle, int(policy.m1_timeout.total_seconds()))
+            # The multi-call pipeline replaces the old judgment retry loop's work,
+            # so retain its total time envelope, always capped by publication time.
+            judgment_timeout = _deadline_timeout(cycle, int(policy.m1_timeout.total_seconds()) * M1_MAX_JUDGMENT_ATTEMPTS)
             judgment_controls = resolve_stage_controls(
                 store, "m1_judgment", timeout=judgment_timeout, search=False,
             )

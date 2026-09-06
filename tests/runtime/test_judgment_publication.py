@@ -202,6 +202,23 @@ def test_later_grounding_rejection_revokes_core_including_restart(tmp_path):
     assert not any(r.stage.endswith("expression") for r in restarted_broker.calls)
 
 
+def test_reasoning_repairs_retain_all_prior_semantic_feedback(tmp_path):
+    class RejectingBroker(Broker):
+        def invoke(self, request):
+            response = super().invoke(request)
+            if request.stage.endswith("review"):
+                number = sum(r.stage.endswith("review") for r in self.calls)
+                response.result["problems"] = [f"material-issue-{number}"]
+            return response
+    broker = RejectingBroker(reject_core=True)
+    pipeline, _, cycle = runtime(tmp_path, broker)
+    with pytest.raises(JudgmentUnavailable):
+        pipeline.produce("m1_judgment", cycle, packet(), time.monotonic() + 60)
+    last = [r for r in broker.calls if r.stage.endswith("reasoning")][-1]
+    assert set(last.packet["feedback"]) >= {"material-issue-1", "material-issue-2"}
+    assert last.packet["previous_candidate"] == core()
+
+
 def test_model_contracts_declare_native_types_and_do_not_duplicate_evidence(tmp_path):
     def check(node):
         if isinstance(node, dict):

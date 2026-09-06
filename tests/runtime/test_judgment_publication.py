@@ -68,7 +68,7 @@ class Broker:
             result = {"core_hash": request.packet["core_hash"], "draft_hash": request.packet["draft_hash"],
                       "grounded": not core_rejected, "faithful": not (self.reject_draft and expressed),
                       "scores": dict(specificity=2, causality=2, counterargument=2, portfolio=2, naturalness=2, broadcast_risk=0),
-                      "problems": ["unsupported assertion"] if reject else []}
+                      "problems": ["unsupported assertion"] if reject else [], "suggestions": []}
         return BrokerResponse("", result, "test", "test", "expert", "expert", "test-id")
 
 
@@ -187,6 +187,18 @@ def test_recovery_conditions_do_not_duplicate_punctuation():
     decision = core()
     decision["transition_conditions"][0]["price"] += "；"
     assert "；，" not in render_core(decision)
+
+
+def test_optional_review_suggestions_do_not_block_qualified_judgment(tmp_path):
+    class SuggestingBroker(Broker):
+        def invoke(self, request):
+            response = super().invoke(request)
+            if request.stage.endswith("review"):
+                response.result["suggestions"] = ["Optional shorter wording"]
+            return response
+    pipeline, _, cycle = runtime(tmp_path, SuggestingBroker())
+    output = pipeline.produce("m1_judgment", cycle, packet(), time.monotonic() + 60)
+    assert CognitiveRouter().verify("m1_judgment", packet(), output)["passed"]
 
 
 def test_later_grounding_rejection_revokes_core_including_restart(tmp_path):

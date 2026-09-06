@@ -10,6 +10,7 @@ from typing import Any
 
 
 POLICY_KINDS = frozenset({"stage_budget", "search_breadth", "source_mix"})
+ACTIVE_RESEARCH_SCOPE = ("daily.review.1520", "manual.non_trading_outlook", "portfolio.holdings")
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class RuntimeStrategyPolicy:
                   candidate_json TEXT,
                   automatic_authorized INTEGER NOT NULL DEFAULT 0,
                   evaluation_profile TEXT NOT NULL DEFAULT 'generic/v1',
+                  applicable_tasks_json TEXT NOT NULL DEFAULT '[]',
                   revision INTEGER NOT NULL,
                   previous_json TEXT,
                   qualification_fingerprint TEXT,
@@ -82,6 +84,8 @@ class RuntimeStrategyPolicy:
                 connection.execute("ALTER TABLE runtime_strategy_cell ADD COLUMN automatic_authorized INTEGER NOT NULL DEFAULT 0")
             if "evaluation_profile" not in columns:
                 connection.execute("ALTER TABLE runtime_strategy_cell ADD COLUMN evaluation_profile TEXT NOT NULL DEFAULT 'generic/v1'")
+            if "applicable_tasks_json" not in columns:
+                connection.execute("ALTER TABLE runtime_strategy_cell ADD COLUMN applicable_tasks_json TEXT NOT NULL DEFAULT '[]'")
             shadow_columns = {row[1] for row in connection.execute("PRAGMA table_info(runtime_strategy_shadow_job)")}
             for name in ("context_fingerprint", "frozen_as_of", "value_window_end"):
                 if name not in shadow_columns:
@@ -96,6 +100,7 @@ class RuntimeStrategyPolicy:
     def register_shadow_candidate(
         self, policy_kind: str, stage: str, baseline: dict[str, Any], candidate: dict[str, Any], *,
         automatic_authorized: bool = False, evaluation_profile: str = "generic/v1",
+        applicable_tasks: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         """Provision a versioned shadow cell; callers cannot promote it here."""
         self._validate(policy_kind, baseline)
@@ -104,6 +109,11 @@ class RuntimeStrategyPolicy:
             raise ValueError("unsupported evaluation profile")
         if evaluation_profile == "active_evidence_research/v1" and automatic_authorized:
             raise ValueError("active research candidates require the dedicated production promotion gate")
+        scope = tuple(dict.fromkeys(applicable_tasks or (
+            ACTIVE_RESEARCH_SCOPE if evaluation_profile == "active_evidence_research/v1" else ()
+        )))
+        if evaluation_profile == "active_evidence_research/v1" and set(scope) != set(ACTIVE_RESEARCH_SCOPE):
+            raise ValueError("active research candidate scope must cover close, weekend, and holdings")
         key = self.cell_key(policy_kind, stage)
         from .store import now
         with self.store.connection() as connection:
@@ -112,24 +122,27 @@ class RuntimeStrategyPolicy:
                 connection.execute(
                     """INSERT INTO runtime_strategy_cell(
                          cell_key,policy_kind,mode,baseline_json,candidate_json,automatic_authorized,
-                         evaluation_profile,revision,updated_at)
-                       VALUES(?,?,'shadow',?,?,?,?,1,?)""",
+                         evaluation_profile,applicable_tasks_json,revision,updated_at)
+                       VALUES(?,?,'shadow',?,?,?,?,?,1,?)""",
                     (key, policy_kind, json.dumps(baseline, sort_keys=True), json.dumps(candidate, sort_keys=True),
-                     int(automatic_authorized), evaluation_profile, now()),
+                     int(automatic_authorized), evaluation_profile, json.dumps(scope), now()),
                 )
             elif existing["mode"] == "promoted":
                 raise ValueError("register a new candidate only after rollback or an explicit replacement")
             else:
                 connection.execute(
                     """UPDATE runtime_strategy_cell SET baseline_json=?,candidate_json=?,revision=revision+1,
-                         previous_json=?,automatic_authorized=?,evaluation_profile=?,updated_at=? WHERE cell_key=?""",
+                         previous_json=?,automatic_authorized=?,evaluation_profile=?,applicable_tasks_json=?,updated_at=? WHERE cell_key=?""",
                     (json.dumps(baseline, sort_keys=True), json.dumps(candidate, sort_keys=True),
-                     json.dumps(dict(existing), sort_keys=True), int(automatic_authorized), evaluation_profile, now(), key),
+                     json.dumps(dict(existing), sort_keys=True), int(automatic_authorized), evaluation_profile,
+                     json.dumps(scope), now(), key),
                 )
             row = connection.execute("SELECT * FROM runtime_strategy_cell WHERE cell_key=?", (key,)).fetchone()
         return dict(row)
 
-    def controls(self, stage: str, *, timeout_seconds: int, search: bool) -> RuntimeStrategyControls:
+    def controls(
+        self, stage: str, *, timeout_seconds: int, search: bool, task_key: str | None = None,
+    ) -> RuntimeStrategyControls:
         """Read current controls without creating rows or silently changing policy."""
         defaults = {
             "stage_budget": {"timeout_seconds": max(1, int(timeout_seconds))},
@@ -143,7 +156,15 @@ class RuntimeStrategyPolicy:
                 tuple(self.cell_key(kind, stage) for kind in ("stage_budget", "search_breadth", "source_mix")),
             ).fetchall()
         for row in rows:
-            decoded = json.loads(row["candidate_json"] if row["mode"] == "promoted" and row["candidate_json"] else row["baseline_json"])
+            candidate_is_in_scope = True
+            if row["evaluation_profile"] == "active_evidence_research/v1":
+                scope = set(json.loads(row["applicable_tasks_json"] or "[]"))
+                candidate_is_in_scope = bool(task_key and task_key in scope)
+            decoded = json.loads(
+                row["candidate_json"]
+                if row["mode"] == "promoted" and row["candidate_json"] and candidate_is_in_scope
+                else row["baseline_json"]
+            )
             values[row["policy_kind"]] = decoded
             revisions.append((row["policy_kind"], int(row["revision"])))
         enabled = tuple(str(item) for item in values["source_mix"]["enabled_backends"])
@@ -153,9 +174,12 @@ class RuntimeStrategyPolicy:
             enabled_backends=enabled if search else (), revisions=tuple(sorted(revisions)),
         )
 
-    def shadow_controls(self, cell_key: str, stage: str, *, timeout_seconds: int, search: bool) -> RuntimeStrategyControls:
+    def shadow_controls(
+        self, cell_key: str, stage: str, *, timeout_seconds: int, search: bool,
+        task_key: str | None = None,
+    ) -> RuntimeStrategyControls:
         """Return one shadow candidate's controls over the active baselines."""
-        controls = self.controls(stage, timeout_seconds=timeout_seconds, search=search)
+        controls = self.controls(stage, timeout_seconds=timeout_seconds, search=search, task_key=task_key)
         with self.store.connection() as connection:
             row = connection.execute(
                 "SELECT * FROM runtime_strategy_cell WHERE cell_key=? AND mode='shadow'", (cell_key,),

@@ -97,6 +97,8 @@ class EvaluationObservatory:
 - `set_schedule`、`set_timing`、`set_router`：只有对应的版本化策略所有者可以执行裁决。
 - 通用 `execute(sql)`、`rebuild_projection`：属于运维或内部实现，不进入产品 interface。
 
+主动证据研究使用专属策略执行器：它只接受 `active_evidence_research/v1` 的指定实时配对评测快照，并在执行前再次核验历史回放门、动态成熟度、保护维度和零安全故障。执行回执必须同时保存旧版本、新版本、收盘/周末/持仓适用范围和显式回滚目标；通用策略执行器不得代为应用该类候选。
+
 ## 内部模型
 
 ### 规范来源事实

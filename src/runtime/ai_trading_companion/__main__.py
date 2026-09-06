@@ -162,14 +162,16 @@ def resolve_stage_controls(
     timeout: int,
     search: bool,
     runtime_strategy_shadow_cell: str | None = None,
+    task_key: str | None = None,
 ) -> RuntimeStrategyControls:
     """Resolve the controls that must be part of a stage's frozen input."""
     runtime_strategy = RuntimeStrategyPolicy(store)
     if runtime_strategy_shadow_cell:
         return runtime_strategy.shadow_controls(
             runtime_strategy_shadow_cell, stage, timeout_seconds=timeout, search=search,
+            task_key=task_key,
         )
-    return runtime_strategy.controls(stage, timeout_seconds=timeout, search=search)
+    return runtime_strategy.controls(stage, timeout_seconds=timeout, search=search, task_key=task_key)
 
 
 def finalize_stage_packet(packet: dict[str, Any], controls: RuntimeStrategyControls) -> dict[str, Any]:
@@ -639,6 +641,7 @@ def _call_stage(
     controls = frozen_controls or resolve_stage_controls(
         store, stage, timeout=timeout, search=search,
         runtime_strategy_shadow_cell=runtime_strategy_shadow_cell,
+        task_key=str(packet.get("task_key") or cycle.get("task_key") or "") or None,
     )
     timeout = controls.timeout_seconds
     search = bool(search and controls.max_operations > 0 and controls.enabled_backends)

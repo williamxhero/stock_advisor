@@ -10,11 +10,14 @@ from unittest.mock import patch
 
 from ai_trading_companion.effort_policy import CognitiveEffortPolicy, EffortPolicyFacts
 from ai_trading_companion.exchange import LocalExchange
-from ai_trading_companion.governance import EvolutionGovernance, RouterGovernance, StrategyPolicyExecutor
+from ai_trading_companion.governance import (
+    ActiveResearchPolicyExecutor, EvolutionGovernance, RouterGovernance, StrategyPolicyExecutor,
+)
 from ai_trading_companion.observatory import (
     EvaluationObservatory, EvaluationRequest, ExperimentRequest, ForecastRequest, SnapshotQuery,
     SourceHealthRequest,
 )
+from ai_trading_companion.portfolio import PortfolioService
 from ai_trading_companion.router import CognitiveRouter
 from ai_trading_companion.runtime_strategy_policy import RuntimeStrategyPolicy
 from ai_trading_companion.store import CompanionStore
@@ -701,6 +704,7 @@ class ExperimentAssessmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = CompanionStore(Path(directory) / "companion.sqlite3")
             store.initialize()
+            portfolio_before = PortfolioService(store).snapshot()
             policy = RuntimeStrategyPolicy(store)
             cell = policy.register_shadow_candidate(
                 "source_mix", "m0_research", {"enabled_backends": ["market"]},
@@ -831,6 +835,79 @@ class ExperimentAssessmentTests(unittest.TestCase):
                     "SELECT mode FROM runtime_strategy_cell WHERE cell_key=?", (cell["cell_key"],),
                 ).fetchone()["mode"]
             self.assertEqual("shadow", mode)
+
+            decision = EvolutionGovernance(store).decide(
+                mature.snapshot_id, "approve", approver="release-governance",
+            )
+            self.assertEqual(
+                ["daily.review.1520", "manual.non_trading_outlook", "portfolio.holdings"],
+                json.loads(decision.applicable_scope_json),
+            )
+            self.assertIn("citation_verifiability", json.loads(decision.protected_dimensions_json))
+            with self.assertRaisesRegex(ValueError, "dedicated active research executor"):
+                StrategyPolicyExecutor(store).apply(decision.decision_id)
+            receipt = ActiveResearchPolicyExecutor(store).apply(decision.decision_id)
+            replayed = ActiveResearchPolicyExecutor(store).apply(decision.decision_id)
+            self.assertEqual(receipt.receipt_id, replayed.receipt_id)
+            self.assertEqual("applied", receipt.result)
+            self.assertNotEqual(receipt.old_policy_version, receipt.new_policy_version)
+            self.assertEqual(receipt.old_policy_version, receipt.rollback_target_version)
+            self.assertEqual(
+                ("gateway", "market"),
+                policy.controls(
+                    "m0_research", timeout_seconds=300, search=True,
+                    task_key="manual.non_trading_outlook",
+                ).enabled_backends,
+            )
+            self.assertEqual(
+                ("market",),
+                policy.controls(
+                    "m0_research", timeout_seconds=300, search=True,
+                    task_key="daily.execution.0945",
+                ).enabled_backends,
+            )
+
+            policy.record_evaluation(
+                cell["cell_key"], "production-hard-fault", "monitor", "divergence",
+                candidate, {**candidate, "hard_fault": True, "safety_faults": 1},
+                source_kind="post_promotion_monitoring",
+            )
+            rollback_assessment = EvaluationObservatory(store).assess_experiment(ExperimentRequest(
+                cell["cell_key"], source_kind="post_promotion_monitoring",
+            ))
+            self.assertEqual("recommend_rollback", rollback_assessment.decision)
+            rollback_decision = EvolutionGovernance(store).decide(
+                rollback_assessment.snapshot_id, "approve", approver="release-governance",
+            )
+            rollback = ActiveResearchPolicyExecutor(store).apply(rollback_decision.decision_id)
+            self.assertEqual("rollback_applied", rollback.result)
+            self.assertEqual(receipt.old_policy_version, rollback.rollback_target_version)
+            self.assertNotEqual(receipt.new_policy_version, rollback.new_policy_version)
+            with store.connection() as connection:
+                mode = connection.execute(
+                    "SELECT mode FROM runtime_strategy_cell WHERE cell_key=?", (cell["cell_key"],),
+                ).fetchone()["mode"]
+                versions = connection.execute(
+                    "SELECT COUNT(*) FROM active_research_policy_version WHERE cell_key=?", (cell["cell_key"],),
+                ).fetchone()[0]
+                running_attempts = connection.execute(
+                    "SELECT COUNT(*) FROM llm_attempt WHERE status='running'",
+                ).fetchone()[0]
+                running_shadows = connection.execute(
+                    "SELECT COUNT(*) FROM runtime_strategy_shadow_job WHERE state='running'",
+                ).fetchone()[0]
+            self.assertEqual("rolled_back", mode)
+            self.assertEqual(3, versions)
+            self.assertEqual(0, running_attempts)
+            self.assertEqual(0, running_shadows)
+            self.assertEqual(portfolio_before, PortfolioService(store).snapshot())
+            self.assertEqual(
+                ("market",),
+                policy.controls(
+                    "m0_research", timeout_seconds=300, search=True,
+                    task_key="manual.non_trading_outlook",
+                ).enabled_backends,
+            )
 
     def test_frozen_replay_rejects_future_known_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

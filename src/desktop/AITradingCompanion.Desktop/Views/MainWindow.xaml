@@ -101,7 +101,8 @@
                         <TabItem.Header>
                             <TextBlock FontSize="14" FontWeight="SemiBold"><Run Text="今日列表  " /><Run Text="{Binding CompletedCount, Mode=OneWay}" /><Run Text="/5" /></TextBlock>
                         </TabItem.Header>
-                        <ListBox Margin="0,14,0,0" ItemsSource="{Binding Tasks}" SelectedItem="{Binding SelectedTask}"
+                        <ListBox x:Name="TodayTasksListBox" Margin="0,14,0,0" ItemsSource="{Binding Tasks}" SelectedItem="{Binding SelectedTask}"
+                                 Loaded="TodayTasksListBox_Loaded"
                                  Background="Transparent" BorderThickness="0" ItemContainerStyle="{StaticResource RecordListItemStyle}"
                                  ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                             <ListBox.ItemTemplate>

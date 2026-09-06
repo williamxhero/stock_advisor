@@ -49,6 +49,8 @@ public partial class MainWindow : Window, IDisposable
     private TaskManagementWindow? _taskManagementWindow;
     private EvaluationObservatoryWindow? _evaluationObservatoryWindow;
     private string? _activeAiMarkdown;
+    private string? _renderedAiTimelineCycleId;
+    private string? _renderedUserTimelineCycleId;
     private string? _requestedProjectionCycleId;
     private string? _editingStagedMessageId;
     private DateTimeOffset _nextRuntimeHealthCheck = DateTimeOffset.MinValue;
@@ -429,6 +431,8 @@ public partial class MainWindow : Window, IDisposable
         if (HasMessageTextSelection()) return;
         var orderedMessages = messages.OrderBy(item => item.At).ToArray();
         if (!_aiTimelineRenderGate.ShouldRender(AiTimelineRenderKeys(orderedMessages))) return;
+        var cycleId = _companionProjection?.CycleId ?? _viewModel.SelectedMessage?.SourceRunId;
+        var changedCycle = !string.Equals(_renderedAiTimelineCycleId, cycleId, StringComparison.Ordinal);
         var wasAtBottom = AiTimelineScrollViewer.ScrollableHeight <= 0
             || AiTimelineScrollViewer.VerticalOffset >= AiTimelineScrollViewer.ScrollableHeight - 36;
         _messageTextViewers.RemoveAll(viewer => AiTimelinePanel.IsAncestorOf(viewer));
@@ -495,7 +499,8 @@ public partial class MainWindow : Window, IDisposable
         }
         else _activeAiMarkdown = orderedMessages.LastOrDefault(message => message.Kind is not ("chat_pending" or "action_pending"))?.Text;
         ReadAloudButton.IsEnabled = !string.IsNullOrWhiteSpace(_activeAiMarkdown);
-        if (wasAtBottom) Dispatcher.BeginInvoke(() => AiTimelineScrollViewer.ScrollToEnd(), DispatcherPriority.Loaded);
+        _renderedAiTimelineCycleId = cycleId;
+        if (changedCycle || wasAtBottom) ScrollToEndAfterLayout(AiTimelineScrollViewer);
     }
 
     private void SetLocalAiNotice(string cycleId, string kind, string text)
@@ -531,6 +536,10 @@ public partial class MainWindow : Window, IDisposable
         if (HasMessageTextSelection()) return;
         var messages = CombinedUserMessages().OrderBy(message => message.At).ToArray();
         if (!_userTimelineRenderGate.ShouldRender(UserTimelineRenderKeys(messages))) return;
+        var cycleId = _companionProjection?.CycleId;
+        var changedCycle = !string.Equals(_renderedUserTimelineCycleId, cycleId, StringComparison.Ordinal);
+        var wasAtBottom = MyMessagesScrollViewer.ScrollableHeight <= 0
+            || MyMessagesScrollViewer.VerticalOffset >= MyMessagesScrollViewer.ScrollableHeight - 36;
         _messageTextViewers.RemoveAll(viewer => MainJudgmentTimelinePanel.IsAncestorOf(viewer));
         MainJudgmentTimelinePanel.Children.Clear();
         foreach (var entry in messages)
@@ -588,7 +597,21 @@ public partial class MainWindow : Window, IDisposable
         }
         if (messages.Length == 0)
             MainJudgmentTimelinePanel.Children.Add(new TextBlock { Text = "当前判断还没有你的消息。", Foreground = (Brush)FindResource("SecondaryTextBrush") });
+        _renderedUserTimelineCycleId = cycleId;
+        if (changedCycle || wasAtBottom) ScrollToEndAfterLayout(MyMessagesScrollViewer);
     }
+
+    private void TodayTasksListBox_Loaded(object sender, RoutedEventArgs e)
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (TodayTasksListBox.Items.Count > 0)
+                TodayTasksListBox.ScrollIntoView(TodayTasksListBox.Items[TodayTasksListBox.Items.Count - 1]);
+        }, DispatcherPriority.Loaded);
+    }
+
+    private void ScrollToEndAfterLayout(ScrollViewer viewer) =>
+        Dispatcher.BeginInvoke(viewer.ScrollToEnd, DispatcherPriority.Loaded);
 
     private IEnumerable<string> AiTimelineRenderKeys(IEnumerable<CompanionAiTimelineEntry> messages)
     {
@@ -664,7 +687,6 @@ public partial class MainWindow : Window, IDisposable
             IsSelectionEnabled = true,
             Focusable = true,
             Cursor = Cursors.IBeam,
-            ToolTip = "可鼠标框选后按 Ctrl+C 复制；复制按钮会保留整条消息的原始 Markdown",
         };
         _messageTextViewers.Add(viewer);
         NestedScrollWheelForwarder.Attach(viewer);
@@ -678,7 +700,6 @@ public partial class MainWindow : Window, IDisposable
             Content = "复制", Tag = text, FontSize = 11,
             Padding = new Thickness(7, 2, 7, 2), Margin = new Thickness(8, 0, 0, 0),
             HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top,
-            ToolTip = "复制消息原文",
         };
         button.Click += CopyMessage_Click;
         return button;

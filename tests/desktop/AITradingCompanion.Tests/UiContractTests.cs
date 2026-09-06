@@ -112,6 +112,7 @@ public sealed class UiContractTests
         Assert.Contains("MainSendButton", xaml, StringComparison.Ordinal);
         Assert.Contains("MainCommitButton", xaml, StringComparison.Ordinal);
         Assert.Contains("Text=\"我的消息\"", xaml, StringComparison.Ordinal);
+        Assert.Contains("TodayTasksListBox", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("Content=\"盘前\"", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("Content=\"M0\"", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("Content=\"M1\"", xaml, StringComparison.Ordinal);
@@ -120,6 +121,13 @@ public sealed class UiContractTests
         Assert.DoesNotContain("M0Viewer", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("M1Viewer", xaml, StringComparison.Ordinal);
         Assert.Contains("BasedOn=\"{StaticResource ThinScrollBarStyle}\"", xaml, StringComparison.Ordinal);
+
+        var code = File.ReadAllText(Path.Combine(root.FullName,
+            "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml.cs"));
+        Assert.Contains("ScrollToEndAfterLayout(AiTimelineScrollViewer)", code, StringComparison.Ordinal);
+        Assert.Contains("ScrollToEndAfterLayout(MyMessagesScrollViewer)", code, StringComparison.Ordinal);
+        Assert.DoesNotContain("可鼠标框选后按 Ctrl+C", code, StringComparison.Ordinal);
+        Assert.DoesNotContain("复制消息原文", code, StringComparison.Ordinal);
     }
 
     [Fact]

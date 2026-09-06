@@ -18,13 +18,14 @@ class BrokerError(RuntimeError):
     def __init__(self, message: str, *, category: str = "broker_error", status: int | None = None,
                  attempts: list[dict[str, Any]] | None = None, request_id: str | None = None,
                  verifier: dict[str, Any] | None = None, tool_trace: list[dict[str, Any]] | None = None,
-                 metadata: dict[str, Any] | None = None) -> None:
+                 metadata: dict[str, Any] | None = None, output: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.category, self.status = category, status
         self.attempts = attempts or []
         self.request_id, self.verifier = request_id, verifier
         self.tool_trace = tool_trace or []
         self.metadata = metadata or {}
+        self.output = output
 
 
 @dataclass(frozen=True)
@@ -211,7 +212,7 @@ class ProviderBrokerClient:
         if not verifier["passed"]:
             raise BrokerError("Broker output did not pass local verification", category="broker_output_invalid",
                               attempts=_safe_attempts(raw.get("attempts")), request_id=_text(raw.get("request_id")), verifier=verifier,
-                              metadata=_metadata(raw, request))
+                              metadata=_metadata(raw, request), output=result if isinstance(result, dict) else None)
         usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
         return BrokerResponse(
             output_text=text, result=result, actual_model=_text(raw.get("actual_model")), provider=_text(raw.get("provider")),

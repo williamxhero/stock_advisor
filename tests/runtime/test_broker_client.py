@@ -108,6 +108,20 @@ class BrokerClientTests(unittest.TestCase):
         self.assertEqual(result.result, {"answer": "ok"})
         self.assertEqual("".join(deltas), result.output_text)
 
+    def test_rejected_candidate_is_retained_for_local_expression_repair(self) -> None:
+        request = self.request()
+        object.__setattr__(request, "verifier", lambda _output: {"passed": False, "problems": ["formal_reply_exposes_research_log"]})
+
+        with self.assertRaises(BrokerError) as raised:
+            self.client.invoke(request)
+
+        self.assertEqual("broker_output_invalid", raised.exception.category)
+        self.assertEqual({"answer": "ok"}, raised.exception.output)
+        self.assertEqual(
+            ["formal_reply_exposes_research_log"],
+            raised.exception.verifier["business"]["problems"],
+        )
+
     def test_unavailable_and_incomplete_stream_are_distinct(self) -> None:
         _BrokerHandler.mode = "unavailable"
         with self.assertRaisesRegex(BrokerError, "HTTP 503") as unavailable:

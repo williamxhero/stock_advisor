@@ -93,7 +93,7 @@ def _m1_should_retry(exc: Exception, *, attempt_number: int, remaining_seconds: 
     if attempt_number >= M1_MAX_JUDGMENT_ATTEMPTS or remaining_seconds < M1_MIN_RETRY_WINDOW_SECONDS:
         return False
     if isinstance(exc, EvidenceInsufficient):
-        return False
+        return _is_expression_rejection(exc)
     if isinstance(exc, TimeoutError):
         return True
     if not isinstance(exc, BrokerError):
@@ -104,6 +104,30 @@ def _m1_should_retry(exc: Exception, *, attempt_number: int, remaining_seconds: 
         "broker_forbidden",
         "broker_secret_rejected",
     }
+
+
+def _is_expression_rejection(exc: Exception) -> bool:
+    verifier = getattr(exc, "verifier", None)
+    if not isinstance(verifier, dict):
+        return False
+    business = verifier.get("business") if isinstance(verifier.get("business"), dict) else verifier
+    problems = business.get("problems") if isinstance(business.get("problems"), list) else []
+    return any(
+        str(problem).startswith(("formal_reply_", "m1_expression_repair_"))
+        for problem in problems
+    )
+
+
+def _m1_expression_invariants(exc: Exception) -> dict[str, Any] | None:
+    """Keep a repair on the same decision while allowing its prose to change."""
+    candidate = getattr(exc, "output", None)
+    if not isinstance(candidate, dict):
+        return None
+    semantic = candidate.get("semantic")
+    if not isinstance(semantic, dict):
+        return None
+    keys = ("direction", "qualified", "horizon", "current_action", "transition_conditions", "position_focus")
+    return {key: semantic.get(key) for key in keys}
 
 
 def _m1_retry_feedback(exc: Exception) -> dict[str, Any] | None:
@@ -117,11 +141,15 @@ def _m1_retry_feedback(exc: Exception) -> dict[str, Any] | None:
             return []
         return [str(item)[:500] for item in value[:20]]
 
-    return {
+    feedback = {
         "category": exc.category,
         "schema_problems": problems(schema.get("problems")),
         "business_problems": problems(business.get("problems")),
     }
+    invariants = _m1_expression_invariants(exc)
+    if invariants is not None:
+        feedback["frozen_decision"] = invariants
+    return feedback
 
 
 def _save_safe_stage_fallback(
@@ -850,6 +878,7 @@ def _call_stage(
             ) else "failed"
             store.finish_attempt(
                 attempt["attempt_id"], status, error=str(exc),
+                output=getattr(exc, "output", None),
                 verifier=getattr(exc, "verifier", None),
                 broker_metadata=exc.metadata or {"request_id": exc.request_id, "attempts": exc.attempts} if isinstance(exc, BrokerError) else None,
                 actual_model=exc.metadata.get("actual_model") if isinstance(exc, BrokerError) else None,
@@ -1330,6 +1359,7 @@ def run_m1(
         )
         raise
     verification_feedback: dict[str, Any] | None = None
+    frozen_expression_decision: dict[str, Any] | None = None
     local_packet: dict[str, Any] | None = None
     for number in range(1, M1_MAX_JUDGMENT_ATTEMPTS + 1):
         try:
@@ -1347,8 +1377,10 @@ def run_m1(
                     **verification_feedback,
                     "attempt_number": number,
                     "instruction": (
-                        "The previous candidate was not published. Correct every listed schema and business-verifier "
-                        "problem while independently recomputing the judgment from the same frozen evidence."
+                        "The previous candidate was not published. Rewrite only its user-facing expression to correct "
+                        "every listed schema and business-verifier problem. Keep frozen_decision unchanged, do not "
+                        "perform new research, do not read H0, and do not change the judgment, action, materiality, "
+                        "position priorities, or transition conditions."
                     ),
                 }
             local_packet = finalize_stage_packet(
@@ -1378,7 +1410,11 @@ def run_m1(
                 remaining = 0
             retryable = _m1_should_retry(exc, attempt_number=number, remaining_seconds=remaining)
             details = getattr(exc, "verifier", None)
-            if isinstance(exc, (BrokerError, TimeoutError)) and not retryable and local_packet is not None:
+            if (
+                isinstance(exc, (BrokerError, TimeoutError, EvidenceInsufficient))
+                and not retryable
+                and local_packet is not None
+            ):
                 try:
                     fallback, fallback_attempt_id = _save_safe_stage_fallback(
                         store, cycle, "m1_judgment", local_packet,
@@ -1408,6 +1444,10 @@ def run_m1(
                 details=details if isinstance(details, dict) else None,
             )
             verification_feedback = _m1_retry_feedback(exc)
+            if frozen_expression_decision is None:
+                frozen_expression_decision = _m1_expression_invariants(exc)
+            if verification_feedback is not None and frozen_expression_decision is not None:
+                verification_feedback["frozen_decision"] = frozen_expression_decision
             cycle = store.get_cycle(cycle_id)
             time.sleep(2)
     raise RuntimeError("M1 attempts exhausted")

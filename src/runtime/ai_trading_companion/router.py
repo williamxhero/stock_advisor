@@ -293,6 +293,7 @@ class CognitiveRouter:
                 problems.append("judgment_position_priority_is_cost_anchored")
             problems.extend(_qualified_reply_acquisition_gap_problems(semantic))
             if stage == "m1_judgment":
+                problems.extend(_m1_expression_repair_invariant_problems(packet, semantic))
                 problems.extend(_formal_m1_expression_problems(packet, normalized.text))
                 problems.extend(_close_review_coverage_problems(packet, semantic))
                 problems.extend(_weekend_review_coverage_problems(packet, semantic))
@@ -544,6 +545,19 @@ def _formal_m1_expression_problems(packet: dict[str, Any], text: str) -> list[st
     ):
         problems.append("formal_reply_lacks_market_interpretation")
     return problems
+
+
+def _m1_expression_repair_invariant_problems(packet: dict[str, Any], semantic: dict[str, Any]) -> list[str]:
+    repair = packet.get("verification_repair") if isinstance(packet.get("verification_repair"), dict) else {}
+    frozen = repair.get("frozen_decision") if isinstance(repair.get("frozen_decision"), dict) else None
+    if frozen is None:
+        return []
+    keys = ("direction", "qualified", "horizon", "current_action", "transition_conditions", "position_focus")
+    changed = [
+        key for key in keys
+        if semantic.get(key) != frozen.get(key)
+    ]
+    return ["m1_expression_repair_changes_frozen_decision:" + ",".join(changed)] if changed else []
 
 
 def _qualified_reply_acquisition_gap_problems(semantic: dict[str, Any]) -> list[str]:

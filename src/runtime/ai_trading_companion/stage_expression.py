@@ -331,7 +331,7 @@ def _verified_close_judgment(
     )
     market_evidence = (
         f"按交易所收盘统计，{turnover}；{breadth_text}。"
-        f"成交明显放大，但下跌家数仍多于上涨家数，{breadth_view}。"
+        f"成交明显放大，但下跌家数仍多于上涨家数，{breadth_view}，市场情绪仍偏弱。"
     )
     leader = theme_fact["leaders"][0]
     laggard = theme_fact["laggards"][0]
@@ -349,7 +349,7 @@ def _verified_close_judgment(
         f"{number(quote_by_symbol[code].get('change_percent'))}%"
         for code in sorted(required)
     )
-    holding_evidence = f"腾讯15:00持仓收盘：{holdings}。"
+    holding_evidence = f"持仓收盘表现：{holdings}。"
     if any(len(item) > 240 for item in (market_evidence, theme_and_sentiment, holding_evidence)):
         return None
     result = {

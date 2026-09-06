@@ -18,7 +18,7 @@ from ai_trading_companion.__main__ import (
 from ai_trading_companion.acquisition import AcquisitionBoundary
 from ai_trading_companion.broker_client import BrokerError
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
-from ai_trading_companion.evidence_gate import EvidenceGate
+from ai_trading_companion.evidence_gate import EvidenceGate, EvidenceInsufficient
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.local_research import BrokerResearchPlanner
 from ai_trading_companion.router import CognitiveRouter
@@ -115,7 +115,9 @@ class EvidenceV3Tests(TestCase):
         self.assertTrue(verdict["passed"], verdict["problems"])
         self.assertIn("20335.82亿元", rendered)
         self.assertIn("领涨", rendered)
-        self.assertIn("市场情绪用广度验证", rendered)
+        self.assertIn("市场情绪仍偏弱", rendered)
+        self.assertNotIn("市场情绪用广度验证", rendered)
+        self.assertNotIn("腾讯15:00", rendered)
         self.assertNotIn("未取得", rendered)
         self.assertNotIn("数据缺失", rendered)
         for code in ("000997", "002891", "300421", "601899", "603861"):
@@ -1230,6 +1232,10 @@ class EvidenceV3Tests(TestCase):
         self.assertTrue(_m1_should_retry(error, attempt_number=3, remaining_seconds=60))
         self.assertFalse(_m1_should_retry(error, attempt_number=4, remaining_seconds=300))
         self.assertFalse(_m1_should_retry(error, attempt_number=1, remaining_seconds=20))
+        expression_rejection = EvidenceInsufficient({
+            "passed": False, "problems": ["formal_reply_exposes_research_log"],
+        })
+        self.assertTrue(_m1_should_retry(expression_rejection, attempt_number=1, remaining_seconds=300))
         self.assertEqual(
             {
                 "category": "broker_output_invalid",

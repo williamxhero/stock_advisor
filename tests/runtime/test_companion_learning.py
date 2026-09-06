@@ -665,6 +665,34 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertIn("formal_reply_unverified_core_role", result["problems"])
         self.assertIn("formal_reply_exposes_unverified_announcement_title", result["problems"])
 
+    def test_m1_expression_repair_cannot_change_the_frozen_decision(self):
+        semantic = {
+            "summary": "市场偏弱，当前保持观察。",
+            "direction": "neutral", "qualified": True, "horizon": "下周",
+            "current_action": "observe",
+            "key_evidence": ["成交放大但市场广度偏弱，短线仍以防守为主。"],
+            "transition_conditions": [{
+                "outcome": "upgrade", "price": "指数站稳", "breadth": "上涨家数占优", "persistence": "连续两日",
+            }, {
+                "outcome": "downgrade", "price": "指数失守", "breadth": "下跌家数扩大", "persistence": "连续两日",
+            }],
+            "position_focus": [{"symbol": "002891", "priority": 1, "action": "observe", "reason": "等待确认"}],
+            "risks": [], "unknowns": [],
+        }
+        frozen = {
+            key: semantic[key]
+            for key in ("direction", "qualified", "horizon", "current_action", "transition_conditions", "position_focus")
+        }
+        packet = {"verification_repair": {"frozen_decision": frozen}}
+        changed = json.loads(json.dumps(semantic, ensure_ascii=False))
+        changed["current_action"] = "reduce_risk"
+
+        accepted = CognitiveRouter().verify("m1_judgment", packet, {"result_version": 4, "semantic": semantic})
+        rejected = CognitiveRouter().verify("m1_judgment", packet, {"result_version": 4, "semantic": changed})
+
+        self.assertTrue(accepted["passed"], accepted["problems"])
+        self.assertIn("m1_expression_repair_changes_frozen_decision:current_action", rejected["problems"])
+
     def test_safe_formal_fallback_is_natural_and_conservative(self):
         m0 = normalize_stage_output("m0_compose", safe_stage_output("m0_compose"))
         m1 = normalize_stage_output("m1_judgment", safe_stage_output("m1_judgment", horizon="午后"))

@@ -28,7 +28,7 @@ from ai_trading_companion.store import CompanionStore
 
 
 class EvidenceV3Tests(TestCase):
-    def test_m0_expression_states_a_missing_fact_as_current_absence(self):
+    def test_m0_expression_does_not_turn_missing_fact_into_delivery_status(self):
         rendered = express_stage_semantics("m0", {
             "summary": "收盘市场整体偏弱。",
             "observations": [],
@@ -36,7 +36,8 @@ class EvidenceV3Tests(TestCase):
             "unknowns": ["缺少成交额及较前一交易日比较，无法判断量价配合。"],
         })
 
-        self.assertIn("本次未取得成交额及较前一交易日比较", rendered)
+        self.assertIn("在成交额及较前一交易日比较得到确认前，我暂不判断量价配合", rendered)
+        self.assertNotIn("未取得", rendered)
         self.assertNotIn("还需要确认缺少", rendered)
 
     def test_m0_safe_fallback_uses_complete_verified_close_instead_of_claiming_a_gap(self):
@@ -114,7 +115,9 @@ class EvidenceV3Tests(TestCase):
         self.assertTrue(verdict["passed"], verdict["problems"])
         self.assertIn("20335.82亿元", rendered)
         self.assertIn("领涨", rendered)
-        self.assertIn("论坛传播数据", rendered)
+        self.assertIn("市场情绪用广度验证", rendered)
+        self.assertNotIn("未取得", rendered)
+        self.assertNotIn("数据缺失", rendered)
         for code in ("000997", "002891", "300421", "601899", "603861"):
             self.assertIn(code, rendered)
 

@@ -34,8 +34,11 @@ def _semantic() -> dict:
             {"symbol": "603861", "priority": 1, "reason": "当前市值暴露最大且相对偏弱", "action": "observe"},
             {"symbol": "300421", "priority": 2, "reason": "收盘表现显著弱于指数", "action": "reduce_risk"},
         ],
-        "risks": ["负广度若延续，指数跌幅可能低估个股风险。"],
-        "unknowns": ["未取得直接论坛传播数据，市场情绪以收盘广度和涨跌停候选作为替代证据。"],
+        "risks": [
+            "负广度若延续，指数跌幅可能低估个股风险。",
+            "市场情绪由收盘广度和涨跌停候选交叉验证：下跌家数占优，风险偏好偏弱。",
+        ],
+        "unknowns": ["下一交易日市场宽度能否回升。"],
     }
 
 
@@ -78,6 +81,7 @@ def test_completed_close_verifier_enforces_requested_visible_coverage() -> None:
     incomplete = _semantic()
     incomplete["summary"] = "收盘判断中性偏谨慎。"
     incomplete["key_evidence"] = ["成交额显著放大，但市场广度偏弱。"]
+    incomplete["risks"] = ["负广度若延续，指数跌幅可能低估个股风险。"]
     incomplete["unknowns"] = []
     rejected = CognitiveRouter().verify(
         "m1_judgment", _packet(), {"result_version": 4, "semantic": incomplete},

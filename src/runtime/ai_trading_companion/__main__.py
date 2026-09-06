@@ -708,13 +708,27 @@ def _call_stage(
                     )
                 )
             executor = ReadOnlyResearchExecutor(backends, max_operations=controls.max_operations)
+            saved_research = store.research_checkpoint(
+                cycle["cycle_id"], stage, str(packet.get("sha256") or request_hash),
+            )
+            def persist_research_checkpoint(value: dict[str, Any]) -> None:
+                store.save_research_checkpoint(
+                    cycle["cycle_id"], stage, str(packet.get("sha256") or request_hash),
+                    attempt["attempt_id"], value,
+                )
             research = LocalResearchChain(
                 # A repair is bounded so an incomplete web discovery cannot
                 # consume the compose model's entire deadline. The gate still
                 # rejects incomplete evidence; it is never published as M0.
-                planner, executor, max_repairs=2,
+                planner, executor, max_repairs=None,
                 deadline=lambda: deadline - time.monotonic(),
                 observation_registrar=evidence_registrar,
+                resume_checkpoint=saved_research["checkpoint"] if saved_research else None,
+                on_checkpoint=persist_research_checkpoint,
+                cancelled=(
+                    (lambda: store.chat_research_terminated(cycle["cycle_id"]))
+                    if stage == "chat_research" else None
+                ),
             ).run(
                 packet, contract, attempt_id=attempt["attempt_id"],
             )
@@ -1900,6 +1914,9 @@ def run_background(
             run_chat_research(engine, store, job, execute)
             return {"action": "chat_research", "job_id": job["job_id"]}
         except Exception as exc:
+            if isinstance(exc, EvidenceInsufficient) and exc.verifier.get("stop_reason") == "user_cancelled":
+                store.finish_research_job(job["job_id"], error="用户已停止公开补查", retry=True)
+                return {"action": "chat_research_cancelled", "job_id": job["job_id"]}
             store.finish_research_job(job["job_id"], error=str(exc), retry=job["attempt_count"] < 2)
             engine.background_failed(job["cycle_id"], "chat_research", str(exc))
             return {"action": "chat_research_failed", "job_id": job["job_id"]}

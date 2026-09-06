@@ -38,6 +38,7 @@ class BrokerRequest:
     visible_stream: bool = False
     on_delta: Callable[[str], None] | None = None
     absolute_deadline: float = math.inf
+    idle_timeout_seconds: float = 30.0
     output_token_limit: int = 2_000
     verifier_name: str = "none/v1"
     verifier: Callable[[dict[str, Any]], dict[str, Any]] | None = None
@@ -48,6 +49,8 @@ class BrokerRequest:
             raise ValueError("Broker intellect must be standard, smart, or expert")
         if self.effort not in {"medium", "high", "xhigh"}:
             raise ValueError("Broker effort must be a capability-contract value")
+        if self.idle_timeout_seconds <= 0:
+            raise ValueError("Broker idle timeout must be positive")
         if self.packet_sha256 != canonical_packet_hash(self.packet):
             raise ValueError("Broker request packet hash does not match canonical frozen input")
         if self.h0_forbidden and _contains_h0(self.packet):
@@ -97,7 +100,9 @@ class ProviderBrokerClient:
             if streamed != str(raw.get("output_text") or ""):
                 raise BrokerError("Broker stream final text does not match deltas", category="broker_stream_incomplete")
         else:
-            raw = self._post("/v1/generate", payload, request.absolute_deadline)
+            raw = self._post(
+                "/v1/generate", payload, request.absolute_deadline, request.idle_timeout_seconds,
+            )
         response = self._response(raw, request)
         return response
 
@@ -116,7 +121,9 @@ class ProviderBrokerClient:
             "output_token_limit": max(1, int(request.output_token_limit)),
         }
 
-    def _post(self, path: str, payload: dict[str, Any], deadline: float) -> dict[str, Any]:
+    def _post(
+        self, path: str, payload: dict[str, Any], deadline: float, idle_timeout_seconds: float,
+    ) -> dict[str, Any]:
         request = Request(
             self.base_url + path,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -125,7 +132,7 @@ class ProviderBrokerClient:
         )
         try:
             with urlopen(request, timeout=_timeout(deadline)) as response:
-                raw = b"".join(_response_chunks(response, deadline)).decode("utf-8")
+                raw = b"".join(_response_chunks(response, deadline, idle_timeout_seconds)).decode("utf-8")
         except HTTPError as exc:
             raise _http_error(exc) from exc
         except TimeoutError as exc:
@@ -150,7 +157,9 @@ class ProviderBrokerClient:
         event, data, chunks, final = None, [], [], None
         try:
             with urlopen(raw_request, timeout=_timeout(request.absolute_deadline)) as response:
-                for line in _response_lines(response, request.absolute_deadline):
+                for line in _response_lines(
+                    response, request.absolute_deadline, request.idle_timeout_seconds,
+                ):
                     if not line:
                         if event == "delta":
                             value = _event_json(data)
@@ -238,13 +247,13 @@ def _timeout(deadline: float) -> float:
     return max(0.1, remaining)
 
 
-def _response_chunks(response: Any, deadline: float):
+def _response_chunks(response: Any, deadline: float, idle_timeout_seconds: float = 30.0):
     """Read an HTTP response without allowing trickle traffic to extend its deadline."""
     reader = getattr(response, "read1", None)
     if not callable(reader):
         reader = response.read
     while True:
-        timeout = _timeout(deadline)
+        timeout = min(_timeout(deadline), max(0.1, float(idle_timeout_seconds)))
         _set_response_timeout(response, timeout)
         chunk = reader(64 * 1024)
         _timeout(deadline)
@@ -253,9 +262,9 @@ def _response_chunks(response: Any, deadline: float):
         yield chunk
 
 
-def _response_lines(response: Any, deadline: float):
+def _response_lines(response: Any, deadline: float, idle_timeout_seconds: float = 30.0):
     pending = b""
-    for chunk in _response_chunks(response, deadline):
+    for chunk in _response_chunks(response, deadline, idle_timeout_seconds):
         pending += chunk
         while b"\n" in pending:
             raw_line, pending = pending.split(b"\n", 1)

@@ -633,13 +633,19 @@ class LocalResearchChain:
                  executor: ReadOnlyResearchExecutor, *, gate: EvidenceGate | None = None,
                  max_repairs: int | None = 2,
                  deadline: Callable[[], float] | None = None,
-                 observation_registrar: Callable[[dict[str, Any]], None] | None = None) -> None:
+                 observation_registrar: Callable[[dict[str, Any]], None] | None = None,
+                 resume_checkpoint: dict[str, Any] | None = None,
+                 on_checkpoint: Callable[[dict[str, Any]], None] | None = None,
+                 cancelled: Callable[[], bool] | None = None) -> None:
         self.planner = planner
         self.executor = executor
         self.gate = gate or EvidenceGate()
         self.max_repairs = None if max_repairs is None else max(0, int(max_repairs))
         self.deadline = deadline
         self.observation_registrar = observation_registrar
+        self.resume_checkpoint = resume_checkpoint
+        self.on_checkpoint = on_checkpoint
+        self.cancelled = cancelled
 
     def _register_observation(self, observation: dict[str, Any]) -> None:
         if self.observation_registrar is not None and observation.get("evidence_items"):
@@ -647,17 +653,46 @@ class LocalResearchChain:
 
     def run(self, packet: dict[str, Any], contract: dict[str, Any], *, attempt_id: str) -> FrozenResearchResult:
         boundary = AcquisitionBoundary(attempt_id)
-        observations: list[dict[str, Any]] = []
+        contract_sha256 = hashlib.sha256(json.dumps(
+            contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        restored = _restored_research_observations(
+            self.resume_checkpoint, contract, contract_sha256, attempt_id,
+        )
+        was_resumed = bool(restored)
+        observations: list[dict[str, Any]] = list(restored)
         verifier: dict[str, Any] = {"passed": False, "problems": ["not_evaluated"], "missing_requirements": []}
-        evidence: dict[str, Any] = {}
+        evidence: dict[str, Any] = _compile_evidence(
+            packet, contract, observations,
+            require_memory_receipts=self.observation_registrar is not None,
+        )
+        if observations:
+            verifier = self.gate.evaluate(
+                evidence, contract, observations,
+                str(packet.get("as_of") or contract.get("as_of") or ""), attempt_id=attempt_id,
+            )
+
+        def checkpoint(terminal_status: str = "running", stop_reason: str | None = None) -> None:
+            if self.on_checkpoint is None:
+                return
+            self.on_checkpoint(_research_checkpoint_payload(
+                packet, contract_sha256, observations, verifier,
+                terminal_status=terminal_status, stop_reason=stop_reason,
+            ))
+
+        forced_stop_reason: str | None = "user_cancelled" if self.cancelled and self.cancelled() else None
         # Acquire every deterministic blocker before the first Broker round.
         # These facts are time-sensitive; waiting for a planning response first
         # can turn an otherwise valid 09:45 snapshot into future evidence.
         preflight = _merge_mandatory_operations(
             {"version": 1, "operations": []}, contract,
-            max_operations=self.executor.max_operations,
+            max_operations=self.executor.max_operations, observations=observations,
+            gaps=list(verifier.get("missing_requirements") or verifier.get("problems") or []),
         )
         for row in self.executor.validate_plan(preflight):
+            if forced_stop_reason or (self.cancelled and self.cancelled()):
+                forced_stop_reason = "user_cancelled"
+                break
             try:
                 backend, result = self.executor.execute(row)
                 observation, _ = boundary.observe(
@@ -678,6 +713,7 @@ class LocalResearchChain:
                 }
                 _attach_tool_resolution_failure(failure, exc)
                 observations.append(failure)
+            checkpoint()
         evidence = _compile_evidence(
             packet, contract, observations,
             require_memory_receipts=self.observation_registrar is not None,
@@ -686,17 +722,24 @@ class LocalResearchChain:
             evidence, contract, observations, str(packet.get("as_of") or contract.get("as_of") or ""),
             attempt_id=attempt_id,
         )
+        checkpoint()
         if verifier.get("passed"):
             normalized = verifier.get("normalized_evidence") or evidence
             gap_states = _build_gap_states(normalized, contract, observations, verifier, final=True)
             normalized = {**normalized, "research_gaps": gap_states}
             verifier = {**verifier, "gap_states": gap_states}
+            checkpoint("complete")
             bundle_bytes, bundle_hash = freeze_evidence_bundle(normalized)
             return FrozenResearchResult(True, normalized, verifier, observations, bundle_bytes, bundle_hash, 0)
         round_number = 0
-        while self.deadline is None or self.deadline() > 1.0:
+        no_gain_rounds = 0
+        while not forced_stop_reason and (self.deadline is None or self.deadline() > 1.0):
             round_observation_start = len(observations)
             gaps = list(verifier.get("missing_requirements") or verifier.get("problems") or [])
+            before_signature = _research_information_signature(observations, verifier)
+            if self.cancelled and self.cancelled():
+                forced_stop_reason = "user_cancelled"
+                break
             planning_packet = {
                 **packet,
                 "deterministic_injection": True,
@@ -742,16 +785,28 @@ class LocalResearchChain:
                     "arguments": {}, "error_category": exc.category,
                     "broker_request_id": exc.request_id,
                 })
+                checkpoint()
                 round_number += 1
                 if self.max_repairs is not None and round_number > self.max_repairs:
                     raise
+                if _research_information_signature(observations, verifier) == before_signature:
+                    forced_stop_reason = "no_information_gain"
+                    break
                 continue
             plan = _merge_mandatory_operations(
                 plan, contract, max_operations=self.executor.max_operations,
                 observations=observations, gaps=gaps,
             )
             operations = self.executor.validate_plan(plan)
+            if was_resumed and gaps:
+                gap_text = "\n".join(str(value) for value in gaps)
+                operations = [
+                    row for row in operations if str(row.get("requirement_key") or "") in gap_text
+                ]
             for row in operations:
+                if self.cancelled and self.cancelled():
+                    forced_stop_reason = "user_cancelled"
+                    break
                 try:
                     backend, result = self.executor.execute(row)
                     observation, _ = boundary.observe(
@@ -772,6 +827,7 @@ class LocalResearchChain:
                     }
                     _attach_tool_resolution_failure(failure, exc)
                     observations.append(failure)
+                checkpoint()
             evidence = _compile_evidence(
                 packet, contract, observations,
                 require_memory_receipts=self.observation_registrar is not None,
@@ -812,17 +868,31 @@ class LocalResearchChain:
                     evidence, contract, observations, str(packet.get("as_of") or contract.get("as_of") or ""),
                     attempt_id=attempt_id,
             )
+            checkpoint()
             if verifier.get("passed"):
                 normalized = verifier.get("normalized_evidence") or evidence
                 gap_states = _build_gap_states(normalized, contract, observations, verifier, final=True)
                 normalized = {**normalized, "research_gaps": gap_states}
                 verifier = {**verifier, "gap_states": gap_states}
+                checkpoint("complete")
                 bundle_bytes, bundle_hash = freeze_evidence_bundle(normalized)
                 return FrozenResearchResult(True, normalized, verifier, observations, bundle_bytes, bundle_hash, round_number)
+            if forced_stop_reason:
+                break
+            after_signature = _research_information_signature(observations, verifier)
+            if after_signature == before_signature:
+                no_gain_rounds += 1
+            else:
+                no_gain_rounds = 0
+            if no_gain_rounds >= 1:
+                forced_stop_reason = "no_information_gain"
+                break
             round_number += 1
             if self.max_repairs is not None and round_number > self.max_repairs:
                 break
-        stop_reason = "reliability_deadline" if self.deadline is not None else "configured_test_rounds"
+        stop_reason = forced_stop_reason or (
+            "reliability_deadline" if self.deadline is not None else "configured_test_rounds"
+        )
         gap_states = _build_gap_states(
             evidence, contract, observations, verifier, final=True, stop_reason=stop_reason,
         )
@@ -847,6 +917,7 @@ class LocalResearchChain:
                 str(packet.get("as_of") or contract.get("as_of") or ""), gap_states,
             ),
         }
+        checkpoint("cancelled" if stop_reason == "user_cancelled" else "stopped", stop_reason)
         bundle_bytes, bundle_hash = freeze_evidence_bundle(evidence)
         failure = {
             "type": "stage_failure", "stage": str(packet.get("stage") or "research"),
@@ -856,6 +927,68 @@ class LocalResearchChain:
         }
         return FrozenResearchResult(False, evidence, verifier, observations, bundle_bytes, bundle_hash,
                                     round_number, [failure])
+
+
+def _restored_research_observations(
+    checkpoint: dict[str, Any] | None, contract: dict[str, Any], contract_sha256: str, attempt_id: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(checkpoint, dict):
+        return []
+    if (
+        checkpoint.get("version") != 1
+        or checkpoint.get("frozen_as_of") != contract.get("as_of")
+        or checkpoint.get("contract_sha256") != contract_sha256
+        or not isinstance(checkpoint.get("observations"), list)
+    ):
+        return []
+    restored: list[dict[str, Any]] = []
+    for value in checkpoint["observations"]:
+        if not isinstance(value, dict):
+            continue
+        item = copy.deepcopy(value)
+        item["attempt_id"] = attempt_id
+        restored.append(item)
+    return restored
+
+
+def _research_checkpoint_payload(
+    packet: dict[str, Any], contract_sha256: str, observations: list[dict[str, Any]],
+    verifier: dict[str, Any], *, terminal_status: str, stop_reason: str | None,
+) -> dict[str, Any]:
+    attempted_routes = [{
+        "requirement_key": str((item.get("arguments") or {}).get("requirement_key") or ""),
+        "backend": str(item.get("backend") or ""), "operation": str(item.get("operation") or ""),
+        "status": str(item.get("status") or ""),
+    } for item in observations]
+    return {
+        "version": 1, "frozen_as_of": str(packet.get("as_of") or ""),
+        "contract_sha256": contract_sha256, "observations": copy.deepcopy(observations),
+        "unresolved_gaps": list(verifier.get("missing_requirements") or verifier.get("problems") or []),
+        "attempted_routes": attempted_routes, "terminal_status": terminal_status,
+        "stop_reason": stop_reason,
+    }
+
+
+def _research_information_signature(
+    observations: list[dict[str, Any]], verifier: dict[str, Any],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    refs = sorted({
+        str(item.get("evidence_ref") or "")
+        for observation in observations if observation.get("status") == "succeeded"
+        for item in observation.get("evidence_items") or [] if item.get("evidence_ref")
+    })
+    gaps = sorted(str(value) for value in verifier.get("missing_requirements") or verifier.get("problems") or [])
+    routes = sorted({
+        "|".join((
+            str((item.get("arguments") or {}).get("requirement_key") or ""),
+            str(item.get("backend") or ""), str(item.get("operation") or ""),
+            str((item.get("arguments") or {}).get("query") or ""),
+            str((item.get("arguments") or {}).get("url") or ""),
+            str(item.get("status") or ""), str(item.get("tool_error_code") or item.get("error_category") or ""),
+        ))
+        for item in observations
+    })
+    return tuple(refs), tuple(gaps), tuple(routes)
 
 
 def freeze_evidence_bundle(evidence: dict[str, Any]) -> tuple[bytes, str]:

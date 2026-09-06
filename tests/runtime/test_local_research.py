@@ -22,6 +22,87 @@ def row(operation: str, *, query: str | None = None, url: str | None = None) -> 
     return {"requirement_key": "market", "backend": "gateway", "operation": operation, "arguments": {"query": query, "categories": "news", "url": url, "symbol": None, "render": "auto", "session_id": None, "actions": None}, "fallback_backends": []}
 
 class LocalResearchTests(unittest.TestCase):
+    def test_holding_announcement_research_maps_each_frozen_entity_without_false_negative(self) -> None:
+        contract = {
+            "version": 4,
+            "as_of": "2026-09-05T02:00:00Z",
+            "requirements": [{
+                "key": "portfolio_events_and_counterevidence", "blocking": True,
+                "allowed_coverage": ["covered", "checked_no_change"],
+                "evidence_class": "public_if_present",
+                "required_entities": ["600001", "600002", "600001", "600003"],
+                "entity_names": {"600001": "标准甲", "600002": "标准乙", "600003": "标准丙"},
+                "negative_query_terms": ["公告", "停复牌", "财报", "风险"],
+                "window": {"mode": "after_start_to_end", "start": "2026-09-01T07:00:00Z", "end": "2026-09-05T02:00:00Z"},
+            }],
+        }
+        queries: list[str] = []
+
+        def backend(operation: str, arguments: dict) -> dict:
+            if operation == "announcement_snapshot":
+                raise RuntimeError("dedicated announcement source unavailable")
+            if operation == "web_search":
+                query = str(arguments.get("query") or "")
+                queries.append(query)
+                symbol = next(code for code in ("600001", "600002", "600003") if code in query)
+                return {"results": [{"url": f"https://www.cninfo.com.cn/{symbol}", "title": symbol}]}
+            symbol = str(arguments.get("url") or "").rsplit("/", 1)[-1]
+            announcements = []
+            if symbol == "600001":
+                announcements = [{
+                    "symbol": symbol, "issuer": "标准甲", "title": "回购进展公告",
+                    "published_at": "2026-09-03T01:00:00Z", "announcement_date": "2026-09-03",
+                    "source_url": f"https://www.cninfo.com.cn/{symbol}/notice-1", "content_verified": False,
+                }, {
+                    "symbol": symbol, "issuer": "标准甲", "title": "回购进展公告",
+                    "published_at": "2026-09-03T01:00:00Z", "announcement_date": "2026-09-03",
+                    "source_url": f"https://www.cninfo.com.cn/{symbol}/notice-1", "content_verified": False,
+                }]
+            proof = {
+                "authority": "cninfo", "query_symbol": symbol,
+                "start_date": "2026-09-01", "end_date": "2026-09-05",
+                "pagination_complete": symbol != "600003",
+            }
+            payload = {"checked_symbol": symbol, "announcements": announcements, "enumeration_proof": proof}
+            return {"results": [{
+                "url": f"https://www.cninfo.com.cn/{symbol}", "title": symbol,
+                "excerpt_text": json.dumps(payload, ensure_ascii=False), "fact_as_of": contract["as_of"],
+            }]}
+
+        def planner(packet: dict, _gaps: list[str], _round: int) -> dict:
+            discoveries = [
+                item for item in packet.get("research_discoveries") or []
+                if "cninfo.com.cn" in str(item.get("url") or "")
+            ]
+            return {"version": 1, "operations": [
+                {**row("web_read", url=str(item["url"])), "requirement_key": "portfolio_events_and_counterevidence"}
+                for item in discoveries
+            ]}
+
+        result = LocalResearchChain(
+            planner,
+            ReadOnlyResearchExecutor({"market": backend, "gateway": backend}),
+            max_repairs=2,
+        ).run({"stage": "m0_research", "as_of": contract["as_of"]}, contract, attempt_id="holding-events")
+
+        self.assertFalse(result.qualified)
+        self.assertEqual(3, len(queries))
+        for code, name in contract["requirements"][0]["entity_names"].items():
+            query = next(value for value in queries if code in value)
+            self.assertIn(name, query)
+            self.assertIn("2026-09-01", query)
+            self.assertIn("2026-09-05", query)
+            self.assertIn("公告 停复牌 财报 风险", query)
+        coverage = result.evidence["coverage"][0]
+        checks = {item["symbol"]: item for item in coverage["entity_checks"]}
+        self.assertEqual("disclosed_pending_content", checks["600001"]["state"])
+        self.assertEqual(1, len(checks["600001"]["announcements"]))
+        self.assertEqual("checked_no_change", checks["600002"]["state"])
+        self.assertEqual("missing", checks["600003"]["state"])
+        self.assertEqual("partial", coverage["coverage_level"])
+        self.assertIn("600003", coverage["unresolved_entities"])
+        self.assertNotIn("600001", coverage["unresolved_entities"])
+
     def test_weekend_research_preserves_directional_fund_flow_and_event_boundaries(self) -> None:
         close = "2026-09-04T07:00:00Z"
         contract = {

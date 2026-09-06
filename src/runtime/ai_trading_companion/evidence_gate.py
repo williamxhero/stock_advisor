@@ -359,6 +359,20 @@ class _EvidenceGateV3:
                 problems.append(f"blocking_requirement_untraceable:{key}"); missing.append(key); continue
             if not self._in_window(bound, requirement.get("window") or {}, problems):
                 problems.append(f"blocking_requirement_stale:{key}"); missing.append(key); continue
+            if key == "portfolio_events_and_counterevidence":
+                checks = {
+                    str(item.get("symbol") or ""): item
+                    for item in row.get("entity_checks") or [] if isinstance(item, dict)
+                }
+                unresolved = [
+                    entity for entity in required_entities
+                    if entity not in checks or checks[entity].get("state") not in {
+                        "checked_no_change", "disclosed_pending_content", "disclosed_verified",
+                    }
+                ]
+                if unresolved:
+                    problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
+                continue
             if row.get("status") == "checked_no_change" and not self._matching_negative_query(bound, requirement.get("negative_query_terms") or []):
                 problems.append(f"checked_no_change_query_not_matched:{key}"); missing.append(key)
                 continue

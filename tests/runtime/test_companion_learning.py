@@ -488,7 +488,9 @@ class CompanionLearningTests(unittest.TestCase):
             })},
             {"excerpt": json.dumps({"checked_symbol": "000997", "announcements": []})},
             {"excerpt": json.dumps({
-                "checked_symbol": "002891", "announcements": [{"title": "回购公司股份的进展公告"}],
+                "checked_symbol": "002891", "announcements": [{
+                    "title": "回购公司股份的进展公告", "content_verified": False,
+                }],
             })},
         ])
         packet = {
@@ -534,7 +536,7 @@ class CompanionLearningTests(unittest.TestCase):
             "semantic": {**base, "key_evidence": [
                 "行业分布上，消费板块领涨、科技板块领跌。",
                 "主力资金方向显示数字人净流入52.81亿元，电子板块净流出。",
-                "逐股公告核查：000997新大陆、002891中宠股份均未发现改变判断的披露。",
+                "逐股公告核查：000997新大陆未发现新增公告；002891中宠股份披露《回购公司股份的进展公告》，内容待核验，暂不据标题改变判断。",
             ], "risks": ["政策与风险事件核查后，相关变化可能对下周风险偏好形成压制，属于影响推断。"]},
         }
         directional_without_boundary = CognitiveRouter().verify("m1_judgment", packet, complete_output)
@@ -548,6 +550,11 @@ class CompanionLearningTests(unittest.TestCase):
         event_as_fact_output = json.loads(json.dumps(complete_output, ensure_ascii=False))
         event_as_fact_output["semantic"]["risks"] = ["政策与风险事件已经压制下周风险偏好。"]
         event_as_fact = CognitiveRouter().verify("m1_judgment", packet, event_as_fact_output)
+        title_overclaim_output = json.loads(json.dumps(complete_output, ensure_ascii=False))
+        title_overclaim_output["semantic"]["position_focus"] = [{
+            "priority": 1, "symbol": "002891", "reason": "因《回购公司股份的进展公告》建议加仓",
+        }]
+        title_overclaim = CognitiveRouter().verify("m1_judgment", packet, title_overclaim_output)
 
         self.assertIn("weekend_review_lacks_sector_distribution", omitted["problems"])
         self.assertIn("weekend_review_lacks_fund_flow_direction", omitted["problems"])
@@ -556,6 +563,7 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertIn("weekend_review_lacks_directional_fund_flow_boundary", directional_without_boundary["problems"])
         self.assertIn("weekend_review_overclaims_directional_fund_flow", overclaimed["problems"])
         self.assertIn("weekend_review_event_impact_not_marked_as_inference", event_as_fact["problems"])
+        self.assertIn("weekend_review_overclaims_unverified_announcement_title", title_overclaim["problems"])
         self.assertTrue(complete["passed"], complete["problems"])
         complete_text = normalize_stage_output("m1_judgment", complete_output).text
         self.assertIn("主力资金方向", complete_text)

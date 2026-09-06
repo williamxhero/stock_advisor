@@ -593,6 +593,80 @@ class EvidenceV3Tests(TestCase):
         )
         self.assertIn("blocking_requirement_lacks_numeric_facts:market_fund_flow", failed["problems"])
 
+    def test_v4_directional_fund_flow_combines_verified_article_sides(self):
+        close = "2026-09-04T07:00:00Z"
+        contract = {"version": 4, "as_of": "2026-09-06T05:58:23Z", "requirements": [{
+            "key": "market_fund_flow", "blocking": True, "allowed_coverage": ["covered"],
+            "minimum_numeric_facts": 3,
+            "window": {"mode": "exact", "start": close, "end": close},
+        }]}
+        payloads = [{
+            "coverage_level": "directional_sector",
+            "title": "A股收评",
+            "sector_inflow_leaders": [
+                {"name": "虚拟数字人", "net_inflow": 5_281_000_000.0, "unit": "CNY"},
+                {"name": "AI应用", "net_inflow": 5_163_000_000.0, "unit": "CNY"},
+                {"name": "文化传媒概念", "net_inflow": 4_208_000_000.0, "unit": "CNY"},
+            ],
+            "sector_outflow_leaders": [],
+        }, {
+            "coverage_level": "directional_sector",
+            "title": "数据看盘",
+            "sector_inflow_leaders": [],
+            "sector_outflow_leaders": [{"name": "电子"}],
+        }]
+        refs = ["flow-in", "flow-out"]
+        evidence = {
+            "schema_version": 3, "as_of": contract["as_of"],
+            "sources": [
+                {"evidence_ref": ref, "excerpt": json.dumps(payload, ensure_ascii=False)}
+                for ref, payload in zip(refs, payloads)
+            ],
+            "coverage": [{"requirement_key": "market_fund_flow", "status": "covered",
+                          "evidence_refs": refs}],
+            "high_impact_events": [],
+        }
+        observations = [{
+            "attempt_id": "attempt", "backend": "market", "status": "succeeded", "non_empty": True,
+            "evidence_items": [{
+                "evidence_ref": ref, "url": url, "excerpt_text": json.dumps(payload, ensure_ascii=False),
+                "fact_as_of": close, "published_at": None, "acquired_at": contract["as_of"],
+            } for ref, url, payload in zip(
+                refs,
+                ["https://news.10jqka.com.cn/20260904/close.shtml", "https://www.cls.cn/detail/close"],
+                payloads,
+            )],
+        }]
+
+        result = EvidenceGate().evaluate(
+            evidence, contract, observations, contract["as_of"], attempt_id="attempt",
+        )
+
+        self.assertTrue(result["passed"], result["problems"])
+
+        conflict = {
+            "coverage_level": "directional_sector",
+            "sector_inflow_leaders": [
+                {"name": "AI应用", "net_inflow": 1.0, "unit": "CNY"},
+            ],
+            "sector_outflow_leaders": [],
+        }
+        evidence["sources"].append({
+            "evidence_ref": "flow-conflict", "excerpt": json.dumps(conflict, ensure_ascii=False),
+        })
+        evidence["coverage"][0]["evidence_refs"].append("flow-conflict")
+        observations[0]["evidence_items"].append({
+            "evidence_ref": "flow-conflict", "url": "https://example.test/conflict",
+            "excerpt_text": json.dumps(conflict, ensure_ascii=False), "fact_as_of": close,
+            "published_at": None, "acquired_at": contract["as_of"],
+        })
+
+        rejected = EvidenceGate().evaluate(
+            evidence, contract, observations, contract["as_of"], attempt_id="attempt",
+        )
+
+        self.assertIn("blocking_requirement_fund_flow_scope_invalid:market_fund_flow", rejected["problems"])
+
     def test_m0_rejects_utc_clock_and_requires_local_quote_time_and_status(self):
         packet = {
             "calendar_context": {},

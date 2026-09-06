@@ -317,9 +317,14 @@ class ToolRunner:
             except ArtifactCapacityError:
                 return EvidenceResolution.failed(request.capability, "tool_archive_capacity_exceeded", tool_version=tool.version)
             if process.returncode != 0:
+                error_code = (
+                    "tool_access_restricted" if process.returncode == 64
+                    else "tool_browser_unavailable" if process.returncode == 69
+                    else "tool_process_failed"
+                )
                 return EvidenceResolution.failed(
                     request.capability,
-                    "tool_access_restricted" if process.returncode == 64 else "tool_process_failed",
+                    error_code,
                     tool_version=tool.version, exit_code=process.returncode,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
                 )

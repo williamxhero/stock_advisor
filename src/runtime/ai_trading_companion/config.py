@@ -17,6 +17,7 @@ DEFAULT_RESEARCH = {
     "web_access_gateway": {
         "mcp_url": "http://yosef-server:8930/mcp",
         "token": "",
+        "authorized_edge_session_id": "",
         "search_timeout_seconds": 35,
         "read_timeout_seconds": 100,
     },

@@ -1133,9 +1133,11 @@ def _planner_research_scope(value: Any) -> dict[str, Any]:
 
 
 def _coverage_metadata(
-    requirement_key: str, status: str, refs: list[str], observations: list[dict[str, Any]],
+    requirement_key: str, requirement: dict[str, Any], status: str,
+    refs: list[str], observations: list[dict[str, Any]],
 ) -> dict[str, Any]:
     payloads: list[dict[str, Any]] = []
+    payload_rows: list[tuple[str, str, str, dict[str, Any]]] = []
     fact_times: list[str] = []
     ref_set = set(refs)
     for observation in observations:
@@ -1148,6 +1150,10 @@ def _coverage_metadata(
                 continue
             if isinstance(payload, dict):
                 payloads.append(payload)
+                payload_rows.append((
+                    str(item.get("evidence_ref") or ""), str(item.get("url") or ""),
+                    str(observation.get("backend") or ""), payload,
+                ))
                 if item.get("fact_as_of"):
                     fact_times.append(str(item["fact_as_of"]))
     if requirement_key == "market_fund_flow":
@@ -1225,6 +1231,103 @@ def _coverage_metadata(
             "impact_status": "inference_only" if refs else "not_assessed",
             "truth_evidence_refs": list(refs),
         }
+    if requirement_key == "portfolio_events_and_counterevidence":
+        required = list(dict.fromkeys(
+            str(value) for value in requirement.get("required_entities") or [] if str(value)
+        ))
+        if not required:
+            return {
+                "status": "checked_no_change", "coverage_level": "complete",
+                "entity_checks": [], "unresolved_entities": [],
+            }
+        names = requirement.get("entity_names") if isinstance(requirement.get("entity_names"), dict) else {}
+        window = requirement.get("window") if isinstance(requirement.get("window"), dict) else {}
+        start_date = str(window.get("start") or "")[:10]
+        end_date = str(window.get("end") or "")[:10]
+        checks: list[dict[str, Any]] = []
+        for symbol in required:
+            relevant = [
+                (ref, source_url, backend, payload) for ref, source_url, backend, payload in payload_rows
+                if payload.get("checked_symbol") == symbol
+            ]
+            announcements: list[dict[str, Any]] = []
+            seen: set[tuple[str, str, str]] = set()
+            proof_complete = False
+            evidence_refs: list[str] = []
+            for ref, evidence_url, backend, payload in relevant:
+                evidence_refs.append(ref)
+                proof = payload.get("enumeration_proof") if isinstance(payload.get("enumeration_proof"), dict) else {}
+                evidence_host = (urlsplit(evidence_url).hostname or "").lower()
+                authoritative_page = (
+                    backend == "market"
+                    or evidence_host == "www.cninfo.com.cn" or evidence_host.endswith(".cninfo.com.cn")
+                    or evidence_host in {"www.sse.com.cn", "www.szse.cn"}
+                )
+                proof_complete = proof_complete or bool(
+                    authoritative_page
+                    and proof.get("authority") in {"cninfo", "sse", "szse"}
+                    and proof.get("query_symbol") == symbol
+                    and proof.get("start_date") == start_date
+                    and proof.get("end_date") == end_date
+                    and proof.get("pagination_complete") is True
+                )
+                for announcement in payload.get("announcements") or []:
+                    if not isinstance(announcement, dict) or str(announcement.get("symbol") or "") != symbol:
+                        continue
+                    identity = (
+                        str(announcement.get("title") or ""),
+                        str(announcement.get("announcement_date") or ""),
+                        str(announcement.get("source_url") or ""),
+                    )
+                    if not all(identity) or identity in seen:
+                        continue
+                    try:
+                        published = _parse_utc(announcement.get("published_at"))
+                        announcement_date = datetime.fromisoformat(identity[1]).date()
+                        in_window = bool(
+                            published and start_date <= announcement_date.isoformat() <= end_date
+                            and str(announcement.get("issuer") or "").strip()
+                            and (
+                                backend == "market"
+                                or (urlsplit(identity[2]).hostname or "").lower() == "www.cninfo.com.cn"
+                                or (urlsplit(identity[2]).hostname or "").lower().endswith(".cninfo.com.cn")
+                                or (urlsplit(identity[2]).hostname or "").lower() in {"www.sse.com.cn", "www.szse.cn"}
+                            )
+                            and published <= (_parse_utc(window.get("end")) or published)
+                        )
+                    except ValueError:
+                        in_window = False
+                    if not in_window:
+                        continue
+                    seen.add(identity)
+                    announcements.append(dict(announcement))
+            if announcements:
+                state = (
+                    "disclosed_verified" if all(item.get("content_verified") is True for item in announcements)
+                    else "disclosed_pending_content"
+                )
+            elif proof_complete:
+                state = "checked_no_change"
+            else:
+                state = "missing"
+            checks.append({
+                "symbol": symbol, "name": str(names.get(symbol) or ""), "state": state,
+                "announcements": announcements, "enumeration_complete": proof_complete,
+                "evidence_refs": list(dict.fromkeys(evidence_refs)),
+            })
+        unresolved = [row["symbol"] for row in checks if row["state"] == "missing"]
+        if unresolved:
+            normalized_status = "partial" if any(row["state"] != "missing" for row in checks) else "missing"
+        else:
+            normalized_status = "checked_no_change" if checks and all(
+                row["state"] == "checked_no_change" for row in checks
+            ) else "covered"
+        return {
+            "status": normalized_status,
+            "coverage_level": "complete" if not unresolved else "partial" if len(unresolved) < len(required) else "missing",
+            "entity_checks": checks,
+            "unresolved_entities": unresolved,
+        }
     return {"coverage_level": "complete" if status in {"covered", "checked_no_change"} else "missing"}
 
 
@@ -1264,7 +1367,7 @@ def _compile_evidence(
             status = "missing"
         coverage.append({
             "requirement_key": key, "status": status, "evidence_refs": refs,
-            **_coverage_metadata(key, status, refs, observations),
+            **_coverage_metadata(key, requirement, status, refs, observations),
         })
     return {
         "schema_version": 3, "as_of": str(packet.get("as_of") or contract.get("as_of") or ""),
@@ -1501,6 +1604,41 @@ def _structured_gap_search_operations(
     return rows
 
 
+def _portfolio_event_search_operations(
+    requirement: dict[str, Any], observations: list[dict[str, Any]], gaps: list[str],
+) -> list[dict[str, Any]]:
+    key = "portfolio_events_and_counterevidence"
+    if not any(key in str(value) for value in gaps):
+        return []
+    related = [
+        item for item in observations
+        if str((item.get("arguments") or {}).get("requirement_key") or "") == key
+    ]
+    if not any(item.get("backend") == "market" for item in related):
+        return []
+    attempted_queries = [
+        str((item.get("arguments") or {}).get("query") or "")
+        for item in related if item.get("operation") == "web_search"
+    ]
+    names = requirement.get("entity_names") if isinstance(requirement.get("entity_names"), dict) else {}
+    window = requirement.get("window") if isinstance(requirement.get("window"), dict) else {}
+    start_date = str(window.get("start") or "")[:10]
+    end_date = str(window.get("end") or "")[:10]
+    categories = " ".join(str(value) for value in requirement.get("negative_query_terms") or [])
+    rows: list[dict[str, Any]] = []
+    for symbol in dict.fromkeys(
+        str(value) for value in requirement.get("required_entities") or [] if str(value)
+    ):
+        if any(symbol in query for query in attempted_queries):
+            continue
+        query = " ".join(value for value in (
+            symbol, str(names.get(symbol) or ""), categories, start_date, end_date,
+            "site:cninfo.com.cn",
+        ) if value)
+        rows.append(_operation(key, "gateway", "web_search", query=query))
+    return rows
+
+
 def _merge_mandatory_operations(
     plan: dict[str, Any], contract: dict[str, Any], *, max_operations: int,
     observations: list[dict[str, Any]] | None = None, gaps: list[str] | None = None,
@@ -1553,6 +1691,9 @@ def _merge_mandatory_operations(
         ))
     required.extend(_structured_gap_search_operations(
         requirements, list(observations or []), list(gaps or []),
+    ))
+    required.extend(_portfolio_event_search_operations(
+        event_requirement, list(observations or []), list(gaps or []),
     ))
     completed = {
         (

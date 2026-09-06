@@ -860,6 +860,19 @@ def _validate_equity_announcement_snapshot(
         return "tool_announcement_time_invalid"
     if not str(data.get("source") or "").strip() or not _valid_public_source_urls(data.get("source_urls")):
         return "tool_market_source_urls_invalid"
+    proofs = data.get("enumeration_proofs")
+    if not isinstance(proofs, list) or {
+        str(row.get("query_symbol") or "") for row in proofs if isinstance(row, dict)
+    } != set(expected):
+        return "tool_announcement_enumeration_incomplete"
+    if any(
+        not isinstance(row, dict)
+        or row.get("authority") not in {"cninfo", "sse", "szse"}
+        or row.get("start_date") != start_text or row.get("end_date") != end_text
+        or row.get("pagination_complete") is not True
+        for row in proofs
+    ):
+        return "tool_announcement_enumeration_incomplete"
     rows = data.get("announcements")
     if not isinstance(rows, list):
         return "tool_announcement_result_invalid"
@@ -870,7 +883,17 @@ def _validate_equity_announcement_snapshot(
             announcement_date = datetime.fromisoformat(str(row.get("announcement_date") or "")).date()
         except ValueError:
             return "tool_announcement_result_invalid"
-        if not start <= announcement_date <= end or not str(row.get("title") or "").strip():
+        try:
+            published_at = _parse_timestamp(str(row.get("published_at") or ""))
+        except ValueError:
+            return "tool_announcement_result_invalid"
+        if (
+            not start <= announcement_date <= end
+            or not str(row.get("title") or "").strip()
+            or not str(row.get("issuer") or "").strip()
+            or not str(row.get("source_url") or "").startswith(("http://", "https://"))
+            or published_at > _parse_timestamp(request.required_at)
+        ):
             return "tool_announcement_result_invalid"
     return None
 

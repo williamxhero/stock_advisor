@@ -129,6 +129,10 @@ class EvidenceContractFactory:
             prior_close_text = self._iso(self._latest_completed_close(close - timedelta(seconds=1)))
             context = internal_context or {}
             holdings = [str(value) for value in context.get("portfolio_entities") or [] if str(value)]
+            entity_names = {
+                code: str((context.get("portfolio_entity_names") or {}).get(code) or "")
+                for code in holdings
+            }
             return [
                 {
                     "key": "indices_close", "blocking": True,
@@ -187,6 +191,7 @@ class EvidenceContractFactory:
                     "window": {"start": prior_close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
                     "evidence_class": "public_if_present",
                     "required_entities": holdings,
+                    "entity_names": entity_names,
                     "negative_query_terms": ["公告", "停复牌", "财报", "风险"],
                 },
                 {
@@ -257,6 +262,10 @@ class EvidenceContractFactory:
         if "portfolio_entities" not in internal_context:
             return requirements
         holdings = [str(value) for value in internal_context.get("portfolio_entities") or [] if str(value)]
+        entity_names = {
+            code: str((internal_context.get("portfolio_entity_names") or {}).get(code) or "")
+            for code in holdings
+        }
         breadth_window = dict(market_window)
         market_finality: str | None = None
         if market_window.get("mode") == "exact":
@@ -290,6 +299,7 @@ class EvidenceContractFactory:
                 "key": "portfolio_events_and_counterevidence", "blocking": True,
                 "allowed_coverage": ["covered", "checked_no_change"],
                 "window": events_window, "evidence_class": "public_if_present", "required_entities": holdings,
+                "entity_names": entity_names,
                 "negative_query_terms": ["公告", "停复牌", "财报", "风险"],
             },
         ]

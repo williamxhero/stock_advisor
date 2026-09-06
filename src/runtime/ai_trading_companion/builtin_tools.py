@@ -1614,6 +1614,7 @@ def announcement_snapshot_payload(
         if not isinstance(rows, list):
             fail(75, "announcement service response is invalid")
         normalized: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str]] = set()
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -1625,26 +1626,57 @@ def announcement_snapshot_payload(
                 continue
             if symbol != item["symbol"] or not (start <= announcement_date <= end):
                 continue
+            title = clean_text(row.get("公告标题") or row.get("title")).strip()[:300]
+            source_url = clean_text(
+                row.get("公告链接") or row.get("source_url") or row.get("url") or url
+            ).strip()
+            identity = (symbol, title, announcement_date.isoformat())
+            if not title or identity in seen:
+                continue
+            seen.add(identity)
+            content = clean_text(row.get("公告内容") or row.get("content")).strip()[:1200]
+            published_at = clean_text(row.get("发布时间") or row.get("published_at")).strip()
+            if not published_at:
+                published_at = announcement_date.isoformat() + "T00:00:00+08:00"
             normalized.append({
-                "symbol": symbol, "name": clean_text(row.get("简称") or row.get("name")).strip(),
-                "title": clean_text(row.get("公告标题") or row.get("title")).strip()[:300],
-                "content": clean_text(row.get("公告内容") or row.get("content")).strip()[:1200],
+                "symbol": symbol,
+                "issuer": clean_text(row.get("简称") or row.get("issuer") or row.get("name")).strip(),
+                "title": title, "content": content,
+                "published_at": published_at,
+                "published_time_precision": "timestamp" if "T" in clean_text(row.get("发布时间") or row.get("published_at")) else "date",
                 "announcement_date": announcement_date.isoformat(),
+                "source_url": source_url,
+                "content_verified": bool(content),
+                "impact_status": "pending_assessment",
             })
-            if len(normalized) >= 10:
-                break
         announcements.extend(normalized)
         source_urls.append(url)
+        pagination = payload.get("pagination") if isinstance(payload, dict) and isinstance(payload.get("pagination"), dict) else {}
+        pagination_complete = not bool(
+            (isinstance(payload, dict) and payload.get("has_more") is True)
+            or pagination.get("has_more") is True
+            or (
+                pagination.get("total_pages") is not None
+                and int(pagination.get("page") or 0) < int(pagination.get("total_pages") or 0)
+            )
+        )
+        enumeration_proof = {
+            "authority": "cninfo", "query_symbol": item["symbol"],
+            "start_date": start_date, "end_date": end_date,
+            "pagination_complete": pagination_complete,
+        }
         source_evidence.append({
             "url": url, "fact_as_of": observed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
             "data": {"summary": f"已核查{item['symbol']}在{start_date}至{end_date}的公告，共{len(normalized)}条",
-                     "checked_symbol": item["symbol"], "announcements": normalized},
+                     "checked_symbol": item["symbol"], "announcements": normalized,
+                     "enumeration_proof": enumeration_proof},
         })
     fact_as_of = observed.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     return {
         "checked_symbols": [item["symbol"] for item in symbols], "start_date": start_date,
         "end_date": end_date, "announcements": announcements, "source": "cninfo_disclosure_search",
         "source_urls": source_urls, "source_evidence": source_evidence,
+        "enumeration_proofs": [row["data"]["enumeration_proof"] for row in source_evidence],
     }, fact_as_of
 
 

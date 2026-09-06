@@ -243,7 +243,10 @@ class ManualAnalysisProfileResolverTests(TestCase):
         contract = EvidenceContractFactory(_Calendar()).build(
             task_key=profile["task_key"], stage="m0_research",
             as_of="2026-09-02T15:20:00+08:00", task_profile=profile,
-            internal_context={"portfolio_entities": ["600487"]},
+            internal_context={
+                "portfolio_entities": ["600487"],
+                "portfolio_entity_names": {"600487": "亨通光电"},
+            },
         )
         requirements = {row["key"]: row for row in contract["requirements"]}
 
@@ -254,6 +257,10 @@ class ManualAnalysisProfileResolverTests(TestCase):
         }, requirements["market_breadth"]["window"])
         self.assertEqual("official_close", requirements["portfolio_market_state"]["finality"])
         self.assertEqual("exact", requirements["portfolio_market_state"]["window"]["mode"])
+        self.assertEqual(
+            {"600487": "亨通光电"},
+            requirements["portfolio_events_and_counterevidence"]["entity_names"],
+        )
         self.assertEqual(["covered"], requirements["turnover_compare"]["allowed_coverage"])
         self.assertTrue(requirements["turnover_compare"]["blocking"])
         self.assertEqual(["covered"], requirements["themes_and_capacity_cores"]["allowed_coverage"])

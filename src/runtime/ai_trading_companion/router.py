@@ -438,6 +438,34 @@ def _weekend_review_coverage_problems(packet: dict[str, Any], semantic: dict[str
         ]
         if not announcement_text or missing:
             problems.append("weekend_review_lacks_portfolio_announcement_checks")
+        pending_titles: list[str] = []
+        for source in evidence.get("sources") or []:
+            if not isinstance(source, dict):
+                continue
+            try:
+                payload = json.loads(str(source.get("excerpt") or ""))
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            pending_titles.extend(
+                str(item.get("title") or "")
+                for item in payload.get("announcements") or []
+                if isinstance(item, dict) and item.get("content_verified") is not True
+            )
+        pending_titles = [title for title in pending_titles if title]
+        if pending_titles and not any(
+            term in announcement_compact for term in ("内容待核验", "影响待核验", "暂不据标题", "不能仅凭标题")
+        ):
+            problems.append("weekend_review_lacks_unverified_announcement_boundary")
+        if any(
+            re.search(
+                rf"(?:因|根据)[^。；]{{0,20}}{re.escape(title)}[^。；]{{0,20}}(?:加仓|减仓|买入|卖出|清仓)",
+                announcement_compact,
+            )
+            for title in pending_titles
+        ):
+            problems.append("weekend_review_overclaims_unverified_announcement_title")
     return problems
 
 

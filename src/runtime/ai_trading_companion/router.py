@@ -293,6 +293,7 @@ class CognitiveRouter:
                 problems.append("judgment_position_priority_is_cost_anchored")
             problems.extend(_qualified_reply_acquisition_gap_problems(semantic))
             if stage == "m1_judgment":
+                problems.extend(_formal_m1_expression_problems(packet, normalized.text))
                 problems.extend(_close_review_coverage_problems(packet, semantic))
                 problems.extend(_weekend_review_coverage_problems(packet, semantic))
         return {"passed": not problems, "problems": problems, "profile": profile.as_json()}
@@ -489,6 +490,59 @@ def _weekend_review_coverage_problems(packet: dict[str, Any], semantic: dict[str
             for title in pending_titles
         ):
             problems.append("weekend_review_overclaims_unverified_announcement_title")
+    return problems
+
+
+def _formal_m1_expression_problems(packet: dict[str, Any], text: str) -> list[str]:
+    """Reject research logs and unsupported roles before a formal M1 reply is published."""
+    compact = "".join(str(text or "").split())
+    problems: list[str] = []
+
+    research_log_markers = (
+        "逐股公告核查",
+        "检出《",
+        "暂不据标题",
+        "内容待核验",
+        "影响待核验",
+        "市场情绪用广度验证",
+    )
+    source_label_pattern = r"(?:上交所、深交所|东方财富(?:15:00板块数据)?|腾讯)(?:数据)?："
+    if any(marker in compact for marker in research_log_markers) or re.search(source_label_pattern, compact):
+        problems.append("formal_reply_exposes_research_log")
+
+    breadth_pattern = r"上涨\d+家、下跌\d+家、平盘\d+家"
+    if len(re.findall(breadth_pattern, compact)) > 1:
+        problems.append("formal_reply_repeats_market_breadth")
+    if re.search(r"核心[^，。；]{0,20}(?:\(\d{6}\)|\d{6})", compact):
+        problems.append("formal_reply_unverified_core_role")
+
+    pending_titles: list[str] = []
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    for source in evidence.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        try:
+            payload = json.loads(str(source.get("excerpt") or ""))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        pending_titles.extend(
+            str(item.get("title") or "")
+            for item in payload.get("announcements") or []
+            if isinstance(item, dict) and item.get("content_verified") is not True
+        )
+    if any(title and title in compact for title in pending_titles):
+        problems.append("formal_reply_exposes_unverified_announcement_title")
+
+    market_fact_markers = ("成交", "上涨", "下跌")
+    market_meaning_markers = (
+        "放量", "缩量", "风险偏好", "赚钱效应", "轮动", "分化", "承压", "偏强", "偏弱", "扩散", "收敛",
+    )
+    if all(marker in compact for marker in market_fact_markers) and not any(
+        marker in compact for marker in market_meaning_markers
+    ):
+        problems.append("formal_reply_lacks_market_interpretation")
     return problems
 
 

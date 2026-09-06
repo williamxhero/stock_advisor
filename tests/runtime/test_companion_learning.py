@@ -536,7 +536,7 @@ class CompanionLearningTests(unittest.TestCase):
             "semantic": {**base, "key_evidence": [
                 "行业分布上，消费板块领涨、科技板块领跌。",
                 "主力资金方向显示数字人净流入52.81亿元，电子板块净流出。",
-                "逐股公告核查：000997新大陆未发现新增公告；002891中宠股份披露《回购公司股份的进展公告》，内容待核验，暂不据标题改变判断。",
+                "持仓公告已完成核对；现有信息没有形成足以单独改变下周策略的新催化。",
             ], "risks": ["政策与风险事件核查后，相关变化可能对下周风险偏好形成压制，属于影响推断。"]},
         }
         directional_without_interpretation = CognitiveRouter().verify("m1_judgment", packet, complete_output)
@@ -592,8 +592,8 @@ class CompanionLearningTests(unittest.TestCase):
         complete_text = normalize_stage_output("m1_judgment", complete_output).text
         self.assertIn("主力资金方向", complete_text)
         self.assertIn("政策与风险事件", complete_text)
-        self.assertIn("000997", complete_text)
-        self.assertIn("002891", complete_text)
+        self.assertNotIn("逐股公告核查", complete_text)
+        self.assertNotIn("内容待核验", complete_text)
 
         verified_packet = json.loads(json.dumps(packet, ensure_ascii=False))
         for source in verified_packet["evidence"]["sources"]:
@@ -628,6 +628,42 @@ class CompanionLearningTests(unittest.TestCase):
         prompt = _RuntimePacketBuilder.prompt(packet)
         self.assertIn("先交付替代证据揭示的市场状态和交易含义", prompt)
         self.assertIn("不得把未取得、未获取或数据缺失当作合格正文", prompt)
+
+    def test_formal_m1_gate_rejects_research_log_speech_before_publish(self):
+        packet = {
+            "task_profile": {"evidence_family": "completed_trading_week"},
+            "evidence": {"sources": [{"excerpt": json.dumps({
+                "announcements": [{
+                    "title": "关于回购公司股份的进展公告",
+                    "content_verified": False,
+                }],
+            }, ensure_ascii=False)}]},
+        }
+        output = {
+            "result_version": 4,
+            "semantic": {
+                "summary": "市场仍偏弱，暂以观察为主。",
+                "direction": "neutral",
+                "qualified": True,
+                "horizon": "下周",
+                "current_action": "observe",
+                "key_evidence": [
+                    "上交所、深交所：两市成交额2万亿元，较前一交易日增加1000亿元；东方财富：上涨2000家、下跌3000家、平盘100家。东方财富15:00板块数据：消费板块领涨2%，核心甲(000001)5%；科技板块领跌-2%，核心乙(000002)-5%；市场情绪用广度验证：上涨2000家、下跌3000家、平盘100家，风险偏好偏弱。逐股公告核查：002891中宠股份检出《关于回购公司股份的进展公告》，暂不据标题改变判断。",
+                ],
+                "transition_conditions": [{
+                    "outcome": "upgrade", "price": "指数站稳", "breadth": "上涨家数占优", "persistence": "连续两日",
+                }],
+                "position_focus": [], "risks": [], "unknowns": [],
+            },
+        }
+
+        result = CognitiveRouter().verify("m1_judgment", packet, output)
+
+        self.assertFalse(result["passed"])
+        self.assertIn("formal_reply_exposes_research_log", result["problems"])
+        self.assertIn("formal_reply_repeats_market_breadth", result["problems"])
+        self.assertIn("formal_reply_unverified_core_role", result["problems"])
+        self.assertIn("formal_reply_exposes_unverified_announcement_title", result["problems"])
 
     def test_safe_formal_fallback_is_natural_and_conservative(self):
         m0 = normalize_stage_output("m0_compose", safe_stage_output("m0_compose"))

@@ -220,7 +220,9 @@ class JudgmentPublicationPipeline:
                                       })
             raise
 
-    def produce(self, stage: str, cycle: dict, frozen_evidence: dict, deadline: float) -> dict:
+    def produce(self, stage: str, cycle: dict, frozen_evidence: dict, deadline: float, *,
+                _core_attempts_left: int = 3, _expressions_left: int = 2,
+                _feedback: list[str] | None = None) -> dict:
         packet = copy.deepcopy(frozen_evidence)
         prefix = "m1" if stage == "m1_judgment" else "m2"
         base = {key: value for key, value in packet.items() if key not in {"sha256", "verification_repair"}}
@@ -245,14 +247,26 @@ class JudgmentPublicationPipeline:
                                                                     "context_projection_version": 2})}
         checkpoint_key = canonical_packet_hash(checkpoint_packet)
         saved = self.store.stage_checkpoint(cycle["cycle_id"], prefix + "_core", checkpoint_key)
-        feedback: list[str] = []
+        feedback: list[str] = list(_feedback or [])
+        revoked: dict[str, list[str]] = {}
+        for attempt in self.store.attempts(cycle["cycle_id"]):
+            if (attempt["stage"] != prefix + "_review" or attempt["status"] != "rejected"
+                    or bool(attempt["is_shadow"]) != self.is_shadow):
+                continue
+            rejection = json.loads(attempt.get("output_json") or "{}")
+            if rejection.get("faithful") is True and rejection.get("grounded") is False:
+                revoked[rejection["core_hash"]] = rejection.get("problems") or ["previously reviewed core was revoked"]
+        if saved and saved["output"]["audit"]["core_hash"] in revoked:
+            feedback = revoked[saved["output"]["audit"]["core_hash"]]
+            saved = None
         audit: dict = {}
         core: dict = {}
         if saved:
             core, audit = saved["output"]["core"], saved["output"]["audit"]
         else:
             last_error: Exception | None = None
-            for _ in range(3):
+            for _ in range(_core_attempts_left):
+                _core_attempts_left -= 1
                 try:
                     core, core_id = self._call(prefix + "_reasoning", cycle, {
                         "instruction": CORE_INSTRUCTION, "context": context, "feedback": feedback,
@@ -261,6 +275,9 @@ class JudgmentPublicationPipeline:
                     if feedback:
                         continue
                     core_hash = canonical_packet_hash(core)
+                    if core_hash in revoked:
+                        feedback = revoked[core_hash]
+                        continue
                     text = render_core(core)
                     review, review_id = self._review(prefix, cycle, core, text, base, deadline)
                     if not review_passed(review, core_hash, canonical_packet_hash({"text": text})):
@@ -295,7 +312,8 @@ class JudgmentPublicationPipeline:
         narrative = baseline
         audit = {**audit, "fallback": True}
         feedback = []
-        for _ in range(2):
+        for _ in range(_expressions_left):
+            _expressions_left -= 1
             try:
                 draft, expression_id = self._call(prefix + "_expression", cycle, {
                     "instruction": "把冻结判断内核写成专业炒股搭档的自然短段，返回 narrative-draft-v1。"
@@ -310,11 +328,18 @@ class JudgmentPublicationPipeline:
                 review, review_id = self._review(prefix, cycle, core, candidate, base, deadline)
                 if not review_passed(review, frozen_hash, canonical_packet_hash({"text": candidate})):
                     feedback = review.get("problems") or ["narrative rubric below threshold"]
+                    if review.get("faithful") is True and review.get("grounded") is False:
+                        # The prose faithfully exposed a defect in the core. Never recover it.
+                        return self.produce(stage, cycle, frozen_evidence, deadline,
+                                            _core_attempts_left=_core_attempts_left,
+                                            _expressions_left=_expressions_left, _feedback=feedback)
                     continue
                 narrative = candidate
                 audit.update(fallback=False, expression_attempt_id=expression_id,
                              review_attempt_id=review_id, narrative_review=review)
                 break
+            except JudgmentUnavailable:
+                raise
             except (BrokerError, TimeoutError):
                 break
         return {"result_version": 5 if prefix == "m1" else 4, "decision_core": core,

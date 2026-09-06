@@ -46,9 +46,10 @@ def packet():
 
 
 class Broker:
-    def __init__(self, *, fail_expression=False, reject_core=False, reject_draft=False, bad_ref=False):
+    def __init__(self, *, fail_expression=False, reject_core=False, reject_draft=False, bad_ref=False, revoke_after_expression=False):
         self.calls = []
         self.fail_expression, self.reject_core, self.reject_draft, self.bad_ref = fail_expression, reject_core, reject_draft, bad_ref
+        self.revoke_after_expression = revoke_after_expression
 
     def invoke(self, request):
         self.calls.append(request)
@@ -61,9 +62,11 @@ class Broker:
                 raise TimeoutError("injected expression timeout")
             result = {"core_hash": request.packet["core_hash"], "paragraphs": render_core(core()).split("\n\n")}
         else:
-            reject = self.reject_core or self.reject_draft and any(r.stage.endswith("expression") for r in self.calls)
+            expressed = any(r.stage.endswith("expression") for r in self.calls)
+            core_rejected = self.reject_core or self.revoke_after_expression and expressed
+            reject = core_rejected or self.reject_draft and expressed
             result = {"core_hash": request.packet["core_hash"], "draft_hash": request.packet["draft_hash"],
-                      "grounded": not reject, "faithful": True,
+                      "grounded": not core_rejected, "faithful": not (self.reject_draft and expressed),
                       "scores": dict(specificity=2, causality=2, counterargument=2, portfolio=2, naturalness=2, broadcast_risk=0),
                       "problems": ["unsupported assertion"] if reject else []}
         return BrokerResponse("", result, "test", "test", "expert", "expert", "test-id")
@@ -184,6 +187,19 @@ def test_recovery_conditions_do_not_duplicate_punctuation():
     decision = core()
     decision["transition_conditions"][0]["price"] += "；"
     assert "；，" not in render_core(decision)
+
+
+def test_later_grounding_rejection_revokes_core_including_restart(tmp_path):
+    broker = Broker(revoke_after_expression=True)
+    pipeline, store, cycle = runtime(tmp_path, broker)
+    with pytest.raises(JudgmentUnavailable):
+        pipeline.produce("m1_judgment", cycle, packet(), time.monotonic() + 60)
+    assert sum(r.stage.endswith("reasoning") for r in broker.calls) <= 3
+    restarted_broker = Broker(reject_core=True)
+    restarted = JudgmentPublicationPipeline(restarted_broker, store, SCHEMAS, intellect="expert", effort="medium")
+    with pytest.raises(JudgmentUnavailable):
+        restarted.produce("m1_judgment", cycle, packet(), time.monotonic() + 60)
+    assert not any(r.stage.endswith("expression") for r in restarted_broker.calls)
 
 
 def test_model_contracts_declare_native_types_and_do_not_duplicate_evidence(tmp_path):

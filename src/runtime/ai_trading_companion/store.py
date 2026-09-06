@@ -279,7 +279,8 @@ class CompanionStore:
               cell_key TEXT PRIMARY KEY, policy_kind TEXT NOT NULL, mode TEXT NOT NULL,
               baseline_json TEXT NOT NULL, candidate_json TEXT, automatic_authorized INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL,
               previous_json TEXT, qualification_fingerprint TEXT,
-              evaluation_profile TEXT NOT NULL DEFAULT 'generic/v1', updated_at TEXT NOT NULL);
+              evaluation_profile TEXT NOT NULL DEFAULT 'generic/v1',
+              applicable_tasks_json TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS runtime_strategy_evaluation (
               evaluation_id TEXT PRIMARY KEY, cell_key TEXT NOT NULL REFERENCES runtime_strategy_cell(cell_key),
               cycle_id TEXT NOT NULL, horizon TEXT NOT NULL, regime TEXT,
@@ -377,6 +378,8 @@ class CompanionStore:
             strategy_columns = {row[1] for row in c.execute("PRAGMA table_info(runtime_strategy_cell)")}
             if "evaluation_profile" not in strategy_columns:
                 c.execute("ALTER TABLE runtime_strategy_cell ADD COLUMN evaluation_profile TEXT NOT NULL DEFAULT 'generic/v1'")
+            if "applicable_tasks_json" not in strategy_columns:
+                c.execute("ALTER TABLE runtime_strategy_cell ADD COLUMN applicable_tasks_json TEXT NOT NULL DEFAULT '[]'")
             strategy_shadow_columns = {row[1] for row in c.execute("PRAGMA table_info(runtime_strategy_shadow_job)")}
             for name in ("context_fingerprint", "frozen_as_of", "value_window_end"):
                 if name not in strategy_shadow_columns:

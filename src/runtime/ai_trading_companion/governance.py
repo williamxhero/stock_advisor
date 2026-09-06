@@ -29,6 +29,9 @@ class GovernanceDecision:
     state: str
     approver: str
     target_policy_version: str
+    evaluation_profile: str
+    applicable_scope_json: str
+    protected_dimensions_json: str
     created_at: str
 
 
@@ -42,6 +45,20 @@ class StrategyApplicationReceipt:
     previous_mode: str
     applied_mode: str
     state: str
+    applied_at: str
+
+
+@dataclass(frozen=True)
+class ActiveResearchPolicyReceipt:
+    receipt_id: str
+    decision_id: str
+    evidence_snapshot_id: str
+    cell_key: str
+    old_policy_version: str
+    new_policy_version: str
+    rollback_target_version: str
+    applicable_scope_json: str
+    result: str
     applied_at: str
 
 
@@ -276,6 +293,9 @@ class EvolutionGovernance:
                   state TEXT NOT NULL,
                   approver TEXT NOT NULL,
                   target_policy_version TEXT NOT NULL,
+                  evaluation_profile TEXT NOT NULL DEFAULT 'generic/v1',
+                  applicable_scope_json TEXT NOT NULL DEFAULT '[]',
+                  protected_dimensions_json TEXT NOT NULL DEFAULT '[]',
                   created_at TEXT NOT NULL,
                   UNIQUE(evidence_snapshot_id,state,approver)
                 );
@@ -291,6 +311,14 @@ class EvolutionGovernance:
                   applied_at TEXT NOT NULL
                 );
             """)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(evolution_governance_decision)")}
+            for name, declaration in {
+                "evaluation_profile": "TEXT NOT NULL DEFAULT 'generic/v1'",
+                "applicable_scope_json": "TEXT NOT NULL DEFAULT '[]'",
+                "protected_dimensions_json": "TEXT NOT NULL DEFAULT '[]'",
+            }.items():
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE evolution_governance_decision ADD COLUMN {name} {declaration}")
 
     def decide(self, evidence_snapshot_id: str, action: str, *, approver: str) -> GovernanceDecision:
         if action not in {"approve", "reject"}:
@@ -313,11 +341,14 @@ class EvolutionGovernance:
             if action == "approve" and approver == "automatic-governance" and payload.get("source_kind") != "live_paired_shadow" and recommendation != "recommend_rollback":
                 raise ValueError("automatic promotion requires live paired shadow evidence")
             runtime_cell = connection.execute(
-                "SELECT policy_kind,revision FROM runtime_strategy_cell WHERE cell_key=?",
+                """SELECT policy_kind,revision,evaluation_profile,applicable_tasks_json
+                     FROM runtime_strategy_cell WHERE cell_key=?""",
                 (payload["experiment_key"],),
             ).fetchone()
             if runtime_cell:
                 target_policy_version = f"runtime-strategy/{runtime_cell['policy_kind']}/v{runtime_cell['revision']}"
+                evaluation_profile = str(runtime_cell["evaluation_profile"])
+                applicable_scope_json = str(runtime_cell["applicable_tasks_json"] or "[]")
             else:
                 policy = connection.execute(
                     "SELECT policy_version FROM cognitive_effort_policy WHERE state='active' ORDER BY activated_at DESC LIMIT 1",
@@ -325,15 +356,40 @@ class EvolutionGovernance:
                 if not policy:
                     raise ValueError("no active cognitive effort policy")
                 target_policy_version = policy["policy_version"]
+                evaluation_profile = "generic/v1"
+                applicable_scope_json = "[]"
+            protected_dimensions = ["qualification", "research_quality", "stability"]
+            if evaluation_profile == "active_evidence_research/v1":
+                protected_dimensions.extend([
+                    "false_gap_declaration", "citation_verifiability",
+                    "numeric_date_accuracy", "safety_faults",
+                ])
+                if action == "approve" and recommendation == "recommend_promotion":
+                    maturity = payload.get("evidence_maturity") or {}
+                    replay_gate = payload.get("historical_replay_gate") or {}
+                    safety = payload.get("safety_faults") or {}
+                    if (
+                        payload.get("source_kind") != "live_paired_shadow"
+                        or not maturity.get("mature")
+                        or not maturity.get("protection_dimensions_stable")
+                        or not replay_gate.get("passed")
+                        or float(safety.get("candidate_mean") or 0) != 0
+                    ):
+                        raise ValueError("active research promotion evidence is not mature and protected")
+                if action == "approve" and recommendation == "recommend_rollback" and payload.get("source_kind") != "post_promotion_monitoring":
+                    raise ValueError("active research rollback requires post-promotion evidence")
+            protected_dimensions_json = json.dumps(protected_dimensions, sort_keys=True)
             state = "approved" if action == "approve" else "rejected"
             decision_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"governance|{evidence_snapshot_id}|{state}|{approver}"))
             at = _now()
             connection.execute(
                 """INSERT OR IGNORE INTO evolution_governance_decision(
                      decision_id,decision_version,evidence_snapshot_id,cell_key,recommendation,state,
-                     approver,target_policy_version,created_at) VALUES(?,1,?,?,?,?,?,?,?)""",
+                     approver,target_policy_version,evaluation_profile,applicable_scope_json,
+                     protected_dimensions_json,created_at) VALUES(?,1,?,?,?,?,?,?,?,?,?,?)""",
                 (decision_id, evidence_snapshot_id, payload["experiment_key"], recommendation,
-                 state, approver, target_policy_version, at),
+                 state, approver, target_policy_version, evaluation_profile, applicable_scope_json,
+                 protected_dimensions_json, at),
             )
             row = connection.execute(
                 "SELECT * FROM evolution_governance_decision WHERE decision_id=?", (decision_id,),
@@ -384,6 +440,8 @@ class StrategyPolicyExecutor:
                 table = "runtime_strategy_cell"
             if not cell:
                 raise ValueError("unknown reversible strategy cell")
+            if table == "runtime_strategy_cell" and cell["evaluation_profile"] == "active_evidence_research/v1":
+                raise ValueError("active research changes require the dedicated active research executor")
             previous_mode = str(cell["mode"])
             applied_at = _now()
             connection.execute(
@@ -405,3 +463,170 @@ class StrategyPolicyExecutor:
                 tuple(receipt.__dict__.values()),
             )
         return receipt
+
+
+class ActiveResearchPolicyExecutor:
+    """Apply only mature active-research decisions with immutable version and rollback receipts."""
+
+    def __init__(self, store: Any) -> None:
+        self.store = store
+        EvolutionGovernance(store)
+        with self.store.connection() as connection:
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS active_research_policy_version (
+                  version_id TEXT PRIMARY KEY,
+                  cell_key TEXT NOT NULL,
+                  revision INTEGER NOT NULL,
+                  policy_json TEXT NOT NULL,
+                  state TEXT NOT NULL,
+                  previous_version_id TEXT,
+                  rollback_target_version_id TEXT,
+                  applicable_scope_json TEXT NOT NULL,
+                  evidence_snapshot_id TEXT,
+                  decision_id TEXT,
+                  created_at TEXT NOT NULL,
+                  UNIQUE(cell_key,revision)
+                );
+                CREATE TABLE IF NOT EXISTS active_research_policy_receipt (
+                  receipt_id TEXT PRIMARY KEY,
+                  decision_id TEXT NOT NULL UNIQUE,
+                  evidence_snapshot_id TEXT NOT NULL,
+                  cell_key TEXT NOT NULL,
+                  old_policy_version TEXT NOT NULL,
+                  new_policy_version TEXT NOT NULL,
+                  rollback_target_version TEXT NOT NULL,
+                  applicable_scope_json TEXT NOT NULL,
+                  result TEXT NOT NULL,
+                  applied_at TEXT NOT NULL
+                );
+            """)
+
+    def apply(self, decision_id: str) -> ActiveResearchPolicyReceipt:
+        with self.store.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM active_research_policy_receipt WHERE decision_id=?", (decision_id,),
+            ).fetchone()
+            if existing:
+                return ActiveResearchPolicyReceipt(**dict(existing))
+            decision = connection.execute(
+                "SELECT * FROM evolution_governance_decision WHERE decision_id=?", (decision_id,),
+            ).fetchone()
+            if not decision or decision["state"] != "approved":
+                raise ValueError("active research execution requires an approved governance decision")
+            if decision["evaluation_profile"] != "active_evidence_research/v1":
+                raise ValueError("decision does not target active evidence research")
+            cell = connection.execute(
+                "SELECT * FROM runtime_strategy_cell WHERE cell_key=?", (decision["cell_key"],),
+            ).fetchone()
+            if not cell or cell["evaluation_profile"] != "active_evidence_research/v1":
+                raise ValueError("active research policy cell is unavailable")
+            snapshot = connection.execute(
+                "SELECT payload_json FROM observatory_snapshot WHERE snapshot_id=?",
+                (decision["evidence_snapshot_id"],),
+            ).fetchone()
+            if not snapshot:
+                raise ValueError("active research evidence snapshot is unavailable")
+            payload = json.loads(snapshot["payload_json"])
+            self._validate_snapshot(payload, str(decision["recommendation"]))
+            scope_json = str(decision["applicable_scope_json"])
+            latest = connection.execute(
+                """SELECT * FROM active_research_policy_version WHERE cell_key=? AND state='active'
+                   ORDER BY revision DESC LIMIT 1""",
+                (decision["cell_key"],),
+            ).fetchone()
+            at = _now()
+            if latest is None:
+                baseline_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"active-research|{decision['cell_key']}|baseline"))
+                connection.execute(
+                    """INSERT OR IGNORE INTO active_research_policy_version(
+                         version_id,cell_key,revision,policy_json,state,previous_version_id,
+                         rollback_target_version_id,applicable_scope_json,evidence_snapshot_id,decision_id,created_at)
+                       VALUES(?,?,1,?,'active',NULL,?,?,NULL,NULL,?)""",
+                    (baseline_id, decision["cell_key"], cell["baseline_json"], baseline_id, scope_json, at),
+                )
+                latest = connection.execute(
+                    "SELECT * FROM active_research_policy_version WHERE version_id=?", (baseline_id,),
+                ).fetchone()
+            old_version = str(latest["version_id"])
+            recommendation = str(decision["recommendation"])
+            if recommendation == "recommend_promotion":
+                policy_json = str(cell["candidate_json"] or "")
+                if not policy_json:
+                    raise ValueError("active research candidate policy is missing")
+                result = "applied"
+                target_mode = "promoted"
+                rollback_target = str(latest["rollback_target_version_id"] or old_version)
+            elif recommendation == "recommend_rollback":
+                rollback_target = str(latest["rollback_target_version_id"] or "")
+                target = connection.execute(
+                    "SELECT * FROM active_research_policy_version WHERE version_id=?", (rollback_target,),
+                ).fetchone()
+                if not target:
+                    raise ValueError("active research rollback target is unavailable")
+                policy_json = str(target["policy_json"])
+                result = "rollback_applied"
+                target_mode = "rolled_back"
+            else:
+                raise ValueError("active research recommendation is not executable")
+            revision = int(latest["revision"]) + 1
+            new_version = str(uuid.uuid5(
+                uuid.NAMESPACE_URL, f"active-research|{decision['cell_key']}|v{revision}|{decision_id}",
+            ))
+            connection.execute(
+                "UPDATE active_research_policy_version SET state='superseded' WHERE version_id=?",
+                (old_version,),
+            )
+            connection.execute(
+                """INSERT INTO active_research_policy_version(
+                     version_id,cell_key,revision,policy_json,state,previous_version_id,
+                     rollback_target_version_id,applicable_scope_json,evidence_snapshot_id,decision_id,created_at)
+                   VALUES(?,?,?,?,'active',?,?,?,?,?,?)""",
+                (new_version, decision["cell_key"], revision, policy_json, old_version,
+                 rollback_target, scope_json, decision["evidence_snapshot_id"], decision_id, at),
+            )
+            connection.execute(
+                """UPDATE runtime_strategy_cell SET previous_json=?,mode=?,revision=revision+1,
+                     qualification_fingerprint=?,updated_at=? WHERE cell_key=?""",
+                (json.dumps(dict(cell), ensure_ascii=False, sort_keys=True), target_mode,
+                 f"assessment:{decision['evidence_snapshot_id']}", at, decision["cell_key"]),
+            )
+            receipt = ActiveResearchPolicyReceipt(
+                receipt_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"active-research-receipt|{decision_id}")),
+                decision_id=decision_id, evidence_snapshot_id=decision["evidence_snapshot_id"],
+                cell_key=decision["cell_key"], old_policy_version=old_version,
+                new_policy_version=new_version, rollback_target_version=rollback_target,
+                applicable_scope_json=scope_json, result=result, applied_at=at,
+            )
+            connection.execute(
+                """INSERT INTO active_research_policy_receipt(
+                     receipt_id,decision_id,evidence_snapshot_id,cell_key,old_policy_version,
+                     new_policy_version,rollback_target_version,applicable_scope_json,result,applied_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                tuple(receipt.__dict__.values()),
+            )
+        return receipt
+
+    @staticmethod
+    def _validate_snapshot(payload: dict[str, Any], recommendation: str) -> None:
+        if payload.get("evaluation_profile") != "active_evidence_research/v1":
+            raise ValueError("snapshot is not an active research assessment")
+        if recommendation == "recommend_promotion":
+            maturity = payload.get("evidence_maturity") or {}
+            replay = payload.get("historical_replay_gate") or {}
+            safety = payload.get("safety_faults") or {}
+            if (
+                payload.get("source_kind") != "live_paired_shadow"
+                or payload.get("decision") != "recommend_promotion"
+                or not maturity.get("mature")
+                or not maturity.get("protection_dimensions_stable")
+                or not replay.get("passed")
+                or float(safety.get("candidate_mean") or 0) != 0
+            ):
+                raise ValueError("specified active research snapshot is not promotable")
+        elif recommendation == "recommend_rollback":
+            if (
+                payload.get("source_kind") != "post_promotion_monitoring"
+                or payload.get("decision") != "recommend_rollback"
+            ):
+                raise ValueError("specified active research snapshot does not authorize rollback")

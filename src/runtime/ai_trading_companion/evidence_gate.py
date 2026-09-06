@@ -782,9 +782,10 @@ class _EvidenceGateV3:
                 leaders = payload.get("sector_inflow_leaders")
                 if isinstance(leaders, list):
                     found.update(
-                        f"sector_net_inflow:{index}"
-                        for index, row in enumerate(leaders)
+                        f"sector_net_inflow:{str(row.get('name') or '').strip()}"
+                        for row in leaders
                         if isinstance(row, dict)
+                        and str(row.get("name") or "").strip()
                         and isinstance(row.get("net_inflow"), (int, float))
                         and not isinstance(row.get("net_inflow"), bool)
                     )
@@ -792,6 +793,9 @@ class _EvidenceGateV3:
 
     @staticmethod
     def _market_fund_flow_scope_valid(sources: list[dict[str, Any]]) -> bool:
+        inflows: dict[str, float] = {}
+        outflows: set[str] = set()
+        conflicting_inflows = False
         for source in sources:
             try:
                 payload = json.loads(str(source.get("excerpt") or ""))
@@ -804,37 +808,47 @@ class _EvidenceGateV3:
             if payload.get("coverage_level") != "directional_sector":
                 continue
             leaders = payload.get("sector_inflow_leaders")
-            outflows = payload.get("sector_outflow_leaders")
-            limitations = {str(value) for value in payload.get("limitations") or []}
+            laggards = payload.get("sector_outflow_leaders")
             if (
-                payload.get("currency") != "CNY" and payload.get("unit") != "CNY"
-                or not isinstance(leaders, list) or len(leaders) < 3
-                or not isinstance(outflows, list) or not outflows
-                or not {"full_market_net_flow_unavailable", "order_size_breakdown_unavailable"}.issubset(limitations)
+                not isinstance(leaders, list) or not isinstance(laggards, list)
                 or "combined" in payload or "markets" in payload
+                or payload.get("scope") not in {None, "", "SSE+SZSE"}
             ):
                 continue
-            try:
-                valid_leaders = all(
-                    isinstance(row, dict)
-                    and str(row.get("name") or "").strip()
-                    and row.get("direction") == "inflow"
-                    and isinstance(row.get("rank"), int) and not isinstance(row.get("rank"), bool)
-                    and float(row.get("net_inflow")) > 0
-                    for row in leaders
-                )
-                valid_outflows = all(
-                    isinstance(row, dict)
-                    and str(row.get("name") or "").strip()
-                    and row.get("direction") == "outflow"
-                    and isinstance(row.get("rank"), int) and not isinstance(row.get("rank"), bool)
-                    for row in outflows
-                )
-            except (TypeError, ValueError):
-                continue
-            if valid_leaders and valid_outflows:
-                return True
-        return False
+            default_unit = str(payload.get("currency") or payload.get("unit") or "")
+            for row in leaders:
+                if not isinstance(row, dict):
+                    continue
+                name = str(row.get("name") or "").strip()
+                direction = str(row.get("direction") or "inflow")
+                unit = str(row.get("unit") or default_unit)
+                rank = row.get("rank")
+                try:
+                    amount = float(row.get("net_inflow"))
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    not name or direction != "inflow" or unit != "CNY" or amount <= 0
+                    or (rank is not None and (not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0))
+                ):
+                    continue
+                prior = inflows.get(name)
+                if prior is not None and prior != amount:
+                    conflicting_inflows = True
+                else:
+                    inflows[name] = amount
+            for row in laggards:
+                if not isinstance(row, dict):
+                    continue
+                name = str(row.get("name") or "").strip()
+                direction = str(row.get("direction") or "outflow")
+                rank = row.get("rank")
+                if (
+                    name and direction == "outflow"
+                    and (rank is None or isinstance(rank, int) and not isinstance(rank, bool) and rank > 0)
+                ):
+                    outflows.add(name)
+        return len(inflows) >= 3 and bool(outflows) and not conflicting_inflows and not (set(inflows) & outflows)
 
     @staticmethod
     def _sector_distribution_complete(sources: list[dict[str, Any]]) -> bool:

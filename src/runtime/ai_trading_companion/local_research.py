@@ -1366,28 +1366,57 @@ def _coverage_metadata(
                 if item.get("fact_as_of"):
                     fact_times.append(str(item["fact_as_of"]))
     if requirement_key == "market_fund_flow":
-        directional = next((
+        directional = [
             payload for payload in payloads
             if payload.get("coverage_level") == "directional_sector"
-        ), None)
-        if directional is not None:
-            limitations = [str(value) for value in directional.get("limitations") or []]
+        ]
+        if directional:
+            directional_facts: list[dict[str, Any]] = []
+            seen_facts: set[tuple[str, str, str]] = set()
+            currencies: list[str] = []
+            limitations = list(dict.fromkeys([
+                str(value)
+                for payload in directional
+                for value in payload.get("limitations") or []
+                if str(value)
+            ] + ["full_market_net_flow_unavailable", "order_size_breakdown_unavailable"]))
+            for payload in directional:
+                default_currency = str(payload.get("currency") or payload.get("unit") or "")
+                for direction, field in (
+                    ("inflow", "sector_inflow_leaders"),
+                    ("outflow", "sector_outflow_leaders"),
+                ):
+                    for rank, row in enumerate(payload.get(field) or [], 1):
+                        if not isinstance(row, dict) or not str(row.get("name") or "").strip():
+                            continue
+                        currency = str(row.get("unit") or default_currency)
+                        fact_direction = str(row.get("direction") or direction)
+                        fact_rank = row.get("rank") if row.get("rank") is not None else rank
+                        amount = row.get("net_inflow")
+                        if fact_direction != direction or not isinstance(fact_rank, int) or isinstance(fact_rank, bool):
+                            continue
+                        if direction == "inflow" and (
+                            currency != "CNY" or not isinstance(amount, (int, float))
+                            or isinstance(amount, bool) or float(amount) <= 0
+                        ):
+                            continue
+                        if currency:
+                            currencies.append(currency)
+                        fact = {
+                            "name": str(row.get("name") or ""),
+                            "direction": fact_direction,
+                            "amount": amount,
+                            "rank": fact_rank,
+                        }
+                        identity = (fact["name"], fact["direction"], str(fact["amount"]))
+                        if identity not in seen_facts:
+                            seen_facts.add(identity)
+                            directional_facts.append(fact)
             return {
                 "coverage_level": "directional",
                 "fact_as_of": max(fact_times) if fact_times else None,
-                "currency": str(directional.get("currency") or directional.get("unit") or ""),
-                "directional_facts": [
-                    {
-                        "name": str(row.get("name") or ""),
-                        "direction": str(row.get("direction") or ""),
-                        "amount": row.get("net_inflow"),
-                        "rank": row.get("rank"),
-                    }
-                    for row in [
-                        *(directional.get("sector_inflow_leaders") or []),
-                        *(directional.get("sector_outflow_leaders") or []),
-                    ] if isinstance(row, dict)
-                ],
+                "currency": "CNY" if "CNY" in currencies else currencies[0] if currencies else "",
+                "directional_facts": directional_facts,
                 "supported_propositions": [
                     "sector_flow_direction", "sector_flow_ranking", "reported_sector_net_amount",
                 ],

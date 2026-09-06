@@ -324,25 +324,26 @@ def _verified_close_judgment(
         if date_match else "收盘"
     )
     turnover = turnover.split("；", 1)[0].rstrip("。")
-    market_evidence = f"上交所、深交所：{turnover}；东方财富：{breadth_text}。"
-    leader = theme_fact["leaders"][0]
-    laggard = theme_fact["laggards"][0]
-    leader_core = leader.get("core") or {}
-    laggard_core = laggard.get("core") or {}
-    themes = (
-        f"{leader.get('name')}板块领涨{number(leader.get('change_percent'))}%，核心"
-        f"{leader_core.get('name')}({leader_core.get('symbol')}){number(leader_core.get('change_percent'))}%；"
-        f"{laggard.get('name')}板块领跌{number(laggard.get('change_percent'))}%，核心"
-        f"{laggard_core.get('name')}({laggard_core.get('symbol')}){number(laggard_core.get('change_percent'))}%"
-    )
     breadth_view = (
         "风险偏好偏弱" if float(breadth.get("down") or 0) > float(breadth.get("up") or 0)
         else "风险偏好偏强" if float(breadth.get("up") or 0) > float(breadth.get("down") or 0)
         else "多空分歧较大"
     )
-    theme_and_sentiment = (
-        f"东方财富15:00板块数据：{themes}；市场情绪用广度验证：{breadth_text}，{breadth_view}。"
+    market_evidence = (
+        f"按交易所收盘统计，{turnover}；{breadth_text}。"
+        f"成交明显放大，但下跌家数仍多于上涨家数，{breadth_view}。"
     )
+    leader = theme_fact["leaders"][0]
+    laggard = theme_fact["laggards"][0]
+    leader_core = leader.get("core") or {}
+    laggard_core = laggard.get("core") or {}
+    themes = (
+        f"{leader.get('name')}领涨{number(leader.get('change_percent'))}%，"
+        f"{leader_core.get('name')}({leader_core.get('symbol')}){number(leader_core.get('change_percent'))}%；"
+        f"{laggard.get('name')}领跌{number(laggard.get('change_percent'))}%，"
+        f"{laggard_core.get('name')}({laggard_core.get('symbol')}){number(laggard_core.get('change_percent'))}%"
+    )
+    theme_and_sentiment = f"板块分化很大：{themes}。这更像局部轮动，而不是全面转强。"
     holdings = "、".join(
         f"{quote_by_symbol[code].get('name') or code}({code}){number(quote_by_symbol[code].get('price'))}/"
         f"{number(quote_by_symbol[code].get('change_percent'))}%"
@@ -355,7 +356,7 @@ def _verified_close_judgment(
         "result_version": 4,
         "semantic": {
             "summary": (
-                f"资料时点{date_label}15:00，腾讯收盘：{index_text}。指数走弱、成交放大且下跌家数多于上涨家数，"
+                f"截至{date_label}收盘，{index_text}。指数走弱、成交放大且下跌家数多于上涨家数，"
                 "题材分化明显；证据暂不支持追涨，维持中性观察。"
             ),
             "direction": "neutral",

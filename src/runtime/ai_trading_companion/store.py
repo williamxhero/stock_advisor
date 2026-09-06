@@ -183,6 +183,13 @@ class CompanionStore:
               stage TEXT NOT NULL, packet_sha256 TEXT NOT NULL, attempt_id TEXT NOT NULL REFERENCES llm_attempt(attempt_id),
               output_json TEXT NOT NULL, output_sha256 TEXT NOT NULL, created_at TEXT NOT NULL,
               PRIMARY KEY(cycle_id,stage,packet_sha256));
+            CREATE TABLE IF NOT EXISTS active_research_checkpoint (
+              checkpoint_id TEXT PRIMARY KEY,
+              cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              stage TEXT NOT NULL, packet_sha256 TEXT NOT NULL, attempt_id TEXT NOT NULL,
+              checkpoint_json TEXT NOT NULL, terminal_status TEXT NOT NULL,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              UNIQUE(cycle_id,stage,packet_sha256));
             CREATE TABLE IF NOT EXISTS preview_import (
               preview_id TEXT PRIMARY KEY, bundle_sha256 TEXT NOT NULL, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               imported_at TEXT NOT NULL);
@@ -1515,6 +1522,56 @@ class CompanionStore:
                 (cycle_id, json.dumps(payload, ensure_ascii=False, sort_keys=True)),
             )
 
+    def save_research_checkpoint(
+        self, cycle_id: str, stage: str, packet_sha256: str, attempt_id: str,
+        checkpoint: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Upsert one resumable public-research state for an immutable packet."""
+        checkpoint_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL, f"research-checkpoint|{cycle_id}|{stage}|{packet_sha256}",
+        ))
+        payload = json.dumps(checkpoint, ensure_ascii=False, sort_keys=True)
+        timestamp = now()
+        terminal_status = str(checkpoint.get("terminal_status") or "running")
+        with self.connection() as c:
+            c.execute(
+                """INSERT INTO active_research_checkpoint(
+                     checkpoint_id,cycle_id,stage,packet_sha256,attempt_id,checkpoint_json,
+                     terminal_status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(cycle_id,stage,packet_sha256) DO UPDATE SET
+                     attempt_id=excluded.attempt_id,checkpoint_json=excluded.checkpoint_json,
+                     terminal_status=excluded.terminal_status,updated_at=excluded.updated_at""",
+                (checkpoint_id, cycle_id, stage, packet_sha256, attempt_id, payload,
+                 terminal_status, timestamp, timestamp),
+            )
+            row = c.execute(
+                """SELECT * FROM active_research_checkpoint
+                   WHERE cycle_id=? AND stage=? AND packet_sha256=?""",
+                (cycle_id, stage, packet_sha256),
+            ).fetchone()
+        result = dict(row)
+        result["checkpoint"] = json.loads(result.pop("checkpoint_json"))
+        return result
+
+    def research_checkpoint(
+        self, cycle_id: str, stage: str, packet_sha256: str,
+    ) -> dict[str, Any] | None:
+        with self.connection() as c:
+            row = c.execute(
+                """SELECT * FROM active_research_checkpoint
+                   WHERE cycle_id=? AND stage=? AND packet_sha256=?""",
+                (cycle_id, stage, packet_sha256),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["checkpoint"] = json.loads(result.pop("checkpoint_json"))
+        except json.JSONDecodeError:
+            return None
+        return result
+
     def resumed_chat_research_checkpoint(self, cycle_id: str, source_artifact_id: str) -> dict[str, Any] | None:
         with self.connection() as c:
             row = c.execute("SELECT resumed_at,research_json FROM companion_chat_control WHERE cycle_id=?", (cycle_id,)).fetchone()
@@ -2168,7 +2225,9 @@ class CompanionStore:
                    LEFT JOIN narrative_artifact a ON a.artifact_id=j.source_artifact_id
                    LEFT JOIN companion_message_batch b
                      ON b.batch_id=json_extract(a.metadata_json,'$.batch_id')
+                   LEFT JOIN companion_chat_control control ON control.cycle_id=j.cycle_id
                    WHERE j.state IN ('pending','retry')
+                     AND NOT(control.terminated_at IS NOT NULL AND control.resumed_at IS NULL)
                    ORDER BY CASE WHEN b.state='pending' THEN 0 ELSE 1 END,
                             j.created_at,j.job_id""",
             )]

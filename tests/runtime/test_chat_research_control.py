@@ -66,6 +66,23 @@ class ChatResearchControlTests(unittest.TestCase):
             self.assertEqual("snap", restored["checkpoint"]["snapshot"]["snapshot_id"])
             self.assertEqual("evidence", restored["checkpoint"]["context"][0]["episode_id"])
 
+    def test_terminated_public_research_job_is_dormant_until_continue(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CompanionStore(Path(temporary) / "runtime.sqlite3")
+            cycle = store.ensure_daily_conversation("2026-09-01")
+            source = store.append_artifact(
+                cycle["cycle_id"], "ai_chat", "user", "请继续查公开资料",
+                "2026-09-01T00:00:00Z",
+            )
+            job = store.queue_research_job(cycle["cycle_id"], source["artifact_id"], {"topic": "风险"})
+            self.assertEqual(job["job_id"], store.pending_research_jobs()[0]["job_id"])
+
+            store.terminate_chat_research(cycle["cycle_id"])
+            self.assertEqual([], store.pending_research_jobs())
+
+            store.continue_chat_research(cycle["cycle_id"])
+            self.assertEqual(job["job_id"], store.pending_research_jobs()[0]["job_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

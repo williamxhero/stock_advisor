@@ -14,6 +14,7 @@ from unittest import mock
 from ai_trading_companion.broker_client import BrokerError
 from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, ToolResolutionError, WebAccessGatewayBackend, _merge_mandatory_operations
 from ai_trading_companion.market_breadth_cache import MarketBreadthSnapshotCache
+from ai_trading_companion.store import CompanionStore
 from ai_trading_companion.tooling import EvidenceResolution, FactRequest, ToolCatalog, ToolRunner
 
 CONTRACT = {"version": 3, "as_of": "2026-08-27T07:00:00Z", "requirements": [{"key": "market", "blocking": True, "allowed_coverage": ["covered"], "window": {"mode": "exact", "start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z"}}]}
@@ -1823,3 +1824,86 @@ print(json.dumps({'contract':'ai-trading-tool-result/v1','fact_as_of':'2026-08-2
         self.assertFalse(result.qualified)
         self.assertEqual(1, result.observations[0]["secret_rejected_items"])
         self.assertNotIn("ABCDEFGHIJKLMNOPQRSTUVWXYZ123456", str(result.observations))
+
+    def test_cancelled_research_checkpoints_and_resume_fetches_only_the_missing_gap(self) -> None:
+        contract = {"version": 4, "as_of": CONTRACT["as_of"], "requirements": [{
+            "key": key, "blocking": True, "allowed_coverage": ["covered"],
+            "window": {"mode": "exact", "start": CONTRACT["as_of"], "end": CONTRACT["as_of"]},
+        } for key in ("stable_close", "dynamic_news")]}
+        operations = [{
+            **row("web_read", url=f"https://example.test/{key}"), "requirement_key": key,
+        } for key in ("stable_close", "dynamic_news")]
+        calls: list[str] = []
+        checkpoints: list[dict] = []
+
+        def backend(_operation: str, arguments: dict) -> dict:
+            key = str(arguments["_requirement_key"])
+            calls.append(key)
+            return {"results": [{
+                "url": f"https://example.test/{key}", "title": key, "excerpt_text": key,
+                "fact_as_of": CONTRACT["as_of"], "primary": True,
+            }]}
+
+        first = LocalResearchChain(
+            lambda *_: {"version": 1, "operations": operations},
+            ReadOnlyResearchExecutor({"gateway": backend}), max_repairs=None,
+            deadline=lambda: 60.0, cancelled=lambda: len(calls) >= 1,
+            on_checkpoint=checkpoints.append,
+        ).run({"stage": "chat_research", "as_of": CONTRACT["as_of"]}, contract, attempt_id="first")
+
+        self.assertFalse(first.qualified)
+        self.assertEqual("user_cancelled", first.verifier["stop_reason"])
+        self.assertEqual("cancelled", checkpoints[-1]["terminal_status"])
+        self.assertEqual(["stable_close"], calls)
+
+        calls.clear()
+        resumed = LocalResearchChain(
+            lambda *_: {"version": 1, "operations": operations},
+            ReadOnlyResearchExecutor({"gateway": backend}), max_repairs=None,
+            deadline=lambda: 60.0, resume_checkpoint=checkpoints[-1],
+        ).run({"stage": "chat_research", "as_of": CONTRACT["as_of"]}, contract, attempt_id="resumed")
+
+        self.assertTrue(resumed.qualified, resumed.verifier["problems"])
+        self.assertEqual(["dynamic_news"], calls)
+        self.assertEqual({"stable_close", "dynamic_news"}, {
+            str((item.get("arguments") or {}).get("requirement_key"))
+            for item in resumed.observations if item.get("status") == "succeeded"
+        })
+
+    def test_research_stops_after_repeated_rounds_with_no_information_gain(self) -> None:
+        plans: list[int] = []
+
+        def planner(_packet: dict, _gaps: list[str], round_number: int) -> dict:
+            plans.append(round_number)
+            return {"version": 1, "operations": [row("web_search", query="same empty query")]}
+
+        result = LocalResearchChain(
+            planner, ReadOnlyResearchExecutor({"gateway": lambda *_: {"results": []}}),
+            max_repairs=None, deadline=lambda: 60.0,
+        ).run({"stage": "m0_research", "as_of": CONTRACT["as_of"]}, CONTRACT, attempt_id="no-gain")
+
+        self.assertFalse(result.qualified)
+        self.assertEqual("no_information_gain", result.verifier["stop_reason"])
+        self.assertLessEqual(len(plans), 3)
+
+    def test_persistent_research_checkpoint_is_idempotent_for_one_frozen_packet(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CompanionStore(Path(directory) / "companion.sqlite3")
+            cycle = store.create_cycle("daily.execution.0945", "2026-08-27T01:45:00Z", CONTRACT["as_of"])
+            checkpoint = {
+                "version": 1, "frozen_as_of": CONTRACT["as_of"], "contract_sha256": "contract",
+                "observations": [], "unresolved_gaps": ["market"], "attempted_routes": [],
+                "terminal_status": "running", "stop_reason": None,
+            }
+
+            first = store.save_research_checkpoint(
+                cycle["cycle_id"], "m0_research", "packet", "attempt-1", checkpoint,
+            )
+            second = store.save_research_checkpoint(
+                cycle["cycle_id"], "m0_research", "packet", "attempt-1", checkpoint,
+            )
+
+            self.assertEqual(first["checkpoint_id"], second["checkpoint_id"])
+            self.assertEqual(checkpoint, store.research_checkpoint(
+                cycle["cycle_id"], "m0_research", "packet",
+            )["checkpoint"])

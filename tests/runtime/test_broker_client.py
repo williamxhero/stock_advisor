@@ -39,6 +39,14 @@ class _BrokerHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
             return
+        if self.mode == "idle_json":
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+            time.sleep(0.3)
+            try:
+                self.wfile.write(b'{"status":"completed","output_text":"{\\"answer\\":\\"late\\"}"}')
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+            return
         if self.mode == "trickle_stream":
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
             try:
@@ -136,6 +144,16 @@ class BrokerClientTests(unittest.TestCase):
             self.client.invoke(request)
         self.assertEqual("broker_timeout", raised.exception.category)
         self.assertLess(time.monotonic() - started, 0.6)
+
+    def test_non_stream_idle_timeout_is_shorter_than_absolute_deadline(self) -> None:
+        _BrokerHandler.mode = "idle_json"
+        request = self.request()
+        object.__setattr__(request, "idle_timeout_seconds", 0.1)
+        started = time.monotonic()
+        with self.assertRaises(BrokerError) as raised:
+            self.client.invoke(request)
+        self.assertEqual("broker_timeout", raised.exception.category)
+        self.assertLess(time.monotonic() - started, 0.5)
 
     def test_runtime_has_no_direct_provider_protocol_or_token_dependency(self) -> None:
         runtime = Path(__file__).resolve().parents[2] / "src" / "runtime" / "ai_trading_companion"

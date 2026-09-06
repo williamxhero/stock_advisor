@@ -156,13 +156,19 @@ def _save_safe_stage_fallback(
     store: CompanionStore, cycle: dict[str, Any], stage: str, packet: dict[str, Any], *, horizon: str,
 ) -> tuple[dict[str, Any], str]:
     """Seal a local conservative reply after a provider candidate has failed closed."""
-    output = safe_stage_output(stage, horizon=horizon, packet=packet)
-    business_verifier = CognitiveRouter().verify(stage, packet, output)
+    fallback_packet = dict(packet)
+    # A retry freezes a provider candidate's decision invariants.  The local
+    # fallback is instead derived directly from the same frozen evidence, so
+    # it must be judged on that evidence rather than rejected for differing
+    # wording or a conservative qualification state.
+    fallback_packet.pop("verification_repair", None)
+    output = safe_stage_output(stage, horizon=horizon, packet=fallback_packet)
+    business_verifier = CognitiveRouter().verify(stage, fallback_packet, output)
     attempt = store.begin_attempt(
-        cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), str(packet.get("sha256") or "local-fallback"),
+        cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), str(fallback_packet.get("sha256") or "local-fallback"),
         model="runtime-safe-fallback", reasoning_effort="deterministic", search_enabled=False,
         timeout_seconds=0, routing_reason="verified-stage-safe-fallback",
-        runner_fingerprint="runtime-safe-fallback/v1", input_packet=packet,
+        runner_fingerprint="runtime-safe-fallback/v1", input_packet=fallback_packet,
     )
     verifier = {
         **business_verifier,

@@ -12,6 +12,7 @@ from ai_trading_companion.governance import RouterGovernance, classify_regime
 from ai_trading_companion.learning import JudgmentLifecycle, WorkflowEvolution
 from ai_trading_companion.packet_builder import RuntimePacketBuilder as _RuntimePacketBuilder
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
+from ai_trading_companion.__main__ import _save_safe_stage_fallback
 from ai_trading_companion.router import CognitiveRouter
 from ai_trading_companion.stage_expression import normalize_stage_output, safe_stage_output
 from ai_trading_companion.store import CompanionStore
@@ -692,6 +693,24 @@ class CompanionLearningTests(unittest.TestCase):
 
         self.assertTrue(accepted["passed"], accepted["problems"])
         self.assertIn("m1_expression_repair_changes_frozen_decision:current_action", rejected["problems"])
+
+    def test_safe_fallback_uses_evidence_not_the_rejected_candidate_invariants(self):
+        cycle = self.cycle("daily.execution.0945", "2026-09-07T09:45:00+08:00", "2026-09-07T01:45:00Z")
+        packet = {
+            "sha256": "fallback-packet",
+            "verification_repair": {"frozen_decision": {
+                "direction": "bullish", "qualified": True, "horizon": "当前", "current_action": "buy",
+                "transition_conditions": [{"outcome": "upgrade"}], "position_focus": [{"symbol": "000001"}],
+            }},
+        }
+
+        fallback, attempt_id = _save_safe_stage_fallback(
+            self.store, cycle, "m1_judgment", packet, horizon="当前",
+        )
+
+        attempt = self.store.verified_attempt(attempt_id, cycle["cycle_id"], "m1_judgment", "fallback-packet")
+        self.assertTrue(CognitiveRouter().verify("m1_judgment", {}, fallback)["passed"])
+        self.assertNotIn("verification_repair", json.loads(attempt["input_packet_json"]))
 
     def test_safe_formal_fallback_is_natural_and_conservative(self):
         m0 = normalize_stage_output("m0_compose", safe_stage_output("m0_compose"))

@@ -220,6 +220,19 @@ class EvidenceMaturity:
 
 
 @dataclass(frozen=True)
+class HistoricalReplayGate:
+    required_incidents: tuple[str, ...]
+    covered_incidents: tuple[str, ...]
+    gap_closure_rate: float | None
+    citation_verifiability_rate: float | None
+    numeric_date_accuracy_rate: float | None
+    hard_faults: int
+    future_data_leaks: int
+    passed: bool
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ExperimentAssessment(ObservatorySnapshot):
     experiment_key: str
     source_kind: str
@@ -230,9 +243,18 @@ class ExperimentAssessment(ObservatorySnapshot):
     judgment_outcome: DimensionComparison
     cost: DimensionComparison
     stability: DimensionComparison
+    gap_closure: DimensionComparison
+    false_gap_declaration: DimensionComparison
+    citation_verifiability: DimensionComparison
+    numeric_date_accuracy: DimensionComparison
+    independent_source_coverage: DimensionComparison
+    in_window_qualification: DimensionComparison
+    safety_faults: DimensionComparison
     data_completeness: float
     market_regimes: tuple[str, ...]
     evidence_maturity: EvidenceMaturity
+    historical_replay_gate: HistoricalReplayGate
+    evaluation_profile: str
     decision: str
     decision_reasons: tuple[str, ...]
 
@@ -929,12 +951,32 @@ class EvaluationObservatory:
         if snapshot_kind == "forecast_calibration":
             return ForecastCalibrationSnapshot(**payload)
         if snapshot_kind == "experiment":
-            for name in ("delivery_speed", "qualification", "research_quality", "judgment_outcome", "cost", "stability"):
+            empty_dimension = {
+                "name": "unknown", "direction": "higher_is_better", "pair_count": 0,
+                "baseline_mean": None, "candidate_mean": None, "mean_delta": None, "deltas": (),
+            }
+            for name in (
+                "delivery_speed", "qualification", "research_quality", "judgment_outcome", "cost", "stability",
+                "gap_closure", "false_gap_declaration", "citation_verifiability",
+                "numeric_date_accuracy", "independent_source_coverage", "in_window_qualification", "safety_faults",
+            ):
+                payload.setdefault(name, {**empty_dimension, "name": name})
                 dimension = payload[name]
                 dimension["deltas"] = tuple(dimension.get("deltas") or ())
                 payload[name] = DimensionComparison(**dimension)
             payload["market_regimes"] = tuple(payload.get("market_regimes") or ())
             payload["evidence_maturity"] = EvidenceMaturity(**payload["evidence_maturity"])
+            replay = payload.get("historical_replay_gate") or {
+                "required_incidents": (), "covered_incidents": (), "gap_closure_rate": None,
+                "citation_verifiability_rate": None, "numeric_date_accuracy_rate": None,
+                "hard_faults": 0, "future_data_leaks": 0, "passed": False,
+                "reasons": ("legacy_snapshot",),
+            }
+            replay["required_incidents"] = tuple(replay.get("required_incidents") or ())
+            replay["covered_incidents"] = tuple(replay.get("covered_incidents") or ())
+            replay["reasons"] = tuple(replay.get("reasons") or ())
+            payload["historical_replay_gate"] = HistoricalReplayGate(**replay)
+            payload.setdefault("evaluation_profile", "generic/v1")
             payload["decision_reasons"] = tuple(payload.get("decision_reasons") or ())
             return ExperimentAssessment(**payload)
         if snapshot_kind == "source_health":
@@ -1227,15 +1269,22 @@ class EvaluationObservatory:
         with self.store.connection() as connection:
             rows = [dict(row) for row in connection.execute(
                 """SELECT evaluation_id,cell_key,cycle_id,horizon,regime,baseline_score_json,candidate_score_json,
-                          state,created_at,'live_paired_shadow' AS recorded_source_kind
+                          state,created_at,resolved_at,source_kind AS recorded_source_kind
                      FROM router_evaluation WHERE cell_key=? AND state='resolved'
                    UNION ALL
                    SELECT evaluation_id,cell_key,cycle_id,horizon,regime,baseline_score_json,candidate_score_json,
-                          state,created_at,source_kind AS recorded_source_kind
+                          state,created_at,resolved_at,source_kind AS recorded_source_kind
                      FROM runtime_strategy_evaluation WHERE cell_key=? AND state='resolved'
                    ORDER BY created_at,evaluation_id""",
                 (request.experiment_key, request.experiment_key),
             )]
+            profile_row = connection.execute(
+                "SELECT evaluation_profile FROM runtime_strategy_cell WHERE cell_key=?",
+                (request.experiment_key,),
+            ).fetchone()
+        evaluation_profile = str(profile_row["evaluation_profile"]) if profile_row else "generic/v1"
+        historical_rows = [row for row in rows if row["recorded_source_kind"] == "historical_replay"]
+        rows = [row for row in rows if row["recorded_source_kind"] == request.source_kind]
         decoded = [
             (row, json.loads(row["baseline_score_json"]), json.loads(row["candidate_score_json"]))
             for row in rows
@@ -1269,15 +1318,49 @@ class EvaluationObservatory:
             "judgment_outcome": compare("judgment_outcome", "value", "higher_is_better"),
             "cost": compare("cost", "cost", "lower_is_better"),
             "stability": compare("stability", "stability", "higher_is_better"),
+            "gap_closure": compare("gap_closure", "gap_closure_rate", "higher_is_better"),
+            "false_gap_declaration": compare(
+                "false_gap_declaration", "false_gap_declaration_rate", "lower_is_better",
+            ),
+            "citation_verifiability": compare(
+                "citation_verifiability", "citation_verifiability_rate", "higher_is_better",
+            ),
+            "numeric_date_accuracy": compare(
+                "numeric_date_accuracy", "numeric_date_accuracy_rate", "higher_is_better",
+            ),
+            "independent_source_coverage": compare(
+                "independent_source_coverage", "independent_source_coverage", "higher_is_better",
+            ),
+            "in_window_qualification": compare(
+                "in_window_qualification", "qualified_in_window", "higher_is_better",
+            ),
+            "safety_faults": compare("safety_faults", "safety_faults", "lower_is_better"),
         }
-        expected = len(rows) * len(dimensions)
-        observed = sum(dimension.pair_count for dimension in dimensions.values())
+        core_dimension_names = (
+            "delivery_speed", "qualification", "research_quality", "judgment_outcome", "cost", "stability",
+        )
+        active_dimension_names = (
+            "gap_closure", "false_gap_declaration", "citation_verifiability",
+            "numeric_date_accuracy", "independent_source_coverage", "delivery_speed",
+            "in_window_qualification", "safety_faults", "research_quality", "stability",
+        )
+        completeness_names = (
+            active_dimension_names if evaluation_profile == "active_evidence_research/v1"
+            else core_dimension_names
+        )
+        expected = len(rows) * len(completeness_names)
+        observed = sum(dimensions[name].pair_count for name in completeness_names)
         completeness = observed / expected if expected else 0.0
         regimes = tuple(sorted({str(row.get("regime") or "unknown") for row in rows}))
         required_regimes = {"trend_expansion", "divergence", "risk_contraction"}
         regime_coverage = len(required_regimes.intersection(regimes)) / len(required_regimes)
-        protected = [dimensions[name] for name in ("qualification", "research_quality", "judgment_outcome", "stability")]
-        effective_weight = sum(dimension.pair_count for dimension in dimensions.values()) / len(dimensions)
+        protected_names = (
+            ("qualification", "research_quality", "stability")
+            if evaluation_profile == "active_evidence_research/v1"
+            else ("qualification", "research_quality", "judgment_outcome", "stability")
+        )
+        protected = [dimensions[name] for name in protected_names]
+        effective_weight = sum(dimensions[name].pair_count for name in completeness_names) / len(completeness_names)
         # A conservative effective-weight width avoids claiming zero uncertainty
         # merely because a small paired sample happened to have zero variance.
         confidence_width = min(2.0, 1.45 / math.sqrt(effective_weight)) if effective_weight > 0 else None
@@ -1286,16 +1369,36 @@ class EvaluationObservatory:
             dimension.mean_delta is not None and dimension.mean_delta >= tolerances[dimension.name]
             for dimension in protected
         )
+        if evaluation_profile == "active_evidence_research/v1":
+            protection_stable = protection_stable and all((
+                dimensions["citation_verifiability"].mean_delta is not None
+                and dimensions["citation_verifiability"].mean_delta >= 0,
+                dimensions["numeric_date_accuracy"].mean_delta is not None
+                and dimensions["numeric_date_accuracy"].mean_delta >= 0,
+                dimensions["false_gap_declaration"].mean_delta is not None
+                and dimensions["false_gap_declaration"].mean_delta <= 0,
+                dimensions["safety_faults"].candidate_mean == 0,
+            ))
+        historical_gate = self._historical_replay_gate(historical_rows)
         maturity = EvidenceMaturity(
             mature=bool(
                 rows and completeness >= .8 and regime_coverage == 1.0
                 and confidence_width is not None and confidence_width <= .52
+                and (
+                    evaluation_profile != "active_evidence_research/v1"
+                    or historical_gate.passed
+                )
             ),
             effective_weight=effective_weight,
             confidence_interval_width=confidence_width, data_completeness=completeness,
             market_regime_coverage=regime_coverage, protection_dimensions_stable=protection_stable,
         )
-        hard_fault = any(bool(candidate.get("hard_fault")) for _, _, candidate in decoded)
+        hard_fault = any(
+            bool(candidate.get("hard_fault"))
+            or float(candidate.get("safety_faults") or 0) > 0
+            or float(candidate.get("false_gap_declaration_rate") or 0) > 0
+            for _, _, candidate in decoded
+        )
         speed, quality = dimensions["delivery_speed"], dimensions["research_quality"]
         if request.source_kind == "post_promotion_monitoring" and hard_fault:
             decision, reasons = "recommend_rollback", ("post_promotion_hard_fault",)
@@ -1316,6 +1419,8 @@ class EvaluationObservatory:
             decision, reasons = "insufficient_evidence", ("live_paired_shadow_required",)
         elif not maturity.mature:
             missing: list[str] = []
+            if evaluation_profile == "active_evidence_research/v1" and not historical_gate.passed:
+                missing.extend(historical_gate.reasons or ("historical_replay_gate_failed",))
             if completeness < .8:
                 missing.append("data_completeness_insufficient")
             if regime_coverage < 1.0:
@@ -1335,6 +1440,8 @@ class EvaluationObservatory:
                 dimensions["qualification"].mean_delta is not None and dimensions["qualification"].mean_delta >= .03,
                 dimensions["cost"].mean_delta is not None and dimensions["cost"].baseline_mean is not None and dimensions["cost"].mean_delta <= -max(.01, dimensions["cost"].baseline_mean * .10),
                 dimensions["stability"].mean_delta is not None and dimensions["stability"].mean_delta >= .02,
+                dimensions["gap_closure"].mean_delta is not None and dimensions["gap_closure"].mean_delta >= .10,
+                dimensions["in_window_qualification"].mean_delta is not None and dimensions["in_window_qualification"].mean_delta >= .05,
             ))
             if material:
                 decision, reasons = "recommend_promotion", ("material_improvement", "all_protection_dimensions_noninferior")
@@ -1342,7 +1449,11 @@ class EvaluationObservatory:
                 decision, reasons = "insufficient_evidence", ("no_material_improvement",)
         fingerprint = hashlib.sha256(json.dumps({
             "request": asdict(request),
-            "rows": [(row["evaluation_id"], row.get("resolved_at")) for row in rows],
+            "evaluation_profile": evaluation_profile,
+            "rows": [(
+                row["evaluation_id"], row.get("resolved_at"), row["baseline_score_json"],
+                row["candidate_score_json"], row["recorded_source_kind"],
+            ) for row in [*historical_rows, *rows]],
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         scope_key = f"{request.experiment_key}|{request.source_kind}"
         existing = self._request_snapshot(request.request_id, "experiment", scope_key, fingerprint)
@@ -1357,8 +1468,16 @@ class EvaluationObservatory:
             delivery_speed=dimensions["delivery_speed"], qualification=dimensions["qualification"],
             research_quality=dimensions["research_quality"], judgment_outcome=dimensions["judgment_outcome"],
             cost=dimensions["cost"], stability=dimensions["stability"],
+            gap_closure=dimensions["gap_closure"],
+            false_gap_declaration=dimensions["false_gap_declaration"],
+            citation_verifiability=dimensions["citation_verifiability"],
+            numeric_date_accuracy=dimensions["numeric_date_accuracy"],
+            independent_source_coverage=dimensions["independent_source_coverage"],
+            in_window_qualification=dimensions["in_window_qualification"],
+            safety_faults=dimensions["safety_faults"],
             data_completeness=completeness, market_regimes=regimes,
-            evidence_maturity=maturity, decision=decision, decision_reasons=reasons,
+            evidence_maturity=maturity, historical_replay_gate=historical_gate,
+            evaluation_profile=evaluation_profile, decision=decision, decision_reasons=reasons,
         )
         task_key = request.experiment_key.split(":", 1)[1] if ":" in request.experiment_key else None
         stored = self._append_snapshot(
@@ -1368,6 +1487,52 @@ class EvaluationObservatory:
         if not isinstance(stored, ExperimentAssessment):
             raise ValueError("request id resolved to an incompatible snapshot")
         return stored
+
+    @staticmethod
+    def _historical_replay_gate(rows: list[dict[str, Any]]) -> HistoricalReplayGate:
+        required = (
+            "weekend_fund_flow", "industry_distribution", "holding_announcement",
+            "expression_loss", "markethub_current_bar",
+        )
+        candidates = [json.loads(row["candidate_score_json"]) for row in rows]
+        covered = tuple(sorted({
+            str(candidate.get("incident_id")) for candidate in candidates
+            if candidate.get("incident_id") in required
+        }))
+
+        def average(key: str) -> float | None:
+            values = [float(candidate[key]) for candidate in candidates if isinstance(candidate.get(key), (int, float))]
+            return sum(values) / len(values) if values else None
+
+        closure = average("gap_closure_rate")
+        citations = average("citation_verifiability_rate")
+        numeric_dates = average("numeric_date_accuracy_rate")
+        future_leaks = sum(bool(candidate.get("future_data_leak")) for candidate in candidates)
+        hard_faults = sum(
+            bool(candidate.get("hard_fault"))
+            or float(candidate.get("safety_faults") or 0) > 0
+            or float(candidate.get("false_gap_declaration_rate") or 0) > 0
+            for candidate in candidates
+        )
+        reasons: list[str] = []
+        if set(covered) != set(required):
+            reasons.append("historical_incident_coverage_incomplete")
+        if closure is None or closure < .90:
+            reasons.append("historical_gap_closure_below_90_percent")
+        if citations != 1.0:
+            reasons.append("historical_citation_verifiability_not_100_percent")
+        if numeric_dates != 1.0:
+            reasons.append("historical_numeric_date_accuracy_not_100_percent")
+        if hard_faults:
+            reasons.append("historical_hard_fault")
+        if future_leaks:
+            reasons.append("historical_future_data_leak")
+        return HistoricalReplayGate(
+            required_incidents=required, covered_incidents=covered, gap_closure_rate=closure,
+            citation_verifiability_rate=citations, numeric_date_accuracy_rate=numeric_dates,
+            hard_faults=hard_faults, future_data_leaks=future_leaks,
+            passed=not reasons, reasons=tuple(reasons),
+        )
 
     def _request_snapshot(
         self, request_id: str | None, snapshot_kind: str, scope_key: str, input_fingerprint: str,

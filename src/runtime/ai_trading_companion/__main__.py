@@ -1000,8 +1000,8 @@ def run_runtime_strategy_shadow(store: CompanionStore, job: dict[str, Any], exec
             regime = connection.execute(
                 "SELECT regime FROM market_regime_snapshot WHERE cycle_id=?", (cycle["cycle_id"],),
             ).fetchone()
-        receipt = policy.record_evaluation(
-            job["cell_key"], cycle["cycle_id"], f"stage:{job['stage']}",
+        receipt = policy.record_live_shadow_evaluation(
+            job["job_id"], candidate.attempt_id, f"stage:{job['stage']}",
             regime["regime"] if regime else "unknown", baseline_score, candidate_score,
         )
         policy.finish_shadow(job["job_id"], candidate_attempt_id=candidate.attempt_id)

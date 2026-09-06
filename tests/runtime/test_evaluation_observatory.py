@@ -697,6 +697,173 @@ class ExperimentAssessmentTests(unittest.TestCase):
         self.assertEqual("insufficient_evidence", insufficient.decision)
         self.assertIn("market_regime_coverage_incomplete", insufficient.decision_reasons)
 
+    def test_active_research_requires_frozen_incident_gate_and_mature_future_live_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CompanionStore(Path(directory) / "companion.sqlite3")
+            store.initialize()
+            policy = RuntimeStrategyPolicy(store)
+            cell = policy.register_shadow_candidate(
+                "source_mix", "m0_research", {"enabled_backends": ["market"]},
+                {"enabled_backends": ["gateway", "market"]},
+                evaluation_profile="active_evidence_research/v1",
+            )
+            incidents = (
+                "weekend_fund_flow", "industry_distribution", "holding_announcement",
+                "expression_loss", "markethub_current_bar",
+            )
+            baseline = {
+                "gap_closure_rate": .4, "false_gap_declaration_rate": .2,
+                "citation_verifiability_rate": .8, "numeric_date_accuracy_rate": .8,
+                "independent_source_coverage": .5, "duration_seconds": 140,
+                "qualified_in_window": False, "qualified": False,
+                "research_quality": .5, "value": .5, "cost": 1.0, "stability": .8,
+                "safety_faults": 0,
+            }
+            candidate = {
+                "gap_closure_rate": 1.0, "false_gap_declaration_rate": 0.0,
+                "citation_verifiability_rate": 1.0, "numeric_date_accuracy_rate": 1.0,
+                "independent_source_coverage": 1.0, "duration_seconds": 100,
+                "qualified_in_window": True, "qualified": True,
+                "research_quality": .95, "value": .8, "cost": .9, "stability": .98,
+                "safety_faults": 0,
+            }
+
+            def record_live_pair(index: int, regime: str, *, mismatch: bool = False) -> None:
+                day = f"2026-10-{index + 1:02d}"
+                at = f"{day}T09:45:00Z"
+                packet = {
+                    "task_key": "daily.execution.0945", "as_of": at,
+                    "value_window_end": f"{day}T10:30:00Z",
+                    "market_context": {"regime": regime, "close": 3200 + index},
+                    "runtime_strategy_controls": {"enabled_backends": ["market"]},
+                    "allowed_research_backends": ["market"], "sha256": f"baseline-{index}",
+                }
+                cycle = store.create_cycle("daily.execution.0945", at, at)
+                def verifier(candidate_route: bool) -> dict:
+                    sources = [{
+                        "evidence_ref": f"ev-{number}", "canonical_url": f"https://source-{number}.test/fact",
+                        "fact_as_of": at if candidate_route or number < 4 else None,
+                        "independence_group": f"group-{number % 2}" if candidate_route else "baseline-group",
+                    } for number in range(5)]
+                    gap_states = [{
+                        "requirement_key": f"gap-{number}", "blocking": True,
+                        "coverage_state": "complete" if candidate_route or number < 2 else "partial",
+                    } for number in range(5)]
+                    return {"passed": True, "evidence_gate": {
+                        "passed": True, "problems": [], "gap_states": gap_states,
+                        "normalized_evidence": {"sources": sources},
+                    }}
+                baseline_attempt = store.begin_attempt(
+                    cycle["cycle_id"], "m0_research", at, f"baseline-{index}", input_packet=packet,
+                )
+                store.finish_attempt(baseline_attempt["attempt_id"], "succeeded", verifier=verifier(False))
+                job_id = policy.queue_shadows(
+                    cycle["cycle_id"], "m0_research", packet,
+                    "companion-evidence-result-v3.schema.json", baseline_attempt["attempt_id"],
+                )[0]
+                job = policy.next_shadow()
+                self.assertEqual(job_id, job["job_id"])
+                shadow_packet = {
+                    **packet,
+                    "market_context": (
+                        {"regime": regime, "close": 9999} if mismatch else packet["market_context"]
+                    ),
+                    "runtime_strategy_controls": {"enabled_backends": ["gateway", "market"]},
+                    "allowed_research_backends": ["gateway", "market"], "sha256": f"candidate-{index}",
+                }
+                shadow_attempt = store.begin_attempt(
+                    cycle["cycle_id"], "m0_research", at, f"candidate-{index}",
+                    is_shadow=True, input_packet=shadow_packet,
+                )
+                store.finish_attempt(shadow_attempt["attempt_id"], "succeeded", verifier=verifier(True))
+                if mismatch:
+                    with self.assertRaisesRegex(ValueError, "frozen market context"):
+                        policy.record_live_shadow_evaluation(
+                            job_id, shadow_attempt["attempt_id"], f"stage:m0_research", regime,
+                            baseline, candidate,
+                        )
+                    policy.finish_shadow(job_id, error="frozen context mismatch")
+                    self.assertEqual("queued", store.get_cycle(cycle["cycle_id"])["state"])
+                    return
+                policy.record_live_shadow_evaluation(
+                    job_id, shadow_attempt["attempt_id"], f"stage:m0_research", regime,
+                    baseline, candidate,
+                )
+                policy.finish_shadow(job_id, candidate_attempt_id=shadow_attempt["attempt_id"])
+
+            for index, incident in enumerate(incidents, start=1):
+                policy.record_frozen_replay(
+                    cell["cell_key"], incident, f"replay-{index}", "2026-08-01T07:00:00Z",
+                    "divergence", baseline, candidate,
+                    evidence_times=[{
+                        "occurred_at": "2026-08-01T06:00:00Z", "known_at": "2026-08-01T06:30:00Z",
+                    }],
+                )
+
+            replay = EvaluationObservatory(store).assess_experiment(ExperimentRequest(
+                cell["cell_key"], source_kind="historical_replay",
+            ))
+            self.assertTrue(replay.historical_replay_gate.passed)
+            self.assertEqual("insufficient_evidence", replay.decision)
+            self.assertIn("live_paired_shadow_required", replay.decision_reasons)
+
+            regimes = ("trend_expansion", "divergence", "risk_contraction")
+            record_live_pair(20, "divergence", mismatch=True)
+            for index in range(5):
+                record_live_pair(index, regimes[index % 3])
+            immature = EvaluationObservatory(store).assess_experiment(ExperimentRequest(cell["cell_key"]))
+            self.assertEqual(5, immature.paired_runs)
+            self.assertEqual("insufficient_evidence", immature.decision)
+            self.assertIn("confidence_interval_too_wide", immature.decision_reasons)
+
+            for index in range(5, 9):
+                record_live_pair(index, regimes[index % 3])
+            mature = EvaluationObservatory(store).assess_experiment(ExperimentRequest(cell["cell_key"]))
+            self.assertEqual("recommend_promotion", mature.decision)
+            self.assertTrue(mature.historical_replay_gate.passed)
+            self.assertEqual(9, mature.gap_closure.pair_count)
+            self.assertEqual(9, mature.citation_verifiability.pair_count)
+            self.assertEqual(9, mature.numeric_date_accuracy.pair_count)
+            self.assertEqual(9, mature.in_window_qualification.pair_count)
+            self.assertEqual(0.0, mature.safety_faults.candidate_mean)
+            with store.connection() as connection:
+                mode = connection.execute(
+                    "SELECT mode FROM runtime_strategy_cell WHERE cell_key=?", (cell["cell_key"],),
+                ).fetchone()["mode"]
+            self.assertEqual("shadow", mode)
+
+    def test_frozen_replay_rejects_future_known_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CompanionStore(Path(directory) / "companion.sqlite3")
+            store.initialize()
+            policy = RuntimeStrategyPolicy(store)
+            cell = policy.register_shadow_candidate(
+                "source_mix", "m0_research", {"enabled_backends": ["market"]},
+                {"enabled_backends": ["gateway", "market"]},
+                evaluation_profile="active_evidence_research/v1",
+            )
+            with self.assertRaisesRegex(ValueError, "future evidence"):
+                policy.record_frozen_replay(
+                    cell["cell_key"], "weekend_fund_flow", "replay-future",
+                    "2026-08-01T07:00:00Z", "divergence", {}, {}, evidence_times=[{
+                        "occurred_at": "2026-08-01T06:00:00Z", "known_at": "2026-08-01T08:00:00Z",
+                    }],
+                )
+            evidence_times = [{
+                "occurred_at": "2026-08-01T06:00:00Z", "known_at": "2026-08-01T06:30:00Z",
+            }]
+            policy.record_frozen_replay(
+                cell["cell_key"], "weekend_fund_flow", "immutable-replay",
+                "2026-08-01T07:00:00Z", "divergence", {"gap_closure_rate": 0.0},
+                {"gap_closure_rate": 1.0}, evidence_times=evidence_times,
+            )
+            with self.assertRaisesRegex(ValueError, "immutable"):
+                policy.record_frozen_replay(
+                    cell["cell_key"], "weekend_fund_flow", "immutable-replay",
+                    "2026-08-01T07:00:00Z", "divergence", {"gap_closure_rate": 0.0},
+                    {"gap_closure_rate": .5}, evidence_times=evidence_times,
+                )
+
     def test_tradeoffs_ask_user_and_material_noninferior_live_evidence_recommends_promotion(self) -> None:
         baseline = {"value": .8, "duration_seconds": 120, "qualified": True, "research_quality": .8, "cost": 1, "stability": .95}
         regimes = ("trend_expansion", "divergence", "risk_contraction")

@@ -116,6 +116,8 @@ def test_no_qualified_core_never_produces_generic_neutral_reply(tmp_path, kwargs
     assert sum(r.stage == "m1_reasoning" for r in broker.calls) == 3
     assert not any(r.stage == "m1_expression" for r in broker.calls)
     assert store.latest_artifact(cycle["cycle_id"], "m1") is None
+    if kwargs.get("reject_core"):
+        assert all(a["status"] == "rejected" for a in store.attempts(cycle["cycle_id"]) if a["stage"] == "m1_review")
 
 
 def test_fact_reference_and_active_position_validation():
@@ -178,6 +180,12 @@ def test_malformed_final_core_is_rejected_without_crashing():
     assert not CognitiveRouter().verify("m1_judgment", packet(), output)["passed"]
 
 
+def test_recovery_conditions_do_not_duplicate_punctuation():
+    decision = core()
+    decision["transition_conditions"][0]["price"] += "；"
+    assert "；，" not in render_core(decision)
+
+
 def test_model_contracts_declare_native_types_and_do_not_duplicate_evidence(tmp_path):
     def check(node):
         if isinstance(node, dict):
@@ -193,10 +201,13 @@ def test_model_contracts_declare_native_types_and_do_not_duplicate_evidence(tmp_
     original = packet()
     original["evidence"]["sources"][0]["excerpt_text"] = original["evidence"]["sources"][0]["excerpt"]
     original["artifacts"] = [{"kind": "m1_evidence", "body": json.dumps(original["evidence"])}]
+    original["memories"] = [{"authority": "published_ai_message", "summary": "obsolete broadcast"},
+                            {"authority": "verified_knowledge", "summary": "learned counterexample"}]
     broker = Broker()
     pipeline, _, cycle = runtime(tmp_path, broker)
     pipeline.produce("m1_judgment", cycle, original, time.monotonic() + 60)
     context = broker.calls[0].packet["context"]
     assert context["artifacts"] == [] and len(context["evidence"]["sources"]) == 1
     assert "excerpt_text" not in context["evidence"]["sources"][0]
+    assert context["memories"] == [original["memories"][1]]
     assert context["evidence"]["sources"][0]["excerpt"] == original["evidence"]["sources"][0]["excerpt"]

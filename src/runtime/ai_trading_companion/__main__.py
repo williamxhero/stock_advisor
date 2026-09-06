@@ -689,11 +689,28 @@ def _call_stage(
                 market_tool_available="market" in controls.enabled_backends,
             )
             tool_runner = ToolRunner(ToolCatalog(PATHS.tools), need_reporter=store.submit_capability_need)
+            gateway_config = dict(settings.research.get("web_access_gateway") or {})
+            authorized_gateway = (
+                WebAccessGatewayClient(settings.research)
+                if gateway_config.get("token") and gateway_config.get("authorized_edge_session_id")
+                else None
+            )
+            def authorized_browser(arguments: dict[str, Any]) -> dict[str, Any]:
+                if authorized_gateway is None:
+                    raise PermissionError("authorized Edge browser is unavailable")
+                actions = [dict(row) for row in arguments.get("actions") or [] if isinstance(row, dict)]
+                url = str(arguments.get("url") or "")
+                if url and not any(row.get("type") == "navigate" for row in actions):
+                    actions.insert(0, {"type": "navigate", "url": url})
+                if not any(row.get("type") == "snapshot" for row in actions):
+                    actions.append({"type": "snapshot"})
+                return authorized_gateway.browser(None, actions)
             web = ToolCatalogResearchBackend(
                 tool_runner,
                 as_of=_evidence_read_cutoff(packet, contract),
                 deadline=lambda: deadline - time.monotonic(),
                 contract=contract,
+                authorized_browser=authorized_browser if authorized_gateway is not None else None,
             )
             market_facts = packet.get("deterministic_market_facts")
             backends = {"gateway": web} if "gateway" in controls.enabled_backends else {}

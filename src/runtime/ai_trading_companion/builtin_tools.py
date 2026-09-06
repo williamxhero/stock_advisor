@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.15"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14"}
+_VERSION = "1.1.16"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -2168,6 +2168,7 @@ def main() -> None:
         if dynamic is not None:
             result({"url": url, "capture_mode": "dynamic", "text": strip_html(dynamic)})
             return
+        fail(69, "authorized browser unavailable")
     url, body = fetch(url)
     if mode == "http_json":
         try:
@@ -2177,8 +2178,6 @@ def main() -> None:
         result({"url": url, "json": parsed})
     elif mode == "web_read":
         result({"url": url, "text": strip_html(body)})
-    elif mode == "browser_capture":
-        result({"url": url, "capture_mode": "static", "text": strip_html(body)})
     else:
         fail(64, "unsupported tool mode")
 

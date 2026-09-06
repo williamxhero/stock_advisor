@@ -42,7 +42,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.15", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.16", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
             routing = json.loads(turnover_routing.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -51,7 +51,7 @@ class ToolRunnerTests(unittest.TestCase):
             )
             official_manifest = json.loads((
                 root / "cn_market_turnover_compare" / "adapters" / "official_exchanges"
-                / "versions" / "1.1.15" / "manifest.json"
+                / "versions" / "1.1.16" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual({
                 "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
@@ -486,7 +486,7 @@ class ToolRunnerTests(unittest.TestCase):
             threading.Thread(target=server.serve_forever, daemon=True).start()
             try:
                 result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
-                    1, "generic_browser_capture", "2026-09-01T01:30:00Z", 8.0,
+                    1, "generic_browser_capture", "2026-09-01T01:30:00Z", 20.0,
                     {"url": f"http://127.0.0.1:{server.server_port}/dynamic"},
                 ))
 
@@ -498,7 +498,7 @@ class ToolRunnerTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
-    def test_browser_capture_falls_back_to_static_read_when_browser_is_unavailable(self) -> None:
+    def test_browser_capture_reports_precise_degradation_when_browser_is_unavailable(self) -> None:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
                 body = b"<html><body>static market breadth fallback</body></html>"
@@ -523,9 +523,8 @@ class ToolRunnerTests(unittest.TestCase):
                         {"url": f"http://127.0.0.1:{server.server_port}/page"},
                     ))
 
-                self.assertTrue(result.succeeded, result.error_code)
-                self.assertEqual("static", result.data["capture_mode"])
-                self.assertIn("static market breadth fallback", result.data["text"])
+                self.assertFalse(result.succeeded)
+                self.assertEqual("tool_browser_unavailable", result.error_code)
             finally:
                 server.shutdown()
                 server.server_close()

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from ai_trading_companion.broker_client import BrokerError
-from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, ToolResolutionError, WebAccessGatewayBackend, _merge_mandatory_operations
+from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, ToolResolutionError, WebAccessGatewayBackend, _merge_mandatory_operations, _verify_research_plan
 from ai_trading_companion.market_breadth_cache import MarketBreadthSnapshotCache
 from ai_trading_companion.store import CompanionStore
 from ai_trading_companion.tooling import EvidenceResolution, FactRequest, ToolCatalog, ToolRunner
@@ -838,6 +838,30 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual("object", actions["items"]["type"])
         self.assertFalse(actions["items"]["additionalProperties"])
         self.assertEqual(set(actions["items"]["properties"]), set(actions["items"]["required"]))
+
+    def test_browser_last_mile_is_rejected_before_search_and_plain_read_are_attempted(self) -> None:
+        packet = {
+            "evidence_contract": {"requirements": [{"key": "market", "blocking": True}]},
+            "coverage_gaps": ["blocking_requirement_missing:market"],
+            "available_backends": ["gateway"], "deterministic_requirement_keys": [],
+            "research_discoveries": [{"requirement_key": "market", "url": "https://example.test/fact"}],
+            "research_route_state": {"market": {
+                "search_attempted": True, "plain_read_attempted": False,
+            }},
+        }
+        plan = {"version": 1, "operations": [{
+            **row("web_browser", url="https://example.test/fact"), "requirement_key": "market",
+        }]}
+
+        problems = _verify_research_plan(packet, plan)["problems"]
+
+        self.assertIn("research_plan_browser_before_public_routes:market", problems)
+
+        packet["research_route_state"]["market"]["plain_read_attempted"] = True
+        self.assertNotIn(
+            "research_plan_browser_before_public_routes:market",
+            _verify_research_plan(packet, plan)["problems"],
+        )
 
     def test_planner_is_strict_and_names_gateway_only(self) -> None:
         broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})

@@ -11,6 +11,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+from .secret_guard import find_secrets
+
 
 class WebAccessGatewayError(RuntimeError):
     """A sanitized gateway failure; credentials are never included."""
@@ -23,6 +25,7 @@ class WebAccessGatewayClient:
         self.token = str(config.get("token") or "")
         self.search_timeout = int(config.get("search_timeout_seconds") or 35)
         self.read_timeout = int(config.get("read_timeout_seconds") or 100)
+        self.edge_session_id = str(config.get("authorized_edge_session_id") or "").strip() or None
 
     def search(self, query: str, categories: str = "news") -> dict[str, Any]:
         value = self._call("web_search", {"query": query, "categories": categories}, self.search_timeout)
@@ -79,17 +82,33 @@ class WebAccessGatewayClient:
         allowed = {"navigate", "click", "wait", "scroll", "snapshot", "screenshot", "close"}
         if not isinstance(actions, list) or any(not isinstance(a, dict) or str(a.get("type") or a.get("action") or "") not in allowed for a in actions):
             raise WebAccessGatewayError("web_browser only accepts read-only navigation actions")
+        if any(not _browser_action_is_read_only(action) for action in actions):
+            raise WebAccessGatewayError("web_browser rejected a potentially mutating action")
         normalized_actions = [
             {key: value for key, value in action.items() if value is not None}
             for action in actions
         ]
-        value = self._call("web_browser", {"session_id": session_id, "actions": normalized_actions}, self.read_timeout)
+        value = self._call(
+            "web_browser",
+            {"session_id": self.edge_session_id or session_id, "actions": normalized_actions},
+            self.read_timeout,
+        )
         snapshot = _text(value, "snapshot") or _text(value, "markdown")
         url = _text(value, "url")
+        lowered = (snapshot + "\n" + _text(value, "title")).casefold()
+        barriers = (
+            "验证码", "请登录", "登录后", "sign in", "log in", "paywall", "subscribe to continue",
+            "付费后", "注册后", "access denied", "drm",
+        )
+        if any(marker in lowered for marker in barriers):
+            raise WebAccessGatewayError("browser stopped at access control")
+        if find_secrets(snapshot):
+            raise WebAccessGatewayError("browser snapshot contained authentication secrets")
+        snapshot = _sanitize_untrusted_browser_text(snapshot)
         return {"trace_id": _text(value, "trace_id"), "results": [{
             "url": url, "title": _text(value, "title"), "excerpt_text": snapshot[:12000],
             "fact_as_of": _fact_as_of(snapshot + "\n" + url), "primary": bool(value.get("primary")),
-            **_provenance(value),
+            "browser_route": "authorized_edge", **_provenance(value),
         }]}
 
     def _call(self, name: str, arguments: dict[str, Any], timeout: int) -> dict[str, Any]:
@@ -166,6 +185,46 @@ def _provenance(value: dict[str, Any]) -> dict[str, Any]:
         "market_propagation": _text(value, "market_propagation"),
         "claims": [dict(row) for row in claims or [] if isinstance(row, dict)],
     }
+
+
+def _sanitize_untrusted_browser_text(value: str) -> str:
+    injection = re.compile(
+        r"(?i)(ignore\s+(?:all\s+)?previous\s+instructions?|system\s+prompt|"
+        r"upload\s+account\s+data|send\s+(?:a\s+)?message|call\s+(?:the\s+)?tool|"
+        r"忽略(?:以上|之前|此前).*指令|系统提示词|上传.*(?:账户|凭据)|发送.*(?:消息|私信))"
+    )
+    retained = [line for line in value.splitlines() if not injection.search(line)]
+    return "[UNTRUSTED_PAGE_TEXT]\n" + "\n".join(retained)
+
+
+def _browser_action_is_read_only(action: dict[str, Any]) -> bool:
+    kind = str(action.get("type") or action.get("action") or "")
+    if kind == "navigate":
+        try:
+            parsed = urlsplit(str(action.get("url") or ""))
+        except ValueError:
+            return False
+        lowered = str(action.get("url") or "").casefold()
+        return bool(
+            parsed.scheme in {"http", "https"} and parsed.netloc
+            and parsed.username is None and parsed.password is None
+            and not any(marker in lowered for marker in (
+                "/login", "/signin", "/auth", "password=", "token=", "cookie=", "api_key=",
+            ))
+        )
+    if kind != "click":
+        return True
+    label = str(action.get("element") or "").casefold()
+    forbidden = (
+        "提交", "发布", "评论", "私信", "发送", "买入", "卖出", "交易", "下单", "删除",
+        "保存", "关注", "订阅", "登录", "注册", "upload", "submit", "post", "comment",
+        "message", "send", "buy", "sell", "trade", "order", "delete", "save", "follow",
+    )
+    read_only = (
+        "下一页", "上一页", "分页", "筛选", "过滤", "展开", "更多", "详情", "标签",
+        "next", "previous", "page", "filter", "expand", "more", "details", "tab",
+    )
+    return bool(label and any(marker in label for marker in read_only) and not any(marker in label for marker in forbidden))
 
 
 def _fact_as_of(text: str, *, not_after: str | None = None) -> str | None:

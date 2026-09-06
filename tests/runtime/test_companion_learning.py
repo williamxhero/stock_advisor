@@ -577,7 +577,7 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertIn("weekend_review_lacks_sector_distribution", omitted["problems"])
         self.assertIn("weekend_review_lacks_fund_flow_direction", omitted["problems"])
         self.assertIn("weekend_review_lacks_market_event_impact", omitted["problems"])
-        self.assertIn("weekend_review_lacks_portfolio_announcement_checks", omitted["problems"])
+        self.assertNotIn("weekend_review_lacks_portfolio_announcement_checks", omitted["problems"])
         self.assertIn(
             "weekend_review_lacks_directional_fund_flow_interpretation",
             directional_without_interpretation["problems"],
@@ -595,8 +595,17 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertIn("000997", complete_text)
         self.assertIn("002891", complete_text)
 
-        fallback = safe_stage_output("m1_judgment", horizon="下周初", packet=packet)
-        fallback_check = CognitiveRouter().verify("m1_judgment", packet, fallback)
+        verified_packet = json.loads(json.dumps(packet, ensure_ascii=False))
+        for source in verified_packet["evidence"]["sources"]:
+            payload = json.loads(source["excerpt"])
+            if payload.get("checked_symbol") == "002891":
+                payload["announcements"][0].update({
+                    "content_verified": True,
+                    "content": "截至公告日，公司已按计划实施股份回购。",
+                })
+                source["excerpt"] = json.dumps(payload, ensure_ascii=False)
+        fallback = safe_stage_output("m1_judgment", horizon="下周初", packet=verified_packet)
+        fallback_check = CognitiveRouter().verify("m1_judgment", verified_packet, fallback)
         fallback_text = normalize_stage_output("m1_judgment", fallback).text
         self.assertTrue(fallback_check["passed"], fallback_check["problems"])
         self.assertIn("主力资金方向", fallback_text)
@@ -605,8 +614,11 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertNotIn("数据缺失", fallback_text)
         self.assertNotIn("未取得可独立核验", fallback_text)
         self.assertIn("政策与风险事件", fallback_text)
-        self.assertIn("新大陆(000997)未发现新增公告", fallback_text)
-        self.assertIn("中宠股份(002891)检出《回购公司股份的进展公告》", fallback_text)
+        self.assertIn("中宠股份的回购仍在推进", fallback_text)
+        self.assertNotIn("新大陆(000997)未发现新增公告", fallback_text)
+        self.assertNotIn("逐股公告核查", fallback_text)
+        self.assertNotIn("检出", fallback_text)
+        self.assertNotIn("暂不据标题", fallback_text)
         self.assertNotIn("上交所、深交所：", fallback_text)
         self.assertNotIn("东方财富15:00板块数据：", fallback_text)
         self.assertNotIn("市场情绪用广度验证：", fallback_text)

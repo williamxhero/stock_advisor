@@ -452,12 +452,33 @@ def _verified_portfolio_announcement_summary(
         announcements = [
             item for item in disclosures[code].get("announcements") or [] if isinstance(item, dict)
         ]
-        if not announcements:
-            parts.append(f"{name}({code})未发现新增公告")
-            continue
-        titles = "、".join(f"《{item.get('title')}》" for item in announcements[:1] if item.get("title"))
-        parts.append(f"{name}({code})检出{titles or '窗口内公告'}，暂不据标题单独改变判断")
-    return "逐股公告核查：" + "；".join(parts) + "。"
+        for announcement in announcements:
+            narrative = _verified_announcement_narrative(name, announcement)
+            if narrative:
+                parts.append(narrative)
+                break
+    return "持仓方面，" + "；".join(parts) + "。" if parts else ""
+
+
+def _verified_announcement_narrative(name: str, announcement: dict[str, Any]) -> str:
+    """Translate verified disclosure content into a bounded trading implication."""
+    if announcement.get("content_verified") is not True:
+        return ""
+    title = _sentence_piece(announcement.get("title"))
+    compact = "".join(str(announcement.get("content") or "").split())
+    if not title or not compact:
+        return ""
+    if "回购" in title + compact:
+        if any(term in compact for term in ("已按计划实施", "已实施股份回购", "累计回购")):
+            return f"{name}的回购仍在推进，属于轻微正面信息，但不足以单独改变当前判断"
+        return f"{name}披露回购进展，正文没有显示足以单独改变当前判断的新催化"
+    if "更正" in title + compact:
+        if "文字" in compact and any(term in compact for term in ("不涉及", "不影响", "无实质影响")):
+            return f"{name}更正的是文字表述，不涉及核心数据，对当前判断影响有限"
+        return f"{name}披露{title}，需要按更正范围评估其对核心数据的影响"
+    if any(term in title + compact for term in ("风险提示", "立案", "处罚", "终止", "诉讼", "停牌")):
+        return f"{name}披露{title}，这是需要优先跟踪的风险变化"
+    return ""
 
 
 def safe_stage_output(

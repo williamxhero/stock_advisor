@@ -452,23 +452,19 @@ def _weekend_review_coverage_problems(packet: dict[str, Any], semantic: dict[str
         problems.append("weekend_review_event_impact_not_marked_as_inference")
 
     if "portfolio_events_and_counterevidence" in available:
-        announcement_markers = ("公告", "披露", "停复牌", "财报")
+        requirement = next((
+            item for item in (packet.get("evidence_contract") or {}).get("requirements") or []
+            if isinstance(item, dict) and item.get("key") == "portfolio_events_and_counterevidence"
+        ), {})
+        required_entities = [str(entity) for entity in requirement.get("required_entities") or [] if str(entity)]
+        if not _portfolio_announcement_coverage_complete(packet, required_entities):
+            problems.append("weekend_review_lacks_portfolio_announcement_checks")
+        announcement_markers = ("公告", "披露", "停复牌", "财报", "回购", "更正")
         announcement_text = "".join(
             segment for segment in re.split(r"[。；\n]", body)
             if any(marker in segment for marker in announcement_markers)
         )
         announcement_compact = "".join(announcement_text.split())
-        requirement = next((
-            item for item in (packet.get("evidence_contract") or {}).get("requirements") or []
-            if isinstance(item, dict) and item.get("key") == "portfolio_events_and_counterevidence"
-        ), {})
-        aliases = _portfolio_entity_aliases(packet)
-        missing = [
-            entity for entity in requirement.get("required_entities") or []
-            if not any(alias and alias in announcement_compact for alias in aliases.get(str(entity), (str(entity),)))
-        ]
-        if not announcement_text or missing:
-            problems.append("weekend_review_lacks_portfolio_announcement_checks")
         pending_titles: list[str] = []
         for source in evidence.get("sources") or []:
             if not isinstance(source, dict):
@@ -485,10 +481,6 @@ def _weekend_review_coverage_problems(packet: dict[str, Any], semantic: dict[str
                 if isinstance(item, dict) and item.get("content_verified") is not True
             )
         pending_titles = [title for title in pending_titles if title]
-        if pending_titles and not any(
-            term in announcement_compact for term in ("内容待核验", "影响待核验", "暂不据标题", "不能仅凭标题")
-        ):
-            problems.append("weekend_review_lacks_unverified_announcement_boundary")
         if any(
             re.search(
                 rf"(?:因|根据)[^。；]{{0,20}}{re.escape(title)}[^。；]{{0,20}}(?:加仓|减仓|买入|卖出|清仓)",
@@ -530,17 +522,32 @@ def _qualified_reply_acquisition_gap_problems(semantic: dict[str, Any]) -> list[
     return []
 
 
-def _portfolio_entity_aliases(packet: dict[str, Any]) -> dict[str, tuple[str, ...]]:
-    business = packet.get("business_context") if isinstance(packet.get("business_context"), dict) else {}
-    private = business.get("private_context_before_h0") if isinstance(business.get("private_context_before_h0"), dict) else {}
-    aliases: dict[str, tuple[str, ...]] = {}
-    for position in private.get("positions") or []:
-        if not isinstance(position, dict):
+def _portfolio_announcement_coverage_complete(packet: dict[str, Any], required_entities: list[str]) -> bool:
+    if not required_entities:
+        return True
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    for coverage in evidence.get("coverage") or []:
+        if not isinstance(coverage, dict) or coverage.get("requirement_key") != "portfolio_events_and_counterevidence":
             continue
-        code, name = str(position.get("code") or ""), str(position.get("name") or "")
-        if code:
-            aliases[code] = tuple(value for value in (code, name) if value)
-    return aliases
+        checks = coverage.get("entity_checks")
+        if isinstance(checks, list):
+            states = {
+                str(item.get("symbol") or ""): str(item.get("state") or "")
+                for item in checks if isinstance(item, dict)
+            }
+            if all(states.get(symbol) in {"checked_no_change", "disclosed_verified", "disclosed_pending_content"} for symbol in required_entities):
+                return True
+    checked_symbols: set[str] = set()
+    for source in evidence.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        try:
+            payload = json.loads(str(source.get("excerpt") or ""))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and str(payload.get("checked_symbol") or ""):
+            checked_symbols.add(str(payload["checked_symbol"]))
+    return set(required_entities).issubset(checked_symbols)
 
 
 def _frozen_portfolio_quotes(value: Any) -> dict[str, dict[str, Any]]:

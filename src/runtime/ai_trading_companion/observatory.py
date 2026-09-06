@@ -48,6 +48,14 @@ class ExperimentRequest:
 
 
 @dataclass(frozen=True)
+class SourceHealthRequest:
+    observed_at: str
+    cycle_id: str | None = None
+    lookback_days: int = 20
+    request_id: str | None = None
+
+
+@dataclass(frozen=True)
 class SnapshotQuery:
     snapshot_kind: str | None = None
     task_key: str | None = None
@@ -227,6 +235,20 @@ class ExperimentAssessment(ObservatorySnapshot):
     evidence_maturity: EvidenceMaturity
     decision: str
     decision_reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SourceHealthSnapshot(ObservatorySnapshot):
+    snapshot_version: int
+    observed_at: str
+    lookback_days: int
+    sample_count: int
+    samples: tuple[dict[str, Any], ...]
+    routes: tuple[dict[str, Any], ...]
+    alerts: tuple[dict[str, Any], ...]
+    candidates: tuple[dict[str, Any], ...]
+    policy_mutation_allowed: bool
+    policy_change_authority: str
 
 
 @dataclass(frozen=True)
@@ -596,6 +618,274 @@ class EvaluationObservatory:
             raise ValueError("unknown observatory snapshot")
         return self._decode_snapshot(row["snapshot_kind"], row["payload_json"])
 
+    def source_health(self, request: SourceHealthRequest) -> SourceHealthSnapshot:
+        observed = _parse(request.observed_at)
+        if not 1 <= request.lookback_days <= 365:
+            raise ValueError("source health lookback must be between 1 and 365 days")
+        window_start = observed - timedelta(days=request.lookback_days)
+        clauses, values = [], []
+        if request.cycle_id is not None:
+            clauses.append("a.cycle_id=?")
+            values.append(request.cycle_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.store.connection() as connection:
+            rows = [dict(row) for row in connection.execute(
+                f"""SELECT a.attempt_id,a.cycle_id,a.stage,a.status,a.started_at,a.completed_at,
+                           a.error,a.verifier_json,a.tool_trace_json,c.task_key,c.scheduled_for
+                      FROM llm_attempt a JOIN companion_cycle c ON c.cycle_id=a.cycle_id
+                      {where}
+                  ORDER BY a.started_at,a.attempt_id""",
+                values,
+            )]
+
+        samples: list[dict[str, Any]] = []
+        alerts: list[dict[str, Any]] = []
+        for attempt in rows:
+            verifier = self._json_object(attempt.get("verifier_json"))
+            gate = verifier.get("evidence_gate") if isinstance(verifier.get("evidence_gate"), dict) else {}
+            problems = tuple(str(item) for item in gate.get("problems") or ())
+            gap_states = {
+                str(item.get("requirement_key")): str(item.get("coverage_state") or "unknown")
+                for item in gate.get("gap_states") or () if isinstance(item, dict) and item.get("requirement_key")
+            }
+            trace_rows = self._json_list(attempt.get("tool_trace_json"))
+            for index, trace in enumerate(trace_rows):
+                if not isinstance(trace, dict):
+                    continue
+                called_at = str(trace.get("started_at") or trace.get("occurred_at") or attempt["started_at"])
+                try:
+                    called = _parse(called_at)
+                except (TypeError, ValueError):
+                    continue
+                if called < window_start or called > observed:
+                    continue
+                arguments = trace.get("arguments") if isinstance(trace.get("arguments"), dict) else {}
+                fact_type = str(
+                    arguments.get("requirement_key") or trace.get("requirement_key")
+                    or trace.get("fact_type") or "unspecified"
+                )
+                operation = str(trace.get("operation") or trace.get("tool") or "unknown")
+                backend = str(trace.get("backend") or trace.get("provider") or "unknown")
+                status = str(trace.get("status") or attempt.get("status") or "unknown")
+                error_category = trace.get("tool_error_code") or trace.get("error_category")
+                coverage = str(trace.get("coverage_level") or gap_states.get(fact_type) or "unknown")
+                latency = self._trace_latency_seconds(trace, called)
+                sources = tuple(sorted({
+                    str(item.get("source_identity") or item.get("canonical_url") or item.get("url"))
+                    for item in trace.get("evidence_items") or ()
+                    if isinstance(item, dict) and (item.get("source_identity") or item.get("canonical_url") or item.get("url"))
+                }))
+                observation_id = str(
+                    trace.get("observation_id") or trace.get("event_id")
+                    or f"{attempt['attempt_id']}:{index}"
+                )
+                sample = {
+                    "sample_id": observation_id,
+                    "attempt_id": attempt["attempt_id"],
+                    "cycle_id": attempt["cycle_id"],
+                    "task_key": attempt["task_key"],
+                    "stage": attempt["stage"],
+                    "trading_date": str(attempt["scheduled_for"])[:10],
+                    "fact_type": fact_type,
+                    "called_at": called_at,
+                    "backend": backend,
+                    "operation": operation,
+                    "status": status,
+                    "error_category": str(error_category) if error_category else None,
+                    "latency_seconds": latency,
+                    "coverage_level": coverage,
+                    "browser_used": "browser" in operation.lower() or "browser" in backend.lower(),
+                    "qualification_passed": bool(gate.get("passed")) if "passed" in gate else verifier.get("passed"),
+                    "qualification_reasons": problems,
+                    "conflict_detected": any("conflict" in problem for problem in problems),
+                    "source_identities": sources,
+                }
+                samples.append(sample)
+                if trace.get("prompt_injection_detected"):
+                    alerts.append({
+                        "kind": "prompt_injection_attempt", "severity": "warning",
+                        "sample_id": observation_id, "fact_type": fact_type,
+                        "blocked": bool(trace.get("prompt_injection_blocked")),
+                    })
+                if trace.get("prompt_injection_succeeded"):
+                    alerts.append({
+                        "kind": "prompt_injection_succeeded", "severity": "critical",
+                        "sample_id": observation_id, "fact_type": fact_type,
+                    })
+                if trace.get("false_complete") or any(
+                    marker in problem
+                    for problem in problems
+                    for marker in (
+                        "checked_no_change", "lacks_distribution", "fund_flow_scope_invalid",
+                        "conflict", "untraceable",
+                    )
+                ):
+                    alerts.append({
+                        "kind": "false_negative_or_completeness", "severity": "critical",
+                        "sample_id": observation_id, "fact_type": fact_type,
+                        "reasons": problems,
+                    })
+
+        samples.sort(key=lambda item: (_parse(str(item["called_at"])), str(item["sample_id"])))
+        grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for sample in samples:
+            key = (str(sample["fact_type"]), str(sample["backend"]), str(sample["operation"]))
+            grouped.setdefault(key, []).append(sample)
+
+        routes: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
+        for (fact_type, backend, operation), route_samples in sorted(grouped.items()):
+            successes = [item for item in route_samples if item["status"] == "succeeded"]
+            failures = [item for item in route_samples if item["status"] != "succeeded"]
+            qualified = [item for item in route_samples if item["qualification_passed"] is True]
+            browser_days = sorted({str(item["trading_date"]) for item in route_samples if item["browser_used"]})
+            success_rate = len(successes) / len(route_samples)
+            parser_stability = len(qualified) / len(successes) if successes else 0.0
+            split = max(1, len(route_samples) // 2)
+            older, recent = route_samples[:split], route_samples[split:]
+            older_success = sum(item["status"] == "succeeded" for item in older) / len(older)
+            recent_success = sum(item["status"] == "succeeded" for item in recent) / len(recent) if recent else older_success
+            older_qualified_successes = [item for item in older if item["status"] == "succeeded"]
+            recent_qualified_successes = [item for item in recent if item["status"] == "succeeded"]
+            older_parser = (
+                sum(item["qualification_passed"] is True for item in older_qualified_successes)
+                / len(older_qualified_successes)
+                if older_qualified_successes else 0.0
+            )
+            recent_parser = (
+                sum(item["qualification_passed"] is True for item in recent_qualified_successes)
+                / len(recent_qualified_successes)
+                if recent_qualified_successes else 0.0
+            )
+            significant_decline = len(route_samples) >= 6 and (
+                recent_success <= older_success - .25 or recent_parser <= older_parser - .25
+            )
+            route = {
+                "fact_type": fact_type, "backend": backend, "operation": operation,
+                "attempts": len(route_samples), "successes": len(successes), "failures": len(failures),
+                "qualification_rejections": len(route_samples) - len(qualified),
+                "success_rate": success_rate, "parser_stability": parser_stability,
+                "older_success_rate": older_success, "recent_success_rate": recent_success,
+                "older_parser_stability": older_parser, "recent_parser_stability": recent_parser,
+                "significant_decline": significant_decline,
+                "browser_trading_days": tuple(browser_days),
+                "p50_latency_seconds": self._median([
+                    float(item["latency_seconds"]) for item in route_samples
+                    if item["latency_seconds"] is not None
+                ]),
+            }
+            routes.append(route)
+            failure_days = sorted({str(item["trading_date"]) for item in failures})
+            if len(failure_days) >= 3:
+                alerts.append({
+                    "kind": "repeated_route_failure", "severity": "warning", "fact_type": fact_type,
+                    "backend": backend, "operation": operation, "trading_dates": tuple(failure_days),
+                })
+            if len(route_samples) >= 5 and (significant_decline or success_rate < .6 or parser_stability < .8):
+                candidates.append({
+                    "kind": "route_downgrade", "state": "isolated_candidate",
+                    "promotion_allowed": False, "required_owner": "versioned_source_policy_owner",
+                    "fact_type": fact_type, "backend": backend, "operation": operation,
+                    "sample_ids": tuple(str(item["sample_id"]) for item in route_samples),
+                    "failure_boundaries": tuple(sorted({
+                        str(item["error_category"] or item["coverage_level"]) for item in failures
+                    })),
+                    "reason": "significant_decline" if significant_decline else "low_route_health",
+                })
+            temporary_route = (
+                any(item["browser_used"] for item in route_samples)
+                or operation in {"web_search", "web_read"}
+            )
+            success_days = sorted({str(item["trading_date"]) for item in successes})
+            if temporary_route and len(success_days) >= 3:
+                candidates.append({
+                    "kind": "formal_adapter", "candidate_version": 1,
+                    "state": "isolated_candidate", "promotion_allowed": False,
+                    "required_owner": "versioned_source_policy_owner",
+                    "required_receipt_fields": (
+                        "old_version", "new_version", "applicable_scope", "idempotency_key", "execution_receipt",
+                    ),
+                    "fact_type": fact_type,
+                    "source_identity": tuple(sorted({
+                        source for item in successes for source in item["source_identities"]
+                    })),
+                    "parsing_rule": {"backend": backend, "operation": operation},
+                    "historical_sample_ids": tuple(str(item["sample_id"]) for item in successes),
+                    "failure_boundaries": tuple(sorted({
+                        str(item["error_category"] or item["coverage_level"]) for item in failures
+                    })),
+                    "evidence_note": "Repeated success creates a candidate only; fixed counts never promote it.",
+                })
+
+        facts = {
+            "request": asdict(request), "samples": samples, "routes": routes,
+            "alerts": alerts, "candidates": candidates,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(facts, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        ).hexdigest()
+        scope_key = f"{request.cycle_id or '*'}|{request.observed_at}|{request.lookback_days}"
+        existing = self._request_snapshot(request.request_id, "source_health", scope_key, fingerprint)
+        if existing is not None:
+            if not isinstance(existing, SourceHealthSnapshot):
+                raise ValueError("request id resolved to an incompatible snapshot")
+            return existing
+        snapshot = SourceHealthSnapshot(
+            snapshot_id=str(uuid.uuid4()), snapshot_kind="source_health", created_at=_now(),
+            source_fingerprint=fingerprint, snapshot_version=1, observed_at=request.observed_at,
+            lookback_days=request.lookback_days, sample_count=len(samples), samples=tuple(samples),
+            routes=tuple(routes), alerts=tuple(alerts), candidates=tuple(candidates),
+            policy_mutation_allowed=False, policy_change_authority="versioned_source_policy_owner",
+        )
+        stored = self._append_snapshot(
+            snapshot, task_key=None, cycle_id=request.cycle_id,
+            request_id=request.request_id, scope_key=scope_key,
+        )
+        if not isinstance(stored, SourceHealthSnapshot):
+            raise ValueError("request id resolved to an incompatible snapshot")
+        return stored
+
+    @staticmethod
+    def _json_object(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        try:
+            decoded = json.loads(value or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
+    @staticmethod
+    def _json_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        try:
+            decoded = json.loads(value or "[]")
+        except (TypeError, json.JSONDecodeError):
+            return []
+        return decoded if isinstance(decoded, list) else []
+
+    @staticmethod
+    def _trace_latency_seconds(trace: dict[str, Any], started: datetime) -> float | None:
+        if isinstance(trace.get("latency_ms"), (int, float)):
+            return max(0.0, float(trace["latency_ms"]) / 1000.0)
+        if not trace.get("completed_at"):
+            return None
+        try:
+            return max(0.0, (_parse(str(trace["completed_at"])) - started).total_seconds())
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _median(values: list[float]) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) / 2.0
+
     @staticmethod
     def _decode_snapshot(snapshot_kind: str, payload_json: str) -> ObservatorySnapshot:
         payload = json.loads(payload_json)
@@ -647,6 +937,13 @@ class EvaluationObservatory:
             payload["evidence_maturity"] = EvidenceMaturity(**payload["evidence_maturity"])
             payload["decision_reasons"] = tuple(payload.get("decision_reasons") or ())
             return ExperimentAssessment(**payload)
+        if snapshot_kind == "source_health":
+            payload.setdefault("snapshot_version", 1)
+            payload["samples"] = tuple(payload.get("samples") or ())
+            payload["routes"] = tuple(payload.get("routes") or ())
+            payload["alerts"] = tuple(payload.get("alerts") or ())
+            payload["candidates"] = tuple(payload.get("candidates") or ())
+            return SourceHealthSnapshot(**payload)
         raise ValueError(f"unsupported snapshot kind: {snapshot_kind}")
 
     def query(self, query: SnapshotQuery) -> Sequence[SnapshotSummary]:

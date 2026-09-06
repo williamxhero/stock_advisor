@@ -878,6 +878,9 @@ class CompanionEngine:
             return f"{stage} 返回内容未通过本地判断质量校验，本次结果未发布；具体拒绝项已保留在本地审计记录中。"
         if not details:
             return cls._user_fault_message(reason, stage)
+        public_failure = str(details.get("public_failure_message") or "").strip()
+        if public_failure:
+            return f"{stage} 未发布：{public_failure}"
         missing = "、".join(str(item) for item in details.get("missing_requirements") or []) or "关键事实覆盖"
         backends = "、".join(str(item) for item in details.get("attempted_backends") or []) or "未取得可用后端结果"
         boundary = str(details.get("safe_boundary") or "no_trading_action_qualified")

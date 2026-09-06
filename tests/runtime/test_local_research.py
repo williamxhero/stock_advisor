@@ -1296,6 +1296,139 @@ print(json.dumps({'contract':'ai-trading-tool-result/v1','fact_as_of':'2026-08-2
             self.assertFalse(result.qualified)
             self.assertEqual("evidence_insufficient", result.stage_failures[0]["category"])
 
+    def test_exhausted_research_returns_traceable_gap_and_truthful_public_boundary(self) -> None:
+        contract = {
+            "version": 4,
+            "as_of": CONTRACT["as_of"],
+            "requirements": [
+                {
+                    "key": "market_breadth",
+                    "blocking": True,
+                    "allowed_coverage": ["covered"],
+                    "minimum_numeric_facts": 2,
+                    "window": {
+                        "mode": "exact", "start": CONTRACT["as_of"], "end": CONTRACT["as_of"],
+                    },
+                },
+                {
+                    "key": "forum_and_sentiment",
+                    "blocking": False,
+                    "allowed_coverage": ["covered"],
+                    "window": {
+                        "mode": "after_start_to_end",
+                        "start": "2026-08-27T06:00:00Z", "end": CONTRACT["as_of"],
+                    },
+                },
+            ],
+        }
+
+        def unavailable(_operation: str, _arguments: dict) -> dict:
+            raise RuntimeError("source unavailable")
+
+        result = LocalResearchChain(
+            lambda *_args: {
+                "version": 1,
+                "operations": [{
+                    **row("web_read", url="https://example.test/breadth"),
+                    "requirement_key": "market_breadth",
+                }],
+            },
+            ReadOnlyResearchExecutor({"gateway": unavailable}),
+            max_repairs=0,
+        ).run(
+            {"stage": "m0_research", "as_of": CONTRACT["as_of"]},
+            contract,
+            attempt_id="traceable-gap",
+        )
+
+        self.assertFalse(result.qualified)
+        self.assertEqual(["market_breadth"], result.evidence["critical_gaps"])
+        gap = next(item for item in result.verifier["gap_states"] if item["requirement_key"] == "market_breadth")
+        self.assertEqual("市场宽度", gap["target_proposition"])
+        self.assertEqual(["至少 2 个数值事实"], gap["required_fields"])
+        self.assertEqual("missing", gap["coverage_state"])
+        self.assertEqual("routes_exhausted", gap["research_state"])
+        self.assertTrue(gap["blocking"])
+        self.assertEqual(
+            ["not_attempted", "in_progress", "routes_exhausted"],
+            [item["state"] for item in gap["transitions"]],
+        )
+        self.assertEqual(["公开搜索与网页", "结构化市场数据"], gap["attempted_source_categories"])
+        public = result.verifier["public_failure_message"]
+        self.assertIn("截至 2026-08-27T07:00:00Z", public)
+        self.assertIn("市场宽度", public)
+        self.assertIn("公开搜索与网页、结构化市场数据", public)
+        self.assertIn("其他已核验事实保持有效", public)
+        self.assertNotIn("market_breadth", public)
+        self.assertNotIn("web_read", public)
+
+    def test_research_gap_states_preserve_coverage_and_terminal_outcomes_in_frozen_bundle(self) -> None:
+        keys = ["complete", "directional", "partial", "conflicted", "permission", "exhausted", "unattempted"]
+        contract = {
+            "version": 4,
+            "as_of": CONTRACT["as_of"],
+            "requirements": [{
+                "key": key,
+                "blocking": True,
+                "allowed_coverage": ["covered"],
+                "window": {"mode": "exact", "start": CONTRACT["as_of"], "end": CONTRACT["as_of"]},
+            } for key in keys],
+        }
+
+        class CoverageGate:
+            def evaluate(self, evidence: dict, _contract: dict, observations: list, _as_of: str, **_kwargs: object) -> dict:
+                attempted = {
+                    str((item.get("arguments") or {}).get("requirement_key") or "")
+                    for item in observations
+                }
+                if not attempted:
+                    return {"passed": False, "problems": ["not_attempted"], "missing_requirements": keys}
+                missing = [key for key in keys if key != "complete"]
+                return {
+                    "passed": False,
+                    "problems": ["conflicting_fact:conflicted"],
+                    "missing_requirements": missing,
+                    "normalized_evidence": evidence,
+                }
+
+        def source(_operation: str, arguments: dict) -> dict:
+            key = str(arguments["_requirement_key"])
+            if key == "permission":
+                raise PermissionError("browser permission required")
+            if key == "exhausted":
+                raise RuntimeError("all routes unavailable")
+            payload = {"fact": key}
+            if key == "directional":
+                payload["coverage_level"] = "directional_sector"
+            return {"results": [{
+                "url": f"https://example.test/{key}",
+                "title": key,
+                "excerpt_text": json.dumps(payload),
+                "fact_as_of": CONTRACT["as_of"],
+            }]}
+
+        operations = [
+            {**row("web_read", url=f"https://example.test/{key}"), "requirement_key": key}
+            for key in keys if key != "unattempted"
+        ]
+        result = LocalResearchChain(
+            lambda *_args: {"version": 1, "operations": operations},
+            ReadOnlyResearchExecutor({"gateway": source}),
+            gate=CoverageGate(),
+            max_repairs=0,
+        ).run({"stage": "m0_research", "as_of": CONTRACT["as_of"]}, contract, attempt_id="gap-states")
+
+        states = {row["requirement_key"]: row for row in result.verifier["gap_states"]}
+        self.assertEqual("complete", states["complete"]["coverage_state"])
+        self.assertEqual("complete", states["complete"]["research_state"])
+        self.assertEqual("directional", states["directional"]["coverage_state"])
+        self.assertEqual("partial", states["partial"]["coverage_state"])
+        self.assertEqual("conflicted", states["conflicted"]["coverage_state"])
+        self.assertEqual("permission_required", states["permission"]["research_state"])
+        self.assertEqual("routes_exhausted", states["exhausted"]["research_state"])
+        self.assertEqual("not_attempted", states["unattempted"]["research_state"])
+        self.assertEqual(result.evidence["research_gaps"], json.loads(result.bundle_bytes)["research_gaps"])
+
     def test_search_listing_is_discovery_not_evidence(self) -> None:
         search = {"results": [{"url": "https://example.test/2026-08-27", "title": "收盘", "excerpt_text": "2026-08-27", "fact_as_of": "2026-08-27T07:00:00Z"}]}
         plan = {"version": 1, "operations": [row("web_search", query="收盘")]}

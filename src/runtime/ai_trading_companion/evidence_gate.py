@@ -377,6 +377,8 @@ class _EvidenceGateV3:
                 flow_facts = self._market_fund_flow_facts(bound)
                 if len(flow_facts) < int(requirement.get("minimum_numeric_facts") or 0):
                     problems.append(f"blocking_requirement_lacks_numeric_facts:{key}"); missing.append(key)
+                elif not self._market_fund_flow_scope_valid(bound):
+                    problems.append(f"blocking_requirement_fund_flow_scope_invalid:{key}"); missing.append(key)
                 continue
             if key == "weekly_market_history":
                 weekly_facts = self._weekly_market_history_facts(bound, required_entities)
@@ -640,6 +642,52 @@ class _EvidenceGateV3:
                         and not isinstance(row.get("net_inflow"), bool)
                     )
         return found
+
+    @staticmethod
+    def _market_fund_flow_scope_valid(sources: list[dict[str, Any]]) -> bool:
+        for source in sources:
+            try:
+                payload = json.loads(str(source.get("excerpt") or ""))
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if isinstance(payload.get("combined"), dict):
+                return True
+            if payload.get("coverage_level") != "directional_sector":
+                continue
+            leaders = payload.get("sector_inflow_leaders")
+            outflows = payload.get("sector_outflow_leaders")
+            limitations = {str(value) for value in payload.get("limitations") or []}
+            if (
+                payload.get("currency") != "CNY" and payload.get("unit") != "CNY"
+                or not isinstance(leaders, list) or len(leaders) < 3
+                or not isinstance(outflows, list) or not outflows
+                or not {"full_market_net_flow_unavailable", "order_size_breakdown_unavailable"}.issubset(limitations)
+                or "combined" in payload or "markets" in payload
+            ):
+                continue
+            try:
+                valid_leaders = all(
+                    isinstance(row, dict)
+                    and str(row.get("name") or "").strip()
+                    and row.get("direction") == "inflow"
+                    and isinstance(row.get("rank"), int) and not isinstance(row.get("rank"), bool)
+                    and float(row.get("net_inflow")) > 0
+                    for row in leaders
+                )
+                valid_outflows = all(
+                    isinstance(row, dict)
+                    and str(row.get("name") or "").strip()
+                    and row.get("direction") == "outflow"
+                    and isinstance(row.get("rank"), int) and not isinstance(row.get("rank"), bool)
+                    for row in outflows
+                )
+            except (TypeError, ValueError):
+                continue
+            if valid_leaders and valid_outflows:
+                return True
+        return False
 
     @staticmethod
     def _sector_distribution_complete(sources: list[dict[str, Any]]) -> bool:

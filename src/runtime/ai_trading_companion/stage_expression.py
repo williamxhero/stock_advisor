@@ -418,7 +418,7 @@ def _verified_market_event_impact(parsed: list[dict[str, Any]]) -> str:
         for sentence in re.split(r"[。；\n]", content):
             compact = "".join(sentence.split())
             if "风险偏好" in compact and any(term in compact for term in ("压制", "支撑", "影响", "扰动")):
-                return "政策与风险事件：" + compact + "。"
+                return "政策与风险事件（影响推断）：" + compact + "。"
     for item in parsed:
         title = str(item.get("title") or "").strip()
         content = str(item.get("content") or "")

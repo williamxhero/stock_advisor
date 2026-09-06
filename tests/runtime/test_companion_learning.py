@@ -535,14 +535,27 @@ class CompanionLearningTests(unittest.TestCase):
                 "行业分布上，消费板块领涨、科技板块领跌。",
                 "主力资金方向显示数字人净流入52.81亿元，电子板块净流出。",
                 "逐股公告核查：000997新大陆、002891中宠股份均未发现改变判断的披露。",
-            ], "risks": ["政策与风险事件核查后，相关变化对下周风险偏好有压制影响。"]},
+            ], "risks": ["政策与风险事件核查后，相关变化可能对下周风险偏好形成压制，属于影响推断。"]},
         }
+        directional_without_boundary = CognitiveRouter().verify("m1_judgment", packet, complete_output)
+        complete_output["semantic"]["key_evidence"].append(
+            "该证据仅代表板块资金方向，不能代表全市场净额，也不包含大中小单拆分。"
+        )
         complete = CognitiveRouter().verify("m1_judgment", packet, complete_output)
+        overclaimed_output = json.loads(json.dumps(complete_output, ensure_ascii=False))
+        overclaimed_output["semantic"]["key_evidence"].append("全市场主力净流入52.81亿元。")
+        overclaimed = CognitiveRouter().verify("m1_judgment", packet, overclaimed_output)
+        event_as_fact_output = json.loads(json.dumps(complete_output, ensure_ascii=False))
+        event_as_fact_output["semantic"]["risks"] = ["政策与风险事件已经压制下周风险偏好。"]
+        event_as_fact = CognitiveRouter().verify("m1_judgment", packet, event_as_fact_output)
 
         self.assertIn("weekend_review_lacks_sector_distribution", omitted["problems"])
         self.assertIn("weekend_review_lacks_fund_flow_direction", omitted["problems"])
         self.assertIn("weekend_review_lacks_market_event_impact", omitted["problems"])
         self.assertIn("weekend_review_lacks_portfolio_announcement_checks", omitted["problems"])
+        self.assertIn("weekend_review_lacks_directional_fund_flow_boundary", directional_without_boundary["problems"])
+        self.assertIn("weekend_review_overclaims_directional_fund_flow", overclaimed["problems"])
+        self.assertIn("weekend_review_event_impact_not_marked_as_inference", event_as_fact["problems"])
         self.assertTrue(complete["passed"], complete["problems"])
         complete_text = normalize_stage_output("m1_judgment", complete_output).text
         self.assertIn("主力资金方向", complete_text)

@@ -27,6 +27,27 @@ _RESULT_CONTRACT = "ai-trading-tool-result/v1"
 _SHANGHAI = timezone(timedelta(hours=8))
 
 
+def _contains_access_restricted_url(value: Any) -> bool:
+    """Reject credential and login URLs before an external tool process starts."""
+    if isinstance(value, dict):
+        return any(_contains_access_restricted_url(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_access_restricted_url(item) for item in value)
+    if not isinstance(value, str):
+        return False
+    parsed = urlsplit(value.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    lowered = value.lower()
+    return bool(
+        parsed.username
+        or parsed.password
+        or any(marker in lowered for marker in (
+            "/login", "/signin", "/auth", "password=", "token=", "cookie=", "apikey=", "api_key=",
+        ))
+    )
+
+
 class ToolLookupError(ValueError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
@@ -266,6 +287,8 @@ class ToolRunner:
             return EvidenceResolution.failed(request.capability, getattr(exc, "code", str(exc)))
         if find_secrets(json.dumps(wire_request, ensure_ascii=False, sort_keys=True)):
             return EvidenceResolution.failed(request.capability, "tool_secret_rejected", tool_version=tool.version)
+        if _contains_access_restricted_url(request.inputs):
+            return EvidenceResolution.failed(request.capability, "tool_access_restricted", tool_version=tool.version)
         if not self.artifacts.can_accept_new_call():
             return EvidenceResolution.failed(request.capability, "tool_archive_capacity_exceeded", tool_version=tool.version)
 

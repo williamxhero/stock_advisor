@@ -422,7 +422,7 @@ class ToolRunnerTests(unittest.TestCase):
             ensure_builtin_tools(root)
 
             result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
-                1, "generic_web_read", "2026-09-01T01:30:00Z", 2.0,
+                1, "generic_web_read", "2026-09-01T01:30:00Z", 0.001,
                 {"url": "https://example.test/login"},
             ))
 

@@ -475,6 +475,36 @@ Protocol: OpportunityDiscovery-v1.3
             attempt_id=self.qualified("m2", packet_hash, output={"m2_markdown": text}), packet_hash=packet_hash,
         )
 
+    def test_recovered_m1_records_internal_event_without_an_extra_ai_message(self):
+        self.ready()
+        cycle_id = self.cycle["cycle_id"]
+        self.engine.command({"command_id": "skip-for-retry", "cycle_id": cycle_id, "type": "skip_h0"})
+        failed_ids = []
+        for status in ("failed", "timed_out"):
+            attempt = self.store.begin_attempt(cycle_id, "m1_judgment", iso(self.now), status)
+            self.store.finish_attempt(attempt["attempt_id"], status)
+            failed_ids.append(attempt["attempt_id"])
+        with patch.object(self.engine.memory, "append", wraps=self.engine.memory.append) as append:
+            result = self.publish_m1("我倾向先观察承接，再决定是否增加风险。")
+        self.assertEqual("complete", result["state"])
+        self.assertEqual(["m1"], [call.args[0]["metadata"]["kind"] for call in append.call_args_list])
+        self.assertIsNone(self.store.latest_artifact(cycle_id, "recovery"))
+        events = self.store.pending_events()
+        self.assertFalse(any(event["event_type"] == "m1.recovered" for event in events))
+        recovered = [event for event in events if event["event_type"] == "m1.retry_succeeded"]
+        self.assertEqual(1, len(recovered))
+        payload = json.loads(recovered[0]["payload_json"])
+        self.assertCountEqual(failed_ids, payload["prior_failed_attempt_ids"])
+        self.assertNotIn("message", payload)
+        self.assertNotIn("m1.retry_succeeded", published_event_types())
+        # Restart/replay must not revive the retired recovery publication path.
+        self.store = CompanionStore(Path(self.temp.name) / "companion.sqlite3")
+        self.engine = CompanionEngine(self.store, memory=self.engine.memory)
+        with self.assertRaisesRegex(ValueError, "formal M1 already exists"):
+            self.publish_m1("我倾向先观察承接，再决定是否增加风险。")
+        self.assertIsNone(self.store.latest_artifact(cycle_id, "recovery"))
+        self.assertEqual(1, sum(event["event_type"] == "m1.retry_succeeded" for event in self.store.pending_events()))
+
     def stage(self, command_id: str, text: str) -> dict:
         return self.engine.command({
             "command_id": command_id,

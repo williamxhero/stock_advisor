@@ -660,10 +660,10 @@ class CompanionEngine:
         if snapshot is not None and verified_output.get("snapshot") is not None and snapshot != verified_output.get("snapshot"):
             raise ValueError("M1 snapshot does not match the verified judgment attempt")
         verifier = json.loads(judgment_attempt.get("verifier_json") or "{}")
-        recovered = (
-            not bool(verifier.get("fallback"))
-            and any(attempt["status"] in {"failed", "timed_out"} for attempt in self.store.attempts(cycle_id))
-        )
+        prior_failed_attempt_ids = [
+            attempt["attempt_id"] for attempt in self.store.attempts(cycle_id)
+            if attempt["status"] in {"failed", "timed_out"}
+        ]
         if self.store.latest_artifact(cycle_id, "m1"):
             raise ValueError("formal M1 already exists")
         if cycle["state"] not in {"researching_m1", "judging_m1", "m1_retry_wait"}:
@@ -692,21 +692,15 @@ class CompanionEngine:
             )
             if next_state == "synthesizing_m2":
                 self.store.queue_event(cycle_id, "m2.started", {"cycle": cycle}, connection=connection)
-        if recovered:
-            recovery = self.present_for_publication(
-                "刚才因为运行配置问题有些延迟，现在已经修复并重新完成；最后的判断来自修复后的完整流程。",
-                cycle["as_of"], "recovery",
-            )
-            self._append_published_memory(cycle, recovery)
-            recovery_artifact = self.store.append_artifact(
-                cycle_id, "recovery", "system", recovery.markdown, cycle["as_of"],
-                self._presentation_metadata({}, recovery),
-            )
-            self.emit(cycle, "m1.recovered", {
-                "cycle": cycle,
-                "message": recovery.message(),
-                "source_artifact_id": recovery_artifact["artifact_id"],
-            })
+            if prior_failed_attempt_ids:
+                # Recovery is execution telemetry, not another AI utterance.
+                # Keep real attempt references without guessing the fault cause.
+                self.store.queue_event(cycle_id, "m1.retry_succeeded", {
+                    "prior_failed_attempt_ids": prior_failed_attempt_ids,
+                    "judgment_attempt_id": judgment_attempt_id,
+                    "source_artifact_id": artifact["artifact_id"],
+                    "fallback": bool(verifier.get("fallback")),
+                }, connection=connection)
         try:
             self._publish_manual_analysis_completion(cycle, presented.markdown)
         except Exception:

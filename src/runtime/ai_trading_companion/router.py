@@ -291,6 +291,7 @@ class CognitiveRouter:
                 for item in positions
             ):
                 problems.append("judgment_position_priority_is_cost_anchored")
+            problems.extend(_qualified_reply_acquisition_gap_problems(semantic))
             if stage == "m1_judgment":
                 problems.extend(_close_review_coverage_problems(packet, semantic))
                 problems.extend(_weekend_review_coverage_problems(packet, semantic))
@@ -331,7 +332,8 @@ def _close_review_coverage_problems(packet: dict[str, Any], semantic: dict[str, 
         problems.append("close_review_lacks_theme_leaders_and_laggards")
     if not (
         any(term in compact for term in ("论坛", "讨论热度", "传播", "市场情绪", "情绪"))
-        and any(term in compact for term in ("数据", "证据", "热度", "替代", "未取得", "缺少"))
+        and any(term in compact for term in ("市场宽度", "广度", "上涨家数", "下跌家数", "涨跌停", "传播", "讨论热度"))
+        and any(term in compact for term in ("偏强", "偏弱", "分化", "风险偏好", "验证", "支持", "显示"))
     ):
         problems.append("close_review_lacks_forum_or_sentiment_substitute")
 
@@ -370,6 +372,11 @@ def _weekend_review_coverage_problems(packet: dict[str, Any], semantic: dict[str
     ]
     body = " ".join(str(value or "") for value in fields)
     compact = "".join(body.split())
+    fund_flow_compact = "".join(
+        "".join(str(value or "").split())
+        for value in fields
+        if any(marker in str(value or "") for marker in ("资金流", "主力资金", "净流入", "净流出"))
+    )
     weekly = verified_weekly_market_comparison(packet)
     problems: list[str] = []
     if weekly is None:
@@ -422,14 +429,12 @@ def _weekend_review_coverage_problems(packet: dict[str, Any], semantic: dict[str
             directional_fund_flow = True
             break
     if directional_fund_flow:
-        has_boundary = (
-            any(term in compact for term in ("仅代表板块", "只覆盖板块", "仅覆盖板块", "当前只覆盖板块"))
-            and "全市场净额" in compact
-            and any(term in compact for term in ("不能代表", "未取得", "不可得", "无法支持"))
-            and any(term in compact for term in ("大中小单", "大小单", "订单规模拆分"))
-        )
-        if not has_boundary:
-            problems.append("weekend_review_lacks_directional_fund_flow_boundary")
+        has_interpretation = any(term in fund_flow_compact for term in (
+            "结构性分化", "板块轮动", "题材轮动", "资金偏向", "资金集中", "方向承压", "电子承压",
+            "科技承压", "而非普遍", "不应外推",
+        ))
+        if not has_interpretation:
+            problems.append("weekend_review_lacks_directional_fund_flow_interpretation")
         if (
             re.search(r"全市场[^。；]{0,18}(?:净流入|净流出)[^。；]{0,8}\d", compact)
             or re.search(r"(?:超大单|大单|中单|小单)[^。；]{0,12}(?:净流入|净流出)[^。；]{0,8}\d", compact)
@@ -493,6 +498,36 @@ def _weekend_review_coverage_problems(packet: dict[str, Any], semantic: dict[str
         ):
             problems.append("weekend_review_overclaims_unverified_announcement_title")
     return problems
+
+
+def _qualified_reply_acquisition_gap_problems(semantic: dict[str, Any]) -> list[str]:
+    """Keep source acquisition diagnostics out of a qualified trading judgment."""
+    if semantic.get("qualified") is not True:
+        return []
+    fields = [
+        semantic.get("summary"), *(semantic.get("key_evidence") or []),
+        *(item.get("reason") for item in semantic.get("position_focus") or [] if isinstance(item, dict)),
+        *(
+            item.get(key)
+            for item in semantic.get("transition_conditions") or [] if isinstance(item, dict)
+            for key in ("price", "breadth", "persistence")
+        ),
+        *(semantic.get("risks") or []), *(semantic.get("unknowns") or []),
+    ]
+    body = "".join(str(value or "") for value in fields)
+    acquisition_objects = "数据|证据|资料|检索结果|查询结果|净额|拆分|明细|序列|行情|公告覆盖|论坛传播"
+    acquisition_patterns = (
+        rf"(?:仍|尚|当前|本次)?未(?:取得|获取|获得|提供|覆盖|查到)[^。；]{{0,24}}(?:{acquisition_objects})",
+        rf"(?:仍|尚|还)?(?:没有|没)(?:取得|获取|获得|拿到|查到|覆盖)[^。；]{{0,24}}(?:{acquisition_objects})",
+        rf"(?:当前|目前|本次)?(?:没有|没|缺少|缺失)[^。；]{{0,24}}(?:{acquisition_objects})",
+        r"(?:当前|目前|本次)?(?:只|仅)(?:能)?覆盖[^。；]{0,20}(?:板块方向|部分板块|数据|字段|范围)",
+        rf"(?:{acquisition_objects})[^。；]{{0,24}}(?:未取得|未获取|未获得|未提供|未覆盖|未查到|缺失|不完整|不可得|无法获取|不包含|拿不到)",
+        rf"(?:无法|不能)[^。；]{{0,8}}(?:取得|获取|获得)[^。；]{{0,12}}(?:{acquisition_objects})",
+        rf"(?:等|待|在)?(?:拿到|取得|获取|获得|补齐|查到)[^。；]{{0,12}}(?:{acquisition_objects})",
+    )
+    if any(re.search(pattern, body) for pattern in acquisition_patterns):
+        return ["qualified_reply_exposes_noncritical_acquisition_gap"]
+    return []
 
 
 def _portfolio_entity_aliases(packet: dict[str, Any]) -> dict[str, tuple[str, ...]]:

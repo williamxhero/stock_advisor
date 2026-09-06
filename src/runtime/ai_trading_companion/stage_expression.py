@@ -335,9 +335,13 @@ def _verified_close_judgment(
         f"{laggard.get('name')}板块领跌{number(laggard.get('change_percent'))}%，核心"
         f"{laggard_core.get('name')}({laggard_core.get('symbol')}){number(laggard_core.get('change_percent'))}%"
     )
+    breadth_view = (
+        "风险偏好偏弱" if float(breadth.get("down") or 0) > float(breadth.get("up") or 0)
+        else "风险偏好偏强" if float(breadth.get("up") or 0) > float(breadth.get("down") or 0)
+        else "多空分歧较大"
+    )
     theme_and_sentiment = (
-        f"东方财富15:00板块数据：{themes}；未取得可独立核验的论坛传播数据，"
-        f"以{breadth_text}作为市场情绪替代证据。"
+        f"东方财富15:00板块数据：{themes}；市场情绪用广度验证：{breadth_text}，{breadth_view}。"
     )
     holdings = "、".join(
         f"{quote_by_symbol[code].get('name') or code}({code}){number(quote_by_symbol[code].get('price'))}/"
@@ -367,7 +371,7 @@ def _verified_close_judgment(
                 "breadth": "下跌家数继续显著多于上涨家数", "persistence": "连续一个交易日确认",
             }],
             "position_focus": [],
-            "risks": ["放量但市场宽度偏弱，量价并未形成一致的上行确认。", "论坛传播数据缺失，情绪判断仅使用市场宽度替代证据。"],
+            "risks": ["放量但市场宽度偏弱，量价并未形成一致的上行确认。"],
             "unknowns": ["下一交易日指数、市场宽度与成交扩散能否同步改善。"],
         },
     }
@@ -407,8 +411,8 @@ def _verified_fund_flow_summary(parsed: list[dict[str, Any]]) -> str:
     )
     laggards = "、".join(str(row.get("name") or "") for row in outflows[:2] if row.get("name"))
     return (
-        f"主力资金方向：{leaders}，{laggards}为净流出领先方向；"
-        "当前只覆盖板块方向，全市场净额及大中小单拆分仍未取得。"
+        f"主力资金方向呈结构性分化：{leaders}，{laggards}为净流出领先方向；"
+        f"这更像板块轮动而非普遍回流，{laggards}方向更承压。"
     )
 
 
@@ -480,12 +484,12 @@ def safe_stage_output(
         return {
             "result_version": 4 if stage == "m1_judgment" else 3,
             "semantic": {
-                "summary": "现有可靠证据还不足以支持方向切换。",
+                "summary": "在价格、市场广度和成交扩散共同确认前，我维持观察，不切换方向。",
                 "direction": "unqualified",
                 "qualified": False,
                 "horizon": horizon,
                 "current_action": "observe",
-                "key_evidence": ["尚未取得可通过质量校验的完整判断结果。"],
+                "key_evidence": [],
                 "transition_conditions": [],
                 "position_focus": [],
                 "risks": [],
@@ -514,7 +518,13 @@ def express_stage_semantics(stage: str, semantic: dict[str, Any]) -> str:
         if unknowns:
             unknown = _sentence_piece(unknowns[0])
             if unknown.startswith("缺少"):
-                paragraphs.append("本次未取得" + unknown.removeprefix("缺少") + "。")
+                detail = unknown.removeprefix("缺少").strip()
+                fact, separator, impact = detail.partition("，")
+                if separator and impact.startswith("无法判断"):
+                    impact = "我暂不判断" + impact.removeprefix("无法判断")
+                else:
+                    impact = "我只采用不依赖它的观察"
+                paragraphs.append(f"在{fact}得到确认前，{impact}。")
             else:
                 paragraphs.append("还需要确认" + unknown + "。")
         return "\n\n".join(paragraphs)

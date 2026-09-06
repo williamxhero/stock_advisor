@@ -539,11 +539,29 @@ class CompanionLearningTests(unittest.TestCase):
                 "逐股公告核查：000997新大陆未发现新增公告；002891中宠股份披露《回购公司股份的进展公告》，内容待核验，暂不据标题改变判断。",
             ], "risks": ["政策与风险事件核查后，相关变化可能对下周风险偏好形成压制，属于影响推断。"]},
         }
-        directional_without_boundary = CognitiveRouter().verify("m1_judgment", packet, complete_output)
+        directional_without_interpretation = CognitiveRouter().verify("m1_judgment", packet, complete_output)
         complete_output["semantic"]["key_evidence"].append(
-            "该证据仅代表板块资金方向，不能代表全市场净额，也不包含大中小单拆分。"
+            "资金呈结构性分化：数字人净流入52.81亿元、电子净流出居前，说明资金偏向数字题材而电子承压；"
+            "这支持板块轮动判断，不应外推为全市场普遍回流。"
         )
         complete = CognitiveRouter().verify("m1_judgment", packet, complete_output)
+        acquisition_dump_output = json.loads(json.dumps(complete_output, ensure_ascii=False))
+        acquisition_dump_output["semantic"]["risks"].append(
+            "当前只覆盖板块方向，全市场净额及大中小单拆分仍未取得。"
+        )
+        acquisition_dump = CognitiveRouter().verify("m1_judgment", packet, acquisition_dump_output)
+        acquisition_variants = [
+            "目前只覆盖板块方向。",
+            "还没有拿到大中小单明细。",
+            "可用资料不包含全市场净额。",
+            "目前没有全市场净额数据。",
+            "缺少论坛传播证据。",
+        ]
+        acquisition_variant_results = []
+        for text in acquisition_variants:
+            variant = json.loads(json.dumps(complete_output, ensure_ascii=False))
+            variant["semantic"]["risks"].append(text)
+            acquisition_variant_results.append(CognitiveRouter().verify("m1_judgment", packet, variant))
         overclaimed_output = json.loads(json.dumps(complete_output, ensure_ascii=False))
         overclaimed_output["semantic"]["key_evidence"].append("全市场主力净流入52.81亿元。")
         overclaimed = CognitiveRouter().verify("m1_judgment", packet, overclaimed_output)
@@ -560,7 +578,13 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertIn("weekend_review_lacks_fund_flow_direction", omitted["problems"])
         self.assertIn("weekend_review_lacks_market_event_impact", omitted["problems"])
         self.assertIn("weekend_review_lacks_portfolio_announcement_checks", omitted["problems"])
-        self.assertIn("weekend_review_lacks_directional_fund_flow_boundary", directional_without_boundary["problems"])
+        self.assertIn(
+            "weekend_review_lacks_directional_fund_flow_interpretation",
+            directional_without_interpretation["problems"],
+        )
+        self.assertIn("qualified_reply_exposes_noncritical_acquisition_gap", acquisition_dump["problems"])
+        for result in acquisition_variant_results:
+            self.assertIn("qualified_reply_exposes_noncritical_acquisition_gap", result["problems"])
         self.assertIn("weekend_review_overclaims_directional_fund_flow", overclaimed["problems"])
         self.assertIn("weekend_review_event_impact_not_marked_as_inference", event_as_fact["problems"])
         self.assertIn("weekend_review_overclaims_unverified_announcement_title", title_overclaim["problems"])
@@ -576,10 +600,16 @@ class CompanionLearningTests(unittest.TestCase):
         fallback_text = normalize_stage_output("m1_judgment", fallback).text
         self.assertTrue(fallback_check["passed"], fallback_check["problems"])
         self.assertIn("主力资金方向", fallback_text)
-        self.assertIn("全市场净额及大中小单拆分仍未取得", fallback_text)
+        self.assertIn("呈结构性分化", fallback_text)
+        self.assertNotIn("仍未取得", fallback_text)
+        self.assertNotIn("数据缺失", fallback_text)
+        self.assertNotIn("未取得可独立核验", fallback_text)
         self.assertIn("政策与风险事件", fallback_text)
         self.assertIn("新大陆(000997)未发现新增公告", fallback_text)
         self.assertIn("中宠股份(002891)检出《回购公司股份的进展公告》", fallback_text)
+        prompt = _RuntimePacketBuilder.prompt(packet)
+        self.assertIn("先交付替代证据揭示的市场状态和交易含义", prompt)
+        self.assertIn("不得把未取得、未获取或数据缺失当作合格正文", prompt)
 
     def test_safe_formal_fallback_is_natural_and_conservative(self):
         m0 = normalize_stage_output("m0_compose", safe_stage_output("m0_compose"))
@@ -593,6 +623,48 @@ class CompanionLearningTests(unittest.TestCase):
             self.assertEqual("unqualified", result.snapshot["direction"])
             self.assertEqual("observe", result.snapshot["current_action"])
             self.assertNotIn("provider_candidate_not_publishable", result.text)
+
+    def test_qualified_m2_cannot_publish_acquisition_status_as_the_answer(self):
+        output = {
+            "result_version": 3,
+            "semantic": {
+                "summary": "我维持中性。",
+                "direction": "neutral",
+                "qualified": True,
+                "horizon": "下周",
+                "current_action": "observe",
+                "key_evidence": ["市场宽度偏弱。"],
+                "transition_conditions": [{
+                    "outcome": "upgrade", "price": "指数站稳",
+                    "breadth": "上涨家数占优", "persistence": "连续两个交易日",
+                }, {
+                    "outcome": "downgrade", "price": "指数跌破",
+                    "breadth": "下跌家数占优", "persistence": "连续两个交易日",
+                }],
+                "position_focus": [],
+                "risks": ["目前只覆盖板块方向。"],
+                "unknowns": [],
+            },
+        }
+
+        verdict = CognitiveRouter().verify("m2", {}, output)
+
+        self.assertIn("qualified_reply_exposes_noncritical_acquisition_gap", verdict["problems"])
+
+        output["semantic"]["risks"] = []
+        output["semantic"]["transition_conditions"][0]["persistence"] = "拿到全市场净额后"
+        condition_verdict = CognitiveRouter().verify("m2", {}, output)
+
+        self.assertIn("qualified_reply_exposes_noncritical_acquisition_gap", condition_verdict["problems"])
+
+        for market_fact in ("公司尚未取得监管审批。", "小微企业无法获取低成本融资。"):
+            output["semantic"]["transition_conditions"][0]["persistence"] = "连续两个交易日"
+            output["semantic"]["risks"] = [market_fact]
+            market_fact_verdict = CognitiveRouter().verify("m2", {}, output)
+            self.assertNotIn(
+                "qualified_reply_exposes_noncritical_acquisition_gap",
+                market_fact_verdict["problems"],
+            )
 
     def test_packet_and_verifier_reject_a_false_non_trading_day_m0(self):
         class TradingDayCalendar:

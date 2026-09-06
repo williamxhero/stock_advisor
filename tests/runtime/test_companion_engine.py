@@ -843,6 +843,11 @@ Protocol: OpportunityDiscovery-v1.3
                 "missing_requirements": ["portfolio_current_bar"],
                 "attempted_backends": ["markethub", "tencent"],
                 "safe_boundary": "no_trading_action_qualified",
+                "public_failure_message": (
+                    "截至 2026-08-25T14:30:00+08:00，已检查结构化市场数据；"
+                    "实有持仓当前行情仍缺少最新成交价与涨跌幅，因此不能支持依赖这些事实的方向判断。"
+                    "其他已核验事实保持有效。"
+                ),
             },
         )
 
@@ -851,10 +856,12 @@ Protocol: OpportunityDiscovery-v1.3
         payload = json.loads(events[0]["payload_json"])
         self.assertEqual("failed", payload["cycle"]["state"])
         text = payload["message"]["text_projection"]
-        self.assertIn("portfolio_current_bar", text)
-        self.assertIn("markethub", text)
-        self.assertIn("tencent", text)
-        self.assertIn("no_trading_action_qualified", text)
+        self.assertIn("实有持仓当前行情", text)
+        self.assertIn("结构化市场数据", text)
+        self.assertIn("其他已核验事实保持有效", text)
+        self.assertNotIn("portfolio_current_bar", text)
+        self.assertNotIn("markethub", text)
+        self.assertNotIn("no_trading_action_qualified", text)
         self.assertFalse(any(item["event_type"] in {"m0.ready", "m1.ready"} for item in self.store.pending_events()))
 
     def test_no_h0_skips_m2(self):

@@ -600,6 +600,7 @@ class ReadOnlyResearchExecutor:
         candidates = [row["backend"], *[item for item in row["fallback_backends"] if item != row["backend"]]]
         failures: list[str] = []
         resolution_failure: ToolResolutionError | None = None
+        permission_failure: Exception | None = None
         for backend in candidates:
             adapter = self.backends.get(backend)
             if adapter is None:
@@ -615,8 +616,15 @@ class ReadOnlyResearchExecutor:
                 failures.append(f"{backend}:{type(exc).__name__}")
                 if isinstance(exc, ToolResolutionError):
                     resolution_failure = exc
+                if isinstance(exc, PermissionError) or any(
+                    token in f"{type(exc).__name__}:{exc}".casefold()
+                    for token in ("permission", "forbidden", "authentication", "authorization")
+                ):
+                    permission_failure = exc
         if resolution_failure is not None:
             raise resolution_failure
+        if permission_failure is not None:
+            raise permission_failure
         raise RuntimeError("all research backends failed: " + ",".join(failures))
 
 
@@ -670,6 +678,9 @@ class LocalResearchChain:
         )
         if verifier.get("passed"):
             normalized = verifier.get("normalized_evidence") or evidence
+            gap_states = _build_gap_states(normalized, contract, observations, verifier, final=True)
+            normalized = {**normalized, "research_gaps": gap_states}
+            verifier = {**verifier, "gap_states": gap_states}
             bundle_bytes, bundle_hash = freeze_evidence_bundle(normalized)
             return FrozenResearchResult(True, normalized, verifier, observations, bundle_bytes, bundle_hash, 0)
         round_number = 0
@@ -782,24 +793,47 @@ class LocalResearchChain:
                 verifier = self.gate.evaluate(
                     evidence, contract, observations, str(packet.get("as_of") or contract.get("as_of") or ""),
                     attempt_id=attempt_id,
-                )
+            )
             if verifier.get("passed"):
                 normalized = verifier.get("normalized_evidence") or evidence
+                gap_states = _build_gap_states(normalized, contract, observations, verifier, final=True)
+                normalized = {**normalized, "research_gaps": gap_states}
+                verifier = {**verifier, "gap_states": gap_states}
                 bundle_bytes, bundle_hash = freeze_evidence_bundle(normalized)
                 return FrozenResearchResult(True, normalized, verifier, observations, bundle_bytes, bundle_hash, round_number)
             round_number += 1
             if self.max_repairs is not None and round_number > self.max_repairs:
                 break
-        bundle_bytes, bundle_hash = freeze_evidence_bundle(evidence)
+        stop_reason = "reliability_deadline" if self.deadline is not None else "configured_test_rounds"
+        gap_states = _build_gap_states(
+            evidence, contract, observations, verifier, final=True, stop_reason=stop_reason,
+        )
+        evidence = {**evidence, "research_gaps": gap_states}
+        attempted_backends = sorted({
+            str(route)
+            for item in observations
+            for route in [item.get("backend"), *(item.get("tool_attempts") or [])]
+            if str(route or "")
+        })
+        attempted_categories = sorted({
+            category for item in observations if (category := _source_category(item))
+        })
         verifier = {
             **verifier,
-            "attempted_backends": sorted({route for item in observations for route in item.get("tool_attempts", [])}),
+            "attempted_backends": attempted_backends,
+            "attempted_source_categories": attempted_categories,
+            "gap_states": gap_states,
+            "stop_reason": stop_reason,
             "safe_boundary": "no_trading_action_qualified",
+            "public_failure_message": _public_failure_message(
+                str(packet.get("as_of") or contract.get("as_of") or ""), gap_states,
+            ),
         }
+        bundle_bytes, bundle_hash = freeze_evidence_bundle(evidence)
         failure = {
             "type": "stage_failure", "stage": str(packet.get("stage") or "research"),
             "category": "evidence_insufficient",
-            "stop_reason": "reliability_deadline" if self.deadline is not None else "configured_test_rounds",
+            "stop_reason": stop_reason,
             "problems": list(verifier.get("problems") or []),
         }
         return FrozenResearchResult(False, evidence, verifier, observations, bundle_bytes, bundle_hash,
@@ -1115,9 +1149,177 @@ def _compile_evidence(packet: dict[str, Any], contract: dict[str, Any], observat
     return {
         "schema_version": 3, "as_of": str(packet.get("as_of") or contract.get("as_of") or ""),
         "spoken_summary": "本地研究证据已按冻结合同采集。", "sources": sources, "coverage": coverage,
-        "critical_gaps": [row["requirement_key"] for row in coverage if row["status"] == "missing"],
+        "critical_gaps": [
+            row["requirement_key"] for row in coverage
+            if row["status"] == "missing"
+            and bool((requirements.get(str(row["requirement_key"])) or {}).get("blocking", True))
+        ],
         "conflicts": [], "high_impact_events": [],
     }
+
+
+_PROPOSITION_LABELS = {
+    "current_market_state": "当前市场状态",
+    "indices_close": "三大指数收盘表现",
+    "turnover_compare": "两市成交额及前一交易日比较",
+    "market_breadth": "市场宽度",
+    "themes_and_capacity_cores": "行业与题材涨跌分布",
+    "market_fund_flow": "市场资金方向",
+    "forum_and_sentiment": "市场情绪与传播",
+    "weekly_market_history": "三大指数周度表现",
+    "material_events_and_counterevidence": "重要市场事件与反证",
+    "prior_judgment_changes": "既有判断变化",
+    "portfolio_market_state": "实有持仓行情",
+    "portfolio_current_bar": "实有持仓当前行情",
+    "portfolio_events_and_counterevidence": "实有持仓公告与风险事件",
+    "private_memory_context": "历史上下文",
+}
+
+
+def _required_field_descriptions(requirement: dict[str, Any]) -> list[str]:
+    fields: list[str] = []
+    numeric = int(requirement.get("minimum_numeric_facts") or 0)
+    named = int(requirement.get("minimum_named_entities") or 0)
+    entities = [str(value) for value in requirement.get("required_entities") or [] if str(value)]
+    if numeric:
+        fields.append(f"至少 {numeric} 个数值事实")
+    if named:
+        fields.append(f"至少 {named} 个具名对象")
+    if entities:
+        fields.append("覆盖对象：" + "、".join(entities))
+    if requirement.get("requires_distribution") is True:
+        fields.append("行业与题材的完整分布")
+    if requirement.get("finality"):
+        fields.append("终值口径：" + str(requirement["finality"]))
+    if requirement.get("negative_query_terms"):
+        fields.append("可回溯的否定核查")
+    return fields or ["满足证据合同的可验证事实"]
+
+
+def _source_category(observation: dict[str, Any]) -> str | None:
+    if observation.get("operation") == "web_browser":
+        return "已授权浏览器"
+    backend = str(observation.get("backend") or "")
+    if backend == "market":
+        return "结构化市场数据"
+    if backend == "gateway":
+        return "公开搜索与网页"
+    return None
+
+
+def _observation_coverage_level(observation: dict[str, Any]) -> str:
+    for item in observation.get("evidence_items") or []:
+        try:
+            payload = json.loads(str(item.get("excerpt_text") or ""))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and str(payload.get("coverage_level") or "").startswith("directional"):
+            return "directional"
+    return ""
+
+
+def _build_gap_states(
+    evidence: dict[str, Any], contract: dict[str, Any], observations: list[dict[str, Any]],
+    verifier: dict[str, Any], *, final: bool, stop_reason: str | None = None,
+) -> list[dict[str, Any]]:
+    coverage = {
+        str(row.get("requirement_key") or ""): row
+        for row in evidence.get("coverage") or [] if isinstance(row, dict)
+    }
+    missing = {str(value) for value in verifier.get("missing_requirements") or []}
+    problems = [str(value) for value in verifier.get("problems") or []]
+    conflict_keys = {
+        str(row.get("requirement_key") or "")
+        for row in evidence.get("conflicts") or [] if isinstance(row, dict)
+    }
+    states: list[dict[str, Any]] = []
+    for requirement in contract.get("requirements") or []:
+        if not isinstance(requirement, dict):
+            continue
+        key = str(requirement.get("key") or "")
+        if not key:
+            continue
+        row = coverage.get(key) or {"status": "missing", "evidence_refs": []}
+        related = [
+            item for item in observations
+            if str((item.get("arguments") or {}).get("requirement_key") or "") == key
+        ]
+        attempted_categories = sorted({
+            category for item in related if (category := _source_category(item))
+        })
+        rejection_reasons = [problem for problem in problems if key in problem]
+        rejection_reasons.extend(
+            str(item.get("tool_error_code") or item.get("error_category") or "source_failed")
+            for item in related if item.get("status") == "failed"
+        )
+        permission_required = any(
+            any(token in str(item.get(field) or "").casefold() for token in ("permission", "forbidden", "authentication", "authorization"))
+            for item in related for field in ("tool_error_code", "error_category")
+        )
+        refs = list(row.get("evidence_refs") or [])
+        if key in conflict_keys or any("conflict" in reason for reason in rejection_reasons):
+            coverage_state = "conflicted"
+        elif refs and any(_observation_coverage_level(item) == "directional" for item in related):
+            coverage_state = "directional"
+        elif refs and key in missing:
+            coverage_state = "partial"
+        elif row.get("status") in set(requirement.get("allowed_coverage") or ["covered"]) and key not in missing:
+            coverage_state = "complete"
+        else:
+            coverage_state = "missing"
+        if coverage_state == "complete":
+            research_state = "complete"
+        elif permission_required:
+            research_state = "permission_required"
+        elif not related:
+            research_state = "not_attempted"
+        elif final:
+            research_state = "routes_exhausted"
+        else:
+            research_state = "in_progress"
+        transitions = ["not_attempted"]
+        if related:
+            transitions.append("in_progress")
+        if research_state not in transitions:
+            transitions.append(research_state)
+        states.append({
+            "requirement_key": key,
+            "target_proposition": _PROPOSITION_LABELS.get(key, "关键市场事实"),
+            "required_fields": _required_field_descriptions(requirement),
+            "coverage_state": coverage_state,
+            "research_state": research_state,
+            "blocking": bool(requirement.get("blocking", True)),
+            "fact_window": dict(requirement.get("window") or {}),
+            "attempted_source_categories": attempted_categories,
+            "rejection_reasons": list(dict.fromkeys(rejection_reasons)),
+            "stop_reason": stop_reason if research_state in {"routes_exhausted", "permission_required"} else None,
+            "transitions": [
+                {"sequence": index + 1, "state": state}
+                for index, state in enumerate(transitions)
+            ],
+        })
+    return states
+
+
+def _public_failure_message(as_of: str, gap_states: list[dict[str, Any]]) -> str:
+    blocking = [
+        row for row in gap_states
+        if row.get("blocking") and row.get("coverage_state") != "complete"
+    ]
+    categories = sorted({
+        str(category) for row in blocking for category in row.get("attempted_source_categories") or []
+        if str(category)
+    })
+    checked = "、".join(categories) if categories else "当前可用来源"
+    gaps = "；".join(
+        f"{row['target_proposition']}仍缺少{'、'.join(row.get('required_fields') or ['可验证事实'])}"
+        f"（当前覆盖：{row.get('coverage_state') or 'missing'}）"
+        for row in blocking
+    ) or "关键事实覆盖仍未达到发布标准"
+    return (
+        f"截至 {as_of}，已检查{checked}；{gaps}，因此不能支持依赖这些事实的方向判断。"
+        "其他已核验事实保持有效。"
+    )
 
 
 def _operation(

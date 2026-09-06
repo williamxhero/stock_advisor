@@ -1,6 +1,7 @@
 """Deterministic qualification for current-information research outputs."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -301,6 +302,17 @@ class _EvidenceGateV3:
             if not item:
                 problems.append("source_ref_not_in_current_attempt")
                 continue
+            if evidence.get("memory_receipt_required") is True:
+                expected_hash = "sha256:" + hashlib.sha256(
+                    str(item.get("excerpt_text") or "").encode("utf-8")
+                ).hexdigest()
+                if (
+                    not str(item.get("memory_episode_id") or "")
+                    or not self._time(item.get("known_at"), "source_known_at", problems)
+                    or str(item.get("memory_content_hash") or "") != expected_hash
+                ):
+                    problems.append("source_memory_receipt_missing_or_invalid")
+                    continue
             excerpt = EvidenceGate._normalize_text(source.get("excerpt"))
             runtime_excerpt = EvidenceGate._normalize_text(item.get("excerpt_text"))
             if not excerpt or not runtime_excerpt or excerpt not in runtime_excerpt:

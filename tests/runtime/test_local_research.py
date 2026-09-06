@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import hashlib
 import json
 import sys
 import tempfile
@@ -21,6 +22,91 @@ def row(operation: str, *, query: str | None = None, url: str | None = None) -> 
     return {"requirement_key": "market", "backend": "gateway", "operation": operation, "arguments": {"query": query, "categories": "news", "url": url, "symbol": None, "render": "auto", "session_id": None, "actions": None}, "fallback_backends": []}
 
 class LocalResearchTests(unittest.TestCase):
+    def test_close_review_recovers_from_incomplete_structured_data_through_receipted_public_reads(self) -> None:
+        contract = {
+            "version": 4,
+            "as_of": CONTRACT["as_of"],
+            "requirements": [{
+                "key": "market_breadth",
+                "blocking": True,
+                "allowed_coverage": ["covered"],
+                "minimum_numeric_facts": 3,
+                "window": {"mode": "exact", "start": CONTRACT["as_of"], "end": CONTRACT["as_of"]},
+            }],
+        }
+        candidates = [
+            "https://blocked.test/breadth",
+            "https://stale.test/breadth",
+            "https://independent.test/breadth",
+        ]
+        calls: list[tuple[str, str]] = []
+        planner_packets: list[dict] = []
+
+        def source(operation: str, arguments: dict) -> dict:
+            calls.append((operation, str(arguments.get("query") or arguments.get("url") or "")))
+            if operation == "market_breadth":
+                return {"results": [{
+                    "url": "https://structured.test/breadth",
+                    "title": "incomplete breadth",
+                    "excerpt_text": json.dumps({"breadth": {"up": 100}}),
+                    "fact_as_of": CONTRACT["as_of"],
+                }]}
+            if operation == "web_search":
+                return {"results": [{"url": url, "title": url} for url in candidates]}
+            url = str(arguments["url"])
+            if url == candidates[0]:
+                raise TimeoutError("first candidate timed out")
+            fact_as_of = "2026-08-26T07:00:00Z" if url == candidates[1] else CONTRACT["as_of"]
+            return {"results": [{
+                "url": url,
+                "title": "breadth evidence",
+                "excerpt_text": json.dumps({"breadth": {"up": 3100, "down": 1900, "flat": 100}}),
+                "fact_as_of": fact_as_of,
+            }]}
+
+        def receipt(observation: dict) -> None:
+            for index, item in enumerate(observation.get("evidence_items") or []):
+                body = str(item["excerpt_text"])
+                item.update({
+                    "memory_episode_id": f"episode-{observation['observation_id']}-{index}",
+                    "known_at": observation["acquired_at"],
+                    "memory_content_hash": "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                })
+
+        def planner(packet: dict, _gaps: list[str], _round: int) -> dict:
+            planner_packets.append(packet)
+            discovered = [
+                item for item in packet.get("research_discoveries") or []
+                if item.get("url") in candidates
+            ]
+            if not discovered:
+                return {"version": 1, "operations": []}
+            self.assertTrue(all(item.get("memory_episode_id") for item in discovered))
+            self.assertTrue(all(item.get("known_at") for item in discovered))
+            self.assertTrue(all(item.get("content_sha256") for item in discovered))
+            return {"version": 1, "operations": [
+                {**row("web_read", url=str(item["url"])), "requirement_key": "market_breadth"}
+                for item in discovered
+            ]}
+
+        result = LocalResearchChain(
+            planner,
+            ReadOnlyResearchExecutor({"market": source, "gateway": source}),
+            max_repairs=2,
+            observation_registrar=receipt,
+        ).run({"stage": "m0_research", "as_of": CONTRACT["as_of"]}, contract, attempt_id="close-fallback")
+
+        self.assertTrue(result.qualified)
+        search = next(value for operation, value in calls if operation == "web_search")
+        self.assertIn("2026年08月27日", search)
+        self.assertIn("市场宽度", search)
+        self.assertIn(("web_read", candidates[0]), calls)
+        self.assertIn(("web_read", candidates[2]), calls)
+        valid = next(source for source in result.evidence["sources"] if source["url"] == candidates[2])
+        self.assertTrue(valid["memory_episode_id"].startswith("episode-"))
+        self.assertEqual(CONTRACT["as_of"], valid["fact_as_of"])
+        self.assertTrue(planner_packets)
+
     def test_weekend_history_urls_are_mandatory_reads(self) -> None:
         urls = [
             "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh000001,day,2026-08-31,2026-09-04,10,qfq",

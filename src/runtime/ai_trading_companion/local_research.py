@@ -632,12 +632,18 @@ class LocalResearchChain:
     def __init__(self, planner: Callable[[dict[str, Any], list[str], int], dict[str, Any]],
                  executor: ReadOnlyResearchExecutor, *, gate: EvidenceGate | None = None,
                  max_repairs: int | None = 2,
-                 deadline: Callable[[], float] | None = None) -> None:
+                 deadline: Callable[[], float] | None = None,
+                 observation_registrar: Callable[[dict[str, Any]], None] | None = None) -> None:
         self.planner = planner
         self.executor = executor
         self.gate = gate or EvidenceGate()
         self.max_repairs = None if max_repairs is None else max(0, int(max_repairs))
         self.deadline = deadline
+        self.observation_registrar = observation_registrar
+
+    def _register_observation(self, observation: dict[str, Any]) -> None:
+        if self.observation_registrar is not None and observation.get("evidence_items"):
+            self.observation_registrar(observation)
 
     def run(self, packet: dict[str, Any], contract: dict[str, Any], *, attempt_id: str) -> FrozenResearchResult:
         boundary = AcquisitionBoundary(attempt_id)
@@ -660,6 +666,7 @@ class LocalResearchChain:
                 )
                 _normalize_exact_close_fact_time(observation, contract, row["requirement_key"])
                 observation["backend"] = backend
+                self._register_observation(observation)
                 observations.append(observation)
             except Exception as exc:
                 failure = {
@@ -671,7 +678,10 @@ class LocalResearchChain:
                 }
                 _attach_tool_resolution_failure(failure, exc)
                 observations.append(failure)
-        evidence = _compile_evidence(packet, contract, observations)
+        evidence = _compile_evidence(
+            packet, contract, observations,
+            require_memory_receipts=self.observation_registrar is not None,
+        )
         verifier = self.gate.evaluate(
             evidence, contract, observations, str(packet.get("as_of") or contract.get("as_of") or ""),
             attempt_id=attempt_id,
@@ -750,6 +760,7 @@ class LocalResearchChain:
                     )
                     _normalize_exact_close_fact_time(observation, contract, row["requirement_key"])
                     observation["backend"] = backend
+                    self._register_observation(observation)
                     observations.append(observation)
                 except Exception as exc:
                     failure = {
@@ -761,7 +772,10 @@ class LocalResearchChain:
                     }
                     _attach_tool_resolution_failure(failure, exc)
                     observations.append(failure)
-            evidence = _compile_evidence(packet, contract, observations)
+            evidence = _compile_evidence(
+                packet, contract, observations,
+                require_memory_receipts=self.observation_registrar is not None,
+            )
             verifier = self.gate.evaluate(
                 evidence, contract, observations, str(packet.get("as_of") or contract.get("as_of") or ""),
                 attempt_id=attempt_id,
@@ -780,6 +794,7 @@ class LocalResearchChain:
                         )
                         _normalize_exact_close_fact_time(observation, contract, row["requirement_key"])
                         observation["backend"] = backend
+                        self._register_observation(observation)
                         observations.append(observation)
                     except Exception as exc:
                         observations.append({
@@ -789,7 +804,10 @@ class LocalResearchChain:
                             "arguments": {**row["arguments"], "requirement_key": row["requirement_key"]},
                             "error_category": type(exc).__name__,
                         })
-                evidence = _compile_evidence(packet, contract, observations)
+                evidence = _compile_evidence(
+                    packet, contract, observations,
+                    require_memory_receipts=self.observation_registrar is not None,
+                )
                 verifier = self.gate.evaluate(
                     evidence, contract, observations, str(packet.get("as_of") or contract.get("as_of") or ""),
                     attempt_id=attempt_id,
@@ -1114,7 +1132,10 @@ def _planner_research_scope(value: Any) -> dict[str, Any]:
     return {key: value[key] for key in allowed if key in value}
 
 
-def _compile_evidence(packet: dict[str, Any], contract: dict[str, Any], observations: list[dict[str, Any]]) -> dict[str, Any]:
+def _compile_evidence(
+    packet: dict[str, Any], contract: dict[str, Any], observations: list[dict[str, Any]], *,
+    require_memory_receipts: bool = False,
+) -> dict[str, Any]:
     sources: list[dict[str, Any]] = []
     refs_by_requirement: dict[str, list[str]] = {}
     requirements = {
@@ -1149,6 +1170,7 @@ def _compile_evidence(packet: dict[str, Any], contract: dict[str, Any], observat
     return {
         "schema_version": 3, "as_of": str(packet.get("as_of") or contract.get("as_of") or ""),
         "spoken_summary": "本地研究证据已按冻结合同采集。", "sources": sources, "coverage": coverage,
+        "memory_receipt_required": require_memory_receipts,
         "critical_gaps": [
             row["requirement_key"] for row in coverage
             if row["status"] == "missing"
@@ -1336,6 +1358,47 @@ def _operation(
     }
 
 
+def _public_gap_query(requirement_key: str, requirement: dict[str, Any]) -> str:
+    window = requirement.get("window") if isinstance(requirement.get("window"), dict) else {}
+    end = _parse_utc(window.get("end"))
+    local_date = end.astimezone(_SHANGHAI).strftime("%Y年%m月%d日") if end else "当前交易日"
+    fact_terms = {
+        "market_breadth": "上涨家数 下跌家数 平盘家数",
+        "turnover_compare": "两市成交额 前一交易日 对比",
+        "themes_and_capacity_cores": "行业 题材 领涨 领跌 分布",
+        "forum_and_sentiment": "论坛 股吧 市场情绪",
+    }.get(requirement_key, "可验证事实")
+    entities = " ".join(str(value) for value in requirement.get("required_entities") or [] if str(value))
+    return " ".join(value for value in (
+        local_date, "A股 收盘", _PROPOSITION_LABELS.get(requirement_key, "关键市场事实"), fact_terms, entities,
+    ) if value)
+
+
+def _structured_gap_search_operations(
+    requirements: dict[str, dict[str, Any]], observations: list[dict[str, Any]], gaps: list[str],
+) -> list[dict[str, Any]]:
+    gap_text = "\n".join(str(value) for value in gaps)
+    close_review_keys = {
+        "market_breadth", "turnover_compare", "themes_and_capacity_cores", "forum_and_sentiment",
+    }
+    rows: list[dict[str, Any]] = []
+    for key in sorted(close_review_keys.intersection(requirements)):
+        if key not in gap_text:
+            continue
+        related = [
+            item for item in observations
+            if str((item.get("arguments") or {}).get("requirement_key") or "") == key
+        ]
+        if not any(item.get("backend") == "market" for item in related):
+            continue
+        if any(item.get("operation") == "web_search" for item in related):
+            continue
+        rows.append(_operation(
+            key, "gateway", "web_search", query=_public_gap_query(key, requirements[key]),
+        ))
+    return rows
+
+
 def _merge_mandatory_operations(
     plan: dict[str, Any], contract: dict[str, Any], *, max_operations: int,
     observations: list[dict[str, Any]] | None = None, gaps: list[str] | None = None,
@@ -1369,7 +1432,7 @@ def _merge_mandatory_operations(
             _operation("forum_and_sentiment", "market", "sentiment_snapshot"),
             _operation(
                 "forum_and_sentiment", "gateway", "web_search",
-                query="A股 收盘 论坛 股吧 市场情绪",
+                query=_public_gap_query("forum_and_sentiment", requirements["forum_and_sentiment"]),
             ),
         ))
     if requirements.get("portfolio_market_state", {}).get("required_entities"):
@@ -1386,6 +1449,9 @@ def _merge_mandatory_operations(
         required.append(_operation(
             "portfolio_events_and_counterevidence", "market", "announcement_snapshot",
         ))
+    required.extend(_structured_gap_search_operations(
+        requirements, list(observations or []), list(gaps or []),
+    ))
     completed = {
         (
             str((item.get("arguments") or {}).get("requirement_key") or ""),
@@ -1492,6 +1558,9 @@ def _discovery_digest(observations: list[dict[str, Any]], contract: dict[str, An
                 "fact_as_of": item.get("fact_as_of"),
                 "published_at": item.get("published_at"),
                 "primary": bool(item.get("primary")),
+                "memory_episode_id": item.get("memory_episode_id"),
+                "known_at": item.get("known_at"),
+                "content_sha256": item.get("memory_content_hash"),
             }
             candidates.append((
                 (

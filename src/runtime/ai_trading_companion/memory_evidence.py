@@ -55,5 +55,6 @@ class MemoryEvidenceRegistrar:
             context={
                 "memory_episode_id": receipt["episode_id"], "url": url,
                 "title": title, "text": body, "known_at": known_at,
+                "content_hash": content_hash,
             },
         )

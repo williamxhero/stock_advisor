@@ -632,6 +632,7 @@ def _call_stage(
     retry_model_slot: str | None = None,
     runtime_strategy_shadow_cell: str | None = None,
     frozen_controls: RuntimeStrategyControls | None = None,
+    evidence_registrar: Callable[[dict[str, Any]], None] | None = None,
 ) -> VerifiedStageResult:
     settings = load_settings(PATHS.home)
     runtime_strategy = RuntimeStrategyPolicy(store)
@@ -713,6 +714,7 @@ def _call_stage(
                 # rejects incomplete evidence; it is never published as M0.
                 planner, executor, max_repairs=2,
                 deadline=lambda: deadline - time.monotonic(),
+                observation_registrar=evidence_registrar,
             ).run(
                 packet, contract, attempt_id=attempt["attempt_id"],
             )
@@ -833,6 +835,46 @@ def _call_stage(
 def _broker_call_trace(outcomes: list[BrokerResponse]) -> list[dict[str, Any]]:
     """Bind each derived Broker request to the owning business-stage attempt."""
     return [outcome.audit_metadata() for outcome in outcomes]
+
+
+def _research_memory_registrar(
+    memory: Any, memory_space_id: str, cycle: dict[str, Any],
+) -> Callable[[dict[str, Any]], None]:
+    """Return a fail-closed receipt gate for every acquired external evidence item."""
+    registrar = MemoryEvidenceRegistrar(memory, clock=lambda: iso(datetime.now(timezone.utc)))
+
+    def register(observation: dict[str, Any]) -> None:
+        for index, item in enumerate(observation.get("evidence_items") or []):
+            body = str(item.get("excerpt_text") or "")
+            url = str(item.get("url") or "")
+            if not body or not url:
+                raise MemoryUnavailable("external evidence requires URL and content before registration")
+            body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+            receipt = registrar.register_web_snapshot(
+                memory_space_id=memory_space_id,
+                source_event_id=(
+                    f"research:{cycle['cycle_id']}:{observation['observation_id']}:{index}:{body_hash[:16]}"
+                ),
+                url=url,
+                title=str(item.get("title") or url),
+                body=body,
+                occurred_at=str(
+                    item.get("published_at") or item.get("fact_as_of") or observation.get("acquired_at")
+                ),
+                object_reference={
+                    "cycle_id": cycle["cycle_id"],
+                    "attempt_id": observation.get("attempt_id"),
+                    "observation_id": observation.get("observation_id"),
+                    "evidence_ref": item.get("evidence_ref"),
+                },
+            )
+            item.update({
+                "memory_episode_id": receipt.episode_id,
+                "known_at": receipt.known_at,
+                "memory_content_hash": receipt.context["content_hash"],
+            })
+
+    return register
 
 
 def _deadline_timeout(cycle: dict[str, Any], requested: int) -> int:
@@ -1091,6 +1133,9 @@ def run_research(
     evidence: dict[str, Any] | None = None
     evidence_attempt_id: str | None = None
     local_packet: dict[str, Any] | None = None
+    evidence_registrar = _research_memory_registrar(
+        engine.memory, engine.memory_space_id, cycle,
+    )
     for number in range(1, 3):
         try:
             checkpoint = store.stage_checkpoint(cycle["cycle_id"], "m0_research", public_packet["sha256"])
@@ -1102,6 +1147,7 @@ def run_research(
                     store, cycle, "m0_research", public_packet, "companion-evidence-result-v3.schema.json",
                     search=True, timeout=research_timeout, frozen_controls=research_controls,
                     retry_model_slot="fast" if number > 1 else None,
+                    evidence_registrar=evidence_registrar,
                 )
                 evidence = evidence_stage.output
                 evidence_attempt_id = evidence_stage.attempt_id

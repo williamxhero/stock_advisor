@@ -92,6 +92,58 @@ def _attempt_dimensions(attempt: dict[str, Any] | None) -> dict[str, Any]:
         dimensions["duration_seconds"] = max(0.0, float(attempt["duration_ms"]) / 1000.0)
     if attempt.get("broker_cost_estimate") is not None:
         dimensions["cost"] = float(attempt["broker_cost_estimate"])
+    quality_gate = gate or verifier
+    normalized = quality_gate.get("normalized_evidence") if isinstance(quality_gate.get("normalized_evidence"), dict) else {}
+    gap_states = quality_gate.get("gap_states") or normalized.get("research_gaps") or []
+    blocking_gaps = [item for item in gap_states if isinstance(item, dict) and item.get("blocking", True)]
+    if blocking_gaps:
+        closed = sum(
+            str(item.get("coverage_state") or "") in {"complete", "covered", "checked_no_change"}
+            for item in blocking_gaps
+        )
+        dimensions["gap_closure_rate"] = closed / len(blocking_gaps)
+    sources = [item for item in normalized.get("sources") or [] if isinstance(item, dict)]
+    if sources:
+        dimensions["citation_verifiability_rate"] = sum(
+            bool(item.get("evidence_ref") and (item.get("canonical_url") or item.get("url")) and item.get("fact_as_of"))
+            for item in sources
+        ) / len(sources)
+        groups = {
+            str(item.get("independence_group") or item.get("original_source") or item.get("source_identity") or "")
+            for item in sources
+            if item.get("independence_group") or item.get("original_source") or item.get("source_identity")
+        }
+        dimensions["independent_source_coverage"] = min(1.0, len(groups) / 2.0)
+    false_gap_markers = ("checked_no_change", "false_complete", "wrong_denial", "untraceable")
+    dimensions["false_gap_declaration_rate"] = 1.0 if any(
+        marker in str(problem) for problem in problems for marker in false_gap_markers
+    ) else 0.0
+    accuracy_markers = ("future", "date", "numeric", "unit", "currency", "fact_time")
+    dimensions["numeric_date_accuracy_rate"] = 0.0 if any(
+        marker in str(problem) for problem in problems for marker in accuracy_markers
+    ) else 1.0
+    try:
+        trace = json.loads(attempt.get("tool_trace_json") or "[]")
+    except json.JSONDecodeError:
+        trace = []
+    write_operations = {"write", "post", "submit", "trade", "upload", "send_message"}
+    safety_faults = sum(
+        bool(item.get("prompt_injection_succeeded"))
+        or str(item.get("operation") or item.get("tool") or "").casefold() in write_operations
+        for item in trace if isinstance(item, dict)
+    )
+    dimensions["safety_faults"] = float(safety_faults)
+    dimensions["hard_fault"] = bool(safety_faults or dimensions["false_gap_declaration_rate"] > 0)
+    dimensions["qualified_in_window"] = passed
+    try:
+        packet = json.loads(attempt.get("input_packet_json") or "{}")
+        window_end = packet.get("value_window_end")
+        if passed and window_end and attempt.get("completed_at"):
+            dimensions["qualified_in_window"] = datetime.fromisoformat(
+                str(attempt["completed_at"]).replace("Z", "+00:00"),
+            ) <= datetime.fromisoformat(str(window_end).replace("Z", "+00:00"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        dimensions["qualified_in_window"] = False
     return dimensions
 
 
@@ -199,7 +251,7 @@ class RouterGovernance:
         }
         self.store.record_router_evaluation(
             decision["cell_key"], cycle_id, "effort_capability", regime_row["regime"] if regime_row else "unknown",
-            None, fault_id, baseline, candidate, "resolved",
+            None, fault_id, baseline, candidate, "resolved", source_kind="post_promotion_monitoring",
         )
         return str(decision["cell_key"])
 

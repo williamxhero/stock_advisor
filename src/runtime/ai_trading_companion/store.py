@@ -272,12 +272,14 @@ class CompanionStore:
               evaluation_id TEXT PRIMARY KEY, cell_key TEXT NOT NULL, cycle_id TEXT NOT NULL,
               horizon TEXT NOT NULL, regime TEXT, baseline_artifact_id TEXT, shadow_job_id TEXT,
               baseline_score_json TEXT NOT NULL, candidate_score_json TEXT NOT NULL,
+              source_kind TEXT NOT NULL DEFAULT 'live_paired_shadow',
               state TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT,
               UNIQUE(cycle_id,horizon,shadow_job_id));
             CREATE TABLE IF NOT EXISTS runtime_strategy_cell (
               cell_key TEXT PRIMARY KEY, policy_kind TEXT NOT NULL, mode TEXT NOT NULL,
               baseline_json TEXT NOT NULL, candidate_json TEXT, automatic_authorized INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL,
-              previous_json TEXT, qualification_fingerprint TEXT, updated_at TEXT NOT NULL);
+              previous_json TEXT, qualification_fingerprint TEXT,
+              evaluation_profile TEXT NOT NULL DEFAULT 'generic/v1', updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS runtime_strategy_evaluation (
               evaluation_id TEXT PRIMARY KEY, cell_key TEXT NOT NULL REFERENCES runtime_strategy_cell(cell_key),
               cycle_id TEXT NOT NULL, horizon TEXT NOT NULL, regime TEXT,
@@ -288,7 +290,8 @@ class CompanionStore:
               job_id TEXT PRIMARY KEY, cell_key TEXT NOT NULL REFERENCES runtime_strategy_cell(cell_key),
               cycle_id TEXT NOT NULL, stage TEXT NOT NULL, packet_json TEXT NOT NULL, schema_name TEXT NOT NULL,
               baseline_attempt_id TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT,
-              completed_at TEXT, candidate_attempt_id TEXT, error TEXT,
+              completed_at TEXT, candidate_attempt_id TEXT, context_fingerprint TEXT,
+              frozen_as_of TEXT, value_window_end TEXT, error TEXT,
               UNIQUE(cell_key,cycle_id,stage,baseline_attempt_id));
             CREATE TABLE IF NOT EXISTS evolution_hypothesis (
               hypothesis_id TEXT PRIMARY KEY, family TEXT NOT NULL, title TEXT NOT NULL,
@@ -371,6 +374,16 @@ class CompanionStore:
             }.items():
                 if name not in attempt_columns:
                     c.execute(f"ALTER TABLE llm_attempt ADD COLUMN {name} {declaration}")
+            strategy_columns = {row[1] for row in c.execute("PRAGMA table_info(runtime_strategy_cell)")}
+            if "evaluation_profile" not in strategy_columns:
+                c.execute("ALTER TABLE runtime_strategy_cell ADD COLUMN evaluation_profile TEXT NOT NULL DEFAULT 'generic/v1'")
+            strategy_shadow_columns = {row[1] for row in c.execute("PRAGMA table_info(runtime_strategy_shadow_job)")}
+            for name in ("context_fingerprint", "frozen_as_of", "value_window_end"):
+                if name not in strategy_shadow_columns:
+                    c.execute(f"ALTER TABLE runtime_strategy_shadow_job ADD COLUMN {name} TEXT")
+            router_evaluation_columns = {row[1] for row in c.execute("PRAGMA table_info(router_evaluation)")}
+            if "source_kind" not in router_evaluation_columns:
+                c.execute("ALTER TABLE router_evaluation ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'live_paired_shadow'")
             cognition_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cognition_job)")}
             for name, declaration in {"claimed_at": "TEXT", "attempt_count": "INTEGER NOT NULL DEFAULT 0"}.items():
                 if name not in cognition_columns:
@@ -1942,15 +1955,18 @@ class CompanionStore:
                 (str(uuid.uuid4()), cycle_id, as_of, regime, json.dumps(metrics, ensure_ascii=False, sort_keys=True), data_quality, now()),
             )
 
-    def record_router_evaluation(self, cell_key: str, cycle_id: str, horizon: str, regime: str | None, baseline_artifact_id: str | None, shadow_job_id: str, baseline_score: dict[str, Any], candidate_score: dict[str, Any], state: str = "resolved") -> None:
+    def record_router_evaluation(self, cell_key: str, cycle_id: str, horizon: str, regime: str | None, baseline_artifact_id: str | None, shadow_job_id: str, baseline_score: dict[str, Any], candidate_score: dict[str, Any], state: str = "resolved", *, source_kind: str = "live_paired_shadow") -> None:
+        if source_kind not in {"live_paired_shadow", "historical_replay", "post_promotion_monitoring"}:
+            raise ValueError("unsupported router evaluation source")
         with self.connection() as c:
             c.execute(
-                """INSERT INTO router_evaluation(evaluation_id,cell_key,cycle_id,horizon,regime,baseline_artifact_id,shadow_job_id,baseline_score_json,candidate_score_json,state,created_at,resolved_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id,horizon,shadow_job_id) DO UPDATE SET
-                     baseline_score_json=excluded.baseline_score_json,candidate_score_json=excluded.candidate_score_json,state=excluded.state,resolved_at=excluded.resolved_at""",
+                """INSERT INTO router_evaluation(evaluation_id,cell_key,cycle_id,horizon,regime,baseline_artifact_id,shadow_job_id,baseline_score_json,candidate_score_json,source_kind,state,created_at,resolved_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id,horizon,shadow_job_id) DO UPDATE SET
+                     baseline_score_json=excluded.baseline_score_json,candidate_score_json=excluded.candidate_score_json,
+                     source_kind=excluded.source_kind,state=excluded.state,resolved_at=excluded.resolved_at""",
                 (str(uuid.uuid4()), cell_key, cycle_id, horizon, regime, baseline_artifact_id, shadow_job_id,
                  json.dumps(baseline_score, ensure_ascii=False, sort_keys=True), json.dumps(candidate_score, ensure_ascii=False, sort_keys=True),
-                 state, now(), now() if state == "resolved" else None),
+                 source_kind, state, now(), now() if state == "resolved" else None),
             )
 
     def router_evaluations(self, cell_key: str) -> list[dict[str, Any]]:

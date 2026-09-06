@@ -28,7 +28,7 @@ Seam 位于来源事实写入之后、治理裁决之前。EvaluationObservatory
 | 事件流投影器 | `project`、`capture_prediction`、`compare`、`query` | 审计、重放、乱序和算法版本语义最清楚 | 把水位、投影器和事件拓扑暴露给业务调用方 | 作为内部实现 |
 | 任务周期聚合根 | `synchronize`、`evaluate`、`predict_delivery`、`assess_experiment` | 09:45、M0、10:30 和工作归因具有很强领域局部性 | 跨周期预测和多分层实验会迫使聚合根持续膨胀 | 作为内部领域模型 |
 | CQRS 窄端口 | 写命令与多个查询端口分离 | 权限边界和测试替身清楚 | 普通调用方必须理解该选哪个端口，返回模型容易碎片化 | 私有适配器采用 |
-| 深模块门面 | 五个面向产品能力的方法 | 小 interface，同时隐藏投影和统计复杂性 | 模块内部实现较重，需要严格契约测试 | 公开 interface |
+| 深模块门面 | 六个面向产品能力的方法 | 小 interface，同时隐藏投影和统计复杂性 | 模块内部实现较重，需要严格契约测试 | 公开 interface |
 
 ## 公开 interface
 
@@ -77,12 +77,16 @@ class EvaluationObservatory:
         self, request: ExperimentRequest
     ) -> "ExperimentAssessment": ...
 
+    def source_health(
+        self, request: "SourceHealthRequest"
+    ) -> "SourceHealthSnapshot": ...
+
     def get_snapshot(self, snapshot_id: str) -> "ObservatorySnapshot": ...
 
     def query(self, query: SnapshotQuery) -> Sequence["SnapshotSummary"]: ...
 ```
 
-`evaluate`、`forecast` 和 `assess_experiment` 是确定性的追加操作。它们不是可覆盖状态更新：同一请求 ID 和同一规范化输入返回原结果；同一请求 ID 对应不同输入时报告幂等冲突。`get_snapshot` 和 `query` 是只读操作。
+`evaluate`、`forecast`、`assess_experiment` 和 `source_health` 是确定性的追加操作。它们不是可覆盖状态更新：同一请求 ID 和同一规范化输入返回原结果；同一请求 ID 对应不同输入时报告幂等冲突。`get_snapshot` 和 `query` 是只读操作。
 
 ## 明确不公开的操作
 
@@ -116,7 +120,8 @@ class EvaluationObservatory:
 
 - `EvaluationSnapshot`：并列保存速度、窗口内合格概率、研究质量、判断结果、安全可靠性和工作归因，不生成统一总分。
 - `ForecastSnapshot`：同时保存条件合格交付时间区间、窗口内合格概率、失败或拒绝风险、置信度和适用分层。
-- `ExperimentAssessment`：保存冻结回放、实时配对影子、动态成熟度、材料性改善和各受保护维度的非劣结论。
+- `ExperimentAssessment`：保存冻结回放、实时配对影子、动态成熟度、材料性改善和各受保护维度的非劣结论；主动研究候选并列保留关键缺口补齐、错误缺口声明、引用可复核、数值与日期准确、独立来源覆盖、窗口内资格和安全故障，不能折叠为单一总分。
+- `SourceHealthSnapshot`：只读保存来源路线样本、连续失败与安全告警、降权候选和 formal adapter 隔离候选；它不能修改 EvidenceGate 或来源策略。
 
 每个输出都保存 `as_of`、完整输入水位、纳入和排除原因、算法版本及评测政策版本。后来事实只能产生新输出，以便校准历史预测和复建当时结论。
 
@@ -136,7 +141,7 @@ class EvaluationObservatory:
 - `EvaluationPolicy`
 - `Clock`
 
-外部测试只通过五个公开方法验证行为；内部适配器测试负责 SQLite 事务、事件去重和迁移兼容。最低合同必须覆盖 10:30 边界、失败与拒绝进入概率分母、09:00 工作归因、乱序事件、快照不可覆盖、同包实时配对、动态成熟度以及 Observatory 无法修改生产策略。
+外部测试只通过六个公开方法验证行为；内部适配器测试负责 SQLite 事务、事件去重和迁移兼容。最低合同必须覆盖 10:30 边界、失败与拒绝进入概率分母、09:00 工作归因、乱序事件、快照不可覆盖、同包实时配对、动态成熟度、来源健康隔离候选以及 Observatory 无法修改生产策略。
 
 ## 增量落地顺序
 
@@ -146,4 +151,3 @@ class EvaluationObservatory:
 4. 将现有 Router shadow 适配到统一实验评估，但继续隔离生产输出。
 5. 将 `effective_m1_reserve` 的隐式统计写入拆开：执行路径只读取获准策略，Observatory 只产出候选证据。
 6. 最后接入 EvolutionGovernance、版本化策略执行回执和桌面“评测与进化中心”。
-

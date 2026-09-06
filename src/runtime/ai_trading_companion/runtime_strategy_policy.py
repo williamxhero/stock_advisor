@@ -1,9 +1,11 @@
 """Reversible runtime controls owned by governance, never by the Observatory."""
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 
@@ -35,6 +37,7 @@ class RuntimeStrategyPolicy:
                   baseline_json TEXT NOT NULL,
                   candidate_json TEXT,
                   automatic_authorized INTEGER NOT NULL DEFAULT 0,
+                  evaluation_profile TEXT NOT NULL DEFAULT 'generic/v1',
                   revision INTEGER NOT NULL,
                   previous_json TEXT,
                   qualification_fingerprint TEXT,
@@ -67,6 +70,9 @@ class RuntimeStrategyPolicy:
                   started_at TEXT,
                   completed_at TEXT,
                   candidate_attempt_id TEXT,
+                  context_fingerprint TEXT,
+                  frozen_as_of TEXT,
+                  value_window_end TEXT,
                   error TEXT,
                   UNIQUE(cell_key,cycle_id,stage,baseline_attempt_id)
                 );
@@ -74,6 +80,12 @@ class RuntimeStrategyPolicy:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(runtime_strategy_cell)")}
             if "automatic_authorized" not in columns:
                 connection.execute("ALTER TABLE runtime_strategy_cell ADD COLUMN automatic_authorized INTEGER NOT NULL DEFAULT 0")
+            if "evaluation_profile" not in columns:
+                connection.execute("ALTER TABLE runtime_strategy_cell ADD COLUMN evaluation_profile TEXT NOT NULL DEFAULT 'generic/v1'")
+            shadow_columns = {row[1] for row in connection.execute("PRAGMA table_info(runtime_strategy_shadow_job)")}
+            for name in ("context_fingerprint", "frozen_as_of", "value_window_end"):
+                if name not in shadow_columns:
+                    connection.execute(f"ALTER TABLE runtime_strategy_shadow_job ADD COLUMN {name} TEXT")
 
     @staticmethod
     def cell_key(policy_kind: str, stage: str) -> str:
@@ -83,11 +95,15 @@ class RuntimeStrategyPolicy:
 
     def register_shadow_candidate(
         self, policy_kind: str, stage: str, baseline: dict[str, Any], candidate: dict[str, Any], *,
-        automatic_authorized: bool = False,
+        automatic_authorized: bool = False, evaluation_profile: str = "generic/v1",
     ) -> dict[str, Any]:
         """Provision a versioned shadow cell; callers cannot promote it here."""
         self._validate(policy_kind, baseline)
         self._validate(policy_kind, candidate)
+        if evaluation_profile not in {"generic/v1", "active_evidence_research/v1"}:
+            raise ValueError("unsupported evaluation profile")
+        if evaluation_profile == "active_evidence_research/v1" and automatic_authorized:
+            raise ValueError("active research candidates require the dedicated production promotion gate")
         key = self.cell_key(policy_kind, stage)
         from .store import now
         with self.store.connection() as connection:
@@ -95,18 +111,20 @@ class RuntimeStrategyPolicy:
             if existing is None:
                 connection.execute(
                     """INSERT INTO runtime_strategy_cell(
-                         cell_key,policy_kind,mode,baseline_json,candidate_json,automatic_authorized,revision,updated_at)
-                       VALUES(?,?,'shadow',?,?,?,1,?)""",
-                    (key, policy_kind, json.dumps(baseline, sort_keys=True), json.dumps(candidate, sort_keys=True), int(automatic_authorized), now()),
+                         cell_key,policy_kind,mode,baseline_json,candidate_json,automatic_authorized,
+                         evaluation_profile,revision,updated_at)
+                       VALUES(?,?,'shadow',?,?,?,?,1,?)""",
+                    (key, policy_kind, json.dumps(baseline, sort_keys=True), json.dumps(candidate, sort_keys=True),
+                     int(automatic_authorized), evaluation_profile, now()),
                 )
             elif existing["mode"] == "promoted":
                 raise ValueError("register a new candidate only after rollback or an explicit replacement")
             else:
                 connection.execute(
                     """UPDATE runtime_strategy_cell SET baseline_json=?,candidate_json=?,revision=revision+1,
-                         previous_json=?,automatic_authorized=?,updated_at=? WHERE cell_key=?""",
+                         previous_json=?,automatic_authorized=?,evaluation_profile=?,updated_at=? WHERE cell_key=?""",
                     (json.dumps(baseline, sort_keys=True), json.dumps(candidate, sort_keys=True),
-                     json.dumps(dict(existing), sort_keys=True), int(automatic_authorized), now(), key),
+                     json.dumps(dict(existing), sort_keys=True), int(automatic_authorized), evaluation_profile, now(), key),
                 )
             row = connection.execute("SELECT * FROM runtime_strategy_cell WHERE cell_key=?", (key,)).fetchone()
         return dict(row)
@@ -167,7 +185,20 @@ class RuntimeStrategyPolicy:
         """Append eligible shadow jobs; official work never waits for them."""
         from .store import now
         serialized = json.dumps(packet, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        context_fingerprint = self._context_fingerprint(packet)
+        frozen_as_of = str(packet.get("as_of") or "") or None
+        value_window_end = str(packet.get("value_window_end") or "") or None
         with self.store.connection() as connection:
+            cycle = connection.execute(
+                "SELECT task_key,scheduled_for,m1_publish_deadline FROM companion_cycle WHERE cycle_id=?",
+                (cycle_id,),
+            ).fetchone()
+            if value_window_end is None and cycle:
+                if stage == "m0_research" and cycle["task_key"] == "daily.execution.0945":
+                    scheduled = self._parse_timestamp(str(cycle["scheduled_for"]))
+                    value_window_end = scheduled.replace(hour=10, minute=30, second=0, microsecond=0).isoformat()
+                elif stage == "m1_judgment" and cycle["m1_publish_deadline"]:
+                    value_window_end = str(cycle["m1_publish_deadline"])
             cells = connection.execute(
                 """SELECT cell_key FROM runtime_strategy_cell
                      WHERE cell_key IN (?,?,?) AND mode='shadow' AND candidate_json IS NOT NULL
@@ -179,9 +210,11 @@ class RuntimeStrategyPolicy:
                 job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"runtime-shadow|{cell['cell_key']}|{cycle_id}|{stage}|{baseline_attempt_id}"))
                 connection.execute(
                     """INSERT OR IGNORE INTO runtime_strategy_shadow_job(
-                         job_id,cell_key,cycle_id,stage,packet_json,schema_name,baseline_attempt_id,state,created_at)
-                       VALUES(?,?,?,?,?,?,?,'queued',?)""",
-                    (job_id, cell["cell_key"], cycle_id, stage, serialized, schema_name, baseline_attempt_id, now()),
+                         job_id,cell_key,cycle_id,stage,packet_json,schema_name,baseline_attempt_id,state,
+                         context_fingerprint,frozen_as_of,value_window_end,created_at)
+                       VALUES(?,?,?,?,?,?,?,'queued',?,?,?,?)""",
+                    (job_id, cell["cell_key"], cycle_id, stage, serialized, schema_name, baseline_attempt_id,
+                     context_fingerprint, frozen_as_of, value_window_end, now()),
                 )
                 job_ids.append(job_id)
         return tuple(job_ids)
@@ -216,30 +249,51 @@ class RuntimeStrategyPolicy:
         self, cell_key: str, cycle_id: str, horizon: str, regime: str | None,
         baseline_score: dict[str, Any], candidate_score: dict[str, Any], *,
         source_kind: str = "live_paired_shadow", state: str = "resolved",
+        _validated_shadow_job_id: str | None = None,
     ) -> Any | None:
         if source_kind not in {"live_paired_shadow", "historical_replay", "post_promotion_monitoring"}:
             raise ValueError("unsupported runtime strategy evidence source")
         from .store import now
         with self.store.connection() as connection:
-            if not connection.execute("SELECT 1 FROM runtime_strategy_cell WHERE cell_key=?", (cell_key,)).fetchone():
+            cell = connection.execute(
+                "SELECT automatic_authorized,mode,evaluation_profile FROM runtime_strategy_cell WHERE cell_key=?",
+                (cell_key,),
+            ).fetchone()
+            if not cell:
                 raise ValueError("unknown runtime strategy cell")
+            if (
+                source_kind == "live_paired_shadow"
+                and cell["evaluation_profile"] == "active_evidence_research/v1"
+                and not _validated_shadow_job_id
+            ):
+                raise ValueError("active research live evidence requires a validated shadow job")
             at = now()
+            baseline_json = json.dumps(baseline_score, sort_keys=True)
+            candidate_json = json.dumps(candidate_score, sort_keys=True)
+            existing = connection.execute(
+                """SELECT regime,baseline_score_json,candidate_score_json,source_kind,state
+                     FROM runtime_strategy_evaluation WHERE cycle_id=? AND horizon=? AND cell_key=?""",
+                (cycle_id, horizon, cell_key),
+            ).fetchone()
+            if existing and (
+                str(existing["regime"] or "") != str(regime or "")
+                or existing["baseline_score_json"] != baseline_json
+                or existing["candidate_score_json"] != candidate_json
+                or existing["source_kind"] != source_kind
+                or existing["state"] != state
+            ):
+                raise ValueError("runtime strategy evaluation is immutable")
             connection.execute(
                 """INSERT INTO runtime_strategy_evaluation(
                      evaluation_id,cell_key,cycle_id,horizon,regime,baseline_score_json,candidate_score_json,
                      source_kind,state,created_at,resolved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(cycle_id,horizon,cell_key) DO UPDATE SET
-                     baseline_score_json=excluded.baseline_score_json,candidate_score_json=excluded.candidate_score_json,
-                     source_kind=excluded.source_kind,state=excluded.state,resolved_at=excluded.resolved_at""",
+                   ON CONFLICT(cycle_id,horizon,cell_key) DO NOTHING""",
                 (str(uuid.uuid4()), cell_key, cycle_id, horizon, regime,
-                 json.dumps(baseline_score, sort_keys=True), json.dumps(candidate_score, sort_keys=True),
+                 baseline_json, candidate_json,
                  source_kind, state, at, at if state == "resolved" else None),
             )
-            policy_state = connection.execute(
-                "SELECT automatic_authorized,mode FROM runtime_strategy_cell WHERE cell_key=?", (cell_key,),
-            ).fetchone()
-            authorized = bool(policy_state["automatic_authorized"])
-            current_mode = str(policy_state["mode"])
+            authorized = bool(cell["automatic_authorized"])
+            current_mode = str(cell["mode"])
         if not authorized:
             return None
         # The authorization is stored with the versioned cell. Assessment still
@@ -260,6 +314,124 @@ class RuntimeStrategyPolicy:
             assessment.snapshot_id, "approve", approver="automatic-governance",
         )
         return StrategyPolicyExecutor(self.store).apply(decision.decision_id)
+
+    def record_live_shadow_evaluation(
+        self, job_id: str, candidate_attempt_id: str, horizon: str, regime: str | None,
+        baseline_score: dict[str, Any], candidate_score: dict[str, Any],
+    ) -> Any | None:
+        """Accept a live pair only when both attempts share the job's frozen context."""
+        with self.store.connection() as connection:
+            job = connection.execute(
+                """SELECT j.*,c.evaluation_profile,c.updated_at AS candidate_registered_at,
+                          cycle.scheduled_for
+                     FROM runtime_strategy_shadow_job j
+                     JOIN runtime_strategy_cell c ON c.cell_key=j.cell_key
+                     JOIN companion_cycle cycle ON cycle.cycle_id=j.cycle_id
+                    WHERE j.job_id=?""",
+                (job_id,),
+            ).fetchone()
+            if not job or job["state"] not in {"running", "succeeded"}:
+                raise ValueError("live pair requires a running or succeeded shadow job")
+            if self._parse_timestamp(str(job["scheduled_for"])) < self._parse_timestamp(str(job["candidate_registered_at"])):
+                raise ValueError("live pair must come from a future formal task")
+            attempts = [dict(row) for row in connection.execute(
+                "SELECT * FROM llm_attempt WHERE attempt_id IN (?,?)",
+                (job["baseline_attempt_id"], candidate_attempt_id),
+            )]
+        by_id = {row["attempt_id"]: row for row in attempts}
+        baseline = by_id.get(job["baseline_attempt_id"])
+        candidate = by_id.get(candidate_attempt_id)
+        if not baseline or not candidate:
+            raise ValueError("live pair attempts are incomplete")
+        if (
+            baseline["cycle_id"] != job["cycle_id"] or candidate["cycle_id"] != job["cycle_id"]
+            or bool(baseline["is_shadow"]) or not bool(candidate["is_shadow"])
+        ):
+            raise ValueError("live pair attempts violate baseline/shadow isolation")
+        expected = str(job["context_fingerprint"] or "")
+        contexts = []
+        for attempt in (baseline, candidate):
+            try:
+                packet = json.loads(attempt["input_packet_json"] or "{}")
+            except json.JSONDecodeError as exc:
+                raise ValueError("live pair input packet is malformed") from exc
+            contexts.append(self._context_fingerprint(packet))
+        if not expected or any(value != expected for value in contexts):
+            raise ValueError("live pair does not share the frozen market context")
+        from .governance import _attempt_dimensions
+        baseline_score = {**baseline_score, **_attempt_dimensions(baseline)}
+        candidate_score = {**candidate_score, **_attempt_dimensions(candidate)}
+        metadata = {
+            "shared_context_fingerprint": expected,
+            "frozen_as_of": job["frozen_as_of"],
+            "value_window_end": job["value_window_end"],
+            "shadow_isolated": True,
+        }
+        if job["value_window_end"]:
+            window_end = self._parse_timestamp(str(job["value_window_end"]))
+            for attempt, score in ((baseline, baseline_score), (candidate, candidate_score)):
+                score["qualified_in_window"] = bool(
+                    score.get("qualified") and attempt.get("completed_at")
+                    and self._parse_timestamp(str(attempt["completed_at"])) <= window_end
+                )
+        return self.record_evaluation(
+            job["cell_key"], job["cycle_id"], horizon, regime,
+            {**baseline_score, **metadata}, {**candidate_score, **metadata},
+            _validated_shadow_job_id=job_id,
+        )
+
+    def record_frozen_replay(
+        self, cell_key: str, incident_id: str, cycle_id: str, frozen_as_of: str,
+        regime: str | None, baseline_score: dict[str, Any], candidate_score: dict[str, Any], *,
+        evidence_times: list[dict[str, str]],
+    ) -> None:
+        """Record one immutable incident replay after proving its information cutoff."""
+        required_incidents = {
+            "weekend_fund_flow", "industry_distribution", "holding_announcement",
+            "expression_loss", "markethub_current_bar",
+        }
+        if incident_id not in required_incidents:
+            raise ValueError("unsupported frozen replay incident")
+        cutoff = self._parse_timestamp(frozen_as_of)
+        if not evidence_times:
+            raise ValueError("frozen replay requires auditable evidence times")
+        for item in evidence_times:
+            occurred = self._parse_timestamp(str(item.get("occurred_at") or ""))
+            known = self._parse_timestamp(str(item.get("known_at") or ""))
+            if occurred > known or known > cutoff:
+                raise ValueError("frozen replay contains future evidence")
+        candidate = {
+            **candidate_score, "incident_id": incident_id, "replay_as_of": frozen_as_of,
+            "future_data_leak": False,
+        }
+        baseline = {
+            **baseline_score, "incident_id": incident_id, "replay_as_of": frozen_as_of,
+            "future_data_leak": False,
+        }
+        self.record_evaluation(
+            cell_key, cycle_id, f"incident:{incident_id}", regime, baseline, candidate,
+            source_kind="historical_replay",
+        )
+
+    @staticmethod
+    def _parse_timestamp(value: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("frozen replay timestamp must be ISO-8601") from exc
+        if parsed.tzinfo is None:
+            raise ValueError("frozen replay timestamp must be timezone-aware")
+        return parsed
+
+    @staticmethod
+    def _context_fingerprint(packet: dict[str, Any]) -> str:
+        frozen = {
+            key: value for key, value in packet.items()
+            if key not in {"sha256", "runtime_strategy_controls", "allowed_research_backends"}
+        }
+        return hashlib.sha256(
+            json.dumps(frozen, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        ).hexdigest()
 
     @staticmethod
     def _validate(policy_kind: str, value: dict[str, Any]) -> None:

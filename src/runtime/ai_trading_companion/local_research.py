@@ -1132,6 +1132,102 @@ def _planner_research_scope(value: Any) -> dict[str, Any]:
     return {key: value[key] for key in allowed if key in value}
 
 
+def _coverage_metadata(
+    requirement_key: str, status: str, refs: list[str], observations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    payloads: list[dict[str, Any]] = []
+    fact_times: list[str] = []
+    ref_set = set(refs)
+    for observation in observations:
+        for item in observation.get("evidence_items") or []:
+            if str(item.get("evidence_ref") or "") not in ref_set:
+                continue
+            try:
+                payload = json.loads(str(item.get("excerpt_text") or ""))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                payloads.append(payload)
+                if item.get("fact_as_of"):
+                    fact_times.append(str(item["fact_as_of"]))
+    if requirement_key == "market_fund_flow":
+        directional = next((
+            payload for payload in payloads
+            if payload.get("coverage_level") == "directional_sector"
+        ), None)
+        if directional is not None:
+            limitations = [str(value) for value in directional.get("limitations") or []]
+            return {
+                "coverage_level": "directional",
+                "fact_as_of": max(fact_times) if fact_times else None,
+                "currency": str(directional.get("currency") or directional.get("unit") or ""),
+                "directional_facts": [
+                    {
+                        "name": str(row.get("name") or ""),
+                        "direction": str(row.get("direction") or ""),
+                        "amount": row.get("net_inflow"),
+                        "rank": row.get("rank"),
+                    }
+                    for row in [
+                        *(directional.get("sector_inflow_leaders") or []),
+                        *(directional.get("sector_outflow_leaders") or []),
+                    ] if isinstance(row, dict)
+                ],
+                "supported_propositions": [
+                    "sector_flow_direction", "sector_flow_ranking", "reported_sector_net_amount",
+                ],
+                "prohibited_propositions": ["full_market_net_flow", "order_size_breakdown"],
+                "limitations": limitations,
+            }
+        if any(isinstance(payload.get("combined"), dict) for payload in payloads):
+            return {
+                "coverage_level": "complete",
+                "supported_propositions": ["full_market_net_flow", "order_size_breakdown"],
+                "prohibited_propositions": [],
+                "limitations": [],
+            }
+        return {
+            "coverage_level": "partial" if refs else "missing",
+            "supported_propositions": [],
+            "prohibited_propositions": ["full_market_net_flow", "order_size_breakdown"],
+            "limitations": ["insufficient_verified_fund_flow_fields"],
+        }
+    if requirement_key == "themes_and_capacity_cores":
+        complete_sets = sorted({
+            kind for payload in payloads
+            for kind, row in (payload.get("distribution") or {}).items()
+            if kind in {"industry", "theme"} and isinstance(row, dict)
+            and isinstance(row.get("total"), int)
+            and sum(int(row.get(field) or 0) for field in ("up", "down", "flat")) == row.get("total")
+        })
+        distribution_counts = {
+            kind: {
+                field: row.get(field) for field in ("total", "up", "down", "flat")
+            }
+            for payload in payloads
+            for kind, row in (payload.get("distribution") or {}).items()
+            if kind in complete_sets and isinstance(row, dict)
+        }
+        return {
+            "coverage_level": "complete" if complete_sets == ["industry", "theme"] else "partial" if refs else "missing",
+            "target_sets": complete_sets,
+            "distribution_counts": distribution_counts,
+            "fact_as_of": max(fact_times) if fact_times else None,
+            "requires_distribution": True,
+        }
+    if requirement_key == "material_events_and_counterevidence":
+        fact_status = next((
+            str(payload.get("event_truth")) for payload in payloads if payload.get("event_truth")
+        ), "reported" if refs else "missing")
+        return {
+            "coverage_level": "complete" if status in {"covered", "checked_no_change"} else "missing",
+            "fact_status": fact_status,
+            "impact_status": "inference_only" if refs else "not_assessed",
+            "truth_evidence_refs": list(refs),
+        }
+    return {"coverage_level": "complete" if status in {"covered", "checked_no_change"} else "missing"}
+
+
 def _compile_evidence(
     packet: dict[str, Any], contract: dict[str, Any], observations: list[dict[str, Any]], *,
     require_memory_receipts: bool = False,
@@ -1166,7 +1262,10 @@ def _compile_evidence(
             status = "covered"
         else:
             status = "missing"
-        coverage.append({"requirement_key": key, "status": status, "evidence_refs": refs})
+        coverage.append({
+            "requirement_key": key, "status": status, "evidence_refs": refs,
+            **_coverage_metadata(key, status, refs, observations),
+        })
     return {
         "schema_version": 3, "as_of": str(packet.get("as_of") or contract.get("as_of") or ""),
         "spoken_summary": "本地研究证据已按冻结合同采集。", "sources": sources, "coverage": coverage,
@@ -1367,6 +1466,8 @@ def _public_gap_query(requirement_key: str, requirement: dict[str, Any]) -> str:
         "turnover_compare": "两市成交额 前一交易日 对比",
         "themes_and_capacity_cores": "行业 题材 领涨 领跌 分布",
         "forum_and_sentiment": "论坛 股吧 市场情绪",
+        "market_fund_flow": "板块 主力资金 净流入 净流出 金额 排名",
+        "material_events_and_counterevidence": "政策 监管 风险 重要事件 反证",
     }.get(requirement_key, "可验证事实")
     entities = " ".join(str(value) for value in requirement.get("required_entities") or [] if str(value))
     return " ".join(value for value in (
@@ -1380,6 +1481,7 @@ def _structured_gap_search_operations(
     gap_text = "\n".join(str(value) for value in gaps)
     close_review_keys = {
         "market_breadth", "turnover_compare", "themes_and_capacity_cores", "forum_and_sentiment",
+        "market_fund_flow", "material_events_and_counterevidence",
     }
     rows: list[dict[str, Any]] = []
     for key in sorted(close_review_keys.intersection(requirements)):

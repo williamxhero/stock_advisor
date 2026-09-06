@@ -22,6 +22,112 @@ def row(operation: str, *, query: str | None = None, url: str | None = None) -> 
     return {"requirement_key": "market", "backend": "gateway", "operation": operation, "arguments": {"query": query, "categories": "news", "url": url, "symbol": None, "render": "auto", "session_id": None, "actions": None}, "fallback_backends": []}
 
 class LocalResearchTests(unittest.TestCase):
+    def test_weekend_research_preserves_directional_fund_flow_and_event_boundaries(self) -> None:
+        close = "2026-09-04T07:00:00Z"
+        contract = {
+            "version": 4,
+            "as_of": "2026-09-05T02:00:00Z",
+            "requirements": [{
+                "key": "themes_and_capacity_cores", "blocking": True,
+                "allowed_coverage": ["covered"], "requires_distribution": True,
+                "minimum_named_entities": 2,
+                "window": {"mode": "after_start_to_end", "start": "2026-09-01T07:00:00Z", "end": close},
+            }, {
+                "key": "market_fund_flow", "blocking": True,
+                "allowed_coverage": ["covered"], "minimum_numeric_facts": 3,
+                "window": {"mode": "exact", "start": close, "end": close},
+            }, {
+                "key": "material_events_and_counterevidence", "blocking": True,
+                "allowed_coverage": ["covered", "checked_no_change"],
+                "window": {"mode": "after_start_to_end", "start": "2026-09-01T07:00:00Z", "end": "2026-09-05T02:00:00Z"},
+            }],
+        }
+        urls = {
+            "market_fund_flow": "https://fund.example.test/2026-09-04",
+            "material_events_and_counterevidence": "https://event.example.test/policy",
+        }
+        calls: list[tuple[str, str]] = []
+
+        def backend(operation: str, arguments: dict) -> dict:
+            key = str(arguments.get("_requirement_key") or "")
+            calls.append((key, operation))
+            if operation == "sector_snapshot":
+                payload = {
+                    "leaders": [{"name": "消费板块", "kind": "industry"}],
+                    "laggards": [{"name": "科技题材", "kind": "theme"}],
+                    "distribution": {
+                        "industry": {"total": 31, "up": 10, "down": 20, "flat": 1, "median_change_percent": -0.4},
+                        "theme": {"total": 120, "up": 45, "down": 70, "flat": 5, "median_change_percent": -0.2},
+                    },
+                }
+                return {"results": [{
+                    "url": "https://sector.example.test/all", "title": "板块全量分布",
+                    "excerpt_text": json.dumps(payload, ensure_ascii=False), "fact_as_of": close,
+                }]}
+            if operation in {"fund_flow_snapshot", "market_event_snapshot"}:
+                raise RuntimeError("preferred structured source unavailable")
+            if operation == "web_search":
+                return {"results": [{"url": urls[key], "title": key}]}
+            if key == "market_fund_flow":
+                payload = {
+                    "trading_date": "2026-09-04", "coverage_level": "directional_sector",
+                    "currency": "CNY", "unit": "CNY",
+                    "sector_inflow_leaders": [
+                        {"name": "数字人", "direction": "inflow", "net_inflow": 5_281_000_000.0, "rank": 1},
+                        {"name": "AI应用", "direction": "inflow", "net_inflow": 5_163_000_000.0, "rank": 2},
+                        {"name": "文化传媒", "direction": "inflow", "net_inflow": 4_208_000_000.0, "rank": 3},
+                    ],
+                    "sector_outflow_leaders": [{"name": "电子", "direction": "outflow", "rank": 1}],
+                    "limitations": ["full_market_net_flow_unavailable", "order_size_breakdown_unavailable"],
+                }
+                fact_as_of = close
+            else:
+                payload = {
+                    "title": "政策组合拳发布", "content": "监管部门于周五发布新政策。",
+                    "event_truth": "reported", "market_impact": "可能改善风险偏好",
+                }
+                fact_as_of = "2026-09-05T01:00:00Z"
+            return {"results": [{
+                "url": urls[key], "title": str(payload.get("title") or key),
+                "excerpt_text": json.dumps(payload, ensure_ascii=False), "fact_as_of": fact_as_of,
+            }]}
+
+        def planner(packet: dict, _gaps: list[str], _round: int) -> dict:
+            discoveries = [
+                item for item in packet.get("research_discoveries") or []
+                if item.get("url") in set(urls.values())
+            ]
+            return {"version": 1, "operations": [
+                {**row("web_read", url=str(item["url"])), "requirement_key": item["requirement_key"]}
+                for item in discoveries
+            ]}
+
+        result = LocalResearchChain(
+            planner,
+            ReadOnlyResearchExecutor({"market": backend, "gateway": backend}),
+            max_repairs=2,
+        ).run({"stage": "m0_research", "as_of": contract["as_of"]}, contract, attempt_id="weekend-drivers")
+
+        self.assertTrue(result.qualified, result.verifier["problems"])
+        self.assertIn(("market_fund_flow", "web_search"), calls)
+        self.assertIn(("material_events_and_counterevidence", "web_search"), calls)
+        coverage = {item["requirement_key"]: item for item in result.evidence["coverage"]}
+        self.assertEqual("complete", coverage["themes_and_capacity_cores"]["coverage_level"])
+        self.assertEqual(["industry", "theme"], coverage["themes_and_capacity_cores"]["target_sets"])
+        self.assertEqual(31, coverage["themes_and_capacity_cores"]["distribution_counts"]["industry"]["total"])
+        self.assertEqual(close, coverage["themes_and_capacity_cores"]["fact_as_of"])
+        fund = coverage["market_fund_flow"]
+        self.assertEqual("directional", fund["coverage_level"])
+        self.assertEqual("CNY", fund["currency"])
+        self.assertEqual(close, fund["fact_as_of"])
+        self.assertEqual("数字人", fund["directional_facts"][0]["name"])
+        self.assertIn("sector_flow_direction", fund["supported_propositions"])
+        self.assertIn("full_market_net_flow", fund["prohibited_propositions"])
+        self.assertNotIn("combined", json.dumps(result.evidence, ensure_ascii=False))
+        event = coverage["material_events_and_counterevidence"]
+        self.assertEqual("reported", event["fact_status"])
+        self.assertEqual("inference_only", event["impact_status"])
+
     def test_close_review_recovers_from_incomplete_structured_data_through_receipted_public_reads(self) -> None:
         contract = {
             "version": 4,

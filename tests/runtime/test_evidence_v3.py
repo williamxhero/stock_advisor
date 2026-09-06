@@ -551,12 +551,14 @@ class EvidenceV3Tests(TestCase):
         payload = {
             "trading_date": "2026-09-04",
             "coverage_level": "directional_sector",
+            "currency": "CNY",
             "sector_inflow_leaders": [
-                {"name": "虚拟数字人", "net_inflow": 5_281_000_000.0},
-                {"name": "AI应用", "net_inflow": 5_163_000_000.0},
-                {"name": "文化传媒概念", "net_inflow": 4_208_000_000.0},
+                {"name": "虚拟数字人", "direction": "inflow", "rank": 1, "net_inflow": 5_281_000_000.0},
+                {"name": "AI应用", "direction": "inflow", "rank": 2, "net_inflow": 5_163_000_000.0},
+                {"name": "文化传媒概念", "direction": "inflow", "rank": 3, "net_inflow": 4_208_000_000.0},
             ],
-            "sector_outflow_leaders": [{"name": "电子"}],
+            "sector_outflow_leaders": [{"name": "电子", "direction": "outflow", "rank": 1}],
+            "limitations": ["full_market_net_flow_unavailable", "order_size_breakdown_unavailable"],
         }
         excerpt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         evidence = {

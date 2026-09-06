@@ -384,11 +384,41 @@ def _weekend_review_coverage_problems(packet: dict[str, Any], semantic: dict[str
     ):
         problems.append("weekend_review_lacks_fund_flow_direction")
 
+    directional_fund_flow = False
+    for source in evidence.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        try:
+            payload = json.loads(str(source.get("excerpt") or ""))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("coverage_level") == "directional_sector":
+            directional_fund_flow = True
+            break
+    if directional_fund_flow:
+        has_boundary = (
+            any(term in compact for term in ("仅代表板块", "只覆盖板块", "仅覆盖板块", "当前只覆盖板块"))
+            and "全市场净额" in compact
+            and any(term in compact for term in ("不能代表", "未取得", "不可得", "无法支持"))
+            and any(term in compact for term in ("大中小单", "大小单", "订单规模拆分"))
+        )
+        if not has_boundary:
+            problems.append("weekend_review_lacks_directional_fund_flow_boundary")
+        if (
+            re.search(r"全市场[^。；]{0,18}(?:净流入|净流出)[^。；]{0,8}\d", compact)
+            or re.search(r"(?:超大单|大单|中单|小单)[^。；]{0,12}(?:净流入|净流出)[^。；]{0,8}\d", compact)
+        ):
+            problems.append("weekend_review_overclaims_directional_fund_flow")
+
     if "material_events_and_counterevidence" in available and not (
         any(term in compact for term in ("政策", "市场事件", "风险事件", "市场公告"))
         and any(term in compact for term in ("影响", "扰动", "催化", "压制", "支撑", "未发现"))
     ):
         problems.append("weekend_review_lacks_market_event_impact")
+    elif "material_events_and_counterevidence" in available and not any(
+        term in compact for term in ("可能", "推断", "仍需", "待验证", "或将")
+    ):
+        problems.append("weekend_review_event_impact_not_marked_as_inference")
 
     if "portfolio_events_and_counterevidence" in available:
         announcement_markers = ("公告", "披露", "停复牌", "财报")

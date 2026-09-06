@@ -1132,6 +1132,7 @@ class EvidenceV3Tests(TestCase):
             )
             settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
             packet = {"task_key": cycle["task_key"], "stage": "m1_judgment", "as_of": self.as_of}
+            packet["evidence"] = {"sources": [{"evidence_ref": "market", "excerpt": "verified market"}]}
 
             with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
                 "ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker,
@@ -1202,6 +1203,7 @@ class EvidenceV3Tests(TestCase):
             )
             settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
             packet = {"task_key": cycle["task_key"], "stage": "m1_judgment", "as_of": self.as_of}
+            packet["evidence"] = {"sources": [{"evidence_ref": "market", "excerpt": "verified market"}]}
 
             with patch("ai_trading_companion.__main__.load_settings", return_value=settings), patch(
                 "ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker,

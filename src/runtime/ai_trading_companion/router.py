@@ -157,6 +157,17 @@ class CognitiveRouter:
     def verify(self, stage: str, packet: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
         problems: list[str] = []
         profile = self.profile(stage, packet, 1)
+        if (stage == "m1_judgment" and output.get("result_version") == 5) or (
+            stage == "m2" and output.get("result_version") == 4
+        ):
+            from .judgment_publication import publication_problems
+            problems = publication_problems(output, packet)
+            if stage == "m1_judgment" and not profile.m1_blind:
+                problems.append("m1_packet_contains_human_input")
+            problems.extend(_formal_m1_expression_problems(packet, output.get("narrative", "")))
+            return {"passed": not problems, "problems": problems, "profile": profile.as_json(),
+                    "publication": output.get("publication"),
+                    "fallback": bool((output.get("publication") or {}).get("fallback"))}
         normalized = normalize_stage_output(stage, output)
         if stage == "m0_compose":
             calendar = packet.get("calendar_context") if isinstance(packet.get("calendar_context"), dict) else {}

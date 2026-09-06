@@ -49,6 +49,7 @@ from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
 from .runtime_strategy_policy import RuntimeStrategyControls, RuntimeStrategyPolicy
 from .stage_expression import normalize_stage_output, safe_stage_output
+from .judgment_publication import JudgmentPublicationPipeline, JudgmentUnavailable
 from .local_research import (
     BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
     ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend,
@@ -802,7 +803,16 @@ def _call_stage(
                 }
                 request_hash = canonical_packet_hash(request_packet)
 
-        if not search or not schema_name.startswith("companion-evidence-result-"):
+        if stage in {"m1_judgment", "m2"} and not search:
+            pipeline = JudgmentPublicationPipeline(
+                broker, store, SCHEMAS, intellect=decision.intellect, effort=decision.reasoning_effort,
+                is_shadow=runtime_strategy_shadow_cell is not None,
+            )
+            data = pipeline.produce(stage, cycle, request_packet, deadline)
+            outcome = pipeline.last_response
+            tool_trace.extend(_broker_call_trace(pipeline.responses))
+            verifier = router.verify(stage, packet, data)
+        elif not search or not schema_name.startswith("companion-evidence-result-"):
             schema = json.loads((SCHEMAS / schema_name).read_text(encoding="utf-8"))
             def verified_output(output: dict[str, Any]) -> dict[str, Any]:
                 return router.verify(stage, packet, output)
@@ -824,7 +834,12 @@ def _call_stage(
                 verifier["evidence_gate"] = evidence_verifier
                 verifier["passed"] = bool(verifier.get("passed")) and bool(evidence_verifier.get("passed"))
 
-        if outcome is None:
+        if stage in {"m1_judgment", "m2"} and data.get("publication"):
+            # All purchased work is accounted once on the individual subattempts.
+            stage_audit = {"kind": "judgment_publication", **data["publication"]}
+            usage = {}
+            actual_model = "runtime-reviewed-core" if data["publication"]["fallback"] else "reviewed-judgment-pipeline"
+        elif outcome is None:
             if not (
                 search and schema_name.startswith("companion-evidence-result-")
                 and verifier.get("passed")
@@ -976,7 +991,7 @@ def run_router_shadow(store: CompanionStore, job: dict[str, Any], execute: bool)
     try:
         request_packet = {key: value for key, value in packet.items() if key != "sha256"}
         router = CognitiveRouter()
-        outcome = broker_client().invoke(BrokerRequest(
+        request = BrokerRequest(
             stage=job["stage"], packet=request_packet, packet_sha256=canonical_packet_hash(request_packet),
             intellect=str(candidate["intellect"]), effort=str(candidate["reasoning_effort"]),
             schema=json.loads((SCHEMAS / job["schema_name"]).read_text(encoding="utf-8")),
@@ -987,16 +1002,27 @@ def run_router_shadow(store: CompanionStore, job: dict[str, Any], execute: bool)
             verifier_name=f"router-shadow/{job['stage']}",
             verifier=lambda output: router.verify(job["stage"], packet, output),
             h0_forbidden=job["stage"] == "m1_judgment",
-        ))
-        if not isinstance(outcome.result, dict):
+        )
+        if job["stage"] in {"m1_judgment", "m2"}:
+            pipeline = JudgmentPublicationPipeline(
+                broker_client(), store, SCHEMAS, intellect=str(candidate["intellect"]),
+                effort=str(candidate["reasoning_effort"]), is_shadow=True,
+            )
+            data = pipeline.produce(job["stage"], cycle, request_packet, request.absolute_deadline)
+            outcome = pipeline.last_response
+        else:
+            outcome = broker_client().invoke(request)
+            data = outcome.result
+        if not isinstance(data, dict):
             raise BrokerError("Broker produced no qualified shadow result", category="broker_output_invalid")
-        data = outcome.result
         verifier = router.verify(job["stage"], packet, data)
         output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(
             attempt["attempt_id"], "succeeded", output_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
-            usage=outcome.usage, verifier=verifier, broker_metadata=outcome.audit_metadata(),
-            tool_trace=[outcome.audit_metadata()], actual_model=outcome.actual_model,
+            usage=outcome.usage if outcome else {}, verifier=verifier,
+            broker_metadata=outcome.audit_metadata() if outcome else {},
+            tool_trace=[outcome.audit_metadata()] if outcome else [],
+            actual_model=outcome.actual_model if outcome else "runtime-reviewed-core",
         )
         store.finish_router_shadow(job["job_id"], output=data, verifier=verifier)
     except Exception as exc:
@@ -1397,7 +1423,7 @@ def run_m1(
                 judgment, judgment_attempt_id = judgment_checkpoint["output"], judgment_checkpoint["attempt_id"]
             else:
                 judgment_stage = _call_stage(
-                    store, cycle, "m1_judgment", local_packet, "companion-m1-result-v4.schema.json",
+                    store, cycle, "m1_judgment", local_packet, "companion-m1-result-v5.schema.json",
                     search=False, timeout=judgment_timeout, frozen_controls=judgment_controls,
                 )
                 judgment, judgment_attempt_id = judgment_stage.output, judgment_stage.attempt_id
@@ -1416,29 +1442,17 @@ def run_m1(
                 remaining = 0
             retryable = _m1_should_retry(exc, attempt_number=number, remaining_seconds=remaining)
             details = getattr(exc, "verifier", None)
+            if isinstance(exc, JudgmentUnavailable):
+                engine.m1_failed(cycle_id, str(exc), retryable=False,
+                                 details={"problems": ["decision_core_unavailable"]})
+                raise
             if (
                 isinstance(exc, (BrokerError, TimeoutError, EvidenceInsufficient))
                 and not retryable
                 and local_packet is not None
             ):
-                try:
-                    fallback, fallback_attempt_id = _save_safe_stage_fallback(
-                        store, cycle, "m1_judgment", local_packet,
-                        horizon="当前",
-                    )
-                except EvidenceInsufficient as fallback_exc:
-                    engine.m1_failed(
-                        cycle_id, str(fallback_exc), retryable=False,
-                        details=fallback_exc.verifier,
-                    )
-                    raise
-                m1_result = normalize_stage_output("m1_judgment", fallback)
-                return engine.m1_ready(
-                    cycle_id, m1_result.text, as_of=evidence.get("as_of"),
-                    research_attempt_id=evidence_attempt_id, judgment_attempt_id=fallback_attempt_id,
-                    research_packet_hash=public_packet["sha256"], judgment_packet_hash=local_packet["sha256"],
-                    snapshot=m1_result.snapshot, qualified=bool(m1_result.qualified),
-                )
+                engine.m1_failed(cycle_id, str(exc), retryable=False, details=details)
+                raise
             if not retryable:
                 engine.m1_failed(
                     cycle_id, str(exc), retryable=False,
@@ -1477,13 +1491,14 @@ def run_m2(engine: CompanionEngine, store: CompanionStore, cycle_id: str, execut
     )
     try:
         stage_result = _call_stage(
-            store, cycle, "m2", packet, "companion-m2-result-v3.schema.json",
+            store, cycle, "m2", packet, "companion-m2-result-v4.schema.json",
             search=False, timeout=timeout, frozen_controls=controls,
         )
         store.save_stage_checkpoint(cycle_id, "m2", packet["sha256"], stage_result.attempt_id, stage_result.output)
         output, attempt_id = stage_result.output, stage_result.attempt_id
-    except (BrokerError, TimeoutError):
-        output, attempt_id = _save_safe_stage_fallback(store, cycle, "m2", packet, horizon="当前")
+    except (BrokerError, TimeoutError, JudgmentUnavailable, EvidenceInsufficient):
+        store.transition(cycle_id, "m2_deferred")
+        raise
     m2_result = normalize_stage_output("m2", output)
     return engine.m2_ready(
         cycle_id, m2_result.text, snapshot=m2_result.snapshot, as_of=frozen_as_of,

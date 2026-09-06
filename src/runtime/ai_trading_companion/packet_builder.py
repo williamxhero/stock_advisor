@@ -91,6 +91,10 @@ class RuntimePacketBuilder:
             packet["public_research_scope"] = self._public_scope(cycle, stage, evidence, context, packet_as_of, memory_cards)
         else:
             packet["protocol"] = self._protocol(cycle, stage)
+            if stage in {"m1_judgment", "m2"}:
+                doctrine = self.store.risk_doctrine()
+                packet["risk_doctrine"] = {"revision": doctrine["revision"],
+                                           "doctrine": doctrine.get("doctrine") or json.loads(doctrine["doctrine_json"])}
             packet["business_context"] = self._business_context(cycle, stage)
             packet["evidence"] = evidence or {}
             if stage == "m0_compose":

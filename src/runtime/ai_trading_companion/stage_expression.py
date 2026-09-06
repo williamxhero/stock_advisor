@@ -573,6 +573,22 @@ def express_stage_semantics(stage: str, semantic: dict[str, Any]) -> str:
 
 def normalize_stage_output(stage: str, output: dict[str, Any]) -> NormalizedStageOutput:
     """Give v2 semantics and read-only v1 results one canonical runtime shape."""
+    if (stage == "m1_judgment" and output.get("result_version") == 5) or (
+        stage == "m2" and output.get("result_version") == 4
+    ):
+        core = output["decision_core"]
+        semantic = {
+            "summary": core["thesis"], "direction": core["direction"], "qualified": True,
+            "horizon": core["horizon"], "current_action": core["current_action"],
+            "key_evidence": [row["implication"] for row in core["reasons"]],
+            "position_focus": core["position_focus"], "transition_conditions": core["transition_conditions"],
+            "risks": [core["counterargument"]["claim"]], "unknowns": core["critical_unknowns"],
+        }
+        snapshot = _semantic_snapshot(semantic)
+        snapshot.update(horizon=core["horizon"], confidence=core["confidence"], decision_core=core)
+        for claim in snapshot["claims"]:
+            claim["confidence"] = core["confidence"]
+        return NormalizedStageOutput(stage, semantic, snapshot, output["narrative"], True, False, True)
     semantic_only_v3 = (
         (stage == "m1_judgment" and output.get("result_version") in {3, 4})
         or (stage == "m2" and output.get("result_version") == 3)

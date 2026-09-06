@@ -474,8 +474,8 @@ def _verified_announcement_narrative(name: str, announcement: dict[str, Any]) ->
         return f"{name}披露回购进展，正文没有显示足以单独改变当前判断的新催化"
     if "更正" in title + compact:
         if "文字" in compact and any(term in compact for term in ("不涉及", "不影响", "无实质影响")):
-            return f"{name}更正的是文字表述，不涉及核心数据，对当前判断影响有限"
-        return f"{name}披露{title}，需要按更正范围评估其对核心数据的影响"
+            return f"{name}更正的是文字表述，不涉及主要财务数据，对当前判断影响有限"
+        return f"{name}披露{title}，需要按更正范围评估其对主要财务数据的影响"
     if any(term in title + compact for term in ("风险提示", "立案", "处罚", "终止", "诉讼", "停牌")):
         return f"{name}披露{title}，这是需要优先跟踪的风险变化"
     return ""

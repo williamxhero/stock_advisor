@@ -71,7 +71,8 @@ class WebAccessGatewayClient:
         detected_time = _fact_as_of(title + "\n" + body + "\n" + url, not_after=not_after)
         return {"trace_id": _text(value, "trace_id"), "results": [{
             "url": _text(value, "url") or url, "title": title, "excerpt_text": body[:12000],
-            "fact_as_of": detected_time, "published_at": detected_time, "primary": True,
+            "fact_as_of": detected_time, "published_at": _text(value, "published_at") or detected_time,
+            "primary": bool(value.get("primary")), **_provenance(value),
         }]}
 
     def browser(self, session_id: str | None, actions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -85,7 +86,11 @@ class WebAccessGatewayClient:
         value = self._call("web_browser", {"session_id": session_id, "actions": normalized_actions}, self.read_timeout)
         snapshot = _text(value, "snapshot") or _text(value, "markdown")
         url = _text(value, "url")
-        return {"trace_id": _text(value, "trace_id"), "results": [{"url": url, "title": _text(value, "title"), "excerpt_text": snapshot[:12000], "fact_as_of": _fact_as_of(snapshot + "\n" + url), "primary": True}]}
+        return {"trace_id": _text(value, "trace_id"), "results": [{
+            "url": url, "title": _text(value, "title"), "excerpt_text": snapshot[:12000],
+            "fact_as_of": _fact_as_of(snapshot + "\n" + url), "primary": bool(value.get("primary")),
+            **_provenance(value),
+        }]}
 
     def _call(self, name: str, arguments: dict[str, Any], timeout: int) -> dict[str, Any]:
         if not self.url.startswith(("http://", "https://")):
@@ -139,7 +144,28 @@ def _text(value: Any, key: str) -> str:
 
 def _item(value: dict[str, Any]) -> dict[str, Any]:
     text = _text(value, "content")
-    return {"url": _text(value, "url"), "title": _text(value, "title"), "excerpt_text": text[:2000], "fact_as_of": _fact_as_of(text + "\n" + _text(value, "url")), "primary": False}
+    return {
+        "url": _text(value, "url"), "title": _text(value, "title"), "excerpt_text": text[:2000],
+        "fact_as_of": _fact_as_of(text + "\n" + _text(value, "url")),
+        "published_at": _text(value, "published_at") or None,
+        "primary": bool(value.get("primary")), **_provenance(value),
+    }
+
+
+def _provenance(value: dict[str, Any]) -> dict[str, Any]:
+    """Pass gateway-observed provenance through without asking the model to reconstruct it."""
+    chain = value.get("citation_chain")
+    claims = value.get("claims")
+    return {
+        "author": _text(value, "author"), "publisher": _text(value, "publisher"),
+        "original_source": _text(value, "original_source") or _text(value, "canonical_source_url"),
+        "original_publisher": _text(value, "original_publisher"),
+        "citation_chain": list(chain) if isinstance(chain, list) else [],
+        "source_tier": _text(value, "source_tier"),
+        "factual_status": _text(value, "factual_status"),
+        "market_propagation": _text(value, "market_propagation"),
+        "claims": [dict(row) for row in claims or [] if isinstance(row, dict)],
+    }
 
 
 def _fact_as_of(text: str, *, not_after: str | None = None) -> str | None:

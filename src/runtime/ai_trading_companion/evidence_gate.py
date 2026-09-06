@@ -327,6 +327,11 @@ class _EvidenceGateV3:
                 if key != "acquired_at" and parsed and as_of and parsed > as_of:
                     problems.append("source_from_future" if key == "fact_as_of" else f"source_{key}_in_future")
             sources[ref] = {**item, "excerpt": excerpt, "analysis": str(source.get("analysis") or "")}
+        source_conflicts = self._source_conflicts(sources)
+        declared_conflicts = [
+            dict(row) for row in evidence.get("conflicts") or [] if isinstance(row, dict)
+        ]
+        conflicts = self._merge_conflicts(declared_conflicts, source_conflicts)
         coverage = {str(row.get("requirement_key") or ""): row for row in evidence.get("coverage") or [] if isinstance(row, dict)}
         missing: list[str] = []
         for requirement in contract.get("requirements") or []:
@@ -357,6 +362,18 @@ class _EvidenceGateV3:
                 continue
             if not refs or len(bound) != len(refs):
                 problems.append(f"blocking_requirement_untraceable:{key}"); missing.append(key); continue
+            if any(
+                conflict.get("resolution") == "unresolved_equal_tier"
+                and (
+                    conflict.get("requirement_key") == key
+                    or bool(set(refs).intersection(conflict.get("competing_evidence_refs") or []))
+                )
+                for conflict in conflicts
+            ):
+                problems.append(f"blocking_requirement_conflicted:{key}"); missing.append(key); continue
+            if self._exact_fact_confirmation_missing(bound):
+                problems.append(f"blocking_requirement_exact_fact_lacks_primary_or_independent_confirmation:{key}")
+                missing.append(key); continue
             if not self._in_window(bound, requirement.get("window") or {}, problems):
                 problems.append(f"blocking_requirement_stale:{key}"); missing.append(key); continue
             if key == "portfolio_events_and_counterevidence":
@@ -443,19 +460,135 @@ class _EvidenceGateV3:
             if absent_entities:
                 problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
         for event in evidence.get("high_impact_events") or []:
-            if event.get("materiality") != "high":
-                continue
-            refs = [str(ref) for ref in event.get("evidence_refs") or []]
-            bound = [sources[ref] for ref in refs if ref in sources]
-            independent = {str(item.get("independence_group") or "") for item in bound if item.get("independence_group")}
-            if not any(item.get("primary") for item in bound) and len(independent) < 2:
-                problems.append("high_impact_fact_lacks_primary_or_independent_confirmation")
+            truth_status = str(event.get("truth_status") or "")
+            propagation_status = str(event.get("propagation_status") or "")
+            if truth_status not in {"verified", "unverified", "refuted"}:
+                problems.append("event_truth_status_missing_or_invalid")
+            if propagation_status not in {"observed", "not_observed", "unknown"}:
+                problems.append("event_propagation_status_missing_or_invalid")
+            truth_refs = [str(ref) for ref in event.get("truth_evidence_refs") or []]
+            propagation_refs = [str(ref) for ref in event.get("propagation_evidence_refs") or []]
+            if any(ref not in sources for ref in [*truth_refs, *propagation_refs]):
+                problems.append("event_status_ref_not_in_current_attempt")
+            if event.get("materiality") == "high" and truth_status in {"verified", "refuted"}:
+                truth_sources = [sources[ref] for ref in truth_refs if ref in sources]
+                if not any(item.get("primary") for item in truth_sources) and len(self._independent_groups(truth_sources)) < 2:
+                    problems.append("high_impact_fact_lacks_primary_or_independent_confirmation")
+            if propagation_status == "observed":
+                propagation_sources = [sources[ref] for ref in propagation_refs if ref in sources]
+                if not propagation_sources or not any(
+                    str(item.get("market_propagation") or "") == "observed"
+                    or any(
+                        str(claim.get("proposition") or "") == "market_propagation"
+                        for claim in item.get("claims") or [] if isinstance(claim, dict)
+                    )
+                    for item in propagation_sources
+                ):
+                    problems.append("observed_market_propagation_lacks_evidence")
         return {
             "validator_version": 3, "passed": not problems,
             "problems": list(dict.fromkeys(problems)), "missing_requirements": list(dict.fromkeys(missing)),
             "attempted_backends": sorted({str(item.get("backend") or "") for item in current if item.get("backend")}),
-            "successful_tool_results": len(current), "normalized_evidence": self._normalized(evidence, sources),
+            "successful_tool_results": len(current),
+            "normalized_evidence": self._normalized(evidence, sources, conflicts),
         }
+
+    @staticmethod
+    def _independent_groups(sources: list[dict[str, Any]]) -> set[str]:
+        groups: set[str] = set()
+        for item in sources:
+            origin = str(item.get("original_source") or "").strip().casefold()
+            group = str(item.get("independence_group") or "").strip().casefold()
+            identity = origin and "origin:" + origin or group
+            if identity:
+                groups.add(identity)
+        return groups
+
+    @classmethod
+    def _exact_fact_confirmation_missing(cls, sources: list[dict[str, Any]]) -> bool:
+        groups: dict[tuple[str, str, str, str, str], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+        for source in sources:
+            for claim in source.get("claims") or []:
+                if not isinstance(claim, dict) or claim.get("precision") != "exact":
+                    continue
+                key = (
+                    str(claim.get("proposition") or ""), str(claim.get("field") or ""),
+                    str(claim.get("scope") or ""), str(claim.get("unit") or ""),
+                    str(claim.get("fact_as_of") or ""),
+                )
+                if key[0] and key[1]:
+                    groups.setdefault(key, []).append((source, claim))
+        for rows in groups.values():
+            values = {json.dumps(claim.get("value"), ensure_ascii=False, sort_keys=True) for _, claim in rows}
+            if len(values) != 1:
+                continue
+            evidence_sources = [source for source, _ in rows]
+            if any(
+                source.get("primary") is True
+                or str(source.get("source_tier") or "").startswith("primary_")
+                for source in evidence_sources
+            ):
+                continue
+            if len(cls._independent_groups(evidence_sources)) < 2:
+                return True
+        return False
+
+    @classmethod
+    def _source_conflicts(cls, sources: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        comparable: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for ref, source in sources.items():
+            for claim in source.get("claims") or []:
+                if not isinstance(claim, dict) or claim.get("precision") != "exact":
+                    continue
+                proposition = str(claim.get("proposition") or "")
+                field = str(claim.get("field") or "")
+                fact_as_of = str(claim.get("fact_as_of") or "")
+                if not proposition or not field:
+                    continue
+                comparable.setdefault((proposition, field, fact_as_of), []).append({
+                    "evidence_ref": ref, "value": claim.get("value"),
+                    "unit": str(claim.get("unit") or ""), "scope": str(claim.get("scope") or ""),
+                    "source_tier": str(source.get("source_tier") or "secondary"),
+                    "requirement_key": str(claim.get("requirement_key") or source.get("tool_arguments", {}).get("requirement_key") or ""),
+                })
+        conflicts: list[dict[str, Any]] = []
+        for (proposition, field, fact_as_of), rows in comparable.items():
+            if len(rows) < 2:
+                continue
+            variants = {json.dumps(row["value"], ensure_ascii=False, sort_keys=True) for row in rows}
+            if len(variants) < 2:
+                continue
+            dimensions = {(row["scope"], row["unit"]) for row in rows}
+            tiers = {row["source_tier"] for row in rows}
+            if len(dimensions) > 1:
+                resolution = "scope_difference"
+            elif len(tiers) == 1:
+                resolution = "unresolved_equal_tier"
+            elif any(tier.startswith("primary_") for tier in tiers):
+                resolution = "primary_precedence"
+            else:
+                resolution = "unresolved_equal_tier"
+            refs = list(dict.fromkeys(row["evidence_ref"] for row in rows))
+            keys = {row["requirement_key"] for row in rows if row["requirement_key"]}
+            conflicts.append({
+                "claim": f"{proposition}.{field}@{fact_as_of}",
+                "competing_evidence_refs": refs, "materiality": "high",
+                "resolution": resolution, "requirement_key": next(iter(keys)) if len(keys) == 1 else "",
+                "observations": rows,
+            })
+        return conflicts
+
+    @staticmethod
+    def _merge_conflicts(declared: list[dict[str, Any]], derived: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        for row in [*derived, *declared]:
+            refs = tuple(sorted(str(ref) for ref in row.get("competing_evidence_refs") or []))
+            identity = (str(row.get("claim") or ""), refs)
+            if identity not in seen:
+                seen.add(identity)
+                merged.append(dict(row))
+        return merged
 
     @staticmethod
     def _time(value: Any, label: str, problems: list[str], *, required: bool = True) -> datetime | None:
@@ -739,10 +872,12 @@ class _EvidenceGateV3:
         return any(all(term.casefold() in str(item.get("tool_arguments", {}).get("query") or "").casefold() for term in terms) for item in sources)
 
     @staticmethod
-    def _normalized(evidence: dict[str, Any], sources: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    def _normalized(
+        evidence: dict[str, Any], sources: dict[str, dict[str, Any]], conflicts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         materialized = []
         for source in evidence.get("sources") or []:
             item = sources.get(str(source.get("evidence_ref") or ""))
             if item:
                 materialized.append({**item, "evidence_ref": source.get("evidence_ref"), "excerpt": source.get("excerpt"), "analysis": source.get("analysis")})
-        return {**evidence, "sources": materialized}
+        return {**evidence, "sources": materialized, "conflicts": conflicts}

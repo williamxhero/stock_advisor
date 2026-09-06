@@ -5,7 +5,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .secret_guard import find_secrets
 
@@ -38,10 +38,35 @@ class AcquisitionBoundary:
             if find_secrets(excerpt):
                 secret_rejected_items += 1
                 continue
+            canonical_url = self._canonical_url(url)
+            original_source = self._canonical_origin(row.get("original_source") or row.get("original_url"))
+            content_fingerprint = "sha256:" + hashlib.sha256(
+                " ".join(excerpt.split()).encode("utf-8")
+            ).hexdigest()
+            independence_group = str(row.get("independence_group") or "").strip()
+            if original_source:
+                independence_group = "origin:" + original_source.casefold()
+            elif not independence_group:
+                independence_group = "publisher:" + str(row.get("original_publisher") or host).strip().casefold()
+            citation_chain = [
+                self._canonical_origin(value) for value in row.get("citation_chain") or []
+                if self._canonical_origin(value)
+            ]
             item = {
                 "evidence_ref": ref, "url": url, "title": str(row.get("title") or result.get("title") or ""),
-                "source_identity": host, "independence_group": str(row.get("independence_group") or host),
+                "canonical_url": canonical_url, "source_identity": host,
+                "author": str(row.get("author") or ""),
+                "publisher": str(row.get("publisher") or row.get("source") or host),
+                "original_source": original_source, "citation_chain": citation_chain,
+                "content_fingerprint": str(row.get("content_fingerprint") or content_fingerprint),
+                "independence_group": independence_group,
                 "primary": bool(row.get("primary")) or self._trusted_primary(host),
+                "source_tier": str(row.get("source_tier") or (
+                    "primary_document" if bool(row.get("primary")) or self._trusted_primary(host) else "secondary"
+                )),
+                "factual_status": str(row.get("factual_status") or "unknown"),
+                "market_propagation": str(row.get("market_propagation") or "unknown"),
+                "claims": [dict(value) for value in row.get("claims") or [] if isinstance(value, dict)],
                 "excerpt_text": excerpt, "fact_as_of": row.get("fact_as_of") or row.get("published_at"),
                 "published_at": row.get("published_at"), "acquired_at": acquired_at,
             }
@@ -63,6 +88,35 @@ class AcquisitionBoundary:
     @staticmethod
     def _hash(value: Any) -> str:
         return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _canonical_url(value: Any) -> str:
+        try:
+            parsed = urlsplit(str(value or "").strip())
+        except ValueError:
+            return ""
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return ""
+        tracking = {"fbclid", "gclid", "spm"}
+        query = [
+            (key, item) for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+            if not key.casefold().startswith("utm_") and key.casefold() not in tracking
+        ]
+        host = parsed.hostname.casefold()
+        if parsed.port and not (
+            parsed.scheme == "http" and parsed.port == 80
+            or parsed.scheme == "https" and parsed.port == 443
+        ):
+            host += f":{parsed.port}"
+        path = parsed.path.rstrip("/") or "/"
+        return urlunsplit((parsed.scheme.casefold(), host, path, urlencode(sorted(query)), "")).rstrip("/")
+
+    @classmethod
+    def _canonical_origin(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return cls._canonical_url(text) or " ".join(text.split())
 
     @staticmethod
     def _trusted_primary(host: str) -> bool:

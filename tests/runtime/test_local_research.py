@@ -1019,7 +1019,15 @@ class LocalResearchTests(unittest.TestCase):
         pdf = "https://static.cninfo.com.cn/finalpage/2026-09-04/1225516182.PDF"
         plan = {"version": 1, "operations": [
             {
+                **row("web_search", query=""),
+                "requirement_key": "candidate_business_research",
+            },
+            {
                 **row("web_search", query="002050 三花智控 半年度报告"),
+                "requirement_key": "candidate_business_research",
+            },
+            {
+                **row("web_read", url=""),
                 "requirement_key": "candidate_business_research",
             },
             {
@@ -1282,13 +1290,17 @@ class LocalResearchTests(unittest.TestCase):
         planner({"as_of": CONTRACT["as_of"], "evidence_contract": CONTRACT}, [], 0)
         request = broker.invoke.call_args.args[0]
 
-        result = request.verifier({"version": 1, "operations": [row("web_search", query="")]})
+        proposed = {"version": 1, "operations": [row("web_search", query="")]}
+        result = _verify_research_plan(request.packet, proposed)
 
         self.assertFalse(result["passed"])
         self.assertIn(
             "research_plan_operation_argument_missing:market:web_search:query",
             result["problems"],
         )
+        salvaged = request.verifier(proposed)
+        self.assertFalse(salvaged["passed"])
+        self.assertIn("research_plan_missing_requirement:market", salvaged["problems"])
 
     def test_plan_verifier_rejects_a_backend_that_is_not_actually_available(self) -> None:
         broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})

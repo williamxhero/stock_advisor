@@ -1248,12 +1248,18 @@ def _bounded_research_plan(output: dict[str, Any], *, per_requirement: int = 8) 
             kept.append(operation)
             continue
         key = str(operation.get("requirement_key") or "")
-        verification_read = operation.get("operation") in {"web_read", "web_browser"}
+        operation_name = str(operation.get("operation") or "")
+        arguments = operation.get("arguments") if isinstance(operation.get("arguments"), dict) else {}
+        if operation_name == "web_search" and not str(arguments.get("query") or "").strip():
+            continue
+        if operation_name in {"web_read", "web_browser"} and not str(arguments.get("url") or "").strip():
+            continue
+        verification_read = operation_name in {"web_read", "web_browser"}
         if (
             key == "candidate_business_research"
             and verification_read
             and _is_non_document_research_url(
-                str((operation.get("arguments") or {}).get("url") or ""),
+                str(arguments.get("url") or ""),
             )
         ):
             # A bad listing URL must not invalidate useful searches and direct

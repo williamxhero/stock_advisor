@@ -107,12 +107,14 @@ class BrokerResearchPlanner:
     """Ask Broker only for declarative JSON; acquisition stays local."""
 
     def __init__(self, broker: ProviderBrokerClient, *, intellect: str, effort: str,
-                 deadline: Callable[[], float] | None = None, market_tool_available: bool = False) -> None:
+                 deadline: Callable[[], float] | None = None, market_tool_available: bool = False,
+                 completion_reserve_seconds: float = 0) -> None:
         self.broker = broker
         self.deadline = deadline or (lambda: math.inf)
         self.intellect = intellect
         self.effort = effort
         self.market_tool_available = market_tool_available
+        self.completion_reserve_seconds = max(0.0, float(completion_reserve_seconds))
         self.outcomes: list[Any] = []
 
     def qualify_candidates(self, evidence: dict[str, Any]) -> dict[str, Any]:
@@ -212,7 +214,9 @@ class BrokerResearchPlanner:
             stage="research", packet=planning_packet, packet_sha256=canonical_packet_hash(planning_packet),
             intellect=self.intellect, effort=self.effort,
             schema=_research_plan_schema(planning_packet["evidence_contract"] or {}),
-            visible_stream=False, absolute_deadline=float(self.deadline()), verifier_name="research-plan/v1",
+            visible_stream=False,
+            absolute_deadline=float(self.deadline()) - self.completion_reserve_seconds,
+            verifier_name="research-plan/v1",
             verifier=lambda output: _verify_research_plan(
                 planning_packet, _prepared_research_plan(planning_packet, output),
             ),
@@ -689,7 +693,8 @@ class LocalResearchChain:
                  resume_checkpoint: dict[str, Any] | None = None,
                  on_checkpoint: Callable[[dict[str, Any]], None] | None = None,
                  cancelled: Callable[[], bool] | None = None,
-                 semantic_qualifier: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> None:
+                 semantic_qualifier: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+                 completion_reserve_seconds: float = 0) -> None:
         self.planner = planner
         self.executor = executor
         self.gate = gate or EvidenceGate()
@@ -700,6 +705,9 @@ class LocalResearchChain:
         self.on_checkpoint = on_checkpoint
         self.cancelled = cancelled
         self.semantic_qualifier = semantic_qualifier
+        self.completion_reserve_seconds = (
+            max(0.0, float(completion_reserve_seconds)) if semantic_qualifier is not None else 0.0
+        )
 
     def _qualify_research(self, evidence: dict[str, Any], verifier: dict[str, Any]) -> dict[str, Any]:
         if not verifier.get("passed") or self.semantic_qualifier is None:
@@ -759,6 +767,9 @@ class LocalResearchChain:
             if forced_stop_reason or (self.cancelled and self.cancelled()):
                 forced_stop_reason = "user_cancelled"
                 break
+            if self.deadline is not None and self.deadline() <= self.completion_reserve_seconds:
+                forced_stop_reason = "semantic_qualification_reserve"
+                break
             tool_started_at, tool_started_clock = _start_tool_timing()
             try:
                 backend, result = self.executor.execute(row)
@@ -805,7 +816,9 @@ class LocalResearchChain:
             return FrozenResearchResult(True, normalized, verifier, observations, bundle_bytes, bundle_hash, 0)
         round_number = 0
         no_gain_rounds = 0
-        while not forced_stop_reason and (self.deadline is None or self.deadline() > 1.0):
+        while not forced_stop_reason and (
+            self.deadline is None or self.deadline() > self.completion_reserve_seconds
+        ):
             round_observation_start = len(observations)
             gaps = list(verifier.get("missing_requirements") or verifier.get("problems") or [])
             before_signature = _research_information_signature(observations, verifier)
@@ -882,6 +895,9 @@ class LocalResearchChain:
                 if self.cancelled and self.cancelled():
                     forced_stop_reason = "user_cancelled"
                     break
+                if self.deadline is not None and self.deadline() <= self.completion_reserve_seconds:
+                    forced_stop_reason = "semantic_qualification_reserve"
+                    break
                 if row.get("operation") == "web_browser" and not _browser_route_allowed(
                     str(row.get("requirement_key") or ""), observations, gaps,
                 ):
@@ -934,6 +950,9 @@ class LocalResearchChain:
                 for item in current_round
             ):
                 for row in _fallback_read_rows(observations, contract, limit=6):
+                    if self.deadline is not None and self.deadline() <= self.completion_reserve_seconds:
+                        forced_stop_reason = "semantic_qualification_reserve"
+                        break
                     tool_started_at, tool_started_clock = _start_tool_timing()
                     try:
                         backend, result = self.executor.execute(row)
@@ -991,7 +1010,10 @@ class LocalResearchChain:
             if self.max_repairs is not None and round_number > self.max_repairs:
                 break
         stop_reason = forced_stop_reason or (
-            "reliability_deadline" if self.deadline is not None else "configured_test_rounds"
+            "semantic_qualification_reserve"
+            if self.deadline is not None and self.completion_reserve_seconds > 0
+            and self.deadline() <= self.completion_reserve_seconds
+            else "reliability_deadline" if self.deadline is not None else "configured_test_rounds"
         )
         gap_states = _build_gap_states(
             evidence, contract, observations, verifier, final=True, stop_reason=stop_reason,

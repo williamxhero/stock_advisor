@@ -88,6 +88,7 @@ M1_MIN_RETRY_WINDOW_SECONDS = 30
 FORMAL_MEMORY_MAX_ACTIONS = 4
 CHAT_MEMORY_MAX_ACTIONS = 4
 OPTIONAL_SHADOW_MAX_SECONDS = 60
+OPPORTUNITY_QUALIFICATION_RESERVE_SECONDS = 90
 
 
 def _m1_should_retry(exc: Exception, *, attempt_number: int, remaining_seconds: int) -> bool:
@@ -723,9 +724,14 @@ def _call_stage(
                     "version": 3, "as_of": packet.get("as_of"),
                     "requirements": packet.get("evidence_requirements") or [],
                 }
+            candidate_qualification_reserve = (
+                float(OPPORTUNITY_QUALIFICATION_RESERVE_SECONDS)
+                if packet.get("task_key") == "daily.opportunity.0900" else 0.0
+            )
             planner = BrokerResearchPlanner(
                 broker, deadline=lambda: deadline, intellect=decision.intellect, effort=decision.reasoning_effort,
                 market_tool_available="market" in controls.enabled_backends,
+                completion_reserve_seconds=candidate_qualification_reserve,
             )
             tool_runner = ToolRunner(ToolCatalog(PATHS.tools), need_reporter=store.submit_capability_need)
             gateway_config = dict(settings.research.get("web_access_gateway") or {})
@@ -783,6 +789,7 @@ def _call_stage(
                 on_checkpoint=persist_research_checkpoint,
                 semantic_qualifier=planner.qualify_candidates
                 if packet.get("task_key") == "daily.opportunity.0900" else None,
+                completion_reserve_seconds=candidate_qualification_reserve,
                 cancelled=(
                     (lambda: store.chat_research_terminated(cycle["cycle_id"]))
                     if stage == "chat_research" else None

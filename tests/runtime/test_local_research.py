@@ -914,6 +914,28 @@ class LocalResearchTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             BrokerResearchPlanner(mock.Mock(), deadline=lambda: 123.0)
 
+    def test_planner_reserves_the_final_deadline_for_candidate_qualification(self) -> None:
+        requests = []
+        broker = mock.Mock()
+
+        def invoke(request):
+            requests.append(request)
+            if request.packet.get("stage") == "research_plan":
+                return SimpleNamespace(result={"version": 1, "operations": []})
+            return SimpleNamespace(result={"passed": True, "problems": []})
+
+        broker.invoke.side_effect = invoke
+        planner = BrokerResearchPlanner(
+            broker, intellect="smart", effort="medium", deadline=lambda: 1_000.0,
+            completion_reserve_seconds=90,
+        )
+
+        planner({"as_of": CONTRACT["as_of"], "evidence_contract": CONTRACT}, [], 0)
+        planner.qualify_candidates({"as_of": CONTRACT["as_of"], "sources": []})
+
+        self.assertEqual(910.0, requests[0].absolute_deadline)
+        self.assertEqual(1_000.0, requests[1].absolute_deadline)
+
     def test_planner_repair_reads_existing_discoveries_without_another_broker_call(self) -> None:
         broker = mock.Mock()
         planner = BrokerResearchPlanner(
@@ -2189,6 +2211,33 @@ print(json.dumps({'contract':'ai-trading-tool-result/v1','fact_as_of':'2026-08-2
 
         self.assertTrue(result.qualified, result.verifier["problems"])
         self.assertEqual([0, 1, 2, 3], rounds)
+
+    def test_research_does_not_spend_the_candidate_qualification_reserve_on_new_tools(self) -> None:
+        remaining = [91.0]
+        planner_calls: list[int] = []
+        tool_calls: list[str] = []
+
+        def planner(_packet: dict, _gaps: list[str], round_number: int) -> dict:
+            planner_calls.append(round_number)
+            remaining[0] = 90.0
+            return {"version": 1, "operations": [row("web_search", query="new company lead")]}
+
+        class AlwaysMissing:
+            def evaluate(self, *_args, **_kwargs):
+                return {"passed": False, "problems": ["needs_repair"], "missing_requirements": ["market"]}
+
+        result = LocalResearchChain(
+            planner,
+            ReadOnlyResearchExecutor({"gateway": lambda operation, _arguments: tool_calls.append(operation) or {"results": []}}),
+            gate=AlwaysMissing(), max_repairs=None, deadline=lambda: remaining[0],
+            completion_reserve_seconds=90,
+            semantic_qualifier=lambda _evidence: {"passed": False, "problems": ["still incomplete"]},
+        ).run({"as_of": CONTRACT["as_of"]}, {"version": 4, "as_of": CONTRACT["as_of"], "requirements": []}, attempt_id="reserve")
+
+        self.assertFalse(result.qualified)
+        self.assertEqual([0], planner_calls)
+        self.assertEqual([], tool_calls)
+        self.assertEqual("semantic_qualification_reserve", result.verifier["stop_reason"])
 
     def test_failed_planned_read_uses_an_untried_discovery_without_new_search(self) -> None:
         search = {"results": [

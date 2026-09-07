@@ -776,6 +776,8 @@ class LocalResearchChain:
         restored = _restored_research_observations(
             self.resume_checkpoint, contract, contract_sha256, attempt_id,
         )
+        for observation in restored:
+            _discard_unreadable_document_items(observation)
         was_resumed = bool(restored)
         observations: list[dict[str, Any]] = list(restored)
         verifier: dict[str, Any] = {"passed": False, "problems": ["not_evaluated"], "missing_requirements": []}
@@ -2529,11 +2531,18 @@ def _normalize_public_read_fact_time(
 
 
 def _discard_unreadable_document_items(observation: dict[str, Any]) -> None:
-    """A successful download is not evidence when the gateway returned raw file bytes."""
-    if str(observation.get("operation") or "") != "web_read":
-        return
+    """Do not let transport success stand in for readable document evidence."""
+    operation = str(observation.get("operation") or "")
+    requirement = str((observation.get("arguments") or {}).get("requirement_key") or "")
     items = list(observation.get("evidence_items") or [])
-    readable = [item for item in items if not _is_raw_pdf_item(item)]
+    readable = [
+        item for item in items
+        if not (operation == "web_read" and _is_raw_pdf_item(item))
+        and not (
+            requirement == "candidate_business_research"
+            and _has_only_unreadable_announcement_bodies(item)
+        )
+    ]
     discarded = len(items) - len(readable)
     if not discarded:
         return
@@ -2549,6 +2558,47 @@ def _is_raw_pdf_item(item: dict[str, Any]) -> bool:
         path = ""
     excerpt = str(item.get("excerpt_text") or "").lstrip("\ufeff \t\r\n")
     return path.endswith(".pdf") and excerpt.startswith("%PDF-")
+
+
+def _has_only_unreadable_announcement_bodies(item: dict[str, Any]) -> bool:
+    """Ignore CNInfo-style wrappers whose metadata is readable but document bodies are not."""
+    try:
+        payload = json.loads(str(item.get("excerpt_text") or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    announcements = payload.get("announcements")
+    if not isinstance(announcements, list):
+        announcements = payload.get("公告")
+    if not isinstance(announcements, list):
+        return False
+    bodies: list[str] = []
+    for announcement in announcements:
+        if not isinstance(announcement, dict):
+            continue
+        for key in ("content", "announcement_content", "公告内容"):
+            if key in announcement:
+                bodies.append(str(announcement.get(key) or ""))
+                break
+    return not bodies or not any(_is_readable_chinese_document_body(body) for body in bodies)
+
+
+def _is_readable_chinese_document_body(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    visible = [character for character in text if not character.isspace()]
+    if not visible:
+        return False
+    controls = sum(not character.isprintable() for character in visible)
+    cjk = sum(
+        "\u3400" <= character <= "\u4dbf"
+        or "\u4e00" <= character <= "\u9fff"
+        or "\uf900" <= character <= "\ufaff"
+        for character in visible
+    )
+    return controls <= max(1, len(visible) // 100) and cjk >= 20 and cjk / len(visible) >= 0.2
 
 
 def _public_page_publication_time(

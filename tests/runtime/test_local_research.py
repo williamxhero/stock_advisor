@@ -103,6 +103,42 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual([], result.evidence["sources"])
         self.assertIn("candidate_business_research", result.verifier["missing_requirements"])
 
+    def test_cninfo_wrapper_metadata_does_not_hide_an_unreadable_announcement_body(self):
+        as_of = "2026-09-07T07:30:00Z"
+        contract = {"version": 4, "as_of": as_of, "requirements": [{
+            "key": "candidate_business_research", "blocking": True,
+            "allowed_coverage": ["covered"],
+            "window": {"mode": "exact", "start": as_of, "end": as_of},
+        }]}
+        payload = {
+            "keyword": "300308", "代码": "300308", "简称": "中际旭创",
+            "公告": [{
+                "代码": "300308", "简称": "中际旭创", "公告标题": "H股公告（翌日披露报表）",
+                "公告内容": "FF305\n\u2209 \u0012\u000f\u0014\u000f\u0011\n\u0ca0\u0ccd\u0ca1\u0cb0\u0cbc\u0ccd\u0ca8\u0019\u01c5\u0014\u0012\u0cb0\n\u0001\n\u0dac\u0dbd\u0db3\u0dbd\u0d82\u0db6\u0dd6\u0010",
+            }],
+        }
+
+        def backend(_operation, _arguments):
+            return {"results": [{
+                "url": "http://yosef-server:8815/api/cninfo/search?q=300308",
+                "title": "cninfo_search", "excerpt_text": json.dumps(payload, ensure_ascii=False),
+                "fact_as_of": as_of,
+            }]}
+
+        plan = {"version": 1, "operations": [{
+            **row("web_read", url="http://yosef-server:8815/api/cninfo/search?q=300308"),
+            "requirement_key": "candidate_business_research",
+        }]}
+        result = LocalResearchChain(
+            lambda *_: plan,
+            ReadOnlyResearchExecutor({"gateway": backend}),
+            max_repairs=0,
+        ).run({"stage": "m0_research", "as_of": as_of}, contract, attempt_id="garbled-company-read")
+
+        self.assertFalse(result.qualified)
+        self.assertEqual([], result.evidence["sources"])
+        self.assertIn("candidate_business_research", result.verifier["missing_requirements"])
+
     def test_company_read_does_not_backdate_same_day_pdf_without_a_time(self):
         result = self._run_late_company_read(
             "北京同有飞骥科技股份有限公司公告，披露存储产品业务。",

@@ -1052,6 +1052,30 @@ class LocalResearchTests(unittest.TestCase):
             problems,
         )
 
+    def test_plan_verifier_allows_read_only_research_for_an_exploratory_candidate(self) -> None:
+        key = "candidate_business_research"
+        packet = {
+            "evidence_contract": {"requirements": [{"key": key, "blocking": True}]},
+            "coverage_gaps": [key],
+            "available_backends": ["market"],
+            "deterministic_requirement_keys": [],
+            "research_discoveries": [],
+        }
+        plan = {"version": 1, "operations": [{
+            "requirement_key": key,
+            "backend": "market",
+            "operation": "announcement_snapshot",
+            "arguments": {
+                "query": None, "categories": None, "url": None, "symbol": "002463",
+                "render": None, "session_id": None, "actions": None,
+            },
+            "fallback_backends": [],
+        }]}
+
+        result = _verify_research_plan(packet, plan)
+
+        self.assertTrue(result["passed"], result["problems"])
+
     def test_bounded_plan_drops_company_listing_page_but_keeps_useful_operations(self) -> None:
         listing = "https://www.cninfo.com.cn/new/disclosure/stock?stockCode=002050"
         homepage = "https://www.cninfo.com.cn/"

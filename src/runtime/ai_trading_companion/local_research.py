@@ -1187,9 +1187,6 @@ def _verify_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> dic
     problems = [f"research_plan_missing_requirement:{key}" for key in sorted(required - planned)]
     problems.extend(f"research_plan_unknown_requirement:{key}" for key in sorted(planned - set(requirements)))
     available_backends = set(packet.get("available_backends") or [])
-    discovered_candidate_symbols = set(_candidate_symbols_from_discoveries(
-        [row for row in packet.get("research_discoveries") or [] if isinstance(row, dict)]
-    ))
     for row in operations:
         if not isinstance(row, dict):
             continue
@@ -1213,8 +1210,6 @@ def _verify_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> dic
             symbol = str(arguments.get("symbol") or "").strip()
             if not _is_supported_a_share_symbol(symbol):
                 problems.append(f"research_plan_operation_argument_missing:{key}:{operation}:symbol")
-            elif symbol not in discovered_candidate_symbols:
-                problems.append(f"research_plan_candidate_symbol_not_discovered:{symbol}")
         if backend and backend not in available_backends:
             problems.append(f"research_plan_backend_unavailable:{backend}")
         if operation == "web_browser":

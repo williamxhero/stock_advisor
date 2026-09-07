@@ -1011,6 +1011,11 @@ class LocalResearchTests(unittest.TestCase):
 
     def test_bounded_plan_drops_company_listing_page_but_keeps_useful_operations(self) -> None:
         listing = "https://www.cninfo.com.cn/new/disclosure/stock?stockCode=002050"
+        homepage = "https://www.cninfo.com.cn/"
+        dynamic_detail = (
+            "https://www.cninfo.com.cn/new/disclosure/detail?stockCode=688825"
+            "&announcementId=1225425451"
+        )
         pdf = "https://static.cninfo.com.cn/finalpage/2026-09-04/1225516182.PDF"
         plan = {"version": 1, "operations": [
             {
@@ -1019,6 +1024,14 @@ class LocalResearchTests(unittest.TestCase):
             },
             {
                 **row("web_read", url=listing),
+                "requirement_key": "candidate_business_research",
+            },
+            {
+                **row("web_read", url=homepage),
+                "requirement_key": "candidate_business_research",
+            },
+            {
+                **row("web_read", url=dynamic_detail),
                 "requirement_key": "candidate_business_research",
             },
             {

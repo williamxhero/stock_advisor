@@ -106,9 +106,9 @@ def model_sources(packet: dict) -> dict[str, dict]:
         seen_content.add(identity)
         unique_sources[ref] = row
     sources = unique_sources
-    excerpt_limit = min(240, max(120, 4_800 // len(sources)))
+    excerpt_limit = min(200, max(120, 4_000 // len(sources)))
     useful_fields = (
-        "evidence_ref", "title", "excerpt", "fact_as_of", "source_identity", "source_tier",
+        "evidence_ref", "title", "excerpt", "fact_as_of", "source_identity",
     )
     projected: dict[str, dict] = {}
     for ref, row in sources.items():
@@ -203,6 +203,33 @@ def model_fact_digest(rows: list[dict]) -> list[dict]:
         "evidence_ref": str(row["evidence_ref"]),
         "excerpt": _bounded_model_text(row.get("excerpt"), excerpt_limit),
     } for row in values]
+
+
+def model_business_context(packet: dict) -> dict:
+    """Keep portfolio decisions legible without transport-only position metadata."""
+    context = packet.get("business_context") or {}
+    if not isinstance(context, dict):
+        return {}
+    portfolio = context.get("private_context_before_h0") or context.get("portfolio") or {}
+    if not isinstance(portfolio, dict):
+        return {"fact_source": context.get("fact_source")}
+    positions = []
+    for row in portfolio.get("positions") or []:
+        if not isinstance(row, dict):
+            continue
+        fields = ("code", "name", "shares", "last_price", "price_as_of")
+        if float(row.get("shares") or 0) > 0:
+            fields += ("average_cost", "market_value", "unrealized_pnl", "weight")
+        positions.append({key: value for key in fields if (value := row.get(key)) is not None})
+    projected = {
+        "positions": positions,
+        "total_assets": portfolio.get("total_assets"),
+        "frozen_at": portfolio.get("frozen_at"),
+    }
+    return {
+        "fact_source": context.get("fact_source"),
+        "private_context_before_h0": {key: value for key, value in projected.items() if value is not None},
+    }
 
 
 def _bounded_model_text(value: Any, limit: int) -> str:
@@ -463,7 +490,8 @@ class JudgmentPublicationPipeline:
         # Keep complete source coverage without repeating the same research bodies in artifacts.
         context = {**base, "artifacts": [a for a in base.get("artifacts", [])
                                         if a.get("kind") not in {"evidence", "m1_evidence"}],
-                   "evidence": model_evidence(base)}
+                   "evidence": model_evidence(base),
+                   "business_context": model_business_context(base)}
         # Prior AI prose is not verified market evidence or an expression exemplar.
         # Outcome/periodic reviews still need the original claims for comparison.
         periodic = str(base.get("task_key") or "").startswith("periodic.")
@@ -592,7 +620,7 @@ class JudgmentPublicationPipeline:
             + ("\n" + REVIEW_RESULT_INSTRUCTION if packet.get("task_key") == "daily.review.1520" else ""),
             "core": core, "text": text,
             "core_hash": canonical_packet_hash(core), "draft_hash": canonical_packet_hash({"text": text}),
-            "evidence": model_sources(packet), "business_context": packet.get("business_context"),
+            "evidence": model_sources(packet), "business_context": model_business_context(packet),
             "protocol": packet.get("protocol"), "as_of": packet.get("as_of"),
             "risk_doctrine": packet.get("risk_doctrine"),
             "prior_opportunity_plans": packet.get("prior_opportunity_plans") or [],

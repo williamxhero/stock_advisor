@@ -9,7 +9,8 @@ import pytest
 
 from ai_trading_companion.broker_client import BrokerResponse, canonical_packet_hash
 from ai_trading_companion.judgment_publication import (
-    JudgmentPublicationPipeline, JudgmentUnavailable, core_problems, model_evidence, render_core,
+    JudgmentPublicationPipeline, JudgmentUnavailable, core_problems, model_business_context,
+    model_evidence, render_core,
 )
 from ai_trading_companion.router import CognitiveRouter
 from ai_trading_companion.stage_expression import normalize_stage_output
@@ -499,3 +500,28 @@ def test_premarket_model_evidence_keeps_decision_inputs_not_noncritical_research
     assert "analysis" not in projected["sources"][-1]
     assert "market_propagation" not in projected["sources"][-1]
     assert "research_gaps" not in projected
+
+
+def test_model_business_context_keeps_active_risk_and_compacts_closed_positions():
+    projected = model_business_context({"business_context": {
+        "fact_source": "runtime_database",
+        "private_context_before_h0": {
+            "frozen_at": "2026-09-07T09:00:00Z", "total_assets": 100_000,
+            "positions": [
+                {"code": "000001", "name": "持仓", "shares": 100, "last_price": 10,
+                 "price_as_of": "2026-09-07T07:00:00Z", "average_cost": 9,
+                 "market_value": 1000, "unrealized_pnl": 100, "revision": 7},
+                {"code": "000002", "name": "最近卖出", "shares": 0, "last_price": 20,
+                 "price_as_of": "2026-09-07T07:00:00Z", "average_cost": 15,
+                 "market_value": 0, "unrealized_pnl": 0, "revision": 3},
+            ],
+        },
+    }})
+
+    positions = projected["private_context_before_h0"]["positions"]
+    assert positions[0]["average_cost"] == 9
+    assert "revision" not in positions[0]
+    assert positions[1] == {
+        "code": "000002", "name": "最近卖出", "shares": 0, "last_price": 20,
+        "price_as_of": "2026-09-07T07:00:00Z",
+    }

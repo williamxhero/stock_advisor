@@ -214,6 +214,18 @@ def _salvageable_m0_candidate_research(
     return all(any(str(problem).startswith(prefix) for prefix in allowed) for problem in problems)
 
 
+def _retain_salvageable_m0_candidate(
+    output: dict[str, Any] | None,
+    verifier: dict[str, Any] | None,
+    previous_output: dict[str, Any] | None,
+    previous_verifier: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Do not lose a repairable candidate set when a later retry only has a transport failure."""
+    if _salvageable_m0_candidate_research(output, verifier):
+        return output, verifier
+    return previous_output, previous_verifier
+
+
 def resolve_stage_controls(
     store: CompanionStore,
     stage: str,
@@ -1282,6 +1294,8 @@ def run_research(
     evidence: dict[str, Any] | None = None
     evidence_attempt_id: str | None = None
     local_packet: dict[str, Any] | None = None
+    salvageable_output: dict[str, Any] | None = None
+    salvageable_verifier: dict[str, Any] | None = None
     evidence_registrar = _research_memory_registrar(
         engine.memory, engine.memory_space_id, cycle,
     )
@@ -1329,6 +1343,10 @@ def run_research(
             publish_observatory_evaluation(store, cycle["cycle_id"])
             return ready
         except Exception as exc:
+            salvageable_output, salvageable_verifier = _retain_salvageable_m0_candidate(
+                getattr(exc, "output", None), getattr(exc, "verifier", None),
+                salvageable_output, salvageable_verifier,
+            )
             if isinstance(exc, EvidenceInsufficient):
                 engine.research_failed(cycle["cycle_id"], str(exc), details=exc.verifier)
                 publish_observatory_evaluation(store, cycle["cycle_id"])
@@ -1346,8 +1364,8 @@ def run_research(
                 try:
                     fallback, fallback_attempt_id = _save_safe_stage_fallback(
                         store, cycle, "m0_compose", local_packet, horizon="当前",
-                        rejected_output=getattr(exc, "output", None),
-                        rejected_verifier=getattr(exc, "verifier", None),
+                        rejected_output=salvageable_output,
+                        rejected_verifier=salvageable_verifier,
                     )
                 except EvidenceInsufficient as fallback_exc:
                     engine.research_failed(cycle["cycle_id"], str(fallback_exc), details=fallback_exc.verifier)

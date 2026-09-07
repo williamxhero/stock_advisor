@@ -23,6 +23,86 @@ def row(operation: str, *, query: str | None = None, url: str | None = None) -> 
     return {"requirement_key": "market", "backend": "gateway", "operation": operation, "arguments": {"query": query, "categories": "news", "url": url, "symbol": None, "render": "auto", "session_id": None, "actions": None}, "fallback_backends": []}
 
 class LocalResearchTests(unittest.TestCase):
+    def test_company_read_uses_article_time_instead_of_late_acquisition_time(self):
+        as_of = "2026-09-07T05:30:55Z"
+        contract = {"version": 4, "as_of": as_of, "requirements": [{
+            "key": "candidate_business_research", "blocking": True,
+            "allowed_coverage": ["covered"],
+            "window": {
+                "mode": "after_start_to_end",
+                "start": "2025-08-03T05:30:55Z",
+                "end": as_of,
+            },
+        }]}
+
+        def backend(_operation, _arguments):
+            return {"results": [{
+                "url": "https://company.test/notice",
+                "title": "神农集团2026年半年度报告",
+                "excerpt_text": "神农集团生猪业务跟踪 2026-09-04 16:34 星期五 神农集团605296披露养殖成本和出栏量；新希望000876可作同业比较。",
+                # This is when the read completed, not when the public fact existed.
+                "fact_as_of": "2026-09-07T05:32:53Z",
+            }]}
+
+        plan = {"version": 1, "operations": [{
+            **row("web_read", url="https://company.test/notice"),
+            "requirement_key": "candidate_business_research",
+        }]}
+        result = LocalResearchChain(
+            lambda *_: plan,
+            ReadOnlyResearchExecutor({"gateway": backend}),
+            max_repairs=0,
+        ).run({"stage": "m0_research", "as_of": as_of}, contract, attempt_id="late-company-read")
+
+        self.assertTrue(result.qualified, result.verifier)
+        self.assertEqual("2026-09-04T08:34:00Z", result.evidence["sources"][0]["fact_as_of"])
+
+    def test_company_read_does_not_backdate_an_unlabelled_business_date(self):
+        result = self._run_late_company_read(
+            "神农集团2026年半年度报告，报告期截至2026-06-30，披露养殖成本和出栏量。",
+        )
+
+        self.assertFalse(result.qualified)
+        self.assertIn("candidate_business_research", result.verifier["missing_requirements"])
+
+    def test_company_read_rejects_a_publication_time_after_the_frozen_as_of(self):
+        result = self._run_late_company_read(
+            "神农集团生猪业务跟踪 发布时间：2026-09-07 14:00，披露养殖成本和出栏量。",
+        )
+
+        self.assertFalse(result.qualified)
+        self.assertIn("candidate_business_research", result.verifier["missing_requirements"])
+
+    def _run_late_company_read(self, excerpt_text: str):
+        as_of = "2026-09-07T05:30:55Z"
+        contract = {"version": 4, "as_of": as_of, "requirements": [{
+            "key": "candidate_business_research", "blocking": True,
+            "allowed_coverage": ["covered"],
+            "window": {
+                "mode": "after_start_to_end",
+                "start": "2025-08-03T05:30:55Z",
+                "end": as_of,
+            },
+        }]}
+
+        def backend(_operation, _arguments):
+            return {"results": [{
+                "url": "https://company.test/notice",
+                "title": "神农集团2026年半年度报告",
+                "excerpt_text": excerpt_text,
+                "fact_as_of": "2026-09-07T05:32:53Z",
+            }]}
+
+        plan = {"version": 1, "operations": [{
+            **row("web_read", url="https://company.test/notice"),
+            "requirement_key": "candidate_business_research",
+        }]}
+        return LocalResearchChain(
+            lambda *_: plan,
+            ReadOnlyResearchExecutor({"gateway": backend}),
+            max_repairs=0,
+        ).run({"stage": "m0_research", "as_of": as_of}, contract, attempt_id="late-company-read")
+
     def test_company_research_continues_when_semantics_require_a_second_source(self):
         contract = {"version": 4, "as_of": CONTRACT["as_of"], "requirements": [{
             "key": "candidate_business_research", "blocking": True, "allowed_coverage": ["covered"],
@@ -913,6 +993,46 @@ class LocalResearchTests(unittest.TestCase):
         requirement_schema = request.schema["properties"]["operations"]["items"]["properties"]["requirement_key"]
         self.assertEqual(["events", "market"], requirement_schema["enum"])
         self.assertIn("Copy requirement_key exactly", request.packet["instruction"])
+
+    def test_planner_deterministically_caps_an_oversubscribed_requirement(self) -> None:
+        operations = [
+            {**row("web_search", query=f"公司业务核验 {index}"), "requirement_key": "market"}
+            for index in range(8)
+        ]
+        operations.append({
+            **row("web_read", url="https://company.test/disclosure"),
+            "requirement_key": "market",
+        })
+        proposed = {"version": 1, "operations": operations}
+        broker = mock.Mock()
+
+        def invoke(request):
+            self.assertTrue(request.verifier(proposed)["passed"])
+            return SimpleNamespace(result=proposed)
+
+        broker.invoke.side_effect = invoke
+        planner = BrokerResearchPlanner(
+            broker, intellect="smart", effort="medium", deadline=lambda: 123.0,
+        )
+
+        plan = planner({
+            "as_of": CONTRACT["as_of"],
+            "evidence_contract": CONTRACT,
+            "research_discoveries": [{
+                "requirement_key": "market",
+                "url": "https://company.test/disclosure",
+            }],
+        }, ["market"], 0)
+
+        self.assertEqual(8, len(plan["operations"]))
+        self.assertEqual(
+            [f"公司业务核验 {index}" for index in range(7)],
+            [
+                item["arguments"]["query"] for item in plan["operations"]
+                if item["operation"] == "web_search"
+            ],
+        )
+        self.assertEqual("web_read", plan["operations"][-1]["operation"])
 
     def test_planner_converts_chinese_market_close_to_shanghai_time(self) -> None:
         broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})

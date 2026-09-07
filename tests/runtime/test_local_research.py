@@ -1213,6 +1213,48 @@ class LocalResearchTests(unittest.TestCase):
         ]
         self.assertEqual([pdf], urls)
 
+    def test_planner_prioritizes_unread_direct_document_over_a_generic_model_read(self) -> None:
+        key = "candidate_business_research"
+        article = "https://finance.example.com/company-overview"
+        pdf = "https://static.cninfo.com.cn/finalpage/2026-09-04/1225516182.PDF"
+        contract = {
+            "version": 4,
+            "as_of": CONTRACT["as_of"],
+            "requirements": [{
+                "key": key,
+                "blocking": True,
+                "window": CONTRACT["requirements"][0]["window"],
+            }],
+        }
+        proposed = {"version": 1, "operations": [{
+            **row("web_read", url=article),
+            "requirement_key": key,
+        }]}
+        broker = mock.Mock()
+
+        def invoke(request):
+            verification = request.verifier(proposed)
+            self.assertTrue(verification["passed"], verification)
+            return SimpleNamespace(result=proposed)
+
+        broker.invoke.side_effect = invoke
+        planner = BrokerResearchPlanner(
+            broker, intellect="smart", effort="medium", deadline=lambda: 123.0,
+        )
+
+        plan = planner({
+            "as_of": CONTRACT["as_of"],
+            "evidence_contract": contract,
+            "research_discoveries": [{"requirement_key": key, "url": pdf}],
+            "attempted_research_urls": ["https://already-read.example.com/report.pdf"],
+        }, [key], 0)
+
+        urls = [
+            operation["arguments"]["url"] for operation in plan["operations"]
+            if operation["operation"] == "web_read"
+        ]
+        self.assertEqual([pdf, article], urls)
+
     def test_planner_converts_chinese_market_close_to_shanghai_time(self) -> None:
         broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})
         planner = BrokerResearchPlanner(broker, intellect="smart", effort="medium", deadline=lambda: 123.0)

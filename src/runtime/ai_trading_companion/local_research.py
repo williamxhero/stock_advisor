@@ -1293,24 +1293,38 @@ def _prepared_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> d
     gap_text = "\n".join(str(value) for value in packet.get("coverage_gaps") or [])
     if key not in gap_text or "gateway" not in set(packet.get("available_backends") or []):
         return plan
-    if any(
-        isinstance(operation, dict)
-        and operation.get("requirement_key") == key
-        and operation.get("operation") in {"web_read", "web_browser"}
-        for operation in plan["operations"]
-    ):
-        return plan
+    attempted_urls = {
+        str(url) for url in packet.get("attempted_research_urls") or [] if str(url)
+    }
+    unread_discoveries = [
+        discovery for discovery in packet.get("research_discoveries") or []
+        if isinstance(discovery, dict)
+        and str(discovery.get("url") or "") not in attempted_urls
+    ]
     repair = _discovery_read_repair_plan(
         packet.get("evidence_contract") or {},
-        list(packet.get("research_discoveries") or []),
+        unread_discoveries,
         [key],
         1,
     )
     if not repair:
         return plan
+    repair_operations = list(repair.get("operations") or [])
+    repair_urls = {
+        str((operation.get("arguments") or {}).get("url") or "")
+        for operation in repair_operations if isinstance(operation, dict)
+    }
+    remaining_operations = [
+        operation for operation in plan["operations"]
+        if not (
+            isinstance(operation, dict)
+            and operation.get("operation") in {"web_read", "web_browser"}
+            and str((operation.get("arguments") or {}).get("url") or "") in repair_urls
+        )
+    ]
     return _bounded_research_plan({
         **plan,
-        "operations": [*(repair.get("operations") or []), *plan["operations"]],
+        "operations": [*repair_operations, *remaining_operations],
     })
 
 

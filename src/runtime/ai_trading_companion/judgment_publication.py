@@ -87,6 +87,11 @@ def model_sources(packet: dict) -> dict[str, dict]:
     sources = evidence_sources(packet)
     if not sources:
         return {}
+    relevant_refs = _premarket_decision_source_refs(packet)
+    if relevant_refs:
+        relevant_sources = {ref: row for ref, row in sources.items() if ref in relevant_refs}
+        if relevant_sources:
+            sources = relevant_sources
     excerpt_limit = min(600, max(80, 8_000 // len(sources)))
     useful_fields = (
         "evidence_ref", "title", "excerpt", "analysis", "fact_as_of",
@@ -110,9 +115,39 @@ def model_evidence(packet: dict) -> dict:
         "schema_version", "as_of", "coverage", "conflicts", "critical_gaps",
         "high_impact_events", "spoken_summary",
     )
+    sources = model_sources(packet)
     projected = {key: value for key in useful_fields if (value := evidence.get(key)) not in (None, "", [], {})}
-    projected["sources"] = list(model_sources(packet).values())
+    if isinstance(projected.get("coverage"), list):
+        selected_refs = set(sources)
+        filtered_coverage = []
+        for row in projected["coverage"]:
+            if not isinstance(row, dict):
+                continue
+            refs = [ref for ref in row.get("evidence_refs") or [] if ref in selected_refs]
+            if row.get("evidence_refs") and not refs:
+                continue
+            filtered_coverage.append({**row, "evidence_refs": refs})
+        projected["coverage"] = filtered_coverage
+    projected["sources"] = list(sources.values())
     return projected
+
+
+def _premarket_decision_source_refs(packet: dict) -> set[str]:
+    if packet.get("task_key") != "daily.opportunity.0900":
+        return set()
+    evidence = packet.get("evidence") or {}
+    coverage = evidence.get("coverage") if isinstance(evidence, dict) else None
+    if not isinstance(coverage, list):
+        return set()
+    decision_requirements = {
+        "current_market_state", "market_breadth", "portfolio_market_state",
+        "candidate_business_research",
+    }
+    return {
+        str(ref)
+        for row in coverage if isinstance(row, dict) and row.get("requirement_key") in decision_requirements
+        for ref in row.get("evidence_refs") or [] if ref
+    }
 
 
 def model_memories(memories: list[dict], *, include_published_ai: bool = False) -> list[dict]:

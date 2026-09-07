@@ -9,7 +9,7 @@ import pytest
 
 from ai_trading_companion.broker_client import BrokerResponse, canonical_packet_hash
 from ai_trading_companion.judgment_publication import (
-    JudgmentPublicationPipeline, JudgmentUnavailable, core_problems, render_core,
+    JudgmentPublicationPipeline, JudgmentUnavailable, core_problems, model_evidence, render_core,
 )
 from ai_trading_companion.router import CognitiveRouter
 from ai_trading_companion.stage_expression import normalize_stage_output
@@ -460,3 +460,35 @@ def test_model_context_is_bounded_without_losing_evidence_identity_or_relevant_m
     assert "公告开头" in sources[0]["excerpt"] and "公告结尾" in sources[0]["excerpt"]
     assert "中段省略" in sources[0]["excerpt"]
     assert reasoning_context["memories"] == [learned]
+
+
+def test_premarket_model_evidence_keeps_decision_inputs_not_noncritical_research_trails():
+    sources = [
+        {"evidence_ref": ref, "excerpt": ref, "title": ref}
+        for ref in ("market", "breadth", "portfolio", "event", "no-change", "candidate")
+    ]
+    packet = {
+        "task_key": "daily.opportunity.0900",
+        "evidence": {
+            "sources": sources,
+            "coverage": [
+                {"requirement_key": "current_market_state", "status": "covered", "evidence_refs": ["market"]},
+                {"requirement_key": "market_breadth", "status": "covered", "evidence_refs": ["breadth"]},
+                {"requirement_key": "portfolio_market_state", "status": "covered", "evidence_refs": ["portfolio"]},
+                {"requirement_key": "material_events_and_counterevidence", "status": "covered", "evidence_refs": ["event"]},
+                {"requirement_key": "portfolio_events_and_counterevidence", "status": "checked_no_change", "evidence_refs": ["no-change"]},
+                {"requirement_key": "candidate_business_research", "status": "covered", "evidence_refs": ["candidate"]},
+            ],
+            "research_gaps": [{"query": "transport-only trace"}],
+        },
+    }
+
+    projected = model_evidence(packet)
+
+    assert {row["evidence_ref"] for row in projected["sources"]} == {
+        "market", "breadth", "portfolio", "candidate",
+    }
+    assert {row["requirement_key"] for row in projected["coverage"]} == {
+        "current_market_state", "market_breadth", "portfolio_market_state", "candidate_business_research",
+    }
+    assert "research_gaps" not in projected

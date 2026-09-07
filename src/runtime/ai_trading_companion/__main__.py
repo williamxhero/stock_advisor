@@ -209,7 +209,8 @@ def _salvageable_m0_candidate_research(
     problems = business.get("problems") if isinstance(business, dict) else None
     if not isinstance(problems, list) or not problems:
         return False
-    allowed = ("m0_overloads_reply_with_holding_quotes", "m0_portfolio_quote_conflict:",
+    allowed = ("m0_overloads_reply_with_holding_quotes", "premarket_candidate_omitted_from_narrative",
+               "m0_portfolio_quote_conflict:",
                "m0_portfolio_quote_status_conflict:", "m0_portfolio_quote_time_conflict:")
     return all(any(str(problem).startswith(prefix) for prefix in allowed) for problem in problems)
 

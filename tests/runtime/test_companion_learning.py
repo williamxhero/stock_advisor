@@ -736,7 +736,9 @@ class CompanionLearningTests(unittest.TestCase):
             }],
             "narrative": "沪电股份之外又机械播报了全部持仓行情。",
         }
-        verifier = {"business": {"problems": ["m0_overloads_reply_with_holding_quotes"]}}
+        verifier = {"business": {"problems": [
+            "m0_overloads_reply_with_holding_quotes", "premarket_candidate_omitted_from_narrative",
+        ]}}
 
         fallback, attempt_id = _save_safe_stage_fallback(
             self.store, cycle, "m0_compose", packet, horizon="当前",
@@ -755,7 +757,9 @@ class CompanionLearningTests(unittest.TestCase):
 
     def test_premarket_retry_keeps_an_earlier_salvageable_candidate(self):
         candidate = {"result_version": 4, "candidate_research": [{"symbol": "002463"}]}
-        verifier = {"business": {"problems": ["m0_overloads_reply_with_holding_quotes"]}}
+        verifier = {"business": {"problems": [
+            "m0_overloads_reply_with_holding_quotes", "premarket_candidate_omitted_from_narrative",
+        ]}}
         saved = _retain_salvageable_m0_candidate(candidate, verifier, None, None)
 
         retained = _retain_salvageable_m0_candidate(None, None, *saved)

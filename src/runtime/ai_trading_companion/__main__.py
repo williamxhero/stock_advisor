@@ -671,6 +671,7 @@ def _call_stage(
     frozen_controls: RuntimeStrategyControls | None = None,
     evidence_registrar: Callable[[dict[str, Any]], None] | None = None,
 ) -> VerifiedStageResult:
+    from .opportunities import is_premarket
     settings = load_settings(PATHS.home)
     runtime_strategy = RuntimeStrategyPolicy(store)
     controls = frozen_controls or resolve_stage_controls(
@@ -780,6 +781,8 @@ def _call_stage(
                 observation_registrar=evidence_registrar,
                 resume_checkpoint=saved_research["checkpoint"] if saved_research else None,
                 on_checkpoint=persist_research_checkpoint,
+                semantic_qualifier=planner.qualify_candidates
+                if packet.get("task_key") == "daily.opportunity.0900" else None,
                 cancelled=(
                     (lambda: store.chat_research_terminated(cycle["cycle_id"]))
                     if stage == "chat_research" else None
@@ -813,11 +816,8 @@ def _call_stage(
             tool_trace.extend(_broker_call_trace(pipeline.responses))
             verifier = router.verify(stage, packet, data)
         elif not search or not schema_name.startswith("companion-evidence-result-"):
-            from .opportunities import is_premarket, OBSERVATION_INSTRUCTION
             if stage == "m0_compose" and is_premarket(packet):
                 schema_name = "companion-m0-opportunity-result-v4.schema.json"
-                request_packet = {**request_packet, "opportunity_instruction": OBSERVATION_INSTRUCTION}
-                request_hash = canonical_packet_hash(request_packet)
             schema = json.loads((SCHEMAS / schema_name).read_text(encoding="utf-8"))
             def verified_output(output: dict[str, Any]) -> dict[str, Any]:
                 return router.verify(stage, packet, output)

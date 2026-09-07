@@ -23,6 +23,28 @@ def row(operation: str, *, query: str | None = None, url: str | None = None) -> 
     return {"requirement_key": "market", "backend": "gateway", "operation": operation, "arguments": {"query": query, "categories": "news", "url": url, "symbol": None, "render": "auto", "session_id": None, "actions": None}, "fallback_backends": []}
 
 class LocalResearchTests(unittest.TestCase):
+    def test_company_research_continues_when_semantics_require_a_second_source(self):
+        contract = {"version": 4, "as_of": CONTRACT["as_of"], "requirements": [{
+            "key": "candidate_business_research", "blocking": True, "allowed_coverage": ["covered"],
+            "window": {"mode": "exact", "start": CONTRACT["as_of"], "end": CONTRACT["as_of"]},
+        }]}
+        def planner(packet, gaps, round_number):
+            return {"version": 1, "operations": [{
+                **row("web_read", url="https://company.test/" + ("counter" if round_number else "business")),
+                "requirement_key": "candidate_business_research",
+            }]}
+        def backend(operation, arguments):
+            return {"results": [{"url": arguments["url"], "excerpt_text": "样本科技600001业务公告与订单反证",
+                                 "fact_as_of": CONTRACT["as_of"]}]}
+        def qualify(evidence):
+            complete = len(evidence["sources"]) >= 2
+            return {"passed": complete, "problems": [] if complete else ["缺少订单反证正文"]}
+        result = LocalResearchChain(planner, ReadOnlyResearchExecutor({"gateway": backend}),
+                                    semantic_qualifier=qualify).run(
+            {"task_key": "daily.opportunity.0900", "as_of": CONTRACT["as_of"]}, contract, attempt_id="candidate")
+        self.assertTrue(result.qualified)
+        self.assertEqual(2, len(result.evidence["sources"]))
+
     def test_holding_announcement_research_maps_each_frozen_entity_without_false_negative(self) -> None:
         contract = {
             "version": 4,

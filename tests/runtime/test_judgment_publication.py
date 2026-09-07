@@ -123,12 +123,139 @@ def test_no_qualified_core_never_produces_generic_neutral_reply(tmp_path, kwargs
         assert all(a["status"] == "rejected" for a in store.attempts(cycle["cycle_id"]) if a["stage"] == "m1_review")
 
 
+def test_premarket_judgment_cannot_replace_selection_with_market_commentary(tmp_path):
+    pipeline, store, cycle = runtime(tmp_path, Broker())
+    premarket = packet()
+    premarket["task_key"] = "daily.opportunity.0900"
+    premarket.pop("task_profile")
+    with pytest.raises(JudgmentUnavailable):
+        pipeline.produce("m1_judgment", cycle, premarket, time.monotonic() + 60)
+    assert store.latest_artifact(cycle["cycle_id"], "m1") is None
+
+
+def test_intraday_cannot_silently_drop_a_premarket_candidate(tmp_path):
+    pipeline, _, cycle = runtime(tmp_path, Broker())
+    intraday = packet()
+    intraday.update(task_key="daily.execution.0945", task_profile={}, prior_opportunity_plans=[{
+        "artifact_id": "morning-plan", "candidates": [{"symbol": "600001", "status": "selected",
+                                                       "trigger": "同业转强", "invalidation": "订单否定"}],
+    }])
+    with pytest.raises(JudgmentUnavailable):
+        pipeline.produce("m1_judgment", cycle, intraday, time.monotonic() + 60)
+
+
+@pytest.mark.parametrize("status", ["supported", "pending", "abandoned"])
+def test_intraday_followup_preserves_original_reference_and_reason(tmp_path, status):
+    reason = {"supported": "样本科技的订单获确认，原触发条件获得支持。",
+              "pending": "样本科技的订单仍待确认，我保留原来的验证条件。",
+              "abandoned": "样本科技的订单被否定，原机会应当放弃。"}[status]
+    class FollowupBroker(Broker):
+        def invoke(self, request):
+            response = super().invoke(request)
+            if request.stage.endswith("reasoning"):
+                response.result["opportunity_followup"] = [{
+                    "source_artifact_id": "morning-plan", "symbol": "600001", "status": status,
+                    "reason": reason, "evidence_refs": ["ev_company"],
+                }]
+            return response
+    pipeline, _, cycle = runtime(tmp_path, FollowupBroker(fail_expression=True))
+    intraday = packet()
+    intraday.update(task_key="daily.execution.0945", task_profile={}, as_of="2026-09-07T01:45:00Z", prior_opportunity_plans=[{
+        "artifact_id": "morning-plan", "as_of": "2026-09-07T01:00:00Z", "candidates": [{"symbol": "600001", "status": "selected"}],
+    }])
+    intraday["evidence"]["sources"].append({"evidence_ref": "ev_company", "excerpt": "600001 " + reason, "fact_as_of": "2026-09-07T01:40:00Z"})
+    output = pipeline.produce("m1_judgment", cycle, intraday, time.monotonic() + 60)
+    assert output["decision_core"]["opportunity_followup"][0]["source_artifact_id"] == "morning-plan"
+    assert reason in output["narrative"]
+    assert CognitiveRouter().verify("m1_judgment", intraday, output)["passed"]
+
+
+@pytest.mark.parametrize("status", ["selected", "rejected"])
+def test_premarket_selection_and_rejection_survive_expression_failure(tmp_path, status):
+    candidate = {
+        "symbol": "600001", "name": "样本科技", "status": status, "priority": 1 if status == "selected" else 0,
+        "why_now": "新产品进入订单验证期", "business_link": "供电产品直接关联产业需求",
+        "comparison": "相比只有概念关联的样本乙，业务依据更直接", "priced_in": "价格是否透支要看开盘承接",
+        "counterargument": "订单没有兑现的风险", "trigger": "订单确认且同行同步转强后才考虑",
+        "invalidation": "订单被否定或独自冲高回落则放弃", "risk_cluster": "数据中心供电",
+        "horizon": "未来一周", "decision_reason": "选择直接业务依据，但不把发布当成收入",
+        "evidence_refs": ["ev_company"],
+    }
+    planned = {**core(), "opportunity_plan": {
+        "research_complete": True, "candidates": [candidate],
+        "no_selection_reason": "订单尚未兑现，暂不承担风险" if status == "rejected" else "",
+    }}
+    class SelectionBroker(Broker):
+        def invoke(self, request):
+            response = super().invoke(request)
+            if request.stage.endswith("reasoning"):
+                response.result.update(planned)
+            return response
+    pipeline, _, cycle = runtime(tmp_path, SelectionBroker(fail_expression=True))
+    premarket = packet()
+    premarket.update(task_key="daily.opportunity.0900", task_profile={})
+    premarket["evidence"]["sources"].append({"evidence_ref": "ev_company", "excerpt": "样本科技600001的新供电产品进入订单验证；样本乙只有概念关联。"})
+    output = pipeline.produce("m1_judgment", cycle, premarket, time.monotonic() + 60)
+    assert output["decision_core"]["opportunity_plan"]["candidates"][0]["status"] == status
+    assert candidate["trigger"] in output["narrative"]
+    assert candidate["invalidation"] in output["narrative"]
+    assert "样本科技" in output["narrative"]
+    assert CognitiveRouter().verify("m1_judgment", premarket, output)["passed"]
+
+
 def test_fact_reference_and_active_position_validation():
     altered = core()
     altered["reasons"][0]["fact"] = "成交放大99.99%"
     altered["position_focus"] = []
     assert "decision_unbound_numeric_fact:99.99" in core_problems(altered, packet())
     assert "decision_missing_portfolio_focus" in core_problems(altered, packet())
+
+
+def test_followup_cannot_confirm_with_premarket_or_future_evidence():
+    context = packet()
+    context.update(as_of="2026-09-07T01:45:00Z", prior_opportunity_plans=[{
+        "artifact_id": "original", "as_of": "2026-09-07T01:00:00Z",
+        "candidates": [{"symbol": "600001", "status": "selected"}],
+    }])
+    decision = {**core(), "opportunity_followup": [{"source_artifact_id": "original", "symbol": "600001",
+                "status": "supported", "reason": "出现承接", "evidence_refs": ["ev_company"]}]}
+    for fact_at in (None, "2026-09-07T01:00:00Z", "2026-09-07T01:46:00Z"):
+        context["evidence"]["sources"].append({"evidence_ref": "ev_company", "excerpt": "600001承接", "fact_as_of": fact_at})
+        assert "opportunity_followup_fresh_evidence_missing" in core_problems(decision, context)
+
+
+@pytest.mark.parametrize("trigger,outcome", [("not_triggered", "rose"), ("triggered", "fell"), ("unknown", "unknown")])
+def test_close_review_requires_both_selected_and_rejected_and_preserves_restart(tmp_path, trigger, outcome):
+    context = packet()
+    context.update(task_key="daily.review.1520", as_of="2026-09-07T07:20:00Z", prior_opportunity_plans=[{
+        "artifact_id": "original", "as_of": "2026-09-07T01:00:00Z",
+        "candidates": [{"symbol": "600001", "status": "selected"}, {"symbol": "600002", "status": "rejected"}],
+    }])
+    decision = core()
+    decision["opportunity_followup"] = [{"source_artifact_id": "original", "symbol": symbol, "status": "pending",
+        "reason": "原先条件仍需区分盘中触发和收盘表现", "evidence_refs": []} for symbol in ("600001", "600002")]
+    assert "opportunity_review_incomplete_or_unbound" in core_problems(decision, context)
+    decision["opportunity_review"] = [{"source_artifact_id": "original", "symbol": symbol,
+        "trigger_status": trigger, "price_outcome": outcome,
+        "evidence_quality": "只按冻结的当日事实核查，不以收盘涨跌反推触发",
+        "process_assessment": "原来关注订单兑现的理由仍合理，但需区别概念炒作",
+        "lesson": "单次结果不足以升级方法", "reason": "样本公司的涨跌与当时条件是否成立是两回事，不能算成成交收益",
+        "evidence_refs": ["ev_" + symbol] if outcome != "unknown" else []} for symbol in ("600001", "600002")]
+    context["evidence"]["sources"] += [{"evidence_ref": "ev_" + symbol,
+        "excerpt": symbol + "当日条件核查与收盘变化", "fact_as_of": "2026-09-07T07:00:00Z"} for symbol in ("600001", "600002")]
+    class ReviewBroker(Broker):
+        def invoke(self, request):
+            response = super().invoke(request)
+            if request.stage.endswith("reasoning"):
+                response.result.update(decision)
+            return response
+    pipeline, store, cycle = runtime(tmp_path, ReviewBroker(fail_expression=True))
+    output = pipeline.produce("m1_judgment", cycle, context, time.monotonic() + 60)
+    assert output["decision_core"]["opportunity_review"] == decision["opportunity_review"]
+    assert "不能算成成交收益" in output["narrative"]
+    restarted = JudgmentPublicationPipeline(ReviewBroker(fail_expression=True), store, SCHEMAS, intellect="expert", effort="medium")
+    replay = restarted.produce("m1_judgment", cycle, context, time.monotonic() + 60)
+    assert replay["decision_core"] == output["decision_core"]
 
 
 def test_final_gate_detects_changed_body_core_or_review(tmp_path):

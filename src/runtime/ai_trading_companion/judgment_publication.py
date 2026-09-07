@@ -15,6 +15,10 @@ from typing import Any
 
 from .broker_client import BrokerError, BrokerRequest, canonical_packet_hash, _validate_schema
 from .paths import RuntimePaths
+from .opportunities import (
+    is_premarket, plan_problems, followup_problems, review_result_problems,
+    PLAN_INSTRUCTION, FOLLOWUP_INSTRUCTION, REVIEW_RESULT_INSTRUCTION,
+)
 
 
 class JudgmentUnavailable(BrokerError):
@@ -46,6 +50,9 @@ def evidence_sources(packet: dict) -> dict[str, dict]:
 def core_problems(core: dict, packet: dict) -> list[str]:
     sources = evidence_sources(packet)
     problems: list[str] = []
+    problems.extend(plan_problems(core, packet, sources))
+    problems.extend(followup_problems(core, packet, sources))
+    problems.extend(review_result_problems(core, packet, sources))
     refs = [ref for reason in core.get("reasons", []) for ref in reason.get("evidence_refs", [])]
     refs += core.get("counterargument", {}).get("evidence_refs", [])
     refs += [ref for position in core.get("position_focus", []) for ref in position.get("evidence_refs", [])]
@@ -94,13 +101,33 @@ def render_core(core: dict) -> str:
         + "，".join(row[key].rstrip("。；，") for key in ("price", "breadth", "persistence")) + "。"
         for row in core["transition_conditions"]
     )
-    return "\n\n".join([
+    paragraphs = [
         core["thesis"].rstrip("。") + "。" + core["action_reason"].rstrip("。") + "。",
         reasons,
         counter["claim"].rstrip("。") + "。" + counter["why_not_base"].rstrip("。") + "。",
         core["portfolio_stance"].rstrip("。") + "。" + positions,
         conditions + " ".join(core["critical_unknowns"]),
-    ])
+    ]
+    plan = core.get("opportunity_plan") or {}
+    market_paragraphs = paragraphs
+    if plan:
+        paragraphs = []
+    for row in sorted(plan.get("candidates") or [], key=lambda row: (row["status"] != "selected", row["priority"])):
+        stance = {"selected": "我会把它列为条件式买入候选", "observe": "我暂时只观察", "rejected": "这次我不选它"}[row["status"]]
+        paragraphs.append(
+            f"{row['name']}，{stance}。{row['decision_reason']}。{row['why_now']}，{row['business_link']}。"
+            f"{row['comparison']}。{row['priced_in']}。我更担心{row['counterargument']}。"
+            f"{row['horizon']}，{row['trigger']}；{row['invalidation']}。同类风险是{row['risk_cluster']}。"
+        )
+    if plan.get("no_selection_reason"):
+        paragraphs.append(plan["no_selection_reason"])
+    if plan:
+        paragraphs.extend(market_paragraphs)
+    if core.get("opportunity_followup"):
+        paragraphs.append(" ".join(row["reason"] for row in core["opportunity_followup"]))
+    if core.get("opportunity_review"):
+        paragraphs.append(" ".join(dict.fromkeys(row["reason"] for row in core["opportunity_review"])))
+    return "\n\n".join(paragraphs)
 
 
 def review_passed(review: dict, core_hash: str, draft_hash: str) -> bool:
@@ -248,7 +275,10 @@ class JudgmentPublicationPipeline:
                              "policy_hash": canonical_packet_hash({"core": CORE_INSTRUCTION,
                                                                     "repair": CORE_REPAIR_INSTRUCTION,
                                                                     "review": REVIEW_INSTRUCTION,
-                                                                    "renderer_version": 2,
+                                                                    "renderer_version": 4,
+                                                                    "opportunity_instruction": PLAN_INSTRUCTION,
+                                                                    "followup_instruction": FOLLOWUP_INSTRUCTION,
+                                                                    "review_result_instruction": REVIEW_RESULT_INSTRUCTION,
                                                                     "context_projection_version": 2})}
         checkpoint_key = canonical_packet_hash(checkpoint_packet)
         saved = self.store.stage_checkpoint(cycle["cycle_id"], prefix + "_core", checkpoint_key)
@@ -274,7 +304,10 @@ class JudgmentPublicationPipeline:
                 _core_attempts_left -= 1
                 try:
                     core, core_id = self._call(prefix + "_reasoning", cycle, {
-                        "instruction": CORE_INSTRUCTION + "\n" + CORE_REPAIR_INSTRUCTION,
+                        "instruction": CORE_INSTRUCTION + "\n" + CORE_REPAIR_INSTRUCTION
+                        + ("\n" + PLAN_INSTRUCTION if is_premarket(base) else "")
+                        + ("\n" + FOLLOWUP_INSTRUCTION if base.get("prior_opportunity_plans") else "")
+                        + ("\n" + REVIEW_RESULT_INSTRUCTION if base.get("task_key") == "daily.review.1520" else ""),
                         "context": context, "feedback": feedback, "previous_candidate": core or None,
                     }, "decision-core-v1", deadline)
                     problems = core_problems(core, base)
@@ -324,7 +357,8 @@ class JudgmentPublicationPipeline:
             try:
                 draft, expression_id = self._call(prefix + "_expression", cycle, {
                     "instruction": "把冻结判断内核写成专业炒股搭档的自然短段，返回 narrative-draft-v1。"
-                    "开头说周期、基准判断和动作；主要篇幅用于解释取舍、反证和组合含义，最多三个事实锚点。"
+                    "有盘前候选时先说今天最值得关注谁及为什么胜过替代标的，不先播报大盘；无候选计划时先说周期、基准判断和动作。"
+                    "主要篇幅用于解释取舍、反证和组合含义，保留候选各自关键条件，不把内部结构照搬为表格或字段清单。"
                     "只改措辞，不增删决定、持仓优先级、风险或条件，不添加新数字，不列标题或工具日志。",
                     "core_hash": frozen_hash, "core": core, "feedback": feedback,
                 }, "narrative-draft-v1", deadline)
@@ -354,11 +388,16 @@ class JudgmentPublicationPipeline:
 
     def _review(self, prefix: str, cycle: dict, core: dict, text: str, packet: dict, deadline: float) -> tuple[dict, str]:
         return self._call(prefix + "_review", cycle, {
-            "instruction": REVIEW_INSTRUCTION, "core": core, "text": text,
+            "instruction": REVIEW_INSTRUCTION + ("\n" + PLAN_INSTRUCTION if is_premarket(packet) or core.get("opportunity_plan") else "")
+            + ("\n" + FOLLOWUP_INSTRUCTION if packet.get("prior_opportunity_plans") else "")
+            + ("\n" + REVIEW_RESULT_INSTRUCTION if packet.get("task_key") == "daily.review.1520" else ""),
+            "core": core, "text": text,
             "core_hash": canonical_packet_hash(core), "draft_hash": canonical_packet_hash({"text": text}),
             "evidence": model_sources(packet), "business_context": packet.get("business_context"),
             "protocol": packet.get("protocol"), "as_of": packet.get("as_of"),
             "risk_doctrine": packet.get("risk_doctrine"),
+            "prior_opportunity_plans": packet.get("prior_opportunity_plans") or [],
+            "prior_opportunity_followups": packet.get("prior_opportunity_followups") or [],
             "prior_judgments": [a for a in packet.get("artifacts", [])
                                 if prefix == "m2" and a.get("kind") in {"m0", "h0", "m1"}],
         }, "narrative-review-v1", deadline)

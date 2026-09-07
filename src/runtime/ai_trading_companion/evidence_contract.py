@@ -43,6 +43,17 @@ class EvidenceContractFactory:
                 "window": {"start": self._iso(frozen - timedelta(days=400)),
                            "end": self._iso(frozen), "mode": "after_start_to_end"},
             })
+        if stage in {"m0_research", "m1_research"} and (task_key.startswith("daily.execution.") or task_key == "daily.review.1520"):
+            plans = (internal_context or {}).get("prior_opportunity_plans") or []
+            if plans:
+                requirements.append({
+                    "key": "opportunity_condition_research", "blocking": True,
+                    "allowed_coverage": ["covered"],
+                    "description": "补查原候选及淘汰对象的新事实、量价承接与原触发/失效条件，不能用盘前材料冒充盘中确认。",
+                    "window": {"start": min(plan["as_of"] for plan in plans),
+                               "end": self._iso(frozen), "mode": "after_start_to_end"},
+                    "required_entities": sorted({row["symbol"] for plan in plans for row in plan["candidates"]}),
+                })
         contract = {
             "version": 4,
             "as_of": frozen.isoformat().replace("+00:00", "Z"),

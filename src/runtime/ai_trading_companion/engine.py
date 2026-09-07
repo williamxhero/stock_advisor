@@ -123,7 +123,8 @@ class CompanionEngine:
             evidence_contract = self.evidence_contract_factory.build(
                 task_key=task_key, stage="m0_research", as_of=requested_at,
                 task_profile=profile_snapshot,
-                internal_context={"portfolio_entities": [str(row["code"]) for row in positions]},
+                internal_context={"portfolio_entities": [str(row["code"]) for row in positions],
+                                  "prior_opportunity_plans": self.store.opportunity_plans_before(requested_at[:10], requested_at)},
             )
         else:
             missing = {"task_key", "task_profile"} - request.keys()
@@ -181,7 +182,8 @@ class CompanionEngine:
         contract = self.evidence_contract_factory.build(
             task_key=str(cycle["task_key"]), stage="m0_research", as_of=as_of,
             task_profile=profile,
-            internal_context={"portfolio_entities": [str(row["code"]) for row in positions]},
+            internal_context={"portfolio_entities": [str(row["code"]) for row in positions],
+                              "prior_opportunity_plans": self.store.opportunity_plans_before(cycle["scheduled_for"][:10], as_of)},
         )
         return self.store.refresh_manual_analysis_contract(cycle_id, as_of, contract)
 

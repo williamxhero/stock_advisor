@@ -14,6 +14,7 @@ from .evidence_contract import EvidenceContractFactory
 from .models import TASK_POLICIES
 from .stage_expression import verified_weekly_market_comparison
 from .trading_calendar import TradingCalendarUnavailable
+from .opportunities import is_premarket, OBSERVATION_INSTRUCTION, REVIEW_RESULT_INSTRUCTION
 
 
 PUBLIC_STAGES = {"m0_research", "m1_research", "outcome_research", "chat_research"}
@@ -64,6 +65,23 @@ class RuntimePacketBuilder:
         if cycle.get("task_profile_json"):
             packet["task_profile"] = json.loads(cycle["task_profile_json"])
         memory_cards = self._memory_cards(cycle, stage, packet_as_of, evidence)
+        if cycle["task_key"].startswith("daily.execution.") or cycle["task_key"] == "daily.review.1520" or stage == "reflection":
+            packet["prior_opportunity_plans"] = self.store.opportunity_plans_before(cycle["scheduled_for"][:10], packet_as_of)
+            if cycle["task_key"] == "daily.review.1520" or stage == "reflection":
+                packet["prior_opportunity_followups"] = [
+                    {"artifact_id": row["artifact_id"], "as_of": row["as_of"], "known_at": row["known_at"],
+                     "followup": row["snapshot"]["decision_core"]["opportunity_followup"]}
+                    for row in self.store.frozen_judgments_before(cycle["scheduled_for"][:10], packet_as_of,
+                        ("daily.execution.0945", "daily.execution.1030", "daily.execution.1430"))
+                    if (row["snapshot"].get("decision_core") or {}).get("opportunity_followup")
+                ]
+        if stage == "m0_compose" and is_premarket(packet):
+            packet["opportunity_instruction"] = OBSERVATION_INSTRUCTION
+            feedback = []
+            for prior in self.store.attempts(cycle["cycle_id"]):
+                if prior["stage"] == "m0_candidate_review" and prior["status"] == "rejected" and not prior["is_shadow"]:
+                    feedback.extend(json.loads(prior.get("verifier_json") or "{}").get("problems") or [])
+            packet["opportunity_review_feedback"] = list(dict.fromkeys(feedback))
         if stage in PUBLIC_STAGES:
             if stage in {"m0_research", "m1_research"}:
                 frozen_contract = cycle.get("evidence_contract_json")
@@ -248,6 +266,7 @@ class RuntimePacketBuilder:
         context = {
             "portfolio_entities": [row["code"] for row in rows],
             "portfolio_entity_names": {row["code"]: row["name"] for row in rows},
+            "prior_opportunity_plans": self.store.opportunity_plans_before(cycle["scheduled_for"][:10], packet_as_of),
         }
         if cycle["task_key"] == "daily.review.1520":
             judgments = self.store.frozen_judgments_before(
@@ -488,6 +507,8 @@ class RuntimePacketBuilder:
             "reflection": "根据冻结判断和结果复盘过程、运气、遗漏与校准。错误观点同样保留并用于反证。只有证据确实指向可复用改进时才填写 workflow_proposal，否则为 null；不得修改代码、权限、自动化或数据。",
             "workflow_feedback": "用户在冻结 H0 中提出了对搜索、信息覆盖或工作方式的反馈。像搭档一样直接回应；如果确实存在可执行改进，填写 workflow_proposal，否则为 null。提案只能修改允许的研究策略字段，不能修改代码、权限、自动化、安全规则或自行扩大调用。",
         }[packet["stage"]]
+        if packet["stage"] == "reflection" and packet.get("prior_opportunity_plans"):
+            instruction += "\n" + REVIEW_RESULT_INSTRUCTION + "\n本阶段不新增判断内核，以既有复盘 answer 契约自然说明这些得失。"
         task_profile = packet.get("task_profile") if isinstance(packet.get("task_profile"), dict) else {}
         if packet["stage"] == "m1_judgment" and task_profile.get("evidence_family") == "completed_trading_week":
             weekly = verified_weekly_market_comparison(packet)

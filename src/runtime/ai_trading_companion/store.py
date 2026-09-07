@@ -1815,17 +1815,18 @@ class CompanionStore:
         placeholders = ",".join("?" for _ in task_keys)
         with self.connection() as c:
             rows = c.execute(
-                f"""SELECT c.task_key,c.scheduled_for,a.kind,a.body_markdown,a.as_of,a.known_at,s.snapshot_json
+                f"""SELECT c.cycle_id,c.task_key,c.scheduled_for,a.artifact_id,a.kind,a.body_markdown,a.as_of,a.known_at,s.snapshot_json
                     FROM companion_cycle c JOIN narrative_artifact a ON a.cycle_id=c.cycle_id
                     JOIN judgment_snapshot s ON s.artifact_id=a.artifact_id
                     WHERE substr(c.scheduled_for,1,10)=? AND c.task_key IN ({placeholders})
-                      AND a.kind IN ('m1','m2') AND a.known_at<=?
+                      AND a.kind IN ('m1','m2') AND julianday(a.known_at)<=julianday(?)
+                      AND julianday(a.as_of)<=julianday(?)
                       AND COALESCE(c.schedule_snapshot_json,'') NOT LIKE '%diagnostic_rerun%'
                       AND EXISTS (SELECT 1 FROM llm_attempt attempt WHERE attempt.cycle_id=c.cycle_id
                         AND attempt.stage=CASE WHEN a.kind='m1' THEN 'm1_judgment' ELSE 'm2' END
                         AND attempt.status='succeeded' AND json_extract(attempt.verifier_json,'$.passed')=1)
                     ORDER BY c.scheduled_for,a.kind""",
-                (trading_date, *task_keys, known_at),
+                (trading_date, *task_keys, known_at, known_at),
             ).fetchall()
         result = []
         for row in rows:
@@ -1833,6 +1834,19 @@ class CompanionStore:
             item["snapshot"] = json.loads(item.pop("snapshot_json"))
             result.append(item)
         return result
+
+    def opportunity_plans_before(self, trading_date: str, known_at: str) -> list[dict[str, Any]]:
+        """One immutable final published plan per cycle; never infer a plan from prose."""
+        by_cycle = {}
+        for row in self.frozen_judgments_before(trading_date, known_at, ("daily.opportunity.0900",)):
+            plan = (row["snapshot"].get("decision_core") or {}).get("opportunity_plan")
+            if plan:
+                by_cycle[row["cycle_id"]] = {
+                    "artifact_id": row["artifact_id"], "cycle_id": row["cycle_id"],
+                    "as_of": row["as_of"], "known_at": row["known_at"],
+                    "candidates": plan["candidates"], "no_selection_reason": plan["no_selection_reason"],
+                }
+        return list(by_cycle.values())
 
     def router_policy_cell(self, cell_key: str, baseline: dict[str, Any], candidate: dict[str, Any] | None) -> dict[str, Any]:
         self.initialize()

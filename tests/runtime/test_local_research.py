@@ -1099,7 +1099,7 @@ class LocalResearchTests(unittest.TestCase):
         )
         self.assertEqual(pdf, bounded["operations"][1]["arguments"]["url"])
 
-    def test_discovery_repair_skips_listing_page_and_prioritizes_direct_document(self) -> None:
+    def test_discovery_repair_skips_listing_page_and_prioritizes_readable_article(self) -> None:
         contract = {"requirements": [{
             "key": "candidate_business_research", "blocking": True,
         }]}
@@ -1115,7 +1115,61 @@ class LocalResearchTests(unittest.TestCase):
 
         self.assertIsNotNone(plan)
         urls = [item["arguments"]["url"] for item in plan["operations"]]
-        self.assertEqual([pdf, article], urls)
+        self.assertEqual([article, pdf], urls)
+
+    def test_company_discovery_repair_reads_across_search_queries_before_repeating_one_company(self) -> None:
+        key = "candidate_business_research"
+        contract = {"requirements": [{"key": key, "blocking": True}]}
+        discoveries = [
+            {
+                "requirement_key": key,
+                "url": f"https://news.example.test/2026090{group}/company-{group}-{item}.shtml",
+                "discovery_query": f"公司{group} 业务 风险",
+                "discovery_observation_id": f"search-{group}",
+            }
+            for group in range(1, 5)
+            for item in range(1, 4)
+        ]
+
+        plan = _discovery_read_repair_plan(contract, discoveries, [key], 1)
+
+        self.assertIsNotNone(plan)
+        urls = [item["arguments"]["url"] for item in plan["operations"]]
+        self.assertEqual(4, len(urls))
+        self.assertEqual(
+            {f"https://news.example.test/2026090{group}/company-{group}-1.shtml" for group in range(1, 5)},
+            set(urls),
+        )
+
+    def test_company_discovery_digest_keeps_multiple_search_queries_in_the_shortlist(self) -> None:
+        key = "candidate_business_research"
+        contract = {"requirements": [{
+            "key": key,
+            "window": {
+                "mode": "after_start_to_end",
+                "start": "2025-08-27T07:00:00Z",
+                "end": CONTRACT["as_of"],
+            },
+        }]}
+        observations = [{
+            "observation_id": f"search-{group}",
+            "operation": "web_search",
+            "status": "succeeded",
+            "arguments": {"requirement_key": key, "query": f"公司{group} 业务 风险"},
+            "evidence_items": [{
+                "url": f"https://news.example.test/2026082{group}/company-{group}-{item}.shtml",
+                "title": f"公司{group} 业务文章 {item}",
+                "excerpt_text": f"公司{group} 搜索线索 {item}",
+                "fact_as_of": CONTRACT["as_of"],
+            } for item in range(1, 7)],
+        } for group in range(1, 5)]
+
+        discoveries = _discovery_digest(observations, contract)
+
+        self.assertEqual(16, len(discoveries))
+        self.assertEqual(4, len({item["discovery_observation_id"] for item in discoveries}))
+        self.assertEqual(4, len({item["discovery_query"] for item in discoveries}))
+        self.assertTrue(all(item.get("discovery_query") for item in discoveries))
 
     def test_search_url_remains_a_lead_when_discovered_after_the_frozen_as_of(self) -> None:
         contract = {"requirements": [{

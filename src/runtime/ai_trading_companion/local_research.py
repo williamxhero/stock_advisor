@@ -1496,7 +1496,7 @@ def _discovery_read_repair_plan(
             if str(discovery.get("requirement_key") or "") == key
         ]
         if key == "candidate_business_research":
-            key_discoveries.sort(key=lambda row: _company_discovery_priority(row[1], row[0]))
+            key_discoveries = _diversify_company_discoveries(key_discoveries)
         for _, discovery in key_discoveries:
             url = str(discovery.get("url") or "")
             if (
@@ -1543,13 +1543,37 @@ def _company_discovery_priority(discovery: dict[str, Any], original_index: int) 
     except ValueError:
         return 3, original_index
     path = parsed.path.casefold()
-    if path.endswith(".pdf") or "/finalpage/" in path:
-        return 0, original_index
-    if re.search(r"/20\d{2}(?:[-/]?\d{2})(?:[-/]?\d{2})", path) or any(
-        marker in path for marker in ("/article/", "/articles/", "/news/", "newsdetail")
+    is_direct_document = path.endswith(".pdf") or "/finalpage/" in path
+    if not is_direct_document and (
+        re.search(r"/20\d{2}(?:[-/]?\d{2})(?:[-/]?\d{2})", path) or any(
+            marker in path for marker in ("/article/", "/articles/", "/news/", "newsdetail")
+        )
     ):
+        return 0, original_index
+    if is_direct_document:
         return 1, original_index
     return 2, original_index
+
+
+def _diversify_company_discoveries(
+    rows: list[tuple[int, dict[str, Any]]],
+) -> list[tuple[int, dict[str, Any]]]:
+    """Round-robin source queries so one company's result page cannot consume the read budget."""
+    ranked = sorted(rows, key=lambda row: _company_discovery_priority(row[1], row[0]))
+    groups: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for original_index, discovery in ranked:
+        group = str(
+            discovery.get("discovery_observation_id")
+            or discovery.get("discovery_query")
+            or f"ungrouped:{original_index}"
+        )
+        groups.setdefault(group, []).append((original_index, discovery))
+    diversified: list[tuple[int, dict[str, Any]]] = []
+    while any(groups.values()):
+        for group_rows in groups.values():
+            if group_rows:
+                diversified.append(group_rows.pop(0))
+    return diversified
 
 
 def _planner_research_scope(value: Any) -> dict[str, Any]:
@@ -2273,7 +2297,11 @@ def _discovery_digest(observations: list[dict[str, Any]], contract: dict[str, An
     for observation in reversed(observations):
         requirement = str((observation.get("arguments") or {}).get("requirement_key") or "")
         is_search_lead = observation.get("operation") == "web_search"
-        for item in observation.get("evidence_items") or []:
+        indexed_items = list(enumerate(observation.get("evidence_items") or []))
+        if is_search_lead and requirement == "candidate_business_research":
+            indexed_items.sort(key=lambda row: _company_discovery_priority(row[1], row[0]))
+            indexed_items = indexed_items[:4]
+        for _, item in indexed_items:
             url = str(item.get("url") or "")
             if not url or url in seen:
                 continue
@@ -2296,6 +2324,10 @@ def _discovery_digest(observations: list[dict[str, Any]], contract: dict[str, An
                 "memory_episode_id": item.get("memory_episode_id"),
                 "known_at": item.get("known_at"),
                 "content_sha256": item.get("memory_content_hash"),
+                "discovery_query": str((observation.get("arguments") or {}).get("query") or "")[:500]
+                if is_search_lead else "",
+                "discovery_observation_id": str(observation.get("observation_id") or "")
+                if is_search_lead else "",
             }
             candidates.append((
                 (

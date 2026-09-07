@@ -156,6 +156,8 @@ def _m1_retry_feedback(exc: Exception) -> dict[str, Any] | None:
 
 def _save_safe_stage_fallback(
     store: CompanionStore, cycle: dict[str, Any], stage: str, packet: dict[str, Any], *, horizon: str,
+    rejected_output: dict[str, Any] | None = None,
+    rejected_verifier: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Seal a local conservative reply after a provider candidate has failed closed."""
     fallback_packet = dict(packet)
@@ -164,7 +166,12 @@ def _save_safe_stage_fallback(
     # it must be judged on that evidence rather than rejected for differing
     # wording or a conservative qualification state.
     fallback_packet.pop("verification_repair", None)
-    output = safe_stage_output(stage, horizon=horizon, packet=fallback_packet)
+    candidate_output = rejected_output if (
+        stage == "m0_compose" and _salvageable_m0_candidate_research(rejected_output, rejected_verifier)
+    ) else None
+    output = safe_stage_output(
+        stage, horizon=horizon, packet=fallback_packet, candidate_output=candidate_output,
+    )
     business_verifier = CognitiveRouter().verify(stage, fallback_packet, output)
     attempt = store.begin_attempt(
         cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), str(fallback_packet.get("sha256") or "local-fallback"),
@@ -189,6 +196,22 @@ def _save_safe_stage_fallback(
         actual_model="runtime-safe-fallback",
     )
     return output, attempt["attempt_id"]
+
+
+def _salvageable_m0_candidate_research(
+    output: dict[str, Any] | None, verifier: dict[str, Any] | None,
+) -> bool:
+    """Only preserve candidates when the rejected draft failed on its surrounding holding narration."""
+    if not isinstance(output, dict) or output.get("result_version") != 4 or not output.get("candidate_research"):
+        return False
+    audit = verifier or {}
+    business = audit.get("business") if isinstance(audit.get("business"), dict) else audit
+    problems = business.get("problems") if isinstance(business, dict) else None
+    if not isinstance(problems, list) or not problems:
+        return False
+    allowed = ("m0_overloads_reply_with_holding_quotes", "m0_portfolio_quote_conflict:",
+               "m0_portfolio_quote_status_conflict:", "m0_portfolio_quote_time_conflict:")
+    return all(any(str(problem).startswith(prefix) for prefix in allowed) for problem in problems)
 
 
 def resolve_stage_controls(
@@ -1323,6 +1346,8 @@ def run_research(
                 try:
                     fallback, fallback_attempt_id = _save_safe_stage_fallback(
                         store, cycle, "m0_compose", local_packet, horizon="当前",
+                        rejected_output=getattr(exc, "output", None),
+                        rejected_verifier=getattr(exc, "verifier", None),
                     )
                 except EvidenceInsufficient as fallback_exc:
                     engine.research_failed(cycle["cycle_id"], str(fallback_exc), details=fallback_exc.verifier)

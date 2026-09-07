@@ -483,9 +483,13 @@ def _verified_announcement_narrative(name: str, announcement: dict[str, Any]) ->
 
 def safe_stage_output(
     stage: str, *, horizon: str = "当前", packet: dict[str, Any] | None = None,
+    candidate_output: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a conservative, auditable local fallback without inventing market facts."""
     if stage == "m0_compose":
+        candidate_fallback = _verified_candidate_research_fallback(candidate_output)
+        if candidate_fallback is not None:
+            return candidate_fallback
         verified = _verified_close_summary(packet)
         if verified is not None:
             return verified
@@ -519,6 +523,36 @@ def safe_stage_output(
             },
         }
     raise ValueError(f"unsupported fallback stage: {stage}")
+
+
+def _verified_candidate_research_fallback(
+    candidate_output: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Rewrite a verified candidate set without carrying a rejected market/holding monologue."""
+    if not isinstance(candidate_output, dict) or candidate_output.get("result_version") != 4:
+        return None
+    candidates = candidate_output.get("candidate_research")
+    if not isinstance(candidates, list) or not candidates or any(not isinstance(row, dict) for row in candidates):
+        return None
+    required = ("symbol", "name", "event", "business_link", "counterevidence", "observation_condition")
+    if any(any(not str(row.get(key) or "").strip() for key in required) for row in candidates):
+        return None
+
+    names = "、".join(str(row["name"]).strip() for row in candidates)
+    paragraphs = [
+        f"收盘后再看，持仓之外这批线索里，{names}值得分开核对。它们不能因为同属热门方向，就被当成同一种机会。"
+    ]
+    for row in candidates:
+        name = str(row["name"]).strip()
+        business = _sentence_piece(row["business_link"])
+        counter = _sentence_piece(row["counterevidence"])
+        condition = _sentence_piece(row["observation_condition"])
+        paragraphs.append(f"看{name}，{business}。不过，{counter}。接下来只用{condition}来验证。")
+    return {
+        "result_version": 4,
+        "candidate_research": [dict(row) for row in candidates],
+        "narrative": "\n\n".join(paragraphs),
+    }
 
 
 def express_stage_semantics(stage: str, semantic: dict[str, Any]) -> str:

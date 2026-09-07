@@ -59,6 +59,20 @@ def test_candidate_observation_reaches_message_without_a_buy_ranking():
     assert normalize_stage_output("m0_compose", output).text == output["narrative"]
 
 
+def test_candidate_review_does_not_reject_optional_narrative_duplication_when_all_quality_gates_pass():
+    output = {
+        "grounded": True,
+        "objective": True,
+        "specific": True,
+        "natural": True,
+        "problems": ["候选字段还可以在正文中展开更多业务数字和反证细节。"],
+    }
+
+    verdict = CognitiveRouter().verify("m0_candidate_review", {}, output)
+
+    assert verdict["passed"]
+
+
 def test_premarket_cannot_publish_a_close_summary_as_opportunity_discovery():
     packet = {
         "task_key": "daily.opportunity.0900",

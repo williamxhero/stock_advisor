@@ -25,12 +25,19 @@ objective 表示没有透露 AI 买入偏好、排序、动作或方向预测；
 不是标题表格报告、机械字段或“已更新记录”的日志。四项必须同时为真才合格。
 数字价位必须有来源和实际时点，不得复制样例的持仓和交易记录；候选不是真实持仓。
 problems 只列实质缺陷，纯润色不拒绝。有保留的机制假设不必由来源直接证明因果。
+若 grounded、objective、specific、natural 四项均为 true，problems 必须为空；想让正文重复更多
+已经存在于 candidate_research 的数字或细节只是可选润色，不得以 problems 拒绝。
 注意这只是 M0，不得要求它提前提供 M1 的买入排序或交易建议。"""
 
 
 def review_problems(output: dict[str, Any]) -> list[str]:
-    return ["premarket_review_rejected:" + key for key in ("grounded", "objective", "specific", "natural")
-            if output.get(key) is not True] + list(output.get("problems") or [])
+    failed = [key for key in ("grounded", "objective", "specific", "natural")
+              if output.get(key) is not True]
+    if not failed:
+        # The four typed gates are authoritative.  A reviewer that marks all
+        # of them true cannot also turn optional expansion into a rejection.
+        return []
+    return ["premarket_review_rejected:" + key for key in failed] + list(output.get("problems") or [])
 
 
 def plan_problems(core: dict, packet: dict, sources: dict) -> list[str]:

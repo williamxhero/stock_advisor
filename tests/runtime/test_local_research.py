@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from ai_trading_companion.broker_client import BrokerError
-from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, ToolResolutionError, WebAccessGatewayBackend, _discovery_digest, _discovery_read_repair_plan, _merge_mandatory_operations, _verify_research_plan
+from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, ToolResolutionError, WebAccessGatewayBackend, _bounded_research_plan, _discovery_digest, _discovery_read_repair_plan, _merge_mandatory_operations, _verify_research_plan
 from ai_trading_companion.market_breadth_cache import MarketBreadthSnapshotCache
 from ai_trading_companion.store import CompanionStore
 from ai_trading_companion.tooling import EvidenceResolution, FactRequest, ToolCatalog, ToolRunner
@@ -1008,6 +1008,32 @@ class LocalResearchTests(unittest.TestCase):
             "research_plan_non_document_url:candidate_business_research",
             problems,
         )
+
+    def test_bounded_plan_drops_company_listing_page_but_keeps_useful_operations(self) -> None:
+        listing = "https://www.cninfo.com.cn/new/disclosure/stock?stockCode=002050"
+        pdf = "https://static.cninfo.com.cn/finalpage/2026-09-04/1225516182.PDF"
+        plan = {"version": 1, "operations": [
+            {
+                **row("web_search", query="002050 三花智控 半年度报告"),
+                "requirement_key": "candidate_business_research",
+            },
+            {
+                **row("web_read", url=listing),
+                "requirement_key": "candidate_business_research",
+            },
+            {
+                **row("web_read", url=pdf),
+                "requirement_key": "candidate_business_research",
+            },
+        ]}
+
+        bounded = _bounded_research_plan(plan)
+
+        self.assertEqual(
+            ["web_search", "web_read"],
+            [operation["operation"] for operation in bounded["operations"]],
+        )
+        self.assertEqual(pdf, bounded["operations"][1]["arguments"]["url"])
 
     def test_discovery_repair_skips_listing_page_and_prioritizes_direct_document(self) -> None:
         contract = {"requirements": [{

@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.17"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15", "1.1.16"}
+_VERSION = "1.1.18"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15", "1.1.16", "1.1.17"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -632,13 +632,14 @@ def frozen_minute_payload(
             fail(75, "spot quote is missing a requested symbol")
         price, quote_at, source_url = frozen_minute(symbol, required_at, minute_endpoint)
         moment = dt.datetime.fromisoformat(quote_at.replace("Z", "+00:00")).astimezone(dt.timezone(dt.timedelta(hours=8)))
-        closed = finality in {"close", "official_close"}
-        if closed and moment.time() < dt.time(15, 0):
+        close_required = finality in {"close", "official_close"}
+        session_closed = moment.time() >= dt.time(15, 0)
+        if close_required and not session_closed:
             fail(75, "minute response does not meet close finality")
         item.update({
             "price": price, "quote_at": quote_at,
             "trading_date": moment.date().isoformat(),
-            "status": "closed" if closed else "trading", "source": "tencent_minute",
+            "status": "closed" if session_closed else "trading", "source": "tencent_minute",
         })
         previous_close = float(item.get("previous_close") or 0)
         if previous_close <= 0:

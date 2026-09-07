@@ -42,7 +42,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.17", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.18", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
             routing = json.loads(turnover_routing.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -51,7 +51,7 @@ class ToolRunnerTests(unittest.TestCase):
             )
             official_manifest = json.loads((
                 root / "cn_market_turnover_compare" / "adapters" / "official_exchanges"
-                / "versions" / "1.1.17" / "manifest.json"
+                / "versions" / "1.1.18" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual({
                 "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
@@ -854,6 +854,13 @@ class ToolRunnerTests(unittest.TestCase):
                 self.assertEqual("2026-09-01T07:00:00Z", quote["quote_at"])
                 self.assertEqual("closed", quote["status"])
                 self.assertEqual("official_close", result.data["finality"])
+                after_close = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_equity_quote_batch", "2026-09-01T07:30:00Z", 4.0,
+                    {"symbols": ["600000"], "tencent_quote_url": base + "/quote?q=",
+                     "tencent_minute_url": base + "/minute?code="}, finality="intraday",
+                ))
+                self.assertTrue(after_close.succeeded, after_close.error_code)
+                self.assertEqual("closed", after_close.data["quotes"][0]["status"])
             finally:
                 server.shutdown()
                 server.server_close()

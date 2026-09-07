@@ -1640,7 +1640,7 @@ def _candidate_symbols_from_discoveries(discoveries: list[dict[str, Any]]) -> li
     seen: set[str] = set()
     for discovery in discoveries:
         text = " ".join(str(discovery.get(field) or "") for field in (
-            "title", "excerpt", "excerpt_text", "discovery_query",
+            "title", "discovery_query",
         ))
         for symbol in re.findall(r"(?<!\d)([034689]\d{5})(?!\d)", text):
             if symbol in seen:

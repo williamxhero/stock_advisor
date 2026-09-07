@@ -1183,6 +1183,13 @@ class LocalResearchTests(unittest.TestCase):
                 (4, "沪电股份(002463)业绩预告", "沪电股份 002463 业务 风险"),
             )
         ]
+        discoveries.append({
+            "requirement_key": key,
+            "url": "https://news.example.test/20260905/equity-option.shtml",
+            "title": "沪电股份股权激励进展",
+            "excerpt": "股票期权代码037464，可行权数量14,761,750份",
+            "discovery_observation_id": "search-5",
+        })
 
         plan = _discovery_read_repair_plan(
             contract, discoveries, [key], 1,

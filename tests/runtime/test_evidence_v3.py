@@ -261,6 +261,11 @@ class EvidenceV3Tests(TestCase):
         self.contract = EvidenceContractFactory(_WeekdayCalendar()).build(
             task_key="daily.opportunity.0900", stage="m0_research", as_of=self.as_of,
         )
+        # These source/time/independence fixtures exercise the two market facts,
+        # not complete premarket candidate discovery (covered by its own tests).
+        self.contract["requirements"] = [row for row in self.contract["requirements"]
+                                         if row["key"] != "candidate_business_research"]
+        self.contract["contract_hash"] = EvidenceContractFactory.contract_hash(self.contract)
         self.planner_contract = {
             "version": 4, "as_of": self.as_of, "requirements": [{
                 "key": "material_events_and_counterevidence", "blocking": True,

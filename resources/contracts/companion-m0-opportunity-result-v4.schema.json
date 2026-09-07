@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object", "additionalProperties": false,
+  "required": ["result_version", "narrative", "candidate_research"],
+  "properties": {
+    "result_version": {"type": "integer", "const": 4},
+    "narrative": {"type": "string", "minLength": 1},
+    "candidate_research": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["symbol", "name", "event", "business_link", "counterevidence", "observation_condition", "evidence_refs"],
+        "properties": {
+          "symbol": {"type": "string", "pattern": "^[0-9]{6}$"},
+          "name": {"type": "string", "minLength": 1},
+          "event": {"type": "string", "minLength": 1},
+          "business_link": {"type": "string", "minLength": 1},
+          "counterevidence": {"type": "string", "minLength": 1},
+          "observation_condition": {"type": "string", "minLength": 1},
+          "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+        }
+      }
+    }
+  }
+}

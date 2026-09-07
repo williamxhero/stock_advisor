@@ -573,6 +573,12 @@ def express_stage_semantics(stage: str, semantic: dict[str, Any]) -> str:
 
 def normalize_stage_output(stage: str, output: dict[str, Any]) -> NormalizedStageOutput:
     """Give v2 semantics and read-only v1 results one canonical runtime shape."""
+    if stage == "m0_compose" and output.get("result_version") == 4:
+        text = str(output.get("narrative") or "")
+        return NormalizedStageOutput(
+            stage, {"summary": text}, {"candidate_research": output.get("candidate_research") or []},
+            text, None, False, True,
+        )
     if (stage == "m1_judgment" and output.get("result_version") == 5) or (
         stage == "m2" and output.get("result_version") == 4
     ):

@@ -1,0 +1,11 @@
+{
+  "type": "object", "additionalProperties": false,
+  "required": ["grounded", "objective", "specific", "natural", "problems"],
+  "properties": {
+    "grounded": {"type": "boolean"},
+    "objective": {"type": "boolean"},
+    "specific": {"type": "boolean"},
+    "natural": {"type": "boolean"},
+    "problems": {"type": "array", "items": {"type": "string"}}
+  }
+}

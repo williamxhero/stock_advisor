@@ -9,6 +9,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .effort_policy import CognitiveEffortPolicy, EffortPolicyFacts
+from .opportunities import observation_problems, review_problems
 from .stage_expression import (
     canonical_direction, normalize_stage_output, semantic_snapshot_conflicts,
     verified_weekly_market_comparison,
@@ -16,7 +17,7 @@ from .stage_expression import (
 
 
 RESEARCH_STAGES = frozenset({"m0_research", "m1_research", "outcome_research", "chat_research"})
-JUDGMENT_STAGES = frozenset({"m1_judgment", "m2", "reflection", "workflow_feedback"})
+JUDGMENT_STAGES = frozenset({"m1_judgment", "m2", "reflection", "workflow_feedback", "m0_candidate_review"})
 MAJOR_TASKS = frozenset({"daily.execution.1430", "daily.review.1520", "manual.non_trading_outlook", "periodic.monthly", "periodic.quarterly", "periodic.annual"})
 
 
@@ -157,6 +158,9 @@ class CognitiveRouter:
     def verify(self, stage: str, packet: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
         problems: list[str] = []
         profile = self.profile(stage, packet, 1)
+        if stage == "m0_candidate_review":
+            problems = review_problems(output)
+            return {"passed": not problems, "problems": problems, "profile": profile.as_json()}
         if (stage == "m1_judgment" and output.get("result_version") == 5) or (
             stage == "m2" and output.get("result_version") == 4
         ):
@@ -170,6 +174,7 @@ class CognitiveRouter:
                     "fallback": bool((output.get("publication") or {}).get("fallback"))}
         normalized = normalize_stage_output(stage, output)
         if stage == "m0_compose":
+            problems.extend(observation_problems(packet, output))
             calendar = packet.get("calendar_context") if isinstance(packet.get("calendar_context"), dict) else {}
             body = "".join(normalized.text.split()).lower()
             if any(marker in body for marker in (

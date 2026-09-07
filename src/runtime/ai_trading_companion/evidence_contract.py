@@ -32,6 +32,17 @@ class EvidenceContractFactory:
     ) -> dict[str, Any]:
         frozen = self._aware(as_of)
         requirements = self._requirements(task_key, stage, frozen, task_profile, internal_context or {})
+        if stage in {"m0_research", "m1_research"} and (
+            task_key == "daily.opportunity.0900"
+            or (task_profile or {}).get("profile_id") == "pre_market_opportunity"
+        ):
+            requirements.append({
+                "key": "candidate_business_research", "blocking": True,
+                "allowed_coverage": ["covered"],
+                "description": "从全市场公开事件追到持仓之外具体公司，读正文核验业务关联、替代公司和反证；不是昨日行情摘要。历史业务材料须与盘前新变化联合使用。",
+                "window": {"start": self._iso(frozen - timedelta(days=400)),
+                           "end": self._iso(frozen), "mode": "after_start_to_end"},
+            })
         contract = {
             "version": 4,
             "as_of": frozen.isoformat().replace("+00:00", "Z"),

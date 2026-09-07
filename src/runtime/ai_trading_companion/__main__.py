@@ -813,6 +813,11 @@ def _call_stage(
             tool_trace.extend(_broker_call_trace(pipeline.responses))
             verifier = router.verify(stage, packet, data)
         elif not search or not schema_name.startswith("companion-evidence-result-"):
+            from .opportunities import is_premarket, OBSERVATION_INSTRUCTION
+            if stage == "m0_compose" and is_premarket(packet):
+                schema_name = "companion-m0-opportunity-result-v4.schema.json"
+                request_packet = {**request_packet, "opportunity_instruction": OBSERVATION_INSTRUCTION}
+                request_hash = canonical_packet_hash(request_packet)
             schema = json.loads((SCHEMAS / schema_name).read_text(encoding="utf-8"))
             def verified_output(output: dict[str, Any]) -> dict[str, Any]:
                 return router.verify(stage, packet, output)
@@ -830,6 +835,25 @@ def _call_stage(
                 raise BrokerError(f"Broker produced no qualified result for {stage}", category="broker_output_invalid")
             data = outcome.result
             verifier = router.verify(stage, packet, data)
+            if stage == "m0_compose" and is_premarket(packet) and verifier.get("passed"):
+                from .opportunities import OBSERVATION_REVIEW_INSTRUCTION
+                try:
+                    reviewed = _call_stage(
+                        store, cycle, "m0_candidate_review",
+                        {"task_key": packet.get("task_key"), "as_of": packet.get("as_of"),
+                         "instruction": OBSERVATION_REVIEW_INSTRUCTION,
+                         "candidate": data, "evidence": packet.get("evidence") or {}},
+                        "companion-opportunity-review-v1.schema.json", search=False,
+                        timeout=max(1, int(deadline - time.monotonic())),
+                        runtime_strategy_shadow_cell=runtime_strategy_shadow_cell,
+                    )
+                except EvidenceInsufficient as exc:
+                    raise BrokerError("candidate observation review rejected", category="broker_output_invalid",
+                                      verifier=exc.verifier) from exc
+                if not reviewed.verifier.get("passed"):
+                    raise BrokerError("candidate observation review rejected", category="broker_output_invalid",
+                                      verifier=reviewed.verifier)
+                verifier["candidate_review_attempt_id"] = reviewed.attempt_id
             if evidence_verifier is not None:
                 verifier["evidence_gate"] = evidence_verifier
                 verifier["passed"] = bool(verifier.get("passed")) and bool(evidence_verifier.get("passed"))

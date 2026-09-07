@@ -92,6 +92,8 @@ def model_sources(packet: dict) -> dict[str, dict]:
 
 def render_core(core: dict) -> str:
     """Recovery prose contains only clauses from the reviewed, frozen decision."""
+    if core.get("opportunity_plan"):
+        return _render_opportunity_core(core)
     reasons = " ".join(f"{r['fact'].rstrip('。')}，{r['mechanism'].rstrip('。')}，{r['implication'].rstrip('。')}。"
                        for r in core["reasons"])
     counter = core["counterargument"]
@@ -127,6 +129,79 @@ def render_core(core: dict) -> str:
         paragraphs.append(" ".join(row["reason"] for row in core["opportunity_followup"]))
     if core.get("opportunity_review"):
         paragraphs.append(" ".join(dict.fromkeys(row["reason"] for row in core["opportunity_review"])))
+    return "\n\n".join(paragraphs)
+
+
+def _render_opportunity_core(core: dict) -> str:
+    """Render a company-selection decision as a conversation, not a field-by-field report."""
+    def clause(value: Any) -> str:
+        return str(value or "").strip().rstrip("。！？；，")
+
+    def without_intro(value: Any, *prefixes: str) -> str:
+        text = clause(value)
+        for prefix in prefixes:
+            if text.startswith(prefix):
+                return text[len(prefix):].lstrip("：，； ")
+        return text
+
+    paragraphs = [f"{clause(core['thesis'])}。{clause(core['action_reason'])}。"]
+    plan = core["opportunity_plan"]
+    for row in sorted(
+        plan.get("candidates") or [], key=lambda item: (item["status"] != "selected", item["priority"]),
+    ):
+        stance = {
+            "selected": "我会把它放进条件式买入候选",
+            "observe": "我暂时只观察",
+            "rejected": "这次我不选",
+        }[row["status"]]
+        decision_reason = without_intro(
+            row["decision_reason"], "列为观察而非直接买入", "列为观察", "列为条件式买入候选",
+        )
+        invalidation = clause(row["invalidation"])
+        invalidation = invalidation if invalidation.startswith(("若", "如果", "一旦")) else "如果" + invalidation
+        paragraphs.append(
+            f"{clause(row['name'])}{stance}。{clause(row['why_now'])}，{clause(row['business_link'])}。"
+            f"{decision_reason}。{clause(row['comparison'])}。"
+            f"我更担心{clause(row['counterargument'])}。具体地说，{clause(row['trigger'])}；"
+            f"{invalidation}，这条线索就作废。"
+        )
+
+    reasons = [row for row in core.get("reasons") or [] if isinstance(row, dict)][:2]
+    if reasons:
+        paragraphs.append("我这样判断，主要因为" + "；".join(
+            f"{clause(row.get('mechanism'))}，所以{clause(row.get('implication'))}" for row in reasons
+        ) + "。")
+    counter = core["counterargument"]
+    counter_claim = without_intro(counter["claim"], "反方认为")
+    why_not_base = without_intro(counter["why_not_base"], "我没有把它作为基准，是因为", "不过")
+    paragraphs.append(
+        f"最强的反方解释是{counter_claim}。我没有把它当作基准，因为{why_not_base}。"
+    )
+
+    position_reasons = [clause(row.get("reason")) for row in core.get("position_focus") or []]
+    portfolio = clause(core.get("portfolio_stance"))
+    if portfolio or position_reasons:
+        paragraphs.append("放到账户里，" + "；".join(value for value in [portfolio, *position_reasons] if value) + "。")
+
+    conditions = {row.get("outcome"): row for row in core.get("transition_conditions") or []}
+    boundary_parts = []
+    for outcome, lead in (("upgrade", "我会上调判断"), ("downgrade", "我会下调判断")):
+        row = conditions.get(outcome)
+        if not row:
+            continue
+        boundary_parts.append(
+            lead + "，要同时看到" + "、".join(clause(row.get(key)) for key in ("price", "breadth"))
+            + "，并且" + clause(row.get("persistence"))
+        )
+    if boundary_parts:
+        paragraphs.append("；反过来，".join(boundary_parts) + "。")
+    unknowns = [clause(value) for value in core.get("critical_unknowns") or [] if clause(value)]
+    if unknowns:
+        paragraphs.append("我还会继续验证" + "；".join(unknowns) + "。")
+    if core.get("opportunity_followup"):
+        paragraphs.append(" ".join(dict.fromkeys(clause(row["reason"]) for row in core["opportunity_followup"])) + "。")
+    if core.get("opportunity_review"):
+        paragraphs.append(" ".join(dict.fromkeys(clause(row["reason"]) for row in core["opportunity_review"])) + "。")
     return "\n\n".join(paragraphs)
 
 
@@ -275,7 +350,7 @@ class JudgmentPublicationPipeline:
                              "policy_hash": canonical_packet_hash({"core": CORE_INSTRUCTION,
                                                                     "repair": CORE_REPAIR_INSTRUCTION,
                                                                     "review": REVIEW_INSTRUCTION,
-                                                                    "renderer_version": 4,
+                                                                    "renderer_version": 5,
                                                                     "opportunity_instruction": PLAN_INSTRUCTION,
                                                                     "followup_instruction": FOLLOWUP_INSTRUCTION,
                                                                     "review_result_instruction": REVIEW_RESULT_INSTRUCTION,

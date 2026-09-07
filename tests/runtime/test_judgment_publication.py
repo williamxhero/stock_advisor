@@ -203,6 +203,39 @@ def test_premarket_selection_and_rejection_survive_expression_failure(tmp_path, 
     assert CognitiveRouter().verify("m1_judgment", premarket, output)["passed"]
 
 
+def test_premarket_recovery_renderer_leads_with_the_decision_and_stays_concise():
+    candidate = {
+        "symbol": "600001", "name": "样本科技", "status": "observe", "priority": 0,
+        "why_now": "今天产业链重新获得资金关注", "business_link": "供电产品直接关联产业需求",
+        "comparison": "相比只有概念关联的样本乙，它的业务依据更直接",
+        "priced_in": "单日已上涨10%，价格先反映了乐观预期",
+        "counterargument": "订单尚未兑现，板块反弹也可能很快分化",
+        "trigger": "订单确认且同行同步转强后再考虑", "invalidation": "若订单被否定或独自冲高回落就放弃",
+        "risk_cluster": "数据中心供电", "horizon": "未来一周",
+        "decision_reason": "列为观察：不在价格已经明显反应时追买",
+        "evidence_refs": ["ev_company"],
+    }
+    decision = {**core(), "opportunity_plan": {
+        "research_complete": True, "candidates": [candidate],
+        "no_selection_reason": "价格已经先反映预期，暂不承担追高风险",
+    }}
+    decision["counterargument"] = {
+        "claim": "反方认为这只是一次快速反弹", "evidence_refs": ["ev_market"],
+        "why_not_base": "我没有把它作为基准，是因为产业链仍有业务验证",
+    }
+
+    text = render_core(decision)
+
+    assert text.startswith(decision["thesis"])
+    assert "样本科技我暂时只观察" in text
+    assert candidate["trigger"] in text and candidate["invalidation"] in text
+    assert "15.50%" not in text and "10%" not in text
+    assert "。。" not in text and "；，" not in text
+    assert "列为观察" not in text and "如果若" not in text
+    assert "反方解释是反方认为" not in text and "因为我没有把它作为基准" not in text
+    assert text.count("样本科技") <= 2
+
+
 def test_fact_reference_and_active_position_validation():
     altered = core()
     altered["reasons"][0]["fact"] = "成交放大99.99%"

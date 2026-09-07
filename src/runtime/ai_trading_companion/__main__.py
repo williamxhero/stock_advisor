@@ -49,7 +49,9 @@ from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
 from .runtime_strategy_policy import RuntimeStrategyControls, RuntimeStrategyPolicy
 from .stage_expression import normalize_stage_output, safe_stage_output
-from .judgment_publication import JudgmentPublicationPipeline, JudgmentUnavailable
+from .judgment_publication import (
+    JudgmentPublicationPipeline, JudgmentUnavailable, model_fact_digest, model_memories, model_sources,
+)
 from .local_research import (
     BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
     ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend,
@@ -261,7 +263,8 @@ def finalize_stage_packet(packet: dict[str, Any], controls: RuntimeStrategyContr
     """Bind runtime controls before deriving the sole hash for a stage invocation.
 
     The returned packet is a new immutable candidate.  Its ``sha256`` covers
-    exactly the object later persisted, checkpointed, and sent to Broker.
+    exactly the lossless object later persisted and checkpointed.  Stages with
+    duplicate large bodies derive a bounded, independently hashed model view.
     """
     final_packet = {
         key: value for key, value in packet.items()
@@ -276,6 +279,27 @@ def finalize_stage_packet(packet: dict[str, Any], controls: RuntimeStrategyContr
     final_packet["allowed_research_backends"] = list(controls.enabled_backends)
     final_packet["sha256"] = canonical_packet_hash(final_packet)
     return final_packet
+
+
+def _model_stage_packet(stage: str, packet: dict[str, Any]) -> dict[str, Any]:
+    """Derive a bounded provider view while preserving the lossless audit packet."""
+    if stage not in {"m0_compose", "m0_candidate_review"}:
+        return packet
+    projected = dict(packet)
+    evidence = packet.get("evidence") or {}
+    if isinstance(evidence, dict):
+        projected["evidence"] = {**evidence, "sources": list(model_sources(packet).values())}
+    if stage == "m0_compose":
+        projected["artifacts"] = [
+            row for row in packet.get("artifacts") or []
+            if isinstance(row, dict) and row.get("kind") not in {"evidence", "m1_evidence"}
+        ]
+        periodic = str(packet.get("task_key") or "").startswith("periodic.")
+        projected["memories"] = model_memories(
+            packet.get("memories") or [], include_published_ai=periodic,
+        )
+        projected["verified_fact_digest"] = model_fact_digest(packet.get("verified_fact_digest") or [])
+    return projected
 
 
 def _evidence_read_cutoff(packet: dict[str, Any], contract: dict[str, Any]) -> str | None:
@@ -875,8 +899,10 @@ def _call_stage(
             schema = json.loads((SCHEMAS / schema_name).read_text(encoding="utf-8"))
             def verified_output(output: dict[str, Any]) -> dict[str, Any]:
                 return router.verify(stage, packet, output)
+            model_packet = _model_stage_packet(stage, request_packet)
+            model_packet_hash = canonical_packet_hash(model_packet)
             request = BrokerRequest(
-                stage=stage, packet=request_packet, packet_sha256=request_hash,
+                stage=stage, packet=model_packet, packet_sha256=model_packet_hash,
                 intellect=decision.intellect, effort=decision.reasoning_effort, schema=schema,
                 visible_stream=False, absolute_deadline=deadline,
                 output_token_limit=6_000 if stage == "m1_judgment" else 4_000 if stage == "m2" else 2_000,

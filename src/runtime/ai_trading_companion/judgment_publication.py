@@ -131,6 +131,18 @@ def model_memories(memories: list[dict], *, include_published_ai: bool = False) 
     return projected
 
 
+def model_fact_digest(rows: list[dict]) -> list[dict]:
+    """Project deterministic facts once without carrying long source bodies a second time."""
+    values = [row for row in rows if isinstance(row, dict) and row.get("evidence_ref")]
+    if not values:
+        return []
+    excerpt_limit = min(800, max(160, 12_000 // len(values)))
+    return [{
+        "evidence_ref": str(row["evidence_ref"]),
+        "excerpt": _bounded_model_text(row.get("excerpt"), excerpt_limit),
+    } for row in values]
+
+
 def _bounded_model_text(value: Any, limit: int) -> str:
     text = " ".join(str(value or "").split())
     if len(text) <= limit:

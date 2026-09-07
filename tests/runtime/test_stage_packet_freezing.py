@@ -2,7 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
-from ai_trading_companion.__main__ import finalize_stage_packet
+from ai_trading_companion.__main__ import _model_stage_packet, finalize_stage_packet
 from ai_trading_companion.broker_client import BrokerRequest, canonical_packet_hash
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.runtime_strategy_policy import RuntimeStrategyControls
@@ -16,6 +16,33 @@ class StagePacketFreezingTests(TestCase):
         enabled_backends=(),
         revisions=(("stage_budget", 3),),
     )
+
+    def test_premarket_model_projection_removes_duplicate_transport_bodies_but_keeps_audit_packet(self) -> None:
+        long_body = "开头事实" + "正文" * 5_000 + "结尾反证"
+        sources = [{
+            "evidence_ref": f"ev-{index}", "title": f"证据{index}", "excerpt": long_body,
+            "fact_as_of": "2026-09-07T07:00:00Z", "tool_arguments": {"raw": "x" * 1_000},
+        } for index in range(40)]
+        packet = {
+            "task_key": "daily.opportunity.0900", "stage": "m0_compose",
+            "evidence": {"sources": sources},
+            "artifacts": [{"kind": "evidence", "body": "y" * 180_000}],
+            "verified_fact_digest": [{"evidence_ref": row["evidence_ref"], "excerpt": long_body} for row in sources],
+            "memories": [{
+                "authority": "mutable_source_snapshot", "episode_type": "external_evidence",
+                "summary": "重复行情" * 500,
+            } for _ in range(73)],
+        }
+
+        projected = _model_stage_packet("m0_compose", packet)
+
+        self.assertLess(len(str(projected)), 65_000)
+        self.assertEqual({row["evidence_ref"] for row in sources}, {
+            row["evidence_ref"] for row in projected["evidence"]["sources"]
+        })
+        self.assertEqual([], projected["artifacts"])
+        self.assertEqual([], projected["memories"])
+        self.assertEqual(180_000, len(packet["artifacts"][0]["body"]))
 
     def test_controls_are_bound_before_broker_hash_is_verified(self) -> None:
         builder_packet = {

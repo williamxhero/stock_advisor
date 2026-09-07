@@ -766,6 +766,7 @@ class LocalResearchChain:
                     row["operation"], {**row["arguments"], "requirement_key": row["requirement_key"]},
                     result, bool(result.get("results") or result.get("url") or result.get("text")),
                 )
+                _discard_unreadable_document_items(observation)
                 _normalize_public_read_fact_time(observation, contract, row["requirement_key"])
                 observation["backend"] = backend
                 _finish_tool_timing(observation, tool_started_at, tool_started_clock)
@@ -900,6 +901,7 @@ class LocalResearchChain:
                         row["operation"], {**row["arguments"], "requirement_key": row["requirement_key"]},
                         result, bool(result.get("results") or result.get("url") or result.get("text")),
                     )
+                    _discard_unreadable_document_items(observation)
                     _normalize_public_read_fact_time(observation, contract, row["requirement_key"])
                     observation["backend"] = backend
                     _finish_tool_timing(observation, tool_started_at, tool_started_clock)
@@ -939,6 +941,7 @@ class LocalResearchChain:
                             row["operation"], {**row["arguments"], "requirement_key": row["requirement_key"]},
                             result, bool(result.get("results") or result.get("url") or result.get("text")),
                         )
+                        _discard_unreadable_document_items(observation)
                         _normalize_public_read_fact_time(observation, contract, row["requirement_key"])
                         observation["backend"] = backend
                         _finish_tool_timing(observation, tool_started_at, tool_started_clock)
@@ -2348,6 +2351,29 @@ def _normalize_public_read_fact_time(
         item["fact_as_of"] = timestamp
 
 
+def _discard_unreadable_document_items(observation: dict[str, Any]) -> None:
+    """A successful download is not evidence when the gateway returned raw file bytes."""
+    if str(observation.get("operation") or "") != "web_read":
+        return
+    items = list(observation.get("evidence_items") or [])
+    readable = [item for item in items if not _is_raw_pdf_item(item)]
+    discarded = len(items) - len(readable)
+    if not discarded:
+        return
+    observation["evidence_items"] = readable
+    observation["non_empty"] = bool(readable)
+    observation["unreadable_document_items"] = discarded
+
+
+def _is_raw_pdf_item(item: dict[str, Any]) -> bool:
+    try:
+        path = urlsplit(str(item.get("url") or "")).path.casefold()
+    except ValueError:
+        path = ""
+    excerpt = str(item.get("excerpt_text") or "").lstrip("\ufeff \t\r\n")
+    return path.endswith(".pdf") and excerpt.startswith("%PDF-")
+
+
 def _public_page_publication_time(
     text: str, *, url: str = "", not_after: datetime,
 ) -> datetime | None:
@@ -2380,6 +2406,28 @@ def _public_page_publication_time(
             value = local.astimezone(timezone.utc)
             if value <= not_after:
                 candidates.append(value)
+    # Article scrapers commonly return ``headline + publication time + body``
+    # without a "发布时间" label.  A full date and clock near the beginning is
+    # publication metadata; requiring the clock avoids relabelling report-period
+    # dates such as "截至 2026-06-30" as publication time.
+    article_header = compact[:800]
+    header_pattern = re.compile(
+        r"(20\d{2})[-年/](\d{1,2})[-月/](\d{1,2})(?:日)?"
+        r"[ T\s]+(\d{1,2})[:：](\d{2})(?::(\d{2}))?",
+        re.IGNORECASE,
+    )
+    for match in header_pattern.finditer(article_header):
+        try:
+            local = datetime(
+                int(match.group(1)), int(match.group(2)), int(match.group(3)),
+                int(match.group(4)), int(match.group(5)), int(match.group(6) or 0),
+                tzinfo=_SHANGHAI,
+            )
+        except ValueError:
+            continue
+        value = local.astimezone(timezone.utc)
+        if value <= not_after:
+            candidates.append(value)
     try:
         parsed_url = urlsplit(str(url or ""))
     except ValueError:

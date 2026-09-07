@@ -82,6 +82,27 @@ class LocalResearchTests(unittest.TestCase):
         self.assertTrue(result.qualified, result.verifier)
         self.assertEqual("2026-09-03T16:00:00Z", result.evidence["sources"][0]["fact_as_of"])
 
+    def test_company_read_uses_a_leading_article_publication_timestamp(self):
+        result = self._run_late_company_read(
+            "景旺电子再度递表港交所：核心刚性PCB产品毛利率持续走低 "
+            "2026-07-06 19:35 每经记者｜蔡鼎。景旺电子603228通信与数据基础设施收入增长，"
+            "但核心产品毛利率下滑。",
+            url="https://m.nbd.com.cn/articles/2026-07-06/4455824.html",
+        )
+
+        self.assertTrue(result.qualified, result.verifier)
+        self.assertEqual("2026-07-06T11:35:00Z", result.evidence["sources"][0]["fact_as_of"])
+
+    def test_raw_pdf_bytes_do_not_count_as_company_research(self):
+        result = self._run_late_company_read(
+            "%PDF-1.7 %\ufffd\ufffd 1 0 obj stream x\ufffd\ufffd\u0001\u0002\u0003\ufffd\ufffd endstream",
+            url="https://static.cninfo.com.cn/finalpage/2026-09-04/1225516182.PDF",
+        )
+
+        self.assertFalse(result.qualified)
+        self.assertEqual([], result.evidence["sources"])
+        self.assertIn("candidate_business_research", result.verifier["missing_requirements"])
+
     def test_company_read_does_not_backdate_same_day_pdf_without_a_time(self):
         result = self._run_late_company_read(
             "北京同有飞骥科技股份有限公司公告，披露存储产品业务。",

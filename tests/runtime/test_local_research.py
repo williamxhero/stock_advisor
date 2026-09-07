@@ -1201,6 +1201,23 @@ class LocalResearchTests(unittest.TestCase):
         )
         self.assertEqual(4, len([item for item in plan["operations"] if item["operation"] == "web_read"]))
 
+        followup = _discovery_read_repair_plan(
+            contract, discoveries, [key], 2,
+            available_backends={"gateway", "market"},
+            attempted_market_checks={
+                "holding_snapshot:300308", "announcement_snapshot:300308",
+                "holding_snapshot:603083", "announcement_snapshot:603083",
+            },
+        )
+        followup_structured = [item for item in followup["operations"] if item["backend"] == "market"]
+        self.assertEqual(
+            [
+                ("holding_snapshot", "603228"), ("announcement_snapshot", "603228"),
+                ("holding_snapshot", "002463"), ("announcement_snapshot", "002463"),
+            ],
+            [(item["operation"], item["arguments"]["symbol"]) for item in followup_structured],
+        )
+
     def test_company_discovery_digest_keeps_multiple_search_queries_in_the_shortlist(self) -> None:
         key = "candidate_business_research"
         contract = {"requirements": [{
@@ -1579,6 +1596,12 @@ class LocalResearchTests(unittest.TestCase):
         request = runner.resolve_with_fallback.call_args.args[0]
         self.assertEqual({"symbols": ["300308"]}, request.inputs)
         self.assertEqual("300308", json.loads(result["results"][0]["excerpt_text"])["quotes"][0]["symbol"])
+
+        backend("announcement_snapshot", {"_requirement_key": key, "symbol": "300308"})
+
+        announcement_request = runner.resolve_with_fallback.call_args.args[0]
+        self.assertEqual("2026-07-28", announcement_request.inputs["start_date"])
+        self.assertEqual("2026-08-27", announcement_request.inputs["end_date"])
 
     def test_tool_catalog_adapter_normalizes_weekly_tencent_history_before_evidence(self) -> None:
         url = (

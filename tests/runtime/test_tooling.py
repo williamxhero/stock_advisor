@@ -42,7 +42,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.16", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.17", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
             routing = json.loads(turnover_routing.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -51,7 +51,7 @@ class ToolRunnerTests(unittest.TestCase):
             )
             official_manifest = json.loads((
                 root / "cn_market_turnover_compare" / "adapters" / "official_exchanges"
-                / "versions" / "1.1.16" / "manifest.json"
+                / "versions" / "1.1.17" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual({
                 "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
@@ -1387,6 +1387,7 @@ class ToolRunnerTests(unittest.TestCase):
                     {"代码": symbol, "简称": "白云电器", "公告标题": "旧公告",
                      "公告内容": "窗口外", "公告日期": "2026-08-01"},
                 ]}
+                payload.update({"start_date": "2026-08-31", "end_date": "2026-09-05"})
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
@@ -1408,6 +1409,13 @@ class ToolRunnerTests(unittest.TestCase):
                 self.assertEqual(["603861"], result.data["checked_symbols"])
                 self.assertEqual(["回购进展公告"], [row["title"] for row in result.data["announcements"]])
                 self.assertEqual("2026-09-02", result.data["announcements"][0]["announcement_date"])
+                incomplete = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_equity_announcement_snapshot", "2026-09-05T02:00:00Z", 5.0,
+                    {"symbols": ["603861"], "start_date": "2026-08-01", "end_date": "2026-09-05",
+                     "base_url": f"http://127.0.0.1:{server.server_port}"}, finality="observed",
+                ))
+                self.assertFalse(incomplete.succeeded)
+                self.assertEqual("tool_announcement_enumeration_incomplete", incomplete.error_code)
             finally:
                 server.shutdown(); server.server_close()
 

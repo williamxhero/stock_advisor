@@ -9,7 +9,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -130,6 +130,14 @@ class BrokerResearchPlanner:
                 "不能要求尚未发生的开盘数据。通过时 problems=[]；不要因可选资料拒绝。"
             ),
         }
+        packet["instruction"] += (
+            " Treat exact valuation multiples, long price histories, and one specifically named filing as optional "
+            "improvements when the evidence already supports an independent shortlist, downgrade, or rejection. "
+            "A frozen quote or limit-up move may establish price reflection; recent official disclosure enumeration "
+            "plus readable company-specific business evidence may establish the company case. Fail only when the "
+            "remaining gap prevents any defensible candidate comparison or conditional conclusion, not merely because "
+            "more research would be desirable."
+        )
         response = self.broker.invoke(BrokerRequest(
             stage="research", packet=packet, packet_sha256=canonical_packet_hash(packet),
             intellect=self.intellect, effort=self.effort, absolute_deadline=float(self.deadline()),
@@ -163,6 +171,7 @@ class BrokerResearchPlanner:
         discovery_repair = _discovery_read_repair_plan(
             packet.get("evidence_contract") or {}, discoveries, gaps, round_number,
             available_backends=available_backends,
+            attempted_market_checks=set(packet.get("attempted_candidate_market_checks") or []),
         )
         if discovery_repair is not None:
             return discovery_repair
@@ -176,6 +185,9 @@ class BrokerResearchPlanner:
             "coverage_gaps": list(gaps),
             "repair_round": int(round_number),
             "research_discoveries": discoveries,
+            "attempted_candidate_market_checks": sorted(
+                set(packet.get("attempted_candidate_market_checks") or [])
+            ),
             "research_route_state": packet.get("research_route_state") or {},
             "verified_research_sources": packet.get("verified_research_sources") or [],
             "research_questions": packet.get("research_questions") or [],
@@ -383,9 +395,15 @@ class ToolCatalogMarketBackend:
                                  else f"{operation} requires frozen portfolio entities")
             inputs = {"symbols": symbols, **({"freq": "1m"} if operation == "current_bar" else {})}
             if operation == "announcement_snapshot":
+                start_date = str(window.get("start") or "")[:10]
+                end_date = str(window.get("end") or "")[:10]
+                if requirement_key == "candidate_business_research":
+                    start_date, end_date = _bounded_candidate_announcement_window(
+                        start_date, end_date, required_at,
+                    )
                 inputs.update({
-                    "start_date": str(window.get("start") or "")[:10],
-                    "end_date": str(window.get("end") or "")[:10],
+                    "start_date": start_date,
+                    "end_date": end_date,
                 })
         elif operation == "market_event_snapshot":
             inputs = {
@@ -432,7 +450,6 @@ class ToolCatalogMarketBackend:
             "url": results[0]["url"], "text": results[0]["excerpt_text"],
             "raw_artifact_ref": resolution.raw_artifact_ref, "results": results,
         }
-
     def _exact_close_ledger_result(
         self, request: FactRequest, requirement: dict[str, Any], operation: str,
     ) -> dict[str, Any] | None:
@@ -601,6 +618,20 @@ class ToolCatalogMarketBackend:
             return {"url": urls[0], "text": excerpt, "raw_artifact_ref": cached.get("raw_artifact_ref"), "results": results}
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
+
+
+def _bounded_candidate_announcement_window(
+    start_date: str, end_date: str, required_at: str,
+) -> tuple[str, str]:
+    """Match the local CNInfo index's honest 30-day search horizon for candidates."""
+    try:
+        required = datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(_SHANGHAI).date()
+        requested_start = datetime.fromisoformat(start_date).date()
+        requested_end = datetime.fromisoformat(end_date).date()
+    except ValueError:
+        return start_date, end_date
+    actual_end = min(required, requested_end)
+    return max(requested_start, actual_end - timedelta(days=30)).isoformat(), actual_end.isoformat()
 
 
 class ToolResolutionError(RuntimeError):
@@ -845,6 +876,16 @@ class LocalResearchChain:
                     str((item.get("arguments") or {}).get("url") or "")
                     for item in observations
                     if str((item.get("arguments") or {}).get("url") or "")
+                }),
+                "attempted_candidate_market_checks": sorted({
+                    f"{item.get('operation')}:{(item.get('arguments') or {}).get('symbol')}"
+                    for item in observations
+                    if item.get("backend") == "market"
+                    and str((item.get("arguments") or {}).get("requirement_key") or "")
+                    == "candidate_business_research"
+                    and _is_supported_a_share_symbol(
+                        str((item.get("arguments") or {}).get("symbol") or "")
+                    )
                 }),
                 "research_route_state": _research_route_state(observations),
                 "verified_research_sources": list(evidence.get("sources") or []),
@@ -1350,6 +1391,7 @@ def _prepared_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> d
         [key],
         1,
         available_backends=set(packet.get("available_backends") or []),
+        attempted_market_checks=set(packet.get("attempted_candidate_market_checks") or []),
     )
     if not repair:
         return plan
@@ -1490,6 +1532,7 @@ def _merge_discoveries(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _discovery_read_repair_plan(
     contract: dict[str, Any], discoveries: list[dict[str, Any]], gaps: list[str], round_number: int,
     *, available_backends: set[str] | None = None,
+    attempted_market_checks: set[str] | None = None,
 ) -> dict[str, Any] | None:
     """Deterministically verify known candidate URLs instead of asking the model to rediscover them."""
     if round_number <= 0 or not discoveries or not gaps:
@@ -1506,6 +1549,7 @@ def _discovery_read_repair_plan(
     if not targets:
         return None
     enabled_backends = {"gateway"} if available_backends is None else set(available_backends)
+    completed_market_checks = set(attempted_market_checks or set())
     operations: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
     seen_urls: set[str] = set()
@@ -1521,9 +1565,23 @@ def _discovery_read_repair_plan(
             if "market" in enabled_backends:
                 for symbol in _candidate_symbols_from_discoveries([
                     discovery for _, discovery in key_discoveries
-                ])[:2]:
-                    for operation in ("holding_snapshot", "announcement_snapshot"):
-                        if len(operations) >= 24:
+                ]):
+                    pending_operations = [
+                        operation for operation in ("holding_snapshot", "announcement_snapshot")
+                        if f"{operation}:{symbol}" not in completed_market_checks
+                    ]
+                    if not pending_operations:
+                        continue
+                    if sum(
+                        1 for item in operations
+                        if item.get("backend") == "market" and item.get("requirement_key") == key
+                    ) >= 4:
+                        break
+                    for operation in pending_operations:
+                        if len(operations) >= 24 or sum(
+                            1 for item in operations
+                            if item.get("backend") == "market" and item.get("requirement_key") == key
+                        ) >= 4:
                             break
                         operations.append({
                             "requirement_key": key,

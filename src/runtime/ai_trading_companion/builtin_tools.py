@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.16"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15"}
+_VERSION = "1.1.17"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15", "1.1.16"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -1652,6 +1652,18 @@ def announcement_snapshot_payload(
         announcements.extend(normalized)
         source_urls.append(url)
         pagination = payload.get("pagination") if isinstance(payload, dict) and isinstance(payload.get("pagination"), dict) else {}
+        reported_start_text = clean_text(
+            payload.get("开始日期") or payload.get("start_date") or start_date
+        ).strip()[:10]
+        reported_end_text = clean_text(
+            payload.get("结束日期") or payload.get("end_date") or end_date
+        ).strip()[:10]
+        try:
+            reported_start = dt.date.fromisoformat(reported_start_text)
+            reported_end = dt.date.fromisoformat(reported_end_text)
+        except ValueError:
+            reported_start, reported_end = start, end
+        requested_window_enumerated = reported_start <= start and reported_end >= end
         pagination_complete = not bool(
             (isinstance(payload, dict) and payload.get("has_more") is True)
             or pagination.get("has_more") is True
@@ -1659,10 +1671,12 @@ def announcement_snapshot_payload(
                 pagination.get("total_pages") is not None
                 and int(pagination.get("page") or 0) < int(pagination.get("total_pages") or 0)
             )
-        )
+        ) and requested_window_enumerated
         enumeration_proof = {
             "authority": "cninfo", "query_symbol": item["symbol"],
             "start_date": start_date, "end_date": end_date,
+            "source_start_date": reported_start.isoformat(),
+            "source_end_date": reported_end.isoformat(),
             "pagination_complete": pagination_complete,
         }
         source_evidence.append({

@@ -83,11 +83,62 @@ def core_problems(core: dict, packet: dict) -> list[str]:
 
 
 def model_sources(packet: dict) -> dict[str, dict]:
-    """Lossless factual projection: omit duplicate text and transport-only bookkeeping."""
-    omitted = {"excerpt_text", "tool_arguments", "memory_content_hash", "memory_episode_id",
-               "content_fingerprint"}
-    return {ref: {k: v for k, v in row.items() if k not in omitted}
-            for ref, row in evidence_sources(packet).items()}
+    """Bound the model projection while the immutable evidence ledger remains lossless."""
+    sources = evidence_sources(packet)
+    if not sources:
+        return {}
+    excerpt_limit = min(1_200, max(200, 32_000 // len(sources)))
+    useful_fields = (
+        "evidence_ref", "title", "excerpt", "analysis", "fact_as_of", "known_at",
+        "source_identity", "source_tier", "primary", "factual_status", "market_propagation",
+    )
+    projected: dict[str, dict] = {}
+    for ref, row in sources.items():
+        item = {key: value for key in useful_fields if (value := row.get(key)) not in (None, "", [], {})}
+        item["evidence_ref"] = ref
+        item["excerpt"] = _bounded_model_text(row.get("excerpt"), excerpt_limit)
+        projected[ref] = item
+    return projected
+
+
+def model_memories(memories: list[dict], *, include_published_ai: bool = False) -> list[dict]:
+    """Keep distinct judgment lessons, not mutable evidence already frozen in this packet."""
+    useful_fields = (
+        "authority", "episode_type", "known_at", "occurred_at", "summary",
+        "source_reference", "corrects_episode_id",
+    )
+    projected: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in memories:
+        if not isinstance(row, dict):
+            continue
+        if row.get("authority") == "published_ai_message" and not include_published_ai:
+            continue
+        if row.get("authority") == "mutable_source_snapshot" and row.get("episode_type") == "external_evidence":
+            continue
+        summary = _bounded_model_text(row.get("summary"), 1_000)
+        if not summary:
+            continue
+        identity = (str(row.get("authority") or ""), str(row.get("episode_type") or ""), summary)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        item = {key: value for key in useful_fields if (value := row.get(key)) not in (None, "", [], {})}
+        item["summary"] = summary
+        projected.append(item)
+        if len(projected) >= 16:
+            break
+    return projected
+
+
+def _bounded_model_text(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    marker = " …[中段省略]… "
+    remaining = max(0, limit - len(marker))
+    head = max(1, int(remaining * 0.72))
+    return text[:head] + marker + text[-(remaining - head):]
 
 
 def render_core(core: dict) -> str:
@@ -341,9 +392,8 @@ class JudgmentPublicationPipeline:
                    "evidence": {**(base.get("evidence") or {}), "sources": list(model_sources(base).values())}}
         # Prior AI prose is not verified market evidence or an expression exemplar.
         # Outcome/periodic reviews still need the original claims for comparison.
-        if not str(base.get("task_key") or "").startswith("periodic."):
-            context["memories"] = [m for m in base.get("memories", [])
-                                   if m.get("authority") != "published_ai_message"]
+        periodic = str(base.get("task_key") or "").startswith("periodic.")
+        context["memories"] = model_memories(base.get("memories", []), include_published_ai=periodic)
         # Reuse only a reviewed core under exactly the same input and policy version.
         checkpoint_packet = {"packet": base, "pipeline_version": 1, "intellect": self.intellect,
                              "effort": self.effort, "is_shadow": self.is_shadow,
@@ -354,7 +404,7 @@ class JudgmentPublicationPipeline:
                                                                     "opportunity_instruction": PLAN_INSTRUCTION,
                                                                     "followup_instruction": FOLLOWUP_INSTRUCTION,
                                                                     "review_result_instruction": REVIEW_RESULT_INSTRUCTION,
-                                                                    "context_projection_version": 2})}
+                                                                    "context_projection_version": 3})}
         checkpoint_key = canonical_packet_hash(checkpoint_packet)
         saved = self.store.stage_checkpoint(cycle["cycle_id"], prefix + "_core", checkpoint_key)
         feedback: list[str] = list(_feedback or [])

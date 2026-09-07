@@ -416,3 +416,47 @@ def test_model_contracts_declare_native_types_and_do_not_duplicate_evidence(tmp_
     assert "excerpt_text" not in context["evidence"]["sources"][0]
     assert context["memories"] == [original["memories"][1]]
     assert context["evidence"]["sources"][0]["excerpt"] == original["evidence"]["sources"][0]["excerpt"]
+
+
+def test_model_context_is_bounded_without_losing_evidence_identity_or_relevant_memory(tmp_path):
+    original = packet()
+    long_body = "公告开头：样本科技进入订单验证。" + "中段资料" * 2000 + "公告结尾：尚未形成收入，存在兑现风险。"
+    original["evidence"]["sources"] = [
+        {
+            "evidence_ref": "ev_market" if number == 0 else f"ev_{number}",
+            "title": f"证据{number}",
+            "excerpt": "成交放大15.50%，下跌占优；力星弱于指数；" + long_body,
+            "analysis": "保留可判断的事实与反证",
+            "fact_as_of": "2026-09-07T01:00:00Z",
+            "source_identity": "example.test",
+            "source_tier": "secondary",
+            "primary": False,
+            "market_propagation": "observed",
+            "tool_arguments": {"duplicated_transport_detail": "x" * 1000},
+        }
+        for number in range(40)
+    ]
+    snapshot = {
+        "authority": "mutable_source_snapshot", "episode_type": "external_evidence",
+        "known_at": "2026-09-07T01:00:00Z", "summary": "重复行情快照" * 100,
+    }
+    learned = {
+        "authority": "verified_knowledge", "episode_type": "outcome",
+        "known_at": "2026-09-06T01:00:00Z", "summary": "订单公告不等于收入兑现",
+    }
+    original["memories"] = [copy.deepcopy(snapshot) for _ in range(73)] + [learned, copy.deepcopy(learned)]
+
+    broker = Broker(fail_expression=True)
+    pipeline, _, cycle = runtime(tmp_path, broker)
+    pipeline.produce("m1_judgment", cycle, original, time.monotonic() + 60)
+
+    model_packets = [request.packet for request in broker.calls if request.stage in {"m1_reasoning", "m1_review"}]
+    assert model_packets
+    assert all(len(json.dumps(value, ensure_ascii=False)) < 60_000 for value in model_packets)
+    reasoning_context = next(request.packet["context"] for request in broker.calls if request.stage == "m1_reasoning")
+    sources = reasoning_context["evidence"]["sources"]
+    assert {row["evidence_ref"] for row in sources} == {row["evidence_ref"] for row in original["evidence"]["sources"]}
+    assert all("tool_arguments" not in row for row in sources)
+    assert "公告开头" in sources[0]["excerpt"] and "公告结尾" in sources[0]["excerpt"]
+    assert "中段省略" in sources[0]["excerpt"]
+    assert reasoning_context["memories"] == [learned]

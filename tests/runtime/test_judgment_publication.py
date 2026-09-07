@@ -467,6 +467,10 @@ def test_premarket_model_evidence_keeps_decision_inputs_not_noncritical_research
         {"evidence_ref": ref, "excerpt": ref, "title": ref}
         for ref in ("market", "breadth", "portfolio", "event", "no-change", "candidate")
     ]
+    sources.append({
+        "evidence_ref": "candidate-duplicate", "excerpt": "candidate", "title": "candidate",
+        "analysis": "duplicate transport annotation", "market_propagation": "unknown",
+    })
     packet = {
         "task_key": "daily.opportunity.0900",
         "evidence": {
@@ -477,7 +481,7 @@ def test_premarket_model_evidence_keeps_decision_inputs_not_noncritical_research
                 {"requirement_key": "portfolio_market_state", "status": "covered", "evidence_refs": ["portfolio"]},
                 {"requirement_key": "material_events_and_counterevidence", "status": "covered", "evidence_refs": ["event"]},
                 {"requirement_key": "portfolio_events_and_counterevidence", "status": "checked_no_change", "evidence_refs": ["no-change"]},
-                {"requirement_key": "candidate_business_research", "status": "covered", "evidence_refs": ["candidate"]},
+                {"requirement_key": "candidate_business_research", "status": "covered", "evidence_refs": ["candidate", "candidate-duplicate"]},
             ],
             "research_gaps": [{"query": "transport-only trace"}],
         },
@@ -491,4 +495,7 @@ def test_premarket_model_evidence_keeps_decision_inputs_not_noncritical_research
     assert {row["requirement_key"] for row in projected["coverage"]} == {
         "current_market_state", "market_breadth", "portfolio_market_state", "candidate_business_research",
     }
+    assert projected["coverage"][-1]["evidence_refs"] == ["candidate"]
+    assert "analysis" not in projected["sources"][-1]
+    assert "market_propagation" not in projected["sources"][-1]
     assert "research_gaps" not in projected

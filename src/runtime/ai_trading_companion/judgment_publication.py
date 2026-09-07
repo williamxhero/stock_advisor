@@ -92,10 +92,23 @@ def model_sources(packet: dict) -> dict[str, dict]:
         relevant_sources = {ref: row for ref, row in sources.items() if ref in relevant_refs}
         if relevant_sources:
             sources = relevant_sources
-    excerpt_limit = min(600, max(80, 8_000 // len(sources)))
+    unique_sources: dict[str, dict] = {}
+    seen_content: set[tuple[str, str, str, str]] = set()
+    for ref, row in sources.items():
+        identity = (
+            str(row.get("title") or ""),
+            " ".join(str(row.get("excerpt") or "").split()),
+            str(row.get("fact_as_of") or ""),
+            str(row.get("source_identity") or ""),
+        )
+        if identity in seen_content:
+            continue
+        seen_content.add(identity)
+        unique_sources[ref] = row
+    sources = unique_sources
+    excerpt_limit = min(240, max(120, 4_800 // len(sources)))
     useful_fields = (
-        "evidence_ref", "title", "excerpt", "analysis", "fact_as_of",
-        "source_identity", "source_tier", "market_propagation",
+        "evidence_ref", "title", "excerpt", "fact_as_of", "source_identity", "source_tier",
     )
     projected: dict[str, dict] = {}
     for ref, row in sources.items():

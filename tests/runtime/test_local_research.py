@@ -1161,6 +1161,50 @@ class LocalResearchTests(unittest.TestCase):
         )
         self.assertEqual("web_read", plan["operations"][-1]["operation"])
 
+    def test_planner_reuses_a_direct_discovery_when_model_only_reads_a_listing(self) -> None:
+        key = "candidate_business_research"
+        listing = "https://www.cninfo.com.cn/new/disclosure/stock?stockCode=002050"
+        pdf = "https://static.cninfo.com.cn/finalpage/2026-09-04/1225516182.PDF"
+        contract = {
+            "version": 4,
+            "as_of": CONTRACT["as_of"],
+            "requirements": [{
+                "key": key,
+                "blocking": True,
+                "window": CONTRACT["requirements"][0]["window"],
+            }],
+        }
+        proposed = {"version": 1, "operations": [
+            {**row("web_search", query="002050 三花智控 半年度报告"), "requirement_key": key},
+            {**row("web_read", url=listing), "requirement_key": key},
+        ]}
+        broker = mock.Mock()
+
+        def invoke(request):
+            verification = request.verifier(proposed)
+            self.assertTrue(verification["passed"], verification)
+            return SimpleNamespace(result=proposed)
+
+        broker.invoke.side_effect = invoke
+        planner = BrokerResearchPlanner(
+            broker, intellect="smart", effort="medium", deadline=lambda: 123.0,
+        )
+
+        plan = planner({
+            "as_of": CONTRACT["as_of"],
+            "evidence_contract": contract,
+            "research_discoveries": [
+                {"requirement_key": key, "url": listing},
+                {"requirement_key": key, "url": pdf},
+            ],
+        }, [key], 0)
+
+        urls = [
+            operation["arguments"]["url"] for operation in plan["operations"]
+            if operation["operation"] == "web_read"
+        ]
+        self.assertEqual([pdf], urls)
+
     def test_planner_converts_chinese_market_close_to_shanghai_time(self) -> None:
         broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})
         planner = BrokerResearchPlanner(broker, intellect="smart", effort="medium", deadline=lambda: 123.0)

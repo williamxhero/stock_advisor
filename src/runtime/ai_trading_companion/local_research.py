@@ -214,14 +214,14 @@ class BrokerResearchPlanner:
             schema=_research_plan_schema(planning_packet["evidence_contract"] or {}),
             visible_stream=False, absolute_deadline=float(self.deadline()), verifier_name="research-plan/v1",
             verifier=lambda output: _verify_research_plan(
-                planning_packet, _bounded_research_plan(output),
+                planning_packet, _prepared_research_plan(planning_packet, output),
             ),
         )
         outcome = self.broker.invoke(request)
         self.outcomes.append(outcome)
         if not isinstance(outcome.result, dict):
             raise ResearchPlanError("Broker did not return a qualified research plan")
-        return _bounded_research_plan(outcome.result)
+        return _prepared_research_plan(planning_packet, outcome.result)
 
 
 class WebAccessGatewayBackend:
@@ -1276,6 +1276,36 @@ def _bounded_research_plan(output: dict[str, Any], *, per_requirement: int = 8) 
                 kept[replace_at] = operation
                 has_verification_read.add(key)
     return {**output, "operations": kept}
+
+
+def _prepared_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
+    """Salvage verified discoveries when a model proposes only non-document reads."""
+    plan = _bounded_research_plan(output)
+    if not isinstance(plan, dict) or not isinstance(plan.get("operations"), list):
+        return plan
+    key = "candidate_business_research"
+    gap_text = "\n".join(str(value) for value in packet.get("coverage_gaps") or [])
+    if key not in gap_text or "gateway" not in set(packet.get("available_backends") or []):
+        return plan
+    if any(
+        isinstance(operation, dict)
+        and operation.get("requirement_key") == key
+        and operation.get("operation") in {"web_read", "web_browser"}
+        for operation in plan["operations"]
+    ):
+        return plan
+    repair = _discovery_read_repair_plan(
+        packet.get("evidence_contract") or {},
+        list(packet.get("research_discoveries") or []),
+        [key],
+        1,
+    )
+    if not repair:
+        return plan
+    return _bounded_research_plan({
+        **plan,
+        "operations": [*(repair.get("operations") or []), *plan["operations"]],
+    })
 
 
 def _planner_time_context(packet: dict[str, Any]) -> dict[str, Any]:

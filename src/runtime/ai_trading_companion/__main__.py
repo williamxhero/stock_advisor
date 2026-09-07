@@ -167,7 +167,7 @@ def _save_safe_stage_fallback(
     # wording or a conservative qualification state.
     fallback_packet.pop("verification_repair", None)
     candidate_output = rejected_output if (
-        stage == "m0_compose" and _salvageable_m0_candidate_research(rejected_output, rejected_verifier)
+        stage == "m0_compose" and _reviewed_salvageable_m0_candidate(rejected_output, rejected_verifier)
     ) else None
     output = safe_stage_output(
         stage, horizon=horizon, packet=fallback_packet, candidate_output=candidate_output,
@@ -225,6 +225,17 @@ def _retain_salvageable_m0_candidate(
     if _salvageable_m0_candidate_research(output, verifier):
         return output, verifier
     return previous_output, previous_verifier
+
+
+def _reviewed_salvageable_m0_candidate(
+    output: dict[str, Any] | None, verifier: dict[str, Any] | None,
+) -> bool:
+    """A final fallback may preserve only candidates that already have an independent review receipt."""
+    if not _salvageable_m0_candidate_research(output, verifier):
+        return False
+    audit = verifier or {}
+    business = audit.get("business") if isinstance(audit.get("business"), dict) else audit
+    return bool(business.get("candidate_review_attempt_id")) if isinstance(business, dict) else False
 
 
 def resolve_stage_controls(
@@ -878,6 +889,16 @@ def _call_stage(
                 raise BrokerError(f"Broker produced no qualified result for {stage}", category="broker_output_invalid")
             data = outcome.result
             verifier = router.verify(stage, packet, data)
+            if (
+                stage == "m0_compose" and is_premarket(packet) and not verifier.get("passed")
+                and _salvageable_m0_candidate_research(data, verifier)
+            ):
+                repaired = safe_stage_output(stage, packet=packet, candidate_output=data)
+                repaired_verifier = router.verify(stage, packet, repaired)
+                if repaired_verifier.get("passed"):
+                    data, verifier = repaired, {
+                        **repaired_verifier, "deterministic_candidate_narrative_repair": True,
+                    }
             if stage == "m0_compose" and is_premarket(packet) and verifier.get("passed"):
                 from .opportunities import OBSERVATION_REVIEW_INSTRUCTION
                 try:

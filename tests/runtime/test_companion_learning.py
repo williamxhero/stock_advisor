@@ -8,6 +8,7 @@ from pathlib import Path
 from ai_trading_companion.asr import lexicon
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
+from ai_trading_companion.evidence_gate import EvidenceInsufficient
 from ai_trading_companion.governance import RouterGovernance, classify_regime
 from ai_trading_companion.learning import JudgmentLifecycle, WorkflowEvolution
 from ai_trading_companion.packet_builder import RuntimePacketBuilder as _RuntimePacketBuilder
@@ -730,7 +731,7 @@ class CompanionLearningTests(unittest.TestCase):
                 "symbol": "002463", "name": "沪电股份",
                 "event": "公开资料显示公司产品用于服务器。",
                 "business_link": "公司主营高端印制电路板，产品用于服务器。",
-                "counterevidence": "板块上涨不能证明公司订单已经改善。",
+                "counterevidence": "板块上涨不能证明公司订单已经改善。公司股价下跌1.1821%。",
                 "observation_condition": "后续看订单与产能兑现是否互相印证。",
                 "evidence_refs": ["ev_company"],
             }],
@@ -738,7 +739,7 @@ class CompanionLearningTests(unittest.TestCase):
         }
         verifier = {"business": {"problems": [
             "m0_overloads_reply_with_holding_quotes", "premarket_candidate_omitted_from_narrative",
-        ]}}
+        ], "candidate_review_attempt_id": "reviewed-candidate"}}
 
         fallback, attempt_id = _save_safe_stage_fallback(
             self.store, cycle, "m0_compose", packet, horizon="当前",
@@ -749,11 +750,26 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertEqual(["002463"], [row["symbol"] for row in fallback["candidate_research"]])
         self.assertIn("沪电股份", fallback["narrative"])
         self.assertNotIn("持仓行情", fallback["narrative"])
+        self.assertNotIn("1.1821", fallback["narrative"])
         self.assertTrue(CognitiveRouter().verify("m0_compose", packet, fallback)["passed"])
         attempt = self.store.verified_attempt(
             attempt_id, cycle["cycle_id"], "m0_compose", "premarket-fallback-packet",
         )
         self.assertEqual("succeeded", attempt["status"])
+
+    def test_safe_premarket_fallback_refuses_an_unreviewed_candidate(self):
+        cycle = self.cycle(
+            "daily.opportunity.0900", "2026-09-07T20:25:00+08:00", "2026-09-07T12:25:00Z",
+        )
+        candidate = {"result_version": 4, "candidate_research": [{"symbol": "002463"}]}
+        verifier = {"business": {"problems": ["premarket_candidate_omitted_from_narrative"]}}
+
+        with self.assertRaises(EvidenceInsufficient):
+            _save_safe_stage_fallback(
+                self.store, cycle, "m0_compose",
+                {"sha256": "unreviewed", "task_key": "daily.opportunity.0900"}, horizon="当前",
+                rejected_output=candidate, rejected_verifier=verifier,
+            )
 
     def test_premarket_retry_keeps_an_earlier_salvageable_candidate(self):
         candidate = {"result_version": 4, "candidate_research": [{"symbol": "002463"}]}

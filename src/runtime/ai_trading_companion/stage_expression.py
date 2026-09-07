@@ -544,15 +544,25 @@ def _verified_candidate_research_fallback(
     ]
     for row in candidates:
         name = str(row["name"]).strip()
-        business = _sentence_piece(row["business_link"])
-        counter = _sentence_piece(row["counterevidence"])
-        condition = _sentence_piece(row["observation_condition"])
+        business = _candidate_research_clause(row["business_link"])
+        counter = _candidate_research_clause(row["counterevidence"])
+        condition = _candidate_research_clause(row["observation_condition"])
         paragraphs.append(f"看{name}，{business}。不过，{counter}。接下来只用{condition}来验证。")
     return {
         "result_version": 4,
         "candidate_research": [dict(row) for row in candidates],
         "narrative": "\n\n".join(paragraphs),
     }
+
+
+def _candidate_research_clause(value: Any) -> str:
+    """Keep business evidence while dropping quote-like sentences that commonly carry stale precision."""
+    sentences = [
+        item.strip() for item in re.split(r"[。！？]", str(value or "")) if item.strip()
+    ]
+    quote_markers = ("股价", "报价", "收于", "前收", "涨幅", "上涨", "下跌")
+    kept = [item for item in sentences if not any(marker in item for marker in quote_markers)]
+    return _sentence_piece("。".join(kept or sentences[:1]))
 
 
 def express_stage_semantics(stage: str, semantic: dict[str, Any]) -> str:

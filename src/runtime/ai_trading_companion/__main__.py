@@ -50,7 +50,7 @@ from .router import CognitiveRouter
 from .runtime_strategy_policy import RuntimeStrategyControls, RuntimeStrategyPolicy
 from .stage_expression import normalize_stage_output, safe_stage_output
 from .judgment_publication import (
-    JudgmentPublicationPipeline, JudgmentUnavailable, model_fact_digest, model_memories, model_sources,
+    JudgmentPublicationPipeline, JudgmentUnavailable, model_evidence, model_fact_digest, model_memories,
 )
 from .local_research import (
     BrokerResearchPlanner, DeterministicMarketBackend, LocalResearchChain,
@@ -286,9 +286,7 @@ def _model_stage_packet(stage: str, packet: dict[str, Any]) -> dict[str, Any]:
     if stage not in {"m0_compose", "m0_candidate_review"}:
         return packet
     projected = dict(packet)
-    evidence = packet.get("evidence") or {}
-    if isinstance(evidence, dict):
-        projected["evidence"] = {**evidence, "sources": list(model_sources(packet).values())}
+    projected["evidence"] = model_evidence(packet)
     if stage == "m0_compose":
         projected["artifacts"] = [
             row for row in packet.get("artifacts") or []

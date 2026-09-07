@@ -36,7 +36,7 @@ class StagePacketFreezingTests(TestCase):
 
         projected = _model_stage_packet("m0_compose", packet)
 
-        self.assertLess(len(str(projected)), 65_000)
+        self.assertLess(len(str(projected)), 40_000)
         self.assertEqual({row["evidence_ref"] for row in sources}, {
             row["evidence_ref"] for row in projected["evidence"]["sources"]
         })

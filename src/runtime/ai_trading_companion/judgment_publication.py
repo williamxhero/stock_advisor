@@ -87,10 +87,10 @@ def model_sources(packet: dict) -> dict[str, dict]:
     sources = evidence_sources(packet)
     if not sources:
         return {}
-    excerpt_limit = min(1_200, max(200, 32_000 // len(sources)))
+    excerpt_limit = min(600, max(80, 8_000 // len(sources)))
     useful_fields = (
-        "evidence_ref", "title", "excerpt", "analysis", "fact_as_of", "known_at",
-        "source_identity", "source_tier", "primary", "factual_status", "market_propagation",
+        "evidence_ref", "title", "excerpt", "analysis", "fact_as_of",
+        "source_identity", "source_tier", "market_propagation",
     )
     projected: dict[str, dict] = {}
     for ref, row in sources.items():
@@ -98,6 +98,20 @@ def model_sources(packet: dict) -> dict[str, dict]:
         item["evidence_ref"] = ref
         item["excerpt"] = _bounded_model_text(row.get("excerpt"), excerpt_limit)
         projected[ref] = item
+    return projected
+
+
+def model_evidence(packet: dict) -> dict:
+    """Expose qualified evidence, not non-critical search bookkeeping."""
+    evidence = packet.get("evidence") or {}
+    if not isinstance(evidence, dict):
+        return {"sources": list(model_sources(packet).values())}
+    useful_fields = (
+        "schema_version", "as_of", "coverage", "conflicts", "critical_gaps",
+        "high_impact_events", "spoken_summary",
+    )
+    projected = {key: value for key in useful_fields if (value := evidence.get(key)) not in (None, "", [], {})}
+    projected["sources"] = list(model_sources(packet).values())
     return projected
 
 
@@ -136,7 +150,7 @@ def model_fact_digest(rows: list[dict]) -> list[dict]:
     values = [row for row in rows if isinstance(row, dict) and row.get("evidence_ref")]
     if not values:
         return []
-    excerpt_limit = min(800, max(160, 12_000 // len(values)))
+    excerpt_limit = min(500, max(100, 6_000 // len(values)))
     return [{
         "evidence_ref": str(row["evidence_ref"]),
         "excerpt": _bounded_model_text(row.get("excerpt"), excerpt_limit),
@@ -401,7 +415,7 @@ class JudgmentPublicationPipeline:
         # Keep complete source coverage without repeating the same research bodies in artifacts.
         context = {**base, "artifacts": [a for a in base.get("artifacts", [])
                                         if a.get("kind") not in {"evidence", "m1_evidence"}],
-                   "evidence": {**(base.get("evidence") or {}), "sources": list(model_sources(base).values())}}
+                   "evidence": model_evidence(base)}
         # Prior AI prose is not verified market evidence or an expression exemplar.
         # Outcome/periodic reviews still need the original claims for comparison.
         periodic = str(base.get("task_key") or "").startswith("periodic.")

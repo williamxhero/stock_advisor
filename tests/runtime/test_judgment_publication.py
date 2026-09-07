@@ -452,7 +452,7 @@ def test_model_context_is_bounded_without_losing_evidence_identity_or_relevant_m
 
     model_packets = [request.packet for request in broker.calls if request.stage in {"m1_reasoning", "m1_review"}]
     assert model_packets
-    assert all(len(json.dumps(value, ensure_ascii=False)) < 60_000 for value in model_packets)
+    assert all(len(json.dumps(value, ensure_ascii=False)) < 35_000 for value in model_packets)
     reasoning_context = next(request.packet["context"] for request in broker.calls if request.stage == "m1_reasoning")
     sources = reasoning_context["evidence"]["sources"]
     assert {row["evidence_ref"] for row in sources} == {row["evidence_ref"] for row in original["evidence"]["sources"]}

@@ -1159,6 +1159,12 @@ def _verify_research_plan(packet: dict[str, Any], output: dict[str, Any]) -> dic
             problems.append(f"research_plan_operation_argument_missing:{key}:web_search:query")
         if operation in {"web_read", "web_browser"} and not str(arguments.get("url") or "").strip():
             problems.append(f"research_plan_operation_argument_missing:{key}:{operation}:url")
+        if (
+            key == "candidate_business_research"
+            and operation in {"web_read", "web_browser"}
+            and _is_non_document_research_url(str(arguments.get("url") or ""))
+        ):
+            problems.append(f"research_plan_non_document_url:{key}")
         if backend and backend not in available_backends:
             problems.append(f"research_plan_backend_unavailable:{backend}")
         if operation == "web_browser":
@@ -1395,31 +1401,69 @@ def _discovery_read_repair_plan(
     operations: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
     seen_urls: set[str] = set()
-    for discovery in discoveries:
-        key = str(discovery.get("requirement_key") or "")
-        url = str(discovery.get("url") or "")
-        if key not in targets or not url.startswith(("http://", "https://")) or url in seen_urls:
+    for key in requirement_keys:
+        if key not in targets:
             continue
-        if counts.get(key, 0) >= 4 or len(operations) >= 24:
-            continue
-        seen_urls.add(url)
-        counts[key] = counts.get(key, 0) + 1
-        operations.append({
-            "requirement_key": key,
-            "backend": "gateway",
-            "operation": "web_read",
-            "arguments": {
-                "query": None,
-                "categories": None,
-                "url": url,
-                "symbol": None,
-                "render": "auto",
-                "session_id": None,
-                "actions": None,
-            },
-            "fallback_backends": [],
-        })
+        key_discoveries = [
+            (index, discovery) for index, discovery in enumerate(discoveries)
+            if str(discovery.get("requirement_key") or "") == key
+        ]
+        if key == "candidate_business_research":
+            key_discoveries.sort(key=lambda row: _company_discovery_priority(row[1], row[0]))
+        for _, discovery in key_discoveries:
+            url = str(discovery.get("url") or "")
+            if (
+                not url.startswith(("http://", "https://"))
+                or url in seen_urls
+                or (key == "candidate_business_research" and _is_non_document_research_url(url))
+            ):
+                continue
+            if counts.get(key, 0) >= 4 or len(operations) >= 24:
+                continue
+            seen_urls.add(url)
+            counts[key] = counts.get(key, 0) + 1
+            operations.append({
+                "requirement_key": key,
+                "backend": "gateway",
+                "operation": "web_read",
+                "arguments": {
+                    "query": None,
+                    "categories": None,
+                    "url": url,
+                    "symbol": None,
+                    "render": "auto",
+                    "session_id": None,
+                    "actions": None,
+                },
+                "fallback_backends": [],
+            })
     return {"version": 1, "operations": operations} if operations else None
+
+
+def _is_non_document_research_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(str(url or ""))
+    except ValueError:
+        return True
+    host = parsed.hostname.casefold() if parsed.hostname else ""
+    path = parsed.path.rstrip("/").casefold()
+    return host.endswith("cninfo.com.cn") and path == "/new/disclosure/stock"
+
+
+def _company_discovery_priority(discovery: dict[str, Any], original_index: int) -> tuple[int, int]:
+    url = str(discovery.get("url") or "")
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return 3, original_index
+    path = parsed.path.casefold()
+    if path.endswith(".pdf") or "/finalpage/" in path:
+        return 0, original_index
+    if re.search(r"/20\d{2}(?:[-/]?\d{2})(?:[-/]?\d{2})", path) or any(
+        marker in path for marker in ("/article/", "/articles/", "/news/", "newsdetail")
+    ):
+        return 1, original_index
+    return 2, original_index
 
 
 def _planner_research_scope(value: Any) -> dict[str, Any]:
@@ -2142,11 +2186,17 @@ def _discovery_digest(observations: list[dict[str, Any]], contract: dict[str, An
     seen: set[str] = set()
     for observation in reversed(observations):
         requirement = str((observation.get("arguments") or {}).get("requirement_key") or "")
+        is_search_lead = observation.get("operation") == "web_search"
         for item in observation.get("evidence_items") or []:
             url = str(item.get("url") or "")
             if not url or url in seen:
                 continue
-            if not _item_in_requirement_window(item, requirements.get(requirement) or {}, allow_undated=True):
+            # Search completion may occur after the frozen fact window. Its URL
+            # is only a lead; the subsequent page read must independently prove
+            # that the public fact existed inside the contract window.
+            if not is_search_lead and not _item_in_requirement_window(
+                item, requirements.get(requirement) or {}, allow_undated=True,
+            ):
                 continue
             seen.add(url)
             candidate = {
@@ -2216,6 +2266,8 @@ def _normalize_public_read_fact_time(
         return
     if str(requirement_key) != "candidate_business_research":
         return
+    if str(observation.get("operation") or "") != "web_read":
+        return
     start, end = _parse_utc(window.get("start")), _parse_utc(window.get("end"))
     if start is None or end is None:
         return
@@ -2223,7 +2275,11 @@ def _normalize_public_read_fact_time(
         fact = _parse_utc(item.get("fact_as_of"))
         if fact is not None and start < fact <= end:
             continue
-        published = _public_page_publication_time(str(item.get("excerpt_text") or ""), not_after=end)
+        published = _public_page_publication_time(
+            str(item.get("excerpt_text") or ""),
+            url=str(item.get("url") or ""),
+            not_after=end,
+        )
         if published is None or not start < published <= end:
             continue
         timestamp = published.isoformat().replace("+00:00", "Z")
@@ -2231,7 +2287,9 @@ def _normalize_public_read_fact_time(
         item["fact_as_of"] = timestamp
 
 
-def _public_page_publication_time(text: str, *, not_after: datetime) -> datetime | None:
+def _public_page_publication_time(
+    text: str, *, url: str = "", not_after: datetime,
+) -> datetime | None:
     compact = " ".join(str(text or "").split())[:8000]
     patterns = (
         re.compile(
@@ -2261,6 +2319,29 @@ def _public_page_publication_time(text: str, *, not_after: datetime) -> datetime
             value = local.astimezone(timezone.utc)
             if value <= not_after:
                 candidates.append(value)
+    try:
+        parsed_url = urlsplit(str(url or ""))
+    except ValueError:
+        parsed_url = urlsplit("")
+    host = parsed_url.hostname.casefold() if parsed_url.hostname else ""
+    path = parsed_url.path
+    trusted_path_date: re.Match[str] | None = None
+    if host == "static.cninfo.com.cn":
+        trusted_path_date = re.search(r"/(20\d{2})-(\d{2})-(\d{2})/", path)
+    elif host == "static.sse.com.cn":
+        trusted_path_date = re.search(r"/(20\d{2})-(\d{2})-(\d{2})/", path)
+    if trusted_path_date is not None:
+        try:
+            local = datetime(
+                int(trusted_path_date.group(1)),
+                int(trusted_path_date.group(2)),
+                int(trusted_path_date.group(3)),
+                tzinfo=_SHANGHAI,
+            )
+        except ValueError:
+            local = None
+        if local is not None and local.date() < not_after.astimezone(_SHANGHAI).date():
+            candidates.append(local.astimezone(timezone.utc))
     return max(candidates) if candidates else None
 
 

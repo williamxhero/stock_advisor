@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from ai_trading_companion.broker_client import BrokerError
-from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, ToolResolutionError, WebAccessGatewayBackend, _merge_mandatory_operations, _verify_research_plan
+from ai_trading_companion.local_research import BrokerResearchPlanner, LocalResearchChain, RESEARCH_PLAN_SCHEMA, ReadOnlyResearchExecutor, ToolCatalogMarketBackend, ToolCatalogResearchBackend, ToolResolutionError, WebAccessGatewayBackend, _discovery_digest, _discovery_read_repair_plan, _merge_mandatory_operations, _verify_research_plan
 from ai_trading_companion.market_breadth_cache import MarketBreadthSnapshotCache
 from ai_trading_companion.store import CompanionStore
 from ai_trading_companion.tooling import EvidenceResolution, FactRequest, ToolCatalog, ToolRunner
@@ -73,7 +73,27 @@ class LocalResearchTests(unittest.TestCase):
         self.assertFalse(result.qualified)
         self.assertIn("candidate_business_research", result.verifier["missing_requirements"])
 
-    def _run_late_company_read(self, excerpt_text: str):
+    def test_company_read_uses_prior_official_pdf_path_date(self):
+        result = self._run_late_company_read(
+            "北京同有飞骥科技股份有限公司半年度报告，披露存储产品业务。",
+            url="https://static.cninfo.com.cn/finalpage/2026-09-04/1225516182.PDF",
+        )
+
+        self.assertTrue(result.qualified, result.verifier)
+        self.assertEqual("2026-09-03T16:00:00Z", result.evidence["sources"][0]["fact_as_of"])
+
+    def test_company_read_does_not_backdate_same_day_pdf_without_a_time(self):
+        result = self._run_late_company_read(
+            "北京同有飞骥科技股份有限公司公告，披露存储产品业务。",
+            url="https://static.cninfo.com.cn/finalpage/2026-09-07/1225516182.PDF",
+        )
+
+        self.assertFalse(result.qualified)
+        self.assertIn("candidate_business_research", result.verifier["missing_requirements"])
+
+    def _run_late_company_read(
+        self, excerpt_text: str, *, url: str = "https://company.test/notice",
+    ):
         as_of = "2026-09-07T05:30:55Z"
         contract = {"version": 4, "as_of": as_of, "requirements": [{
             "key": "candidate_business_research", "blocking": True,
@@ -87,14 +107,14 @@ class LocalResearchTests(unittest.TestCase):
 
         def backend(_operation, _arguments):
             return {"results": [{
-                "url": "https://company.test/notice",
+                "url": url,
                 "title": "神农集团2026年半年度报告",
                 "excerpt_text": excerpt_text,
                 "fact_as_of": "2026-09-07T05:32:53Z",
             }]}
 
         plan = {"version": 1, "operations": [{
-            **row("web_read", url="https://company.test/notice"),
+            **row("web_read", url=url),
             "requirement_key": "candidate_business_research",
         }]}
         return LocalResearchChain(
@@ -964,6 +984,74 @@ class LocalResearchTests(unittest.TestCase):
             "research_plan_browser_before_public_routes:market",
             _verify_research_plan(packet, plan)["problems"],
         )
+
+    def test_plan_verifier_rejects_a_company_disclosure_listing_page(self) -> None:
+        packet = {
+            "evidence_contract": {"requirements": [{
+                "key": "candidate_business_research", "blocking": True,
+            }]},
+            "coverage_gaps": ["candidate_business_research"],
+            "available_backends": ["gateway"],
+            "deterministic_requirement_keys": [],
+        }
+        plan = {"version": 1, "operations": [{
+            **row(
+                "web_read",
+                url="https://www.cninfo.com.cn/new/disclosure/stock?stockCode=002050",
+            ),
+            "requirement_key": "candidate_business_research",
+        }]}
+
+        problems = _verify_research_plan(packet, plan)["problems"]
+
+        self.assertIn(
+            "research_plan_non_document_url:candidate_business_research",
+            problems,
+        )
+
+    def test_discovery_repair_skips_listing_page_and_prioritizes_direct_document(self) -> None:
+        contract = {"requirements": [{
+            "key": "candidate_business_research", "blocking": True,
+        }]}
+        listing = "https://www.cninfo.com.cn/new/disclosure/stock?stockCode=002050"
+        article = "https://stock.10jqka.com.cn/20260904/c123.shtml"
+        pdf = "https://static.cninfo.com.cn/finalpage/2026-09-04/1225516182.PDF"
+
+        plan = _discovery_read_repair_plan(contract, [
+            {"requirement_key": "candidate_business_research", "url": listing},
+            {"requirement_key": "candidate_business_research", "url": article},
+            {"requirement_key": "candidate_business_research", "url": pdf},
+        ], ["candidate_business_research"], 1)
+
+        self.assertIsNotNone(plan)
+        urls = [item["arguments"]["url"] for item in plan["operations"]]
+        self.assertEqual([pdf, article], urls)
+
+    def test_search_url_remains_a_lead_when_discovered_after_the_frozen_as_of(self) -> None:
+        contract = {"requirements": [{
+            "key": "candidate_business_research",
+            "window": {
+                "mode": "after_start_to_end",
+                "start": "2025-08-03T05:30:55Z",
+                "end": "2026-09-07T05:30:55Z",
+            },
+        }]}
+        url = "https://static.cninfo.com.cn/finalpage/2026-09-04/1225516182.PDF"
+        observations = [{
+            "operation": "web_search",
+            "status": "succeeded",
+            "arguments": {"requirement_key": "candidate_business_research"},
+            "evidence_items": [{
+                "url": url,
+                "title": "公司半年度报告",
+                "excerpt_text": "搜索结果线索",
+                "fact_as_of": "2026-09-07T05:35:00Z",
+            }],
+        }]
+
+        discoveries = _discovery_digest(observations, contract)
+
+        self.assertEqual([url], [item["url"] for item in discoveries])
 
     def test_planner_is_strict_and_names_gateway_only(self) -> None:
         broker = mock.Mock(); broker.invoke.return_value = SimpleNamespace(result={"version": 1, "operations": []})

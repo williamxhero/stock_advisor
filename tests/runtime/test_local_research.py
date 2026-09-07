@@ -1141,6 +1141,42 @@ class LocalResearchTests(unittest.TestCase):
             set(urls),
         )
 
+    def test_company_discovery_repair_adds_quotes_and_disclosures_for_named_candidates(self) -> None:
+        key = "candidate_business_research"
+        contract = {"requirements": [{"key": key, "blocking": True}]}
+        discoveries = [
+            {
+                "requirement_key": key,
+                "url": f"https://news.example.test/2026090{group}/company-{group}.shtml",
+                "title": title,
+                "discovery_query": query,
+                "discovery_observation_id": f"search-{group}",
+            }
+            for group, title, query in (
+                (1, "中际旭创(300308)业务进展", "中际旭创 300308 业务 风险"),
+                (2, "剑桥科技(603083)订单跟踪", "剑桥科技 603083 业务 风险"),
+                (3, "景旺电子(603228)产能变化", "景旺电子 603228 业务 风险"),
+                (4, "沪电股份(002463)业绩预告", "沪电股份 002463 业务 风险"),
+            )
+        ]
+
+        plan = _discovery_read_repair_plan(
+            contract, discoveries, [key], 1,
+            available_backends={"gateway", "market"},
+        )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(8, len(plan["operations"]))
+        structured = [item for item in plan["operations"] if item["backend"] == "market"]
+        self.assertEqual(
+            [
+                ("holding_snapshot", "300308"), ("announcement_snapshot", "300308"),
+                ("holding_snapshot", "603083"), ("announcement_snapshot", "603083"),
+            ],
+            [(item["operation"], item["arguments"]["symbol"]) for item in structured],
+        )
+        self.assertEqual(4, len([item for item in plan["operations"] if item["operation"] == "web_read"]))
+
     def test_company_discovery_digest_keeps_multiple_search_queries_in_the_shortlist(self) -> None:
         key = "candidate_business_research"
         contract = {"requirements": [{
@@ -1492,6 +1528,33 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual("generic_web_read", second_request.capability)
         self.assertEqual({}, first_request.context)
         self.assertEqual(CONTRACT["as_of"], second_request.required_at)
+
+    def test_market_adapter_accepts_an_explicit_candidate_symbol_outside_the_portfolio(self) -> None:
+        key = "candidate_business_research"
+        contract = {"version": 4, "as_of": CONTRACT["as_of"], "requirements": [{
+            "key": key,
+            "window": {"mode": "after_start_to_end", "start": "2025-08-27T07:00:00Z", "end": CONTRACT["as_of"]},
+        }]}
+        runner = mock.Mock()
+        runner.resolve_with_fallback.return_value = EvidenceResolution(
+            True, "cn_equity_quote_batch", "1.0.0", CONTRACT["as_of"], CONTRACT["as_of"],
+            {
+                "source": "tencent_quote",
+                "source_evidence": [{
+                    "url": "https://qt.gtimg.cn/q=sz300308",
+                    "fact_as_of": CONTRACT["as_of"],
+                    "data": {"quotes": [{"symbol": "300308", "name": "中际旭创", "price": 100.0}]},
+                }],
+            },
+            "artifact:sha256:" + "c" * 64, None, ("tool_result_schema_valid",),
+        )
+        backend = ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 30.0)
+
+        result = backend("holding_snapshot", {"_requirement_key": key, "symbol": "300308"})
+
+        request = runner.resolve_with_fallback.call_args.args[0]
+        self.assertEqual({"symbols": ["300308"]}, request.inputs)
+        self.assertEqual("300308", json.loads(result["results"][0]["excerpt_text"])["quotes"][0]["symbol"])
 
     def test_tool_catalog_adapter_normalizes_weekly_tencent_history_before_evidence(self) -> None:
         url = (

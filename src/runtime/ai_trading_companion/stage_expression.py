@@ -558,9 +558,9 @@ def _verified_candidate_research_fallback(
 def _candidate_research_clause(value: Any) -> str:
     """Keep business evidence while dropping quote-like sentences that commonly carry stale precision."""
     sentences = [
-        item.strip() for item in re.split(r"[。！？]", str(value or "")) if item.strip()
+        item.strip() for item in re.split(r"[。！？；]", str(value or "")) if item.strip()
     ]
-    quote_markers = ("股价", "报价", "收于", "前收", "涨幅", "上涨", "下跌")
+    quote_markers = ("股价", "报价", "收于", "前收", "涨幅", "上涨", "下跌", "回购价", "元/股")
     kept = [item for item in sentences if not any(marker in item for marker in quote_markers)]
     return _sentence_piece("。".join(kept or sentences[:1]))
 

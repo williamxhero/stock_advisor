@@ -730,7 +730,7 @@ class CompanionLearningTests(unittest.TestCase):
             "candidate_research": [{
                 "symbol": "002463", "name": "沪电股份",
                 "event": "公开资料显示公司产品用于服务器。",
-                "business_link": "公司主营高端印制电路板，产品用于服务器。",
+                "business_link": "公司主营高端印制电路板，产品用于服务器；回购价上限1200元/股。",
                 "counterevidence": "板块上涨不能证明公司订单已经改善。公司股价下跌1.1821%。",
                 "observation_condition": "后续看订单与产能兑现是否互相印证。",
                 "evidence_refs": ["ev_company"],
@@ -751,6 +751,7 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertIn("沪电股份", fallback["narrative"])
         self.assertNotIn("持仓行情", fallback["narrative"])
         self.assertNotIn("1.1821", fallback["narrative"])
+        self.assertNotIn("1200", fallback["narrative"])
         self.assertTrue(CognitiveRouter().verify("m0_compose", packet, fallback)["passed"])
         attempt = self.store.verified_attempt(
             attempt_id, cycle["cycle_id"], "m0_compose", "premarket-fallback-packet",

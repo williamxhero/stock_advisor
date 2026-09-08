@@ -36,6 +36,12 @@ def test_scheduled_and_manual_premarket_require_company_research():
         requirements = {row["key"]: row for row in contract["requirements"]}
         assert requirements["candidate_business_research"]["blocking"]
         assert requirements["candidate_business_research"]["allowed_coverage"] == ["covered"]
+        assert requirements["candidate_business_research"]["quote_window"] == {
+            "start": "2026-09-04T07:00:00Z",
+            "end": "2026-09-04T07:00:00Z",
+            "mode": "exact",
+        }
+        assert requirements["candidate_business_research"]["quote_finality"] == "official_close"
 
 
 def test_candidate_observation_reaches_message_without_a_buy_ranking():

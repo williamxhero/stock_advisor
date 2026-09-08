@@ -36,12 +36,22 @@ class EvidenceContractFactory:
             task_key == "daily.opportunity.0900"
             or (task_profile or {}).get("profile_id") == "pre_market_opportunity"
         ):
+            candidate_quote_at = self._iso(self._latest_completed_close(frozen))
             requirements.append({
                 "key": "candidate_business_research", "blocking": True,
                 "allowed_coverage": ["covered"],
                 "description": "从全市场公开事件追到持仓之外具体公司，读正文核验业务关联、替代公司和反证；不是昨日行情摘要。历史业务材料须与盘前新变化联合使用。",
                 "window": {"start": self._iso(frozen - timedelta(days=400)),
                            "end": self._iso(frozen), "mode": "after_start_to_end"},
+                # Company documents and price reflection deliberately have
+                # different clocks.  Before the open there is no current-day
+                # minute quote, so freeze candidate pricing at the latest
+                # completed official close instead of the broad document
+                # window's end.
+                "quote_window": {
+                    "start": candidate_quote_at, "end": candidate_quote_at, "mode": "exact",
+                },
+                "quote_finality": "official_close",
             })
         if stage in {"m0_research", "m1_research"} and (task_key.startswith("daily.execution.") or task_key == "daily.review.1520"):
             plans = (internal_context or {}).get("prior_opportunity_plans") or []

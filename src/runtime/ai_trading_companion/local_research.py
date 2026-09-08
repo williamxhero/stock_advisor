@@ -375,9 +375,19 @@ class ToolCatalogMarketBackend:
         if capability is None:
             raise ValueError(f"unsupported live market operation: {operation}")
         window = requirement.get("window") if isinstance(requirement.get("window"), dict) else {}
+        if (
+            requirement_key == "candidate_business_research"
+            and operation == "holding_snapshot"
+            and isinstance(requirement.get("quote_window"), dict)
+        ):
+            window = requirement["quote_window"]
         required_at = str(window.get("end") or self.contract.get("as_of") or "")
         mode = str(window.get("mode") or "")
-        declared_finality = str(requirement.get("finality") or "")
+        declared_finality = str((
+            requirement.get("quote_finality")
+            if requirement_key == "candidate_business_research" and operation == "holding_snapshot"
+            else requirement.get("finality")
+        ) or "")
         finality = declared_finality or (
             "official_close"
             if (mode == "exact" and required_at[11:16] == "07:00")
@@ -705,7 +715,10 @@ class ReadOnlyResearchExecutor:
             if adapter is None:
                 failures.append(f"{backend}:not_configured")
                 continue
-            operation = row["operation"] if row["operation"] in _OPERATIONS[backend] else _fallback_operation(backend)
+            if row["operation"] not in _OPERATIONS[backend]:
+                failures.append(f"{backend}:operation_incompatible")
+                continue
+            operation = row["operation"]
             try:
                 result = adapter(operation, {**row["arguments"], "_requirement_key": row["requirement_key"]})
                 if not isinstance(result, dict):
@@ -2405,10 +2418,6 @@ def _deterministic_requirement_keys(contract: dict[str, Any]) -> list[str]:
         "portfolio_current_bar", "portfolio_events_and_counterevidence", "market_fund_flow",
         "themes_and_capacity_cores",
     }))
-
-
-def _fallback_operation(backend: str) -> str:
-    return {"market": "market_snapshot", "gateway": "web_search"}[backend]
 
 
 def _discovery_digest(observations: list[dict[str, Any]], contract: dict[str, Any]) -> list[dict[str, Any]]:

@@ -1646,6 +1646,66 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual("2026-07-28", announcement_request.inputs["start_date"])
         self.assertEqual("2026-08-27", announcement_request.inputs["end_date"])
 
+    def test_premarket_candidate_quote_uses_the_frozen_completed_close(self) -> None:
+        contract = {
+            "version": 4,
+            "as_of": "2026-09-08T00:30:00Z",
+            "requirements": [{
+                "key": "candidate_business_research",
+                "window": {
+                    "mode": "after_start_to_end",
+                    "start": "2025-08-04T00:30:00Z",
+                    "end": "2026-09-08T00:30:00Z",
+                },
+                "quote_window": {
+                    "mode": "exact",
+                    "start": "2026-09-07T07:00:00Z",
+                    "end": "2026-09-07T07:00:00Z",
+                },
+                "quote_finality": "official_close",
+            }],
+        }
+        runner = mock.Mock()
+        runner.resolve_with_fallback.return_value = EvidenceResolution(
+            True, "cn_equity_quote_batch", "1.1.18",
+            "2026-09-07T07:00:00Z", "2026-09-08T00:30:01Z", {
+                "source": "tencent_minute",
+                "source_evidence": [{
+                    "url": "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sz002463",
+                    "fact_as_of": "2026-09-07T07:00:00Z",
+                    "data": {"quotes": [{"symbol": "002463", "price": 88.6}]},
+                }],
+            }, "artifact:sha256:" + "e" * 64, None, ("tool_result_schema_valid",),
+        )
+
+        ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 30.0)(
+            "holding_snapshot",
+            {"_requirement_key": "candidate_business_research", "symbol": "002463"},
+        )
+
+        request = runner.resolve_with_fallback.call_args.args[0]
+        self.assertEqual("2026-09-07T07:00:00Z", request.required_at)
+        self.assertEqual("official_close", request.finality)
+
+    def test_executor_does_not_rewrite_a_market_operation_as_an_empty_web_search(self) -> None:
+        market = mock.Mock(side_effect=RuntimeError("market unavailable"))
+        gateway = mock.Mock()
+        operation = {
+            "requirement_key": "candidate_business_research",
+            "backend": "market",
+            "operation": "holding_snapshot",
+            "arguments": {
+                "query": None, "categories": None, "url": None, "symbol": "002463",
+                "render": None, "session_id": None, "actions": None,
+            },
+            "fallback_backends": ["gateway"],
+        }
+
+        with self.assertRaises(RuntimeError):
+            ReadOnlyResearchExecutor({"market": market, "gateway": gateway}).execute(operation)
+
+        gateway.assert_not_called()
+
     def test_tool_catalog_adapter_normalizes_weekly_tencent_history_before_evidence(self) -> None:
         url = (
             "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"

@@ -292,6 +292,8 @@ class EvidenceV3Tests(TestCase):
 
         self.assertEqual(["covered", "checked_no_change"], requirements["overseas_market_context"]["allowed_coverage"])
         self.assertEqual(["covered", "checked_no_change"], requirements["theme_business_and_expectations"]["allowed_coverage"])
+        self.assertEqual(["日本股市", "韩国股市", "全球风险", "A股", "联动"], requirements["overseas_market_context"]["negative_query_terms"])
+        self.assertEqual(["产业链", "题材", "催化", "预期", "反证"], requirements["theme_business_and_expectations"]["negative_query_terms"])
         self.assertEqual([["Japan", "日本"], ["Korea", "韩国"], ["A-share", "A股"]], requirements["overseas_market_context"]["evidence_terms"])
         self.assertEqual(2, len(requirements["theme_business_and_expectations"]["evidence_terms"]))
         self.assertEqual("internal_runtime", requirements["prior_market_understanding_changes"]["evidence_class"])

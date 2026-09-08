@@ -466,7 +466,10 @@ class ToolCatalogMarketBackend:
         """Revalidate qualified ledger JSON through the same contract as a live tool result."""
         if operation not in {"market_snapshot", "market_breadth", "holding_snapshot"} or request.finality != "official_close":
             return None
-        window = requirement.get("window") if isinstance(requirement.get("window"), dict) else {}
+        window_key = "quote_window" if (
+            operation == "holding_snapshot" and isinstance(requirement.get("quote_window"), dict)
+        ) else "window"
+        window = requirement.get(window_key) if isinstance(requirement.get(window_key), dict) else {}
         if (
             window.get("mode") != "exact"
             or str(window.get("start") or "") != request.required_at
@@ -484,6 +487,10 @@ class ToolCatalogMarketBackend:
         field = "indices" if operation == "market_snapshot" else "quotes"
         expected = {str(value) for value in request.inputs.get("symbols") or [] if str(value)}
         if not expected:
+            return None
+        try:
+            required_at = datetime.fromisoformat(request.required_at.replace("Z", "+00:00"))
+        except ValueError:
             return None
 
         variants: dict[str, dict[str, dict[str, Any]]] = {symbol: {} for symbol in expected}
@@ -507,6 +514,12 @@ class ToolCatalogMarketBackend:
             selected: list[dict[str, Any]] = []
             for value in payload[field]:
                 if not isinstance(value, dict) or str(value.get("symbol") or "") not in expected:
+                    continue
+                try:
+                    quote_at = datetime.fromisoformat(str(value.get("quote_at") or "").replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if quote_at != required_at:
                     continue
                 row = json.loads(json.dumps(value, ensure_ascii=False, sort_keys=True))
                 symbol = str(row["symbol"])
@@ -551,6 +564,12 @@ class ToolCatalogMarketBackend:
     def _exact_close_breadth_ledger_result(
         self, request: FactRequest, packet_as_of: datetime,
     ) -> dict[str, Any] | None:
+        try:
+            expected_date = datetime.fromisoformat(
+                request.required_at.replace("Z", "+00:00"),
+            ).astimezone(_SHANGHAI).date().isoformat()
+        except ValueError:
+            return None
         variants: dict[str, dict[str, Any]] = {}
         candidates: list[tuple[str, str, dict[str, Any]]] = []
         for entry in self.daily_ledger:
@@ -571,7 +590,11 @@ class ToolCatalogMarketBackend:
                 "trading_date": payload.get("trading_date"), "breadth": payload.get("breadth"),
                 "finality": payload.get("finality"),
             }
-            if core["finality"] != request.finality or not isinstance(core["breadth"], dict):
+            if (
+                core["trading_date"] != expected_date
+                or core["finality"] != request.finality
+                or not isinstance(core["breadth"], dict)
+            ):
                 continue
             signature = json.dumps(core, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             variants[signature] = core

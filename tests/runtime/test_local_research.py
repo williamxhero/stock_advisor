@@ -698,7 +698,20 @@ class LocalResearchTests(unittest.TestCase):
         ).run({"task_key": "daily.review.1520", "as_of": contract["as_of"]}, contract, attempt_id="forum-failure")
 
         forum_failures = [row for row in result.observations if row.get("operation") == "web_search"]
-        self.assertEqual(2, runner.resolve_with_fallback.call_count)
+        candidate_contract = {
+            "version": 4, "as_of": as_of, "requirements": [{
+                "key": "candidate_business_research", "blocking": True,
+                "allowed_coverage": ["covered"], "quote_finality": "official_close",
+                "quote_window": {"mode": "exact", "start": close, "end": close},
+                "window": {"mode": "after_start_to_end", "start": "2025-08-01T00:00:00Z", "end": as_of},
+            }],
+        }
+        candidate = ToolCatalogMarketBackend(
+            runner, contract=candidate_contract, deadline=lambda: 10.0, daily_ledger=ledger,
+        )("holding_snapshot", {"_requirement_key": "candidate_business_research", "symbol": "300378"})
+        self.assertEqual("daily_evidence_ledger", candidate["source"])
+
+        self.assertEqual(3, runner.resolve_with_fallback.call_count)
         self.assertEqual(["tool_network_transient", "tool_network_transient"], [
             row.get("tool_error_code") for row in forum_failures
         ])
@@ -1873,6 +1886,34 @@ class LocalResearchTests(unittest.TestCase):
             "text": json.dumps({
                 "trading_date": "2026-09-03", "finality": "official_close",
                 "breadth": {"up": 2218, "down": 2827, "flat": 166, "limit_up": 51, "limit_down": 8},
+            }, ensure_ascii=False),
+        })
+        stale_close = "2026-09-02T07:00:00Z"
+        stale_rows = json.loads(json.dumps(rows, ensure_ascii=False))
+        for values in stale_rows.values():
+            for item in values:
+                item["quote_at"] = stale_close
+                item["trading_date"] = "2026-09-02"
+                item["price"] = float(item["price"]) + 1.0
+                item["change"] = round(float(item["price"]) - float(item["previous_close"]), 4)
+                item["change_percent"] = round(
+                    float(item["change"]) / float(item["previous_close"]) * 100, 4,
+                )
+        ledger.extend([
+            {
+                "title": f"stale {key} {item['symbol']}",
+                "url": f"https://example.test/stale/{key}/{item['symbol']}",
+                "known_at": "2026-09-02T07:10:00Z", "coverage_state": "observed",
+                "text": json.dumps({"finality": "official_close", spec["field"]: [item]}, ensure_ascii=False),
+            }
+            for key, spec in contracts.items() for item in stale_rows[key]
+        ])
+        ledger.append({
+            "title": "stale market breadth", "url": "https://example.test/stale/market-breadth",
+            "known_at": "2026-09-02T07:10:00Z", "coverage_state": "observed",
+            "text": json.dumps({
+                "trading_date": "2026-09-02", "finality": "official_close",
+                "breadth": {"up": 1, "down": 2, "flat": 3, "limit_up": 0, "limit_down": 0},
             }, ensure_ascii=False),
         })
         runner = mock.Mock()

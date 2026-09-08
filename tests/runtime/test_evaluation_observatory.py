@@ -845,8 +845,7 @@ class ExperimentAssessmentTests(unittest.TestCase):
             self.assertEqual(
                 [
                     "daily.opportunity.0900", "daily.execution.0945", "daily.execution.1030",
-                    "daily.execution.1430", "daily.review.1520", "manual.non_trading_outlook",
-                    "portfolio.holdings",
+                    "daily.execution.1430", "daily.review.1520",
                 ],
                 json.loads(decision.applicable_scope_json),
             )
@@ -867,7 +866,7 @@ class ExperimentAssessmentTests(unittest.TestCase):
                 ("gateway", "market"),
                 policy.controls(
                     "m0_research", timeout_seconds=300, search=True,
-                    task_key="manual.non_trading_outlook",
+                    task_key="daily.execution.1430",
                 ).enabled_backends,
             )
             self.assertEqual(
@@ -1144,8 +1143,16 @@ class ExperimentAssessmentTests(unittest.TestCase):
                 periodic["cycle_id"], "m0_research", {"task_key": periodic["task_key"], "sha256": "periodic"},
                 "companion-evidence-result-v3.schema.json", "periodic-attempt",
             )
+            manual = store.create_cycle(
+                "daily.execution.1430", "2026-10-01T15:00:00+08:00", "2026-10-01T15:00:00+08:00", kind="manual",
+            )
+            manual_jobs = policy.queue_shadows(
+                manual["cycle_id"], "m0_research", {"task_key": manual["task_key"], "sha256": "manual"},
+                "companion-evidence-result-v3.schema.json", "manual-attempt",
+            )
             self.assertEqual(1, len(formal_jobs))
             self.assertEqual((), periodic_jobs)
+            self.assertEqual((), manual_jobs)
 
     def test_authorized_runtime_strategy_promotes_and_rolls_back_from_live_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

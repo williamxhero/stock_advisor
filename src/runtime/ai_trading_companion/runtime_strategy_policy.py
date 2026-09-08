@@ -16,8 +16,6 @@ ACTIVE_RESEARCH_SCOPE = (
     "daily.execution.1030",
     "daily.execution.1430",
     "daily.review.1520",
-    "manual.non_trading_outlook",
-    "portfolio.holdings",
 )
 
 
@@ -122,7 +120,7 @@ class RuntimeStrategyPolicy:
             ACTIVE_RESEARCH_SCOPE if evaluation_profile == "active_evidence_research/v1" else ()
         )))
         if evaluation_profile == "active_evidence_research/v1" and set(scope) != set(ACTIVE_RESEARCH_SCOPE):
-            raise ValueError("active research candidate scope must cover every formal market task, weekend, and holdings")
+            raise ValueError("active research candidate scope must cover every scheduled formal market task")
         key = self.cell_key(policy_kind, stage)
         from .store import now
         with self.store.connection() as connection:
@@ -258,7 +256,7 @@ class RuntimeStrategyPolicy:
         value_window_end = str(packet.get("value_window_end") or "") or None
         with self.store.connection() as connection:
             cycle = connection.execute(
-                "SELECT task_key,scheduled_for,m1_publish_deadline FROM companion_cycle WHERE cycle_id=?",
+                "SELECT task_key,scheduled_for,m1_publish_deadline,kind FROM companion_cycle WHERE cycle_id=?",
                 (cycle_id,),
             ).fetchone()
             if value_window_end is None and cycle:
@@ -277,7 +275,7 @@ class RuntimeStrategyPolicy:
             for cell in cells:
                 if cycle and cell["evaluation_profile"] == "active_evidence_research/v1":
                     scope = set(json.loads(cell["applicable_tasks_json"] or "[]"))
-                    if cycle["task_key"] not in scope:
+                    if cycle["kind"] != "scheduled" or cycle["task_key"] not in scope:
                         continue
                 job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"runtime-shadow|{cell['cell_key']}|{cycle_id}|{stage}|{baseline_attempt_id}"))
                 connection.execute(

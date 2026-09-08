@@ -698,20 +698,7 @@ class LocalResearchTests(unittest.TestCase):
         ).run({"task_key": "daily.review.1520", "as_of": contract["as_of"]}, contract, attempt_id="forum-failure")
 
         forum_failures = [row for row in result.observations if row.get("operation") == "web_search"]
-        candidate_contract = {
-            "version": 4, "as_of": as_of, "requirements": [{
-                "key": "candidate_business_research", "blocking": True,
-                "allowed_coverage": ["covered"], "quote_finality": "official_close",
-                "quote_window": {"mode": "exact", "start": close, "end": close},
-                "window": {"mode": "after_start_to_end", "start": "2025-08-01T00:00:00Z", "end": as_of},
-            }],
-        }
-        candidate = ToolCatalogMarketBackend(
-            runner, contract=candidate_contract, deadline=lambda: 10.0, daily_ledger=ledger,
-        )("holding_snapshot", {"_requirement_key": "candidate_business_research", "symbol": "300378"})
-        self.assertEqual("daily_evidence_ledger", candidate["source"])
-
-        self.assertEqual(3, runner.resolve_with_fallback.call_count)
+        self.assertEqual(2, runner.resolve_with_fallback.call_count)
         self.assertEqual(["tool_network_transient", "tool_network_transient"], [
             row.get("tool_error_code") for row in forum_failures
         ])
@@ -1941,7 +1928,20 @@ class LocalResearchTests(unittest.TestCase):
                 row["symbol"] for payload in payloads for row in payload[spec["field"]]
             })
 
-        self.assertEqual(2, runner.resolve_with_fallback.call_count)
+        candidate_contract = {
+            "version": 4, "as_of": as_of, "requirements": [{
+                "key": "candidate_business_research", "blocking": True,
+                "allowed_coverage": ["covered"], "quote_finality": "official_close",
+                "quote_window": {"mode": "exact", "start": close, "end": close},
+                "window": {"mode": "after_start_to_end", "start": "2025-08-01T00:00:00Z", "end": as_of},
+            }],
+        }
+        candidate = ToolCatalogMarketBackend(
+            runner, contract=candidate_contract, deadline=lambda: 10.0, daily_ledger=ledger,
+        )("holding_snapshot", {"_requirement_key": "candidate_business_research", "symbol": "300378"})
+        self.assertEqual("daily_evidence_ledger", candidate["source"])
+
+        self.assertEqual(3, runner.resolve_with_fallback.call_count)
 
         runner.reset_mock()
         combined_contract = {

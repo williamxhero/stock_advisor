@@ -71,6 +71,48 @@ class CompanionLearningTests(unittest.TestCase):
         packet = RuntimePacketBuilder(PROJECT_ROOT / "resources", PROJECT_ROOT / "data", self.store).build(intraday, "m0_research")
         self.assertEqual("baseline_recovery", packet["public_research_scope"]["mode"])
 
+    def test_public_scope_includes_prior_day_required_by_exact_close_contract(self):
+        prior = self.cycle(
+            "daily.opportunity.0900", "2026-09-07T09:00:00+08:00", "2026-09-07T00:30:00Z",
+        )
+        close = "2026-09-07T07:00:00Z"
+        self.store.record_evidence(prior, "m0_research", {
+            "as_of": close,
+            "sources": [{
+                "url": "https://example.com/close", "title": "上日官方收盘",
+                "published_or_retrieved_at": "2026-09-07T07:10:00Z",
+                "excerpt": json.dumps({
+                    "finality": "official_close", "quotes": [{
+                        "symbol": "000997", "price": 21.07, "previous_close": 21.6,
+                        "change": -0.53, "change_percent": -2.4537,
+                        "quote_at": close, "trading_date": "2026-09-07", "status": "closed",
+                    }],
+                }),
+            }],
+        })
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE evidence_ledger_entry SET known_at='2026-09-07T07:10:00Z' WHERE cycle_id=?",
+                (prior["cycle_id"],),
+            )
+        current = self.cycle(
+            "daily.opportunity.0900", "2026-09-08T10:00:00+08:00", "2026-09-08T02:00:00Z",
+        )
+        current["evidence_contract_json"] = json.dumps({
+            "version": 4, "as_of": "2026-09-08T02:00:00Z", "requirements": [{
+                "key": "portfolio_market_state", "finality": "official_close",
+                "window": {"mode": "exact", "start": close, "end": close},
+            }],
+        })
+
+        packet = RuntimePacketBuilder(
+            PROJECT_ROOT / "resources", PROJECT_ROOT / "data", self.store,
+        ).build(current, "m0_research")
+
+        self.assertIn("上日官方收盘", [
+            item["title"] for item in packet["public_research_scope"]["daily_ledger"]
+        ])
+
     def test_h0_snapshot_freezes_latest_direction_and_schedules_three_horizons(self):
         cycle = self.cycle("daily.execution.0945", "2026-08-25T09:45:00+08:00", "2026-08-25T01:45:00Z")
         artifact = self.store.append_artifact(

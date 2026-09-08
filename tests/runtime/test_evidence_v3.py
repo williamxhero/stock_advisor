@@ -273,6 +273,7 @@ class EvidenceV3Tests(TestCase):
     def test_1430_contract_requires_fresh_intraday_market_and_event_evidence(self):
         contract = EvidenceContractFactory(_WeekdayCalendar()).build(
             task_key="daily.execution.1430", stage="m0_research", as_of="2026-08-26T06:30:00Z",
+            internal_context={"portfolio_entities": [], "prior_judgment_count": 1},
         )
         market = next(item for item in contract["requirements"] if item["key"] == "current_market_state")
         events = next(item for item in contract["requirements"] if item["key"] == "material_events_and_counterevidence")
@@ -281,6 +282,19 @@ class EvidenceV3Tests(TestCase):
         self.assertEqual("2026-08-26T06:15:00Z", market["window"]["start"])
         self.assertEqual("2026-08-26T06:30:00Z", market["window"]["end"])
         self.assertEqual("2026-08-26T02:30:00Z", events["window"]["start"])
+
+    def test_1430_contract_requires_overseas_and_theme_context(self):
+        contract = EvidenceContractFactory(_WeekdayCalendar()).build(
+            task_key="daily.execution.1430", stage="m0_research", as_of="2026-08-26T06:30:00Z",
+            internal_context={"portfolio_entities": [], "prior_judgment_count": 1},
+        )
+        requirements = {item["key"]: item for item in contract["requirements"]}
+
+        self.assertEqual(["covered", "checked_no_change"], requirements["overseas_market_context"]["allowed_coverage"])
+        self.assertEqual(["covered", "checked_no_change"], requirements["theme_business_and_expectations"]["allowed_coverage"])
+        self.assertEqual("internal_runtime", requirements["prior_market_understanding_changes"]["evidence_class"])
+        self.assertEqual(1, requirements["prior_market_understanding_changes"]["internal_record_count"])
+        self.assertEqual("2026-08-26T06:30:00Z", requirements["overseas_market_context"]["window"]["end"])
 
     def test_premarket_and_early_sessions_keep_separate_fact_windows(self):
         factory = EvidenceContractFactory(_WeekdayCalendar())

@@ -236,7 +236,9 @@ class RuntimePacketBuilder:
             "frozen_prior_judgments": self.store.frozen_judgments_before(
                 cycle["scheduled_for"][:10], packet_as_of,
                 ("daily.execution.0945", "daily.execution.1030", "daily.execution.1430"),
-            ) if cycle["task_key"] == "daily.review.1520" else [],
+            ) if cycle["task_key"] in {
+                "daily.execution.0945", "daily.execution.1030", "daily.execution.1430", "daily.review.1520",
+            } else [],
             "daily_ledger": [
                 {
                     "title": item["source_title"], "url": item["source_url"],
@@ -295,7 +297,9 @@ class RuntimePacketBuilder:
             "portfolio_entity_names": {row["code"]: row["name"] for row in rows},
             "prior_opportunity_plans": self.store.opportunity_plans_before(cycle["scheduled_for"][:10], packet_as_of),
         }
-        if cycle["task_key"] == "daily.review.1520":
+        if cycle["task_key"] in {
+            "daily.execution.0945", "daily.execution.1030", "daily.execution.1430", "daily.review.1520",
+        }:
             judgments = self.store.frozen_judgments_before(
                 cycle["scheduled_for"][:10], packet_as_of,
                 ("daily.execution.0945", "daily.execution.1030", "daily.execution.1430"),

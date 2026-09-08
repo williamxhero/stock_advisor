@@ -2121,6 +2121,7 @@ _PROPOSITION_LABELS = {
     "weekly_market_history": "三大指数周度表现",
     "material_events_and_counterevidence": "重要市场事件与反证",
     "prior_judgment_changes": "既有判断变化",
+    "prior_market_understanding_changes": "既有市场理解变化",
     "portfolio_market_state": "实有持仓行情",
     "portfolio_current_bar": "实有持仓当前行情",
     "portfolio_events_and_counterevidence": "实有持仓公告与风险事件",
@@ -2302,6 +2303,8 @@ def _public_gap_query(requirement_key: str, requirement: dict[str, Any]) -> str:
         "forum_and_sentiment": "论坛 股吧 市场情绪",
         "market_fund_flow": "板块 主力资金 净流入 净流出 金额 排名",
         "material_events_and_counterevidence": "政策 监管 风险 重要事件 反证",
+        "overseas_market_context": "Japan Korea market global risk A-share industry linkage",
+        "theme_business_and_expectations": "industry chain theme catalyst expectations priced in counterevidence",
     }.get(requirement_key, "可验证事实")
     entities = " ".join(str(value) for value in requirement.get("required_entities") or [] if str(value))
     return " ".join(value for value in (
@@ -2398,6 +2401,11 @@ def _merge_mandatory_operations(
         required.append(_operation("themes_and_capacity_cores", "market", "sector_snapshot"))
     if "market_fund_flow" in requirements:
         required.append(_operation("market_fund_flow", "market", "fund_flow_snapshot"))
+    for key in ("overseas_market_context", "theme_business_and_expectations"):
+        if key in requirements:
+            required.append(_operation(
+                key, "gateway", "web_search", query=_public_gap_query(key, requirements[key]),
+            ))
     if "forum_and_sentiment" in requirements:
         required.extend((
             _operation("forum_and_sentiment", "market", "sentiment_snapshot"),

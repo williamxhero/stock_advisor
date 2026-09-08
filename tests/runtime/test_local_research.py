@@ -564,6 +564,28 @@ class LocalResearchTests(unittest.TestCase):
             for row in plan["operations"]
         ))
 
+    def test_overseas_and_theme_context_are_mandatory_independent_searches(self) -> None:
+        contract = {
+            "version": 4, "as_of": "2026-09-04T06:30:00Z", "requirements": [
+                {"key": "overseas_market_context", "blocking": True,
+                 "allowed_coverage": ["covered", "checked_no_change"],
+                 "window": {"mode": "after_start_to_end", "start": "2026-09-04T02:30:00Z", "end": "2026-09-04T06:30:00Z"}},
+                {"key": "theme_business_and_expectations", "blocking": True,
+                 "allowed_coverage": ["covered", "checked_no_change"],
+                 "window": {"mode": "after_start_to_end", "start": "2026-09-04T02:30:00Z", "end": "2026-09-04T06:30:00Z"}},
+            ],
+        }
+
+        plan = _merge_mandatory_operations({"version": 1, "operations": []}, contract, max_operations=24)
+        searches = {
+            row["requirement_key"]: row["arguments"]["query"]
+            for row in plan["operations"] if row["operation"] == "web_search"
+        }
+
+        self.assertIn("overseas_market_context", searches)
+        self.assertIn("theme_business_and_expectations", searches)
+        self.assertNotEqual(searches["overseas_market_context"], searches["theme_business_and_expectations"])
+
     def test_close_review_mandatory_research_attempts_turnover_themes_and_forum_sentiment(self) -> None:
         contract = {
             "version": 4,

@@ -287,6 +287,26 @@ class EvidenceContractFactory:
         events_window: dict[str, Any], internal_context: dict[str, Any],
     ) -> list[dict[str, Any]]:
         """Attach the deterministic blocking facts every formal analysis needs."""
+        market_understanding_requirements = [
+            {
+                "key": "overseas_market_context", "blocking": True,
+                "allowed_coverage": ["covered", "checked_no_change"],
+                "window": events_window,
+                "negative_query_terms": ["Japan market", "Korea market", "global risk", "A-share linkage"],
+            },
+            {
+                "key": "theme_business_and_expectations", "blocking": True,
+                "allowed_coverage": ["covered", "checked_no_change"],
+                "window": events_window,
+                "negative_query_terms": ["industry chain", "theme catalyst", "expectations", "counterevidence"],
+            },
+            {
+                "key": "prior_market_understanding_changes", "blocking": True,
+                "allowed_coverage": ["covered", "checked_no_change"],
+                "evidence_class": "internal_runtime",
+                "internal_record_count": int(internal_context.get("prior_judgment_count") or 0),
+            },
+        ]
         # Runtime always supplies this key from its authoritative portfolio store.
         # Keeping direct factory callers on their original shape preserves read-only
         # v3 artifact tests and prevents callers without a portfolio snapshot from
@@ -307,6 +327,7 @@ class EvidenceContractFactory:
                 market_finality = "official_close"
         return [
             *requirements,
+            *market_understanding_requirements,
             {
                 "key": "market_breadth", "blocking": True,
                 "allowed_coverage": ["covered"], "window": breadth_window,

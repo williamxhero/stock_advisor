@@ -2009,6 +2009,7 @@ def _compile_evidence(
             if ref and excerpt and _item_in_requirement_window(item, requirements.get(requirement) or {}):
                 sources.append({"evidence_ref": ref, "excerpt": excerpt, "analysis": f"支持 {requirement}"})
                 refs_by_requirement.setdefault(requirement, []).append(ref)
+    high_impact_events = _structured_high_impact_events(observations, {row["evidence_ref"] for row in sources})
     coverage = []
     for requirement in contract.get("requirements") or []:
         key = str(requirement.get("key") or "")
@@ -2035,8 +2036,78 @@ def _compile_evidence(
             if row["status"] == "missing"
             and bool((requirements.get(str(row["requirement_key"])) or {}).get("blocking", True))
         ],
-        "conflicts": [], "high_impact_events": [],
+        "conflicts": [], "high_impact_events": high_impact_events,
     }
+
+
+def _structured_high_impact_events(
+    observations: list[dict[str, Any]], source_refs: set[str],
+) -> list[dict[str, Any]]:
+    """Preserve explicit, tool-proved event envelopes without inferring a headline."""
+    events: dict[str, dict[str, Any]] = {}
+    for observation in observations:
+        if observation.get("operation") == "web_search":
+            continue
+        for item in observation.get("evidence_items") or []:
+            ref = str(item.get("evidence_ref") or "")
+            if ref not in source_refs:
+                continue
+            try:
+                payload = json.loads(str(item.get("excerpt_text") or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            envelope = payload.get("market_understanding") if isinstance(payload, dict) else None
+            rows = (envelope or payload).get("events") if isinstance(envelope or payload, dict) else None
+            for raw in rows or []:
+                if not isinstance(raw, dict):
+                    continue
+                summary = str(raw.get("summary") or "").strip()
+                scope = str(raw.get("scope") or "")
+                materiality = str(raw.get("materiality") or "")
+                truth = str(raw.get("truth_status") or "")
+                propagation = str(raw.get("propagation_status") or "")
+                if not summary or scope not in {"market", "theme", "portfolio"}:
+                    continue
+                if materiality not in {"medium", "high"}:
+                    continue
+                if truth not in {"verified", "unverified", "refuted"}:
+                    continue
+                if propagation not in {"observed", "not_observed", "unknown"}:
+                    continue
+                event_id = str(raw.get("event_id") or hashlib.sha256(
+                    f"{scope}:{summary}".encode("utf-8")
+                ).hexdigest()[:20])
+                allowed_refs = set(source_refs)
+                truth_refs = [
+                    str(value) for value in raw.get("truth_evidence_refs") or []
+                    if str(value) in allowed_refs
+                ] or [ref]
+                propagation_refs = [
+                    str(value) for value in raw.get("propagation_evidence_refs") or []
+                    if str(value) in allowed_refs
+                ]
+                if propagation == "observed" and not propagation_refs:
+                    propagation_refs = [ref]
+                candidate = {
+                    "event_id": event_id, "summary": summary, "scope": scope,
+                    "materiality": materiality, "evidence_refs": [ref],
+                    "truth_status": truth, "propagation_status": propagation,
+                    "truth_evidence_refs": truth_refs,
+                    "propagation_evidence_refs": propagation_refs,
+                    **({"clarifies_event_id": str(raw["clarifies_event_id"])}
+                       if raw.get("clarifies_event_id") else {}),
+                }
+                existing = events.get(event_id)
+                if existing is None:
+                    events[event_id] = candidate
+                    continue
+                for key in ("evidence_refs", "truth_evidence_refs", "propagation_evidence_refs"):
+                    existing[key] = list(dict.fromkeys([*existing[key], *candidate[key]]))
+                if candidate["truth_status"] == "refuted":
+                    existing["truth_status"] = "refuted"
+                if candidate["propagation_status"] == "observed":
+                    existing["propagation_status"] = "observed"
+    return list(events.values())
 
 
 _PROPOSITION_LABELS = {

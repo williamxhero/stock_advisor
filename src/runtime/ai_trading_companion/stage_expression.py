@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import re
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .stage_output_compat import adapt_legacy_stage_output
 
@@ -153,8 +155,8 @@ def _v4_judgment_expression(semantic: dict[str, Any]) -> str:
     return "\n\n".join(paragraphs)
 
 
-def _verified_close_summary(packet: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Build a useful M0 fallback only from the packet's frozen verified facts."""
+def _verified_market_snapshot_summary(packet: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Build an M0 fallback whose wording matches the frozen snapshot's stage."""
     facts: list[dict[str, Any]] = []
     for item in (packet or {}).get("verified_fact_digest") or []:
         if not isinstance(item, dict):
@@ -174,8 +176,31 @@ def _verified_close_summary(packet: dict[str, Any] | None) -> dict[str, Any] | N
     def number(value: Any) -> str:
         return format(value, ".15g") if isinstance(value, float) else str(value)
 
+    value = packet or {}
+    as_of = str(value.get("as_of") or "")
+    try:
+        snapshot_time = datetime.fromisoformat(as_of.replace("Z", "+00:00")).astimezone(
+            ZoneInfo("Asia/Shanghai")
+        ).strftime("%H:%M")
+    except ValueError:
+        time_match = re.search(r"T(\d{2}:\d{2})", as_of)
+        snapshot_time = time_match.group(1) if time_match else ""
+    requirements = (
+        (value.get("evidence_contract") or {}).get("requirements") or []
+        if isinstance(value.get("evidence_contract"), dict) else []
+    )
+    has_official_close = any(
+        isinstance(requirement, dict) and requirement.get("finality") == "official_close"
+        for requirement in requirements
+    )
+    is_completed_close = has_official_close and bool(snapshot_time) and snapshot_time >= "15:00"
+    quote_verb = "收于" if is_completed_close else "报于"
+    stage_label = "收盘后" if is_completed_close else (
+        f"截至{snapshot_time}" if snapshot_time else "截至本轮已验证时点"
+    )
+
     index_text = "，".join(
-        f"{row.get('name') or row.get('symbol')}收于{number(row.get('price'))}（{number(row.get('change_percent'))}%）"
+        f"{row.get('name') or row.get('symbol')}{quote_verb}{number(row.get('price'))}（{number(row.get('change_percent'))}%）"
         for row in indices[:3]
         if row.get("price") is not None and row.get("change_percent") is not None
     )
@@ -191,25 +216,55 @@ def _verified_close_summary(packet: dict[str, Any] | None) -> dict[str, Any] | N
         breadth_parts.append(f"涨停候选{number(breadth['limit_up'])}家")
     if breadth.get("limit_down") is not None:
         breadth_parts.append(f"跌停候选{number(breadth['limit_down'])}家")
-    observations = ["市场广度偏弱：" + "、".join(breadth_parts) + "。"]
+    up, down = float(breadth["up"]), float(breadth["down"])
+    breadth_view = (
+        "上涨家数多于下跌家数"
+        if up > down else "下跌家数多于上涨家数"
+        if down > up else "上涨与下跌家数相当"
+    )
+    observations = ["市场广度：" + "、".join(breadth_parts) + f"；{breadth_view}。"]
+    event_observation = _verified_event_observation(value)
+    if event_observation:
+        observations.insert(0, event_observation)
     selected_quotes = sorted(
         (row for row in quotes if row.get("price") is not None and row.get("change_percent") is not None),
         key=lambda row: abs(float(row.get("change_percent") or 0)), reverse=True,
     )[:2]
     if selected_quotes:
         observations.append("持仓表现有分化：" + "，".join(
-            f"{row.get('name') or row.get('symbol')}收于{number(row.get('price'))}（{number(row.get('change_percent'))}%）"
+            f"{row.get('name') or row.get('symbol')}{quote_verb}{number(row.get('price'))}（{number(row.get('change_percent'))}%）"
             for row in selected_quotes
         ) + "。")
     return {
         "result_version": 3,
         "semantic": {
-            "summary": f"收盘后看，三大指数接近平盘，{index_text}。",
+            "summary": f"{stage_label}，三大指数：{index_text}。",
             "observations": observations,
-            "risks": ["指数平稳但下跌家数明显多于上涨家数，个股承压程度高于指数表面。"],
-            "unknowns": ["指数近乎横盘与个股普跌的背离能否在下一交易日收敛。"],
+            "risks": [],
+            "unknowns": [],
         },
     }
+
+
+def _verified_event_observation(packet: dict[str, Any]) -> str:
+    """State one material event faithfully when the model reply needs a safe M0 fallback."""
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    for event in evidence.get("high_impact_events") or []:
+        if not isinstance(event, dict) or event.get("materiality") not in {"medium", "high"}:
+            continue
+        summary = str(event.get("summary") or "").strip()
+        truth = str(event.get("truth_status") or "")
+        propagation = str(event.get("propagation_status") or "")
+        if not summary or truth not in {"verified", "unverified", "refuted"}:
+            continue
+        factual = (
+            f"已核验的重要事件：{summary}"
+            if truth == "verified" else f"关于{summary}的消息尚未证实"
+            if truth == "unverified" else f"关于{summary}的说法已被否认"
+        )
+        propagation_text = "；其传播已在本轮市场材料中被观察到" if propagation == "observed" else ""
+        return factual + propagation_text + "。"
+    return ""
 
 
 def verified_weekly_market_comparison(packet: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -490,7 +545,7 @@ def safe_stage_output(
         candidate_fallback = _verified_candidate_research_fallback(candidate_output)
         if candidate_fallback is not None:
             return candidate_fallback
-        verified = _verified_close_summary(packet)
+        verified = _verified_market_snapshot_summary(packet)
         if verified is not None:
             return verified
         return {

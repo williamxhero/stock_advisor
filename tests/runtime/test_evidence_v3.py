@@ -71,6 +71,45 @@ class EvidenceV3Tests(TestCase):
         self.assertNotIn("信息还在核对", rendered)
         self.assertTrue(CognitiveRouter().verify("m0_compose", packet, output)["passed"])
 
+    def test_m0_intraday_safe_fallback_uses_snapshot_language_and_actual_breadth(self):
+        packet = {
+            "stage": "m0_compose",
+            "task_key": "daily.execution.1430",
+            "as_of": "2026-09-08T06:30:00Z",
+            "evidence": {"high_impact_events": [{
+                "event_id": "policy-semiconductor-20260908",
+                "summary": "半导体产业支持政策已发布",
+                "scope": "theme", "materiality": "high",
+                "evidence_refs": ["policy"], "truth_status": "verified",
+                "propagation_status": "observed", "truth_evidence_refs": ["policy"],
+                "propagation_evidence_refs": ["policy"],
+            }]},
+            "verified_fact_digest": [
+                {"excerpt": json.dumps({"indices": [
+                    {"name": "上证指数", "price": 3942.09, "change_percent": 0.0178},
+                    {"name": "深证成指", "price": 13625.12, "change_percent": 0.0997},
+                    {"name": "创业板指", "price": 3312.54, "change_percent": 0.0091},
+                ]}, ensure_ascii=False)},
+                {"excerpt": json.dumps({"breadth": {
+                    "up": 3132, "down": 1966, "flat": 118,
+                }}, ensure_ascii=False)},
+            ],
+        }
+
+        output = safe_stage_output("m0_compose", packet=packet)
+        rendered = " ".join([output["semantic"]["summary"], *output["semantic"]["observations"]])
+
+        self.assertIn("截至14:30", rendered)
+        self.assertIn("上涨3132家、下跌1966家", rendered)
+        self.assertIn("上涨家数多于下跌家", rendered)
+        self.assertIn("半导体产业支持政策已发布", rendered)
+        self.assertIn("传播", rendered)
+        self.assertNotIn("收盘后", rendered)
+        self.assertNotIn("收于", rendered)
+        self.assertNotIn("下跌家数明显多于上涨家数", rendered)
+        self.assertNotIn("个股普跌", rendered)
+        self.assertNotIn("下一交易日", rendered)
+
     def test_m1_safe_fallback_preserves_complete_close_review_evidence(self):
         def source(value):
             return {"excerpt": json.dumps(value, ensure_ascii=False)}

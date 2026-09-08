@@ -23,6 +23,40 @@ def row(operation: str, *, query: str | None = None, url: str | None = None) -> 
     return {"requirement_key": "market", "backend": "gateway", "operation": operation, "arguments": {"query": query, "categories": "news", "url": url, "symbol": None, "render": "auto", "session_id": None, "actions": None}, "fallback_backends": []}
 
 class LocalResearchTests(unittest.TestCase):
+    def test_research_preserves_a_material_event_with_truth_and_propagation_evidence(self):
+        as_of = "2026-09-08T06:30:00Z"
+        contract = {"version": 4, "as_of": as_of, "requirements": [{
+            "key": "material_events_and_counterevidence", "blocking": True,
+            "allowed_coverage": ["covered"],
+            "window": {"mode": "after_start_to_end", "start": "2026-09-08T02:30:00Z", "end": as_of},
+        }]}
+        plan = {"version": 1, "operations": [{
+            **row("web_read", url="https://example.test/event"),
+            "requirement_key": "material_events_and_counterevidence",
+        }]}
+        event = {
+            "event_id": "policy-semiconductor-20260908",
+            "summary": "监管部门发布半导体产业支持政策",
+            "scope": "theme", "materiality": "high",
+            "truth_status": "verified", "propagation_status": "observed",
+        }
+        result = LocalResearchChain(
+            lambda *_: plan,
+            ReadOnlyResearchExecutor({"gateway": lambda *_: {"results": [{
+                "url": "https://example.test/event", "excerpt_text": json.dumps({"events": [event]}, ensure_ascii=False),
+                "fact_as_of": as_of, "primary": True, "factual_status": "verified",
+                "market_propagation": "observed",
+            }]}}),
+            max_repairs=0,
+        ).run({"stage": "m0_research", "as_of": as_of}, contract, attempt_id="event-proof")
+
+        self.assertTrue(result.qualified, result.verifier)
+        self.assertEqual(["policy-semiconductor-20260908"], [item["event_id"] for item in result.evidence["high_impact_events"]])
+        preserved = result.evidence["high_impact_events"][0]
+        self.assertEqual("verified", preserved["truth_status"])
+        self.assertEqual("observed", preserved["propagation_status"])
+        self.assertEqual(preserved["truth_evidence_refs"], preserved["propagation_evidence_refs"])
+
     def test_company_read_uses_article_time_instead_of_late_acquisition_time(self):
         as_of = "2026-09-07T05:30:55Z"
         contract = {"version": 4, "as_of": as_of, "requirements": [{

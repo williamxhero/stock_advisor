@@ -190,6 +190,38 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertEqual("[查看交易所收盘数据](https://example.com/close)", material["markdown"])
         self.assertNotIn("official_close", presented.markdown)
 
+    def test_machine_source_identifiers_are_replaced_with_public_source_names(self):
+        presented = present_message(
+            "大盘仍是结构性行情。 [[material:index-1]] [[material:breadth-1]] [[material:news-1]]",
+            as_of="2026-09-08T05:08:49Z",
+            kind="ai_chat",
+            material_registry={
+                "index-1": {
+                    "title": "tencent_minute",
+                    "url": "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=sh000001",
+                    "markdown": '{"index":"sh000001"}',
+                },
+                "breadth-1": {
+                    "title": "eastmoney_breadth",
+                    "url": "https://push2delay.eastmoney.com/api/qt/clist/get",
+                    "markdown": '{"up":3400}',
+                },
+                "news-1": {
+                    "title": "yosef_bounded_market_event_snapshot",
+                    "url": "https://www.cls.cn/detail/2475972",
+                    "markdown": '{"headline":"盘中市场报道"}',
+                },
+            },
+        )
+
+        self.assertNotIn("tencent_minute", presented.markdown)
+        self.assertNotIn("eastmoney_breadth", presented.markdown)
+        self.assertNotIn("yosef_bounded_market_event_snapshot", presented.markdown)
+        self.assertEqual(
+            ["腾讯行情数据", "东方财富市场数据", "财联社报道"],
+            [part["source_title"] for part in presented.parts if part["kind"] == "material"],
+        )
+
     def test_unattributed_quote_does_not_get_material_format_privilege(self):
         presented = present_message(
             "我不认可这个说法。\n\n> - 这是没有来源的清单",

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 import uuid
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 
@@ -17,6 +18,17 @@ _FIELD = re.compile(r"^\s*([a-z\u4e00-\u9fff][a-z0-9_\u4e00-\u9fff]{0,40})\s*[:�
 _ISO_DAY = re.compile(r"(?<!\d)(20\d{2})[-‐‑‒–—−](\d{2})[-‐‑‒–—−](\d{2})(?:[T\s]([0-2]\d):([0-5]\d)(?::[0-5]\d)?(?:\.\d+)?(?:Z|[+-][0-2]\d:?\d\d)?)?(?!\d)")
 _URL = re.compile(r"https?://[^\s)>]+")
 _MATERIAL_REF = re.compile(r"\[\[material:([A-Za-z0-9._:-]+)\]\]")
+_MACHINE_SOURCE_TITLE = re.compile(r"^[a-z][a-z0-9]*(?:[_+.-][a-z0-9]+)+$", re.I)
+
+_PUBLIC_SOURCE_TITLES = (
+    ("gtimg.cn", "腾讯行情数据"),
+    ("eastmoney.com", "东方财富市场数据"),
+    ("cls.cn", "财联社报道"),
+    ("10jqka.com.cn", "同花顺报道"),
+    ("sse.com.cn", "上交所资料"),
+    ("szse.cn", "深交所资料"),
+    ("cninfo.com.cn", "巨潮资讯资料"),
+)
 
 _INTERNAL_FIELDS = {
     "task_key", "stage", "protocol", "reference_at", "model", "token",
@@ -123,7 +135,11 @@ def present_message(
             raise MessageQualificationError(["unknown_material_id"])
         if not all(str(material.get(field) or "").strip() for field in ("title", "url", "markdown")):
             raise MessageQualificationError(["unattributed_material"])
-        materials.append({**material, "material_id": material_id})
+        materials.append({
+            **material,
+            "title": _public_source_title(str(material["title"]), str(material["url"])),
+            "material_id": material_id,
+        })
     parts: list[dict[str, Any]] = []
     rendered: list[str] = []
     if speech:
@@ -387,6 +403,22 @@ def _is_machine_readable_material(markdown: str) -> bool:
     except json.JSONDecodeError:
         return False
     return isinstance(value, (dict, list))
+
+
+def _public_source_title(title: str, url: str) -> str:
+    """Keep internal provider identifiers out of the published message."""
+    candidate = str(title or "").strip()
+    if not _MACHINE_SOURCE_TITLE.fullmatch(candidate):
+        return candidate
+    try:
+        hostname = (urlsplit(str(url or "")).hostname or "").lower()
+    except ValueError:
+        hostname = ""
+    for suffix, public_title in _PUBLIC_SOURCE_TITLES:
+        if hostname == suffix or hostname.endswith("." + suffix):
+            return public_title
+    public_host = hostname.removeprefix("www.")
+    return f"{public_host} 资料" if public_host else "来源资料"
 
 
 def _source_title(markdown: str) -> str:

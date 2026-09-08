@@ -647,8 +647,11 @@ public partial class MainWindow : Window, IDisposable
             return CreateMarkdownViewer(message.Text, new Thickness(0, 8, 0, 0));
 
         var panel = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
+        var compactSources = MessageMaterialPresentation.CompactLinkOnlySources(message.Parts);
         foreach (var part in message.Parts)
         {
+            if (MessageMaterialPresentation.IsLinkOnly(part))
+                continue;
             if (part.Kind == "material")
             {
                 var material = new StackPanel();
@@ -666,6 +669,17 @@ public partial class MainWindow : Window, IDisposable
                 });
             }
             else panel.Children.Add(CreateMarkdownViewer(part.Text, new Thickness(0)));
+        }
+        if (compactSources.Count > 0)
+        {
+            panel.Children.Add(new Expander
+            {
+                Header = $"查看依据（{compactSources.Count}）",
+                IsExpanded = false,
+                Foreground = (Brush)FindResource("SecondaryTextBrush"),
+                Margin = new Thickness(0, 7, 0, 0),
+                Content = CreateMarkdownViewer(compactSources.Markdown, new Thickness(0, 5, 0, 0)),
+            });
         }
         return panel;
     }

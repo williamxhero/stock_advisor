@@ -273,7 +273,7 @@ class EvidenceV3Tests(TestCase):
     def test_1430_contract_requires_fresh_intraday_market_and_event_evidence(self):
         contract = EvidenceContractFactory(_WeekdayCalendar()).build(
             task_key="daily.execution.1430", stage="m0_research", as_of="2026-08-26T06:30:00Z",
-            internal_context={"portfolio_entities": [], "prior_judgment_count": 1},
+            internal_context={"portfolio_entities": [], "prior_judgment_count": 1, "market_understanding_enabled": True},
         )
         market = next(item for item in contract["requirements"] if item["key"] == "current_market_state")
         events = next(item for item in contract["requirements"] if item["key"] == "material_events_and_counterevidence")
@@ -286,7 +286,7 @@ class EvidenceV3Tests(TestCase):
     def test_1430_contract_requires_overseas_and_theme_context(self):
         contract = EvidenceContractFactory(_WeekdayCalendar()).build(
             task_key="daily.execution.1430", stage="m0_research", as_of="2026-08-26T06:30:00Z",
-            internal_context={"portfolio_entities": [], "prior_judgment_count": 1},
+            internal_context={"portfolio_entities": [], "prior_judgment_count": 1, "market_understanding_enabled": True},
         )
         requirements = {item["key"]: item for item in contract["requirements"]}
 
@@ -311,7 +311,7 @@ class EvidenceV3Tests(TestCase):
         ):
             contract = factory.build(
                 task_key=task_key, stage="m0_research", as_of=as_of,
-                internal_context={"portfolio_entities": [], "prior_judgment_count": 0},
+                internal_context={"portfolio_entities": [], "prior_judgment_count": 0, "market_understanding_enabled": True},
             )
             keys = {item["key"] for item in contract["requirements"]}
             self.assertTrue({
@@ -331,6 +331,17 @@ class EvidenceV3Tests(TestCase):
         self.assertEqual("2026-08-25T07:00:00Z", premarket_market["window"]["end"])
         self.assertEqual("2026-08-26T01:30:00Z", early_market["window"]["start"])
         self.assertEqual("2026-08-26T02:15:00Z", middle_market["window"]["start"])
+
+    def test_baseline_contract_does_not_activate_market_understanding_before_promotion(self):
+        contract = EvidenceContractFactory(_WeekdayCalendar()).build(
+            task_key="daily.execution.1430", stage="m0_research", as_of="2026-08-26T06:30:00Z",
+            internal_context={"portfolio_entities": [], "prior_judgment_count": 1},
+        )
+        keys = {item["key"] for item in contract["requirements"]}
+        self.assertFalse({
+            "overseas_market_context", "theme_business_and_expectations",
+            "prior_market_understanding_changes",
+        }.intersection(keys))
 
     def setUp(self):
         self.as_of = "2026-08-26T01:00:00Z"
@@ -393,7 +404,7 @@ class EvidenceV3Tests(TestCase):
         as_of = "2026-08-27T07:20:02.555Z"
         contract = EvidenceContractFactory(_WeekdayCalendar()).build(
             task_key="daily.review.1520", stage="m0_research", as_of=as_of,
-            internal_context={"prior_judgment_count": 3, "portfolio_entities": ["600000"]},
+            internal_context={"prior_judgment_count": 3, "portfolio_entities": ["600000"], "market_understanding_enabled": True},
         )
         requirements = {row["key"]: row for row in contract["requirements"]}
 

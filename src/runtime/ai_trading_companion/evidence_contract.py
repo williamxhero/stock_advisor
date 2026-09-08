@@ -292,6 +292,8 @@ class EvidenceContractFactory:
     def _market_understanding_requirements(
         events_window: dict[str, Any], internal_context: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        if internal_context.get("market_understanding_enabled") is not True:
+            return []
         return [
             {
                 "key": "overseas_market_context", "blocking": True,

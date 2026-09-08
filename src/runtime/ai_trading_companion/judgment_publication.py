@@ -92,6 +92,15 @@ def core_problems(core: dict, packet: dict) -> list[str]:
     refs += [ref for position in core.get("position_focus", []) for ref in position.get("evidence_refs", [])]
     if not sources or not refs or any(ref not in sources for ref in refs):
         problems.append("decision_unknown_evidence_reference")
+    material_event_refs = {
+        str(ref)
+        for event in (packet.get("evidence") or {}).get("high_impact_events") or []
+        if isinstance(event, dict) and event.get("materiality") == "high"
+        for ref in event.get("evidence_refs") or []
+        if str(ref)
+    }
+    if material_event_refs and not material_event_refs.intersection(refs):
+        problems.append("decision_omits_high_impact_event_evidence")
     conditions = core.get("transition_conditions") or []
     if {item.get("outcome") for item in conditions} != {"upgrade", "downgrade"}:
         problems.append("decision_missing_bidirectional_conditions")
@@ -472,6 +481,13 @@ problems 只记录必须阻止发布的事实失真、逻辑不成立、风险�
 若 grounded/faithful 均为真、各质量项达到2且 broadcast_risk 不超过1，不应再因可选润色拒绝。不要为了填 problems 而降低原本合格的评分。"""
 
 
+CORE_EVENT_INSTRUCTION = (
+    "When high-impact events are present, cite their frozen evidence in the decision core. "
+    "State verified, unverified, and refuted status separately from observed market propagation; "
+    "explain whether the event changes the base case or is the strongest countercase."
+)
+
+
 class JudgmentPublicationPipeline:
     def __init__(self, broker: Any, store: Any, schemas: Path, *, intellect: str, effort: str, is_shadow: bool = False):
         self.broker, self.store, self.schemas = broker, store, schemas
@@ -577,7 +593,7 @@ class JudgmentPublicationPipeline:
                 _core_attempts_left -= 1
                 try:
                     core, core_id = self._call(prefix + "_reasoning", cycle, {
-                        "instruction": CORE_INSTRUCTION + "\n" + CORE_REPAIR_INSTRUCTION
+                        "instruction": CORE_INSTRUCTION + "\n" + CORE_EVENT_INSTRUCTION + "\n" + CORE_REPAIR_INSTRUCTION
                         + ("\n" + PLAN_INSTRUCTION if is_premarket(base) else "")
                         + ("\n" + FOLLOWUP_INSTRUCTION if base.get("prior_opportunity_plans") else "")
                         + ("\n" + REVIEW_RESULT_INSTRUCTION if base.get("task_key") == "daily.review.1520" else ""),

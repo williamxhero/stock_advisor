@@ -355,6 +355,19 @@ def test_event_transition_is_evidence_bound_and_renders_without_market_proxy():
     assert "official order confirmation" in render_core(decision)
 
 
+def test_high_impact_event_must_reach_the_decision_core():
+    frozen = copy.deepcopy(packet())
+    frozen["evidence"]["sources"].append({"evidence_ref": "ev_event", "excerpt": "official event"})
+    frozen["evidence"]["high_impact_events"] = [{
+        "materiality": "high", "evidence_refs": ["ev_event"],
+    }]
+
+    assert "decision_omits_high_impact_event_evidence" in core_problems(core(), frozen)
+    decision = core()
+    decision["reasons"][0]["evidence_refs"].append("ev_event")
+    assert "decision_omits_high_impact_event_evidence" not in core_problems(decision, frozen)
+
+
 def test_event_transition_schema_rejects_an_unbound_event():
     schema = json.loads((SCHEMAS / "companion-m1-result-v4.schema.json").read_text(encoding="utf-8"))
     item_schema = schema["properties"]["semantic"]["properties"]["transition_conditions"]["items"]

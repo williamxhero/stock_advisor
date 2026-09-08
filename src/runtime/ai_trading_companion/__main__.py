@@ -611,6 +611,10 @@ def _gateway_command(
 def run_gateway(execute: bool = False) -> None:
     """Serve desktop requests without granting the desktop database access."""
     engine, store, exchange, portfolio = runtime()
+    # Register the reversible research treatment before the next market task is
+    # due.  This is definition-only: the baseline remains disabled and no
+    # formal output can consume the candidate until governance promotes it.
+    RuntimeStrategyPolicy(store).provision_market_understanding_candidate()
     # A hard process stop (for example, an application update) can prevent a
     # worker's finally block from releasing its durable slot.  At this point a
     # new Gateway owns no workers yet, so every stored claim is orphaned.

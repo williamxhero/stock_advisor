@@ -1,11 +1,24 @@
 using System.Windows;
 using System.Windows.Documents;
+using System.Windows.Media;
 using AITradingCompanion.Desktop.Converters;
 
 namespace AITradingCompanion.Tests;
 
 public sealed class MarkdownDocumentBuilderTests
 {
+    [Fact]
+    public void UsesReadableChineseTypographyForLongMessages()
+    {
+        var document = MarkdownDocumentBuilder.Build("这是一段需要持续阅读的研判正文。");
+
+        Assert.Equal(SystemFonts.MessageFontFamily, document.FontFamily);
+        Assert.Equal(16d, document.FontSize);
+        Assert.Equal(27d, document.LineHeight);
+        Assert.Equal(TextFormattingMode.Display, TextOptions.GetTextFormattingMode(document));
+        Assert.Equal(TextRenderingMode.ClearType, TextOptions.GetTextRenderingMode(document));
+    }
+
     [Fact]
     public void RendersCommonMarkdownAsFlowDocumentElements()
     {

@@ -36,11 +36,13 @@ public static class MarkdownDocumentBuilder
         {
             Background = MediaBrushes.Transparent,
             Foreground = PrimaryText,
-            FontFamily = new MediaFontFamily("Segoe UI"),
-            FontSize = 15,
-            LineHeight = 25,
+            FontFamily = System.Windows.SystemFonts.MessageFontFamily,
+            FontSize = 16,
+            LineHeight = 27,
             PagePadding = new Thickness(0)
         };
+        TextOptions.SetTextFormattingMode(document, TextFormattingMode.Display);
+        TextOptions.SetTextRenderingMode(document, TextRenderingMode.ClearType);
 
         if (string.IsNullOrWhiteSpace(markdown))
         {
@@ -87,7 +89,7 @@ public static class MarkdownDocumentBuilder
 
     private static Paragraph RenderHeading(HeadingBlock heading)
     {
-        var sizes = new[] { 27d, 23d, 20d, 18d, 16d, 15d };
+        var sizes = new[] { 27d, 23d, 20d, 18d, 17d, 16d };
         var paragraph = new Paragraph
         {
             FontSize = sizes[Math.Clamp(heading.Level, 1, 6) - 1],
@@ -102,7 +104,7 @@ public static class MarkdownDocumentBuilder
 
     private static Paragraph RenderParagraph(ParagraphBlock source)
     {
-        var paragraph = new Paragraph { Margin = new Thickness(0, 2, 0, 10) };
+        var paragraph = new Paragraph { Margin = new Thickness(0, 2, 0, 12) };
         AddInlines(paragraph.Inlines, source.Inline);
         return paragraph;
     }
@@ -221,7 +223,7 @@ public static class MarkdownDocumentBuilder
 
     private static Paragraph RenderLeaf(LeafBlock source)
     {
-        var paragraph = new Paragraph { Margin = new Thickness(0, 2, 0, 10) };
+        var paragraph = new Paragraph { Margin = new Thickness(0, 2, 0, 12) };
         AddInlines(paragraph.Inlines, source.Inline);
         return paragraph;
     }

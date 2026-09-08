@@ -9,6 +9,46 @@ namespace AITradingCompanion.Tests;
 public sealed class UiContractTests
 {
     [Fact]
+    public void DesktopTypographyUsesReadableChineseSizingAndRendering()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln")))
+            root = root.Parent;
+        Assert.NotNull(root);
+
+        var desktop = Path.Combine(root.FullName!, "src", "desktop", "AITradingCompanion.Desktop");
+        var app = File.ReadAllText(Path.Combine(desktop, "App.xaml"));
+        Assert.Contains("<FontFamily x:Key=\"UiFontFamily\">Microsoft YaHei UI</FontFamily>", app, StringComparison.Ordinal);
+        Assert.Contains("<sys:Double x:Key=\"UiBodyFontSize\">14</sys:Double>", app, StringComparison.Ordinal);
+        Assert.Contains("<sys:Double x:Key=\"UiAuxiliaryFontSize\">13</sys:Double>", app, StringComparison.Ordinal);
+        Assert.Contains("Color=\"#E8EEF8\"", app, StringComparison.Ordinal);
+        Assert.Contains("Color=\"#A6B2C7\"", app, StringComparison.Ordinal);
+
+        foreach (var name in new[]
+                 {
+                     "MainWindow.xaml",
+                     "PortfolioWindow.xaml",
+                     "TaskManagementWindow.xaml",
+                     "EvaluationObservatoryWindow.xaml",
+                 })
+        {
+            var xaml = File.ReadAllText(Path.Combine(desktop, "Views", name));
+            Assert.Contains("FontFamily=\"{StaticResource UiFontFamily}\"", xaml, StringComparison.Ordinal);
+            Assert.Contains("UseLayoutRounding=\"True\"", xaml, StringComparison.Ordinal);
+            Assert.Contains("SnapsToDevicePixels=\"True\"", xaml, StringComparison.Ordinal);
+            Assert.Contains("TextOptions.TextFormattingMode=\"Display\"", xaml, StringComparison.Ordinal);
+            Assert.Contains("TextOptions.TextRenderingMode=\"ClearType\"", xaml, StringComparison.Ordinal);
+        }
+
+        var allDesktopSource = string.Join("\n", Directory.EnumerateFiles(
+                Path.Combine(root.FullName!, "src", "desktop"), "*.*", SearchOption.AllDirectories)
+            .Where(path => path.EndsWith(".xaml", StringComparison.OrdinalIgnoreCase) ||
+                           path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+            .Select(File.ReadAllText));
+        Assert.DoesNotMatch("FontSize\\s*=\\s*[\\\"'](?:10|11|12)[\\\"']|FontSize\\s*=\\s*(?:10|11|12)\\b", allDesktopSource);
+    }
+
+    [Fact]
     public void ThinScrollbarStyleIsTwoDipTransparentAndHasNoDirectionButtons()
     {
         Exception? failure = null;

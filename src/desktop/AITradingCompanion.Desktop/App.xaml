@@ -9,36 +9,45 @@
         <sys:Double x:Key="{x:Static SystemParameters.VerticalScrollBarWidthKey}">2</sys:Double>
         <sys:Double x:Key="{x:Static SystemParameters.HorizontalScrollBarHeightKey}">2</sys:Double>
         <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+        <FontFamily x:Key="UiFontFamily">Microsoft YaHei UI</FontFamily>
+        <sys:Double x:Key="UiBodyFontSize">14</sys:Double>
+        <sys:Double x:Key="UiAuxiliaryFontSize">13</sys:Double>
         <SolidColorBrush x:Key="WindowBrush" Color="#0B111D" />
         <SolidColorBrush x:Key="PanelBrush" Color="#111A2A" />
         <SolidColorBrush x:Key="CardBrush" Color="#162235" />
         <SolidColorBrush x:Key="BorderBrush" Color="#263550" />
-        <SolidColorBrush x:Key="PrimaryTextBrush" Color="#FFFFFF" />
-        <SolidColorBrush x:Key="SecondaryTextBrush" Color="#FFFFFF" />
+        <SolidColorBrush x:Key="PrimaryTextBrush" Color="#E8EEF8" />
+        <SolidColorBrush x:Key="SecondaryTextBrush" Color="#A6B2C7" />
         <SolidColorBrush x:Key="AccentBrush" Color="#46D3A6" />
         <SolidColorBrush x:Key="BlueBrush" Color="#6A9EFF" />
         <!-- Native WPF ComboBox popups use SystemColors rather than the
              control's Background setter. Keep the closed control and its
              drop-down on the same dark surface. -->
         <SolidColorBrush x:Key="{x:Static SystemColors.WindowBrushKey}" Color="#111A2A" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.WindowTextBrushKey}" Color="#FFFFFF" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.WindowTextBrushKey}" Color="#E8EEF8" />
         <SolidColorBrush x:Key="{x:Static SystemColors.ControlBrushKey}" Color="#111A2A" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.ControlTextBrushKey}" Color="#FFFFFF" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.ControlTextBrushKey}" Color="#E8EEF8" />
         <SolidColorBrush x:Key="{x:Static SystemColors.ControlLightBrushKey}" Color="#162235" />
         <SolidColorBrush x:Key="{x:Static SystemColors.ControlLightLightBrushKey}" Color="#162235" />
         <SolidColorBrush x:Key="{x:Static SystemColors.ControlDarkBrushKey}" Color="#263550" />
         <SolidColorBrush x:Key="{x:Static SystemColors.ControlDarkDarkBrushKey}" Color="#0B111D" />
         <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}" Color="#223552" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}" Color="#FFFFFF" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}" Color="#E8EEF8" />
         <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightBrushKey}" Color="#1D2B42" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightTextBrushKey}" Color="#FFFFFF" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.GrayTextBrushKey}" Color="#AAB7CC" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightTextBrushKey}" Color="#E8EEF8" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.GrayTextBrushKey}" Color="#A6B2C7" />
 
         <Style TargetType="TextBlock">
             <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Setter Property="FontFamily" Value="{StaticResource UiFontFamily}" />
+            <Setter Property="FontSize" Value="{StaticResource UiBodyFontSize}" />
+            <Setter Property="TextOptions.TextFormattingMode" Value="Display" />
+            <Setter Property="TextOptions.TextRenderingMode" Value="ClearType" />
         </Style>
         <Style TargetType="Label">
             <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Setter Property="FontFamily" Value="{StaticResource UiFontFamily}" />
+            <Setter Property="FontSize" Value="{StaticResource UiBodyFontSize}" />
         </Style>
 
         <Style TargetType="Button">
@@ -47,7 +56,8 @@
             <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="Padding" Value="16,9" />
-            <Setter Property="FontSize" Value="13" />
+            <Setter Property="FontFamily" Value="{StaticResource UiFontFamily}" />
+            <Setter Property="FontSize" Value="{StaticResource UiBodyFontSize}" />
             <Setter Property="Cursor" Value="Hand" />
             <Setter Property="Template">
                 <Setter.Value>
@@ -73,6 +83,8 @@
             <Setter Property="Background" Value="#0E1726" />
             <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
             <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Setter Property="FontFamily" Value="{StaticResource UiFontFamily}" />
+            <Setter Property="FontSize" Value="{StaticResource UiBodyFontSize}" />
             <Setter Property="Padding" Value="9,7" />
             <Setter Property="CaretBrush" Value="{StaticResource PrimaryTextBrush}" />
         </Style>
@@ -81,18 +93,24 @@
             <Setter Property="Background" Value="#0E1726" />
             <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
             <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Setter Property="FontFamily" Value="{StaticResource UiFontFamily}" />
+            <Setter Property="FontSize" Value="{StaticResource UiBodyFontSize}" />
             <Setter Property="Padding" Value="9,7" />
             <Setter Property="CaretBrush" Value="{StaticResource PrimaryTextBrush}" />
         </Style>
 
         <Style TargetType="CheckBox">
             <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
+            <Setter Property="FontFamily" Value="{StaticResource UiFontFamily}" />
+            <Setter Property="FontSize" Value="{StaticResource UiBodyFontSize}" />
         </Style>
 
         <Style TargetType="ComboBox">
             <Setter Property="Background" Value="#0E1726" />
             <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
             <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Setter Property="FontFamily" Value="{StaticResource UiFontFamily}" />
+            <Setter Property="FontSize" Value="{StaticResource UiBodyFontSize}" />
             <Setter Property="Padding" Value="7,4" />
             <Setter Property="Template">
                 <Setter.Value>
@@ -108,10 +126,10 @@
                                                       Content="{TemplateBinding SelectionBoxItem}" ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
                                                       ContentStringFormat="{TemplateBinding SelectionBoxItemStringFormat}" />
                                     <TextBox x:Name="PART_EditableTextBox" Grid.Column="0" Margin="5,1,2,1" Padding="3,1"
-                                             Background="#0E1726" Foreground="#FFFFFF" BorderThickness="0"
-                                             CaretBrush="#FFFFFF" Visibility="Hidden"
+                                             Background="#0E1726" Foreground="{StaticResource PrimaryTextBrush}" BorderThickness="0"
+                                             CaretBrush="{StaticResource PrimaryTextBrush}" Visibility="Hidden"
                                              Text="{Binding Text, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                                    <Path Grid.Column="1" Margin="7,0" Fill="#FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                    <Path Grid.Column="1" Margin="7,0" Fill="{StaticResource SecondaryTextBrush}" HorizontalAlignment="Center" VerticalAlignment="Center"
                                           Data="M 0 0 L 8 0 L 4 5 Z" />
                                 </Grid>
                             </ToggleButton>
@@ -119,7 +137,7 @@
                                    IsOpen="{TemplateBinding IsDropDownOpen}" PopupAnimation="Fade">
                                 <Border x:Name="DropDownBorder" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
                                         MaxHeight="300" Background="#111A2A" BorderBrush="#263550" BorderThickness="1" Padding="1">
-                                    <ScrollViewer CanContentScroll="True" Background="#111A2A" Foreground="#FFFFFF">
+                                    <ScrollViewer CanContentScroll="True" Background="{StaticResource PanelBrush}" Foreground="{StaticResource PrimaryTextBrush}">
                                         <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Contained" />
                                     </ScrollViewer>
                                 </Border>
@@ -155,6 +173,8 @@
             <Setter Property="Background" Value="#0E1726" />
             <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
             <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Setter Property="FontFamily" Value="{StaticResource UiFontFamily}" />
+            <Setter Property="FontSize" Value="{StaticResource UiBodyFontSize}" />
         </Style>
         <Style TargetType="ListBoxItem">
             <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
@@ -170,6 +190,8 @@
             <Setter Property="Background" Value="#0E1726" />
             <Setter Property="Foreground" Value="{StaticResource PrimaryTextBrush}" />
             <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Setter Property="FontFamily" Value="{StaticResource UiFontFamily}" />
+            <Setter Property="FontSize" Value="{StaticResource UiBodyFontSize}" />
             <Setter Property="RowBackground" Value="#111A2A" />
             <Setter Property="AlternatingRowBackground" Value="#0E1726" />
             <Setter Property="GridLinesVisibility" Value="Horizontal" />

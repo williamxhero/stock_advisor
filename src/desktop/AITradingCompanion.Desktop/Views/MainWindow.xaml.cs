@@ -463,7 +463,7 @@ public partial class MainWindow : Window, IDisposable
             var timing = new TextBlock
             {
                 Text = FormatTiming(message), Foreground = (Brush)FindResource("SecondaryTextBrush"),
-                FontSize = 11,
+                FontSize = (double)FindResource("UiAuxiliaryFontSize"),
             };
             var body = CreatePublishedMessageViewer(message);
             var headerRow = new Grid();
@@ -548,7 +548,7 @@ public partial class MainWindow : Window, IDisposable
             var headerText = entry.At.ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture);
             var header = new TextBlock
             {
-                Text = headerText, FontSize = 11,
+                Text = headerText, FontSize = (double)FindResource("UiAuxiliaryFontSize"),
                 Foreground = isStaged ? (Brush)FindResource("BlueBrush") : (Brush)FindResource("SecondaryTextBrush"),
             };
             var body = CreateMarkdownViewer(entry.Text, new Thickness(0, 3, 0, 0));
@@ -565,7 +565,8 @@ public partial class MainWindow : Window, IDisposable
             {
                 content.Children.Add(new TextBlock
                 {
-                    Text = status, Foreground = (Brush)FindResource("AccentBrush"), FontSize = 11,
+                    Text = status, Foreground = (Brush)FindResource("AccentBrush"),
+                    FontSize = (double)FindResource("UiAuxiliaryFontSize"),
                     Margin = new Thickness(0, 7, 0, 0), TextWrapping = TextWrapping.Wrap,
                 });
             }
@@ -711,7 +712,7 @@ public partial class MainWindow : Window, IDisposable
     {
         var button = new Button
         {
-            Content = "复制", Tag = text, FontSize = 11,
+            Content = "复制", Tag = text, FontSize = (double)FindResource("UiAuxiliaryFontSize"),
             Padding = new Thickness(7, 2, 7, 2), Margin = new Thickness(8, 0, 0, 0),
             HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top,
         };

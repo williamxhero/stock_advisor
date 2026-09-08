@@ -3,7 +3,13 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="评测与进化中心" Width="920" Height="680" MinWidth="720" MinHeight="520"
         WindowStartupLocation="CenterOwner" Background="{StaticResource WindowBrush}"
-        Foreground="{StaticResource PrimaryTextBrush}">
+        Foreground="{StaticResource PrimaryTextBrush}"
+        FontFamily="{StaticResource UiFontFamily}"
+        FontSize="{StaticResource UiBodyFontSize}"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
+        TextOptions.TextFormattingMode="Display"
+        TextOptions.TextRenderingMode="ClearType">
     <Window.Resources>
         <Style TargetType="ScrollBar" BasedOn="{StaticResource ThinScrollBarStyle}" />
         <DataTemplate x:Key="ObservatoryCardTemplate">

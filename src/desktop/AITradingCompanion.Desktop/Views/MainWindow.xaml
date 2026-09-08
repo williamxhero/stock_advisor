@@ -8,7 +8,12 @@
         WindowStartupLocation="CenterScreen"
         Background="{StaticResource WindowBrush}"
         Foreground="{StaticResource PrimaryTextBrush}"
-        FontFamily="Segoe UI">
+        FontFamily="{StaticResource UiFontFamily}"
+        FontSize="{StaticResource UiBodyFontSize}"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
+        TextOptions.TextFormattingMode="Display"
+        TextOptions.TextRenderingMode="ClearType">
     <Window.Resources>
         <Style TargetType="ScrollBar" BasedOn="{StaticResource ThinScrollBarStyle}" />
         <Style x:Key="RecordListItemStyle" TargetType="ListBoxItem">
@@ -48,7 +53,7 @@
         <Grid Grid.Row="0">
             <TextBlock Text="{Binding TodayText}" FontSize="29" FontWeight="SemiBold" />
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
-                <TextBlock Text="{Binding StatusText}" Foreground="{StaticResource SecondaryTextBrush}" FontSize="12"
+                <TextBlock Text="{Binding StatusText}" Foreground="{StaticResource SecondaryTextBrush}" FontSize="{StaticResource UiAuxiliaryFontSize}"
                            VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="260" />
                 <Button Content="任务管理" Click="TaskButton_Click" Padding="12,6" Margin="12,0,0,0" />
                 <Button Content="工具管理" Click="ToolManagerButton_Click" Padding="12,6" Margin="12,0,0,0" />
@@ -116,7 +121,7 @@
                                         <TextBlock Text="{Binding TimeText}" Foreground="{StaticResource BlueBrush}" FontSize="14" FontWeight="SemiBold" VerticalAlignment="Center" />
                                         <StackPanel Grid.Column="1">
                                             <TextBlock Text="{Binding Name}" FontSize="14" TextTrimming="CharacterEllipsis" />
-                                            <TextBlock Text="{Binding StatusText}" FontSize="11" Margin="0,4,0,0" ToolTip="{Binding RuntimeError}">
+                                            <TextBlock Text="{Binding StatusText}" FontSize="{StaticResource UiAuxiliaryFontSize}" Margin="0,4,0,0" ToolTip="{Binding RuntimeError}">
                                                 <TextBlock.Style>
                                                     <Style TargetType="TextBlock">
                                                         <Setter Property="Foreground" Value="{StaticResource SecondaryTextBrush}" />
@@ -210,7 +215,7 @@
                         </Grid>
                         <Grid Grid.Row="1" Margin="0,9,0,0">
                             <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
-                            <TextBlock x:Name="InputStatusText" Foreground="{StaticResource SecondaryTextBrush}" FontSize="11"
+                            <TextBlock x:Name="InputStatusText" Foreground="{StaticResource SecondaryTextBrush}" FontSize="{StaticResource UiAuxiliaryFontSize}"
                                        VerticalAlignment="Center" TextWrapping="Wrap" Margin="0,0,8,0" />
                             <StackPanel Grid.Column="1" Orientation="Horizontal">
                                 <Button x:Name="MainVoiceButton" Content="语音输入" Click="MainVoice_Click" Padding="10,6" />

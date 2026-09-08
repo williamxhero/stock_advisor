@@ -143,6 +143,28 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertIn("14:30", frozen["horizon"])
         self.assertNotIn("收盘至下一交易日", frozen["horizon"])
 
+    def test_later_intraday_judgment_gets_same_day_frozen_market_predecessors(self):
+        earlier = self.cycle("daily.execution.0945", "2026-08-25T09:45:00+08:00", "2026-08-25T01:45:00Z")
+        artifact = self.store.append_artifact(
+            earlier["cycle_id"], "m1", "model", "market stayed neutral", "2026-08-25T01:45:00Z",
+            known_at="2026-08-25T01:45:00Z",
+        )
+        JudgmentLifecycle(self.store).capture(
+            artifact, "m1", "market stayed neutral", snapshot={"direction": "neutral"},
+        )
+        attempt = self.store.begin_attempt(
+            earlier["cycle_id"], "m1_judgment", "2026-08-25T01:45:00Z", "predecessor",
+        )
+        self.store.finish_attempt(attempt["attempt_id"], "succeeded", verifier={"passed": True})
+        later = self.cycle("daily.execution.1430", "2026-08-25T14:30:00+08:00", "2026-08-25T06:30:00Z")
+
+        packet = RuntimePacketBuilder(PROJECT_ROOT / "resources", PROJECT_ROOT / "data", self.store).build(
+            later, "m1_judgment", evidence={"sources": [{"evidence_ref": "market", "excerpt": "facts"}]},
+        )
+
+        self.assertEqual(["daily.execution.0945"], [row["task_key"] for row in packet["prior_market_understanding"]])
+        self.assertEqual("neutral", packet["prior_market_understanding"][0]["direction"])
+
     def test_outcome_updates_verification_and_failed_case_is_retrievable(self):
         cycle = self.cycle("daily.execution.0945", "2026-08-25T09:45:00+08:00", "2026-08-25T01:45:00Z")
         artifact = self.store.append_artifact(cycle["cycle_id"], "m1", "model", "603179短线看多。", "2026-08-25T02:00:00Z")

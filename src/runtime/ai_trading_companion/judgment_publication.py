@@ -495,6 +495,8 @@ CORE_EVENT_INSTRUCTION = (
     "When high-impact events are present, cite their frozen evidence in the decision core. "
     "State verified, unverified, and refuted status separately from observed market propagation; "
     "explain whether the event changes the base case or is the strongest countercase."
+    " When prior_market_understanding is present, explicitly recheck what changed, what did not, and whether it changes the base case; "
+    "do not restate a predecessor merely because it was published earlier."
 )
 
 

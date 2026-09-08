@@ -115,6 +115,10 @@ class RuntimePacketBuilder:
                                            "doctrine": doctrine.get("doctrine") or json.loads(doctrine["doctrine_json"])}
             packet["business_context"] = self._business_context(cycle, stage)
             packet["evidence"] = evidence or {}
+            if stage in {"m1_judgment", "m2"} and cycle["task_key"] in {
+                "daily.execution.0945", "daily.execution.1030", "daily.execution.1430", "daily.review.1520",
+            }:
+                packet["prior_market_understanding"] = self._prior_market_understanding(cycle, packet_as_of)
             if stage == "m0_compose":
                 frozen_contract = cycle.get("evidence_contract_json")
                 packet["evidence_contract"] = (
@@ -306,6 +310,19 @@ class RuntimePacketBuilder:
             )
             context["prior_judgment_count"] = len(judgments)
         return context
+
+    def _prior_market_understanding(self, cycle: dict[str, Any], packet_as_of: str) -> list[dict[str, Any]]:
+        """Give a formal decision its same-day frozen predecessors, never mutable prose."""
+        rows = self.store.frozen_judgments_before(
+            cycle["scheduled_for"][:10], packet_as_of,
+            ("daily.execution.0945", "daily.execution.1030", "daily.execution.1430"),
+        )
+        return [{
+            "task_key": str(row.get("task_key") or ""), "as_of": str(row.get("as_of") or ""),
+            "direction": str((row.get("snapshot") or {}).get("direction") or "unknown"),
+            "horizon": str((row.get("snapshot") or {}).get("horizon") or ""),
+            "judgment": str((row.get("snapshot") or {}).get("original_judgment_text") or "")[:1_200],
+        } for row in rows]
 
     @staticmethod
     def _verified_fact_digest(evidence: dict[str, Any]) -> list[dict[str, Any]]:

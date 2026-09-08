@@ -39,6 +39,9 @@ class LocalResearchTests(unittest.TestCase):
             "summary": "监管部门发布半导体产业支持政策",
             "scope": "theme", "materiality": "high",
             "truth_status": "verified", "propagation_status": "observed",
+            "origin_evidence_refs": ["will-be-bound-by-local-research"],
+            "propagation_observed_from": "2026-09-08T06:00:00Z",
+            "propagation_observed_to": as_of,
         }
         result = LocalResearchChain(
             lambda *_: plan,
@@ -56,6 +59,8 @@ class LocalResearchTests(unittest.TestCase):
         self.assertEqual("verified", preserved["truth_status"])
         self.assertEqual("observed", preserved["propagation_status"])
         self.assertEqual(preserved["truth_evidence_refs"], preserved["propagation_evidence_refs"])
+        self.assertEqual(preserved["truth_evidence_refs"], preserved["origin_evidence_refs"])
+        self.assertEqual("2026-09-08T06:00:00Z", preserved["propagation_observed_from"])
 
     def test_company_read_uses_article_time_instead_of_late_acquisition_time(self):
         as_of = "2026-09-07T05:30:55Z"

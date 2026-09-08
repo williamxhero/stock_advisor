@@ -165,7 +165,7 @@ class EvidenceContractFactory:
                 code: str((context.get("portfolio_entity_names") or {}).get(code) or "")
                 for code in holdings
             }
-            return [
+            requirements = [
                 {
                     "key": "indices_close", "blocking": True,
                     "allowed_coverage": ["covered"],
@@ -232,6 +232,13 @@ class EvidenceContractFactory:
                     "window": {"start": prior_close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
                 },
             ]
+            return [
+                *requirements,
+                *self._market_understanding_requirements(
+                    {"start": prior_close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
+                    context,
+                ),
+            ]
         if task_key in _INTRADAY_EVENT_ANCHORS and stage in {"m0_research", "m1_research"}:
             return self._scheduled_intraday_requirements(task_key, as_of, internal_context or {})
         market_window = {"start": self._iso(as_of), "end": self._iso(as_of), "mode": "exact"}
@@ -282,12 +289,10 @@ class EvidenceContractFactory:
         ], market_window=market_window, events_window=events_window, internal_context=internal_context)
 
     @staticmethod
-    def _with_portfolio_requirements(
-        requirements: list[dict[str, Any]], *, market_window: dict[str, Any],
+    def _market_understanding_requirements(
         events_window: dict[str, Any], internal_context: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Attach the deterministic blocking facts every formal analysis needs."""
-        market_understanding_requirements = [
+        return [
             {
                 "key": "overseas_market_context", "blocking": True,
                 "allowed_coverage": ["covered", "checked_no_change"],
@@ -307,6 +312,16 @@ class EvidenceContractFactory:
                 "internal_record_count": int(internal_context.get("prior_judgment_count") or 0),
             },
         ]
+
+    @staticmethod
+    def _with_portfolio_requirements(
+        requirements: list[dict[str, Any]], *, market_window: dict[str, Any],
+        events_window: dict[str, Any], internal_context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Attach the deterministic blocking facts every formal analysis needs."""
+        market_understanding_requirements = EvidenceContractFactory._market_understanding_requirements(
+            events_window, internal_context,
+        )
         # Runtime always supplies this key from its authoritative portfolio store.
         # Keeping direct factory callers on their original shape preserves read-only
         # v3 artifact tests and prevents callers without a portfolio snapshot from

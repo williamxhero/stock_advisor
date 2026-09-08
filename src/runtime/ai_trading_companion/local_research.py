@@ -2088,12 +2088,21 @@ def _structured_high_impact_events(
                 ]
                 if propagation == "observed" and not propagation_refs:
                     propagation_refs = [ref]
+                origin_refs = [
+                    str(value) for value in raw.get("origin_evidence_refs") or []
+                    if str(value) in allowed_refs
+                ] or truth_refs or propagation_refs or [ref]
                 candidate = {
                     "event_id": event_id, "summary": summary, "scope": scope,
                     "materiality": materiality, "evidence_refs": [ref],
                     "truth_status": truth, "propagation_status": propagation,
                     "truth_evidence_refs": truth_refs,
                     "propagation_evidence_refs": propagation_refs,
+                    "origin_evidence_refs": origin_refs,
+                    **({"propagation_observed_from": str(raw["propagation_observed_from"])}
+                       if raw.get("propagation_observed_from") else {}),
+                    **({"propagation_observed_to": str(raw["propagation_observed_to"])}
+                       if raw.get("propagation_observed_to") else {}),
                     **({"clarifies_event_id": str(raw["clarifies_event_id"])}
                        if raw.get("clarifies_event_id") else {}),
                 }
@@ -2101,7 +2110,7 @@ def _structured_high_impact_events(
                 if existing is None:
                     events[event_id] = candidate
                     continue
-                for key in ("evidence_refs", "truth_evidence_refs", "propagation_evidence_refs"):
+                for key in ("evidence_refs", "truth_evidence_refs", "propagation_evidence_refs", "origin_evidence_refs"):
                     existing[key] = list(dict.fromkeys([*existing[key], *candidate[key]]))
                 if candidate["truth_status"] == "refuted":
                     existing["truth_status"] = "refuted"

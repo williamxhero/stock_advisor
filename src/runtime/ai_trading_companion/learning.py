@@ -138,7 +138,7 @@ class JudgmentLifecycle:
                 "daily.opportunity.0900": "开盘至09:45，并跟踪T+1/T+3/T+5",
                 "daily.execution.0945": "09:45至10:30，并跟踪T+1/T+3/T+5",
                 "daily.execution.1030": "10:30至14:30，并跟踪T+1/T+3/T+5",
-                "daily.execution.1430": "收盘至下一交易日，并跟踪T+1/T+3/T+5",
+                "daily.execution.1430": "14:30至收盘前的尾盘变化与下一交易日，并跟踪T+1/T+3/T+5",
                 "daily.review.1520": "未来1至5个交易日",
             }.get(cycle["task_key"], "声明周期及T+1/T+3/T+5")
         if frozen.get("horizon") is None:

@@ -296,6 +296,25 @@ class EvidenceV3Tests(TestCase):
         self.assertEqual(1, requirements["prior_market_understanding_changes"]["internal_record_count"])
         self.assertEqual("2026-08-26T06:30:00Z", requirements["overseas_market_context"]["window"]["end"])
 
+    def test_every_formal_daily_cycle_requires_market_understanding_context(self):
+        factory = EvidenceContractFactory(_WeekdayCalendar())
+        for task_key, as_of in (
+            ("daily.opportunity.0900", "2026-08-26T01:00:00Z"),
+            ("daily.execution.0945", "2026-08-26T01:45:00Z"),
+            ("daily.execution.1030", "2026-08-26T02:30:00Z"),
+            ("daily.execution.1430", "2026-08-26T06:30:00Z"),
+            ("daily.review.1520", "2026-08-26T07:20:00Z"),
+        ):
+            contract = factory.build(
+                task_key=task_key, stage="m0_research", as_of=as_of,
+                internal_context={"portfolio_entities": [], "prior_judgment_count": 0},
+            )
+            keys = {item["key"] for item in contract["requirements"]}
+            self.assertTrue({
+                "overseas_market_context", "theme_business_and_expectations",
+                "prior_market_understanding_changes",
+            }.issubset(keys), task_key)
+
     def test_premarket_and_early_sessions_keep_separate_fact_windows(self):
         factory = EvidenceContractFactory(_WeekdayCalendar())
         premarket = factory.build(task_key="daily.opportunity.0900", stage="m0_research", as_of="2026-08-26T00:30:00Z")
@@ -397,6 +416,8 @@ class EvidenceV3Tests(TestCase):
             "events_and_counterevidence",
             "prior_judgment_changes", "portfolio_market_state",
             "portfolio_events_and_counterevidence", "forum_and_sentiment",
+            "overseas_market_context", "theme_business_and_expectations",
+            "prior_market_understanding_changes",
         ], blockers)
 
         rejected = EvidenceGate().evaluate(
@@ -1007,11 +1028,11 @@ class EvidenceV3Tests(TestCase):
             "evidence_ref": "ev_attempt-1_3", "excerpt": "无新增重大公告", "analysis": "独立确认",
         })
         evidence["high_impact_events"] = [{
-            "summary": "重大事件已独立确认", "scope": "market", "materiality": "high",
+            "event_id": "confirmed-event-20260826", "summary": "重大事件已独立确认", "scope": "market", "materiality": "high",
             "evidence_refs": ["ev_attempt-1_2", "ev_attempt-1_3"], "truth_status": "verified",
             "propagation_status": "not_observed",
             "truth_evidence_refs": ["ev_attempt-1_2", "ev_attempt-1_3"],
-            "propagation_evidence_refs": [],
+            "propagation_evidence_refs": [], "origin_evidence_refs": ["ev_attempt-1_2"],
         }]
 
         result = EvidenceGate().evaluate(evidence, self.contract, self.observations, self.as_of, attempt_id="attempt-1")
@@ -1022,10 +1043,12 @@ class EvidenceV3Tests(TestCase):
         evidence = self._evidence()
         self.observations[0]["evidence_items"][1]["market_propagation"] = "observed"
         evidence["high_impact_events"] = [{
-            "summary": "传闻已被官方否认但仍广泛传播", "scope": "market", "materiality": "high",
+            "event_id": "refuted-rumor-20260826", "summary": "传闻已被官方否认但仍广泛传播", "scope": "market", "materiality": "high",
             "evidence_refs": ["ev_attempt-1_1", "ev_attempt-1_2"], "truth_status": "refuted",
             "propagation_status": "observed", "truth_evidence_refs": ["ev_attempt-1_1"],
-            "propagation_evidence_refs": ["ev_attempt-1_2"],
+            "propagation_evidence_refs": ["ev_attempt-1_2"], "origin_evidence_refs": ["ev_attempt-1_2"],
+            "propagation_observed_from": "2026-08-26T00:40:00Z",
+            "propagation_observed_to": self.as_of,
         }]
 
         result = EvidenceGate().evaluate(evidence, self.contract, self.observations, self.as_of, attempt_id="attempt-1")
@@ -1034,6 +1057,28 @@ class EvidenceV3Tests(TestCase):
         event = result["normalized_evidence"]["high_impact_events"][0]
         self.assertEqual("refuted", event["truth_status"])
         self.assertEqual("observed", event["propagation_status"])
+
+    def test_observed_rumor_requires_a_trackable_origin_and_observation_range(self):
+        evidence = self._evidence()
+        self.observations[0]["evidence_items"][1]["market_propagation"] = "observed"
+        evidence["high_impact_events"] = [{
+            "event_id": "rumor-20260826", "summary": "rumor remains in circulation",
+            "scope": "market", "materiality": "high", "evidence_refs": ["ev_attempt-1_2"],
+            "truth_status": "unverified", "propagation_status": "observed",
+            "truth_evidence_refs": [], "propagation_evidence_refs": ["ev_attempt-1_2"],
+            "origin_evidence_refs": ["ev_attempt-1_2"],
+            "propagation_observed_from": "2026-08-26T00:40:00Z",
+            "propagation_observed_to": self.as_of,
+        }]
+
+        accepted = EvidenceGate().evaluate(evidence, self.contract, self.observations, self.as_of, attempt_id="attempt-1")
+        self.assertTrue(accepted["passed"], accepted["problems"])
+
+        evidence["high_impact_events"][0].pop("origin_evidence_refs")
+        evidence["high_impact_events"][0].pop("propagation_observed_to")
+        rejected = EvidenceGate().evaluate(evidence, self.contract, self.observations, self.as_of, attempt_id="attempt-1")
+        self.assertIn("event_origin_evidence_missing", rejected["problems"])
+        self.assertIn("event_propagation_observed_to_missing", rejected["problems"])
 
     def test_equal_tier_exact_fact_conflict_blocks_only_dependent_requirement(self):
         evidence = self._evidence()

@@ -460,21 +460,33 @@ class _EvidenceGateV3:
             if absent_entities:
                 problems.append(f"blocking_requirement_missing_entities:{key}"); missing.append(key)
         for event in evidence.get("high_impact_events") or []:
+            event_id = str(event.get("event_id") or "").strip()
             truth_status = str(event.get("truth_status") or "")
             propagation_status = str(event.get("propagation_status") or "")
+            if not event_id:
+                problems.append("event_id_missing")
             if truth_status not in {"verified", "unverified", "refuted"}:
                 problems.append("event_truth_status_missing_or_invalid")
             if propagation_status not in {"observed", "not_observed", "unknown"}:
                 problems.append("event_propagation_status_missing_or_invalid")
             truth_refs = [str(ref) for ref in event.get("truth_evidence_refs") or []]
             propagation_refs = [str(ref) for ref in event.get("propagation_evidence_refs") or []]
-            if any(ref not in sources for ref in [*truth_refs, *propagation_refs]):
+            origin_refs = [str(ref) for ref in event.get("origin_evidence_refs") or []]
+            if not origin_refs:
+                problems.append("event_origin_evidence_missing")
+            if any(ref not in sources for ref in [*truth_refs, *propagation_refs, *origin_refs]):
                 problems.append("event_status_ref_not_in_current_attempt")
             if event.get("materiality") == "high" and truth_status in {"verified", "refuted"}:
                 truth_sources = [sources[ref] for ref in truth_refs if ref in sources]
                 if not any(item.get("primary") for item in truth_sources) and len(self._independent_groups(truth_sources)) < 2:
                     problems.append("high_impact_fact_lacks_primary_or_independent_confirmation")
             if propagation_status == "observed":
+                observed_from = self._time(event.get("propagation_observed_from"), "event_propagation_observed_from", problems)
+                observed_to = self._time(event.get("propagation_observed_to"), "event_propagation_observed_to", problems)
+                if observed_from and observed_to and observed_from > observed_to:
+                    problems.append("event_propagation_observation_range_invalid")
+                if observed_to and as_of and observed_to > as_of:
+                    problems.append("event_propagation_observation_after_as_of")
                 propagation_sources = [sources[ref] for ref in propagation_refs if ref in sources]
                 if not propagation_sources or not any(
                     str(item.get("market_propagation") or "") == "observed"

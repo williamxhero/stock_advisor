@@ -131,6 +131,18 @@ class CompanionLearningTests(unittest.TestCase):
             )}
         self.assertEqual({"T+1", "T+3", "T+5"}, horizons)
 
+    def test_1430_snapshot_tracks_the_tail_not_an_unfinished_close(self):
+        cycle = self.cycle("daily.execution.1430", "2026-08-25T14:30:00+08:00", "2026-08-25T06:30:00Z")
+        artifact = self.store.append_artifact(
+            cycle["cycle_id"], "m1", "model", "market remains neutral", "2026-08-25T06:30:00Z",
+        )
+
+        snapshot = JudgmentLifecycle(self.store).capture(artifact, "m1", "market remains neutral")
+
+        frozen = json.loads(snapshot["snapshot_json"])
+        self.assertIn("14:30", frozen["horizon"])
+        self.assertNotIn("收盘至下一交易日", frozen["horizon"])
+
     def test_outcome_updates_verification_and_failed_case_is_retrievable(self):
         cycle = self.cycle("daily.execution.0945", "2026-08-25T09:45:00+08:00", "2026-08-25T01:45:00Z")
         artifact = self.store.append_artifact(cycle["cycle_id"], "m1", "model", "603179短线看多。", "2026-08-25T02:00:00Z")

@@ -79,6 +79,34 @@ class StagePacketFreezingTests(TestCase):
             key: value for key, value in builder_packet.items() if key != "sha256"
         }))
 
+    def test_market_understanding_is_a_candidate_only_contract_treatment(self) -> None:
+        packet = {
+            "task_key": "daily.execution.1430",
+            "stage": "m0_research",
+            "as_of": "2026-08-30T14:30:00+08:00",
+            "evidence_contract": {
+                "requirements": [{
+                    "key": "material_events_and_counterevidence",
+                    "window": {"start": "2026-08-30T10:30:00+08:00", "end": "2026-08-30T14:30:00+08:00"},
+                }],
+            },
+        }
+        baseline = finalize_stage_packet(packet, self.controls)
+        candidate = finalize_stage_packet(packet, RuntimeStrategyControls(
+            timeout_seconds=300, max_operations=0, enabled_backends=(), revisions=(),
+            market_understanding_enabled=True,
+        ))
+
+        self.assertNotIn("overseas_market_context", {
+            row["key"] for row in baseline["evidence_contract"]["requirements"]
+        })
+        self.assertTrue(candidate["runtime_strategy_controls"]["market_understanding_enabled"])
+        self.assertEqual(1, candidate["evidence_contract"]["market_understanding_policy_version"])
+        self.assertTrue({"overseas_market_context", "theme_business_and_expectations", "prior_market_understanding_changes"}.issubset({
+            row["key"] for row in candidate["evidence_contract"]["requirements"]
+        }))
+        self.assertNotEqual(baseline["sha256"], candidate["sha256"])
+
     def test_m0_compose_attempt_and_checkpoint_share_final_packet_hash(self) -> None:
         packet = finalize_stage_packet({
             "task_key": "daily.execution.0945",

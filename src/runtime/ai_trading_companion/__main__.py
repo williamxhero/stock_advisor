@@ -25,6 +25,7 @@ from .adaptive_memory import AdaptiveMemoryResearch, MemoryResearchError
 from .broker_client import BrokerError, BrokerRequest, BrokerResponse, ProviderBrokerClient, canonical_packet_hash
 from .config import load_settings, remove_legacy_provider_settings, save_research_settings
 from .engine import CompanionEngine, iso
+from .evidence_contract import EvidenceContractFactory
 from .evidence_gate import EvidenceGate, EvidenceInsufficient
 from .effort_policy import CognitiveEffortPolicy
 from .exchange import LocalExchange
@@ -270,10 +271,15 @@ def finalize_stage_packet(packet: dict[str, Any], controls: RuntimeStrategyContr
         key: value for key, value in packet.items()
         if key not in {"sha256", "runtime_strategy_controls", "allowed_research_backends"}
     }
+    if controls.market_understanding_enabled and isinstance(final_packet.get("evidence_contract"), dict):
+        final_packet["evidence_contract"] = EvidenceContractFactory.with_market_understanding(
+            final_packet["evidence_contract"],
+        )
     final_packet["runtime_strategy_controls"] = {
         "timeout_seconds": controls.timeout_seconds,
         "max_operations": controls.max_operations,
         "enabled_backends": list(controls.enabled_backends),
+        "market_understanding_enabled": controls.market_understanding_enabled,
         "revisions": list(controls.revisions),
     }
     final_packet["allowed_research_backends"] = list(controls.enabled_backends)
@@ -744,6 +750,10 @@ def _call_stage(
     from .opportunities import is_premarket
     settings = load_settings(PATHS.home)
     runtime_strategy = RuntimeStrategyPolicy(store)
+    if runtime_strategy_shadow_cell is None and stage == "m0_research":
+        # Provisioning is idempotent and never overwrites a human-operated cell.
+        # A conflicting cell simply leaves the official baseline untouched.
+        runtime_strategy.provision_market_understanding_candidate()
     controls = frozen_controls or resolve_stage_controls(
         store, stage, timeout=timeout, search=search,
         runtime_strategy_shadow_cell=runtime_strategy_shadow_cell,

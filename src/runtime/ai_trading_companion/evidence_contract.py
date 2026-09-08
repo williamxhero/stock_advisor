@@ -1,6 +1,7 @@
 """Task-semantic, frozen Evidence v4 contracts."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from datetime import datetime, time, timedelta
@@ -524,3 +525,29 @@ class EvidenceContractFactory:
         payload = {key: value for key, value in contract.items() if key != "contract_hash"}
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def with_market_understanding(cls, contract: dict[str, Any]) -> dict[str, Any]:
+        """Derive a candidate-only contract without altering the frozen baseline packet."""
+        value = copy.deepcopy(contract)
+        requirements = [row for row in value.get("requirements") or [] if isinstance(row, dict)]
+        keys = {str(row.get("key") or "") for row in requirements}
+        if "overseas_market_context" in keys:
+            return value
+        event_requirement = next((row for row in requirements if row.get("key") in {
+            "material_events_and_counterevidence", "events_and_counterevidence",
+        }), None)
+        if event_requirement is None or not isinstance(event_requirement.get("window"), dict):
+            raise ValueError("market-understanding candidate requires an event evidence window")
+        prior = next((row for row in requirements if row.get("key") == "prior_judgment_changes"), {})
+        context = {
+            "market_understanding_enabled": True,
+            "prior_judgment_count": int(prior.get("internal_record_count") or 0),
+        }
+        value["requirements"] = [
+            *requirements,
+            *cls._market_understanding_requirements(dict(event_requirement["window"]), context),
+        ]
+        value["market_understanding_policy_version"] = 1
+        value["contract_hash"] = cls.contract_hash(value)
+        return value

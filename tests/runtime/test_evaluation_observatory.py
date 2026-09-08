@@ -775,6 +775,9 @@ class ExperimentAssessmentTests(unittest.TestCase):
                     "runtime_strategy_controls": {"enabled_backends": ["gateway", "market"]},
                     "allowed_research_backends": ["gateway", "market"], "sha256": f"candidate-{index}",
                 }
+                # The candidate may have stricter reasoning requirements while
+                # sharing the exact acquired market context with its baseline.
+                shadow_packet["evidence_contract"] = {"candidate_treatment": True}
                 shadow_attempt = store.begin_attempt(
                     cycle["cycle_id"], "m0_research", at, f"candidate-{index}",
                     is_shadow=True, input_packet=shadow_packet,
@@ -840,7 +843,11 @@ class ExperimentAssessmentTests(unittest.TestCase):
                 mature.snapshot_id, "approve", approver="release-governance",
             )
             self.assertEqual(
-                ["daily.review.1520", "manual.non_trading_outlook", "portfolio.holdings"],
+                [
+                    "daily.opportunity.0900", "daily.execution.0945", "daily.execution.1030",
+                    "daily.execution.1430", "daily.review.1520", "manual.non_trading_outlook",
+                    "portfolio.holdings",
+                ],
                 json.loads(decision.applicable_scope_json),
             )
             self.assertIn("citation_verifiability", json.loads(decision.protected_dimensions_json))
@@ -867,7 +874,7 @@ class ExperimentAssessmentTests(unittest.TestCase):
                 ("market",),
                 policy.controls(
                     "m0_research", timeout_seconds=300, search=True,
-                    task_key="daily.execution.0945",
+                    task_key="periodic.monthly",
                 ).enabled_backends,
             )
 
@@ -1100,6 +1107,45 @@ class ExperimentAssessmentTests(unittest.TestCase):
                 stored = connection.execute("SELECT * FROM runtime_strategy_shadow_job WHERE job_id=?", (job["job_id"],)).fetchone()
             self.assertEqual("succeeded", stored["state"])
             self.assertEqual("shadow-attempt", stored["candidate_attempt_id"])
+
+    def test_market_understanding_candidate_is_idempotent_and_formal_scope_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = CompanionStore(Path(directory) / "companion.sqlite3")
+            store.initialize()
+            policy = RuntimeStrategyPolicy(store)
+
+            first = policy.provision_market_understanding_candidate()
+            second = policy.provision_market_understanding_candidate()
+
+            self.assertIsNotNone(first)
+            self.assertEqual(first["cell_key"], second["cell_key"])
+            self.assertEqual(1, second["revision"])
+            self.assertFalse(policy.controls(
+                "m0_research", timeout_seconds=300, search=True,
+                task_key="daily.execution.1430",
+            ).market_understanding_enabled)
+            shadow = policy.shadow_controls(
+                first["cell_key"], "m0_research", timeout_seconds=300, search=True,
+                task_key="daily.execution.1430",
+            )
+            self.assertTrue(shadow.market_understanding_enabled)
+
+            formal = store.create_cycle(
+                "daily.execution.1430", "2026-10-01T14:30:00+08:00", "2026-10-01T14:30:00+08:00",
+            )
+            periodic = store.create_cycle(
+                "periodic.monthly", "2026-10-01T18:00:00+08:00", "2026-10-01T18:00:00+08:00",
+            )
+            formal_jobs = policy.queue_shadows(
+                formal["cycle_id"], "m0_research", {"task_key": formal["task_key"], "sha256": "formal"},
+                "companion-evidence-result-v3.schema.json", "formal-attempt",
+            )
+            periodic_jobs = policy.queue_shadows(
+                periodic["cycle_id"], "m0_research", {"task_key": periodic["task_key"], "sha256": "periodic"},
+                "companion-evidence-result-v3.schema.json", "periodic-attempt",
+            )
+            self.assertEqual(1, len(formal_jobs))
+            self.assertEqual((), periodic_jobs)
 
     def test_authorized_runtime_strategy_promotes_and_rolls_back_from_live_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

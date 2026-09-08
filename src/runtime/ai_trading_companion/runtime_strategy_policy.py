@@ -10,7 +10,15 @@ from typing import Any
 
 
 POLICY_KINDS = frozenset({"stage_budget", "search_breadth", "source_mix"})
-ACTIVE_RESEARCH_SCOPE = ("daily.review.1520", "manual.non_trading_outlook", "portfolio.holdings")
+ACTIVE_RESEARCH_SCOPE = (
+    "daily.opportunity.0900",
+    "daily.execution.0945",
+    "daily.execution.1030",
+    "daily.execution.1430",
+    "daily.review.1520",
+    "manual.non_trading_outlook",
+    "portfolio.holdings",
+)
 
 
 @dataclass(frozen=True)
@@ -19,6 +27,7 @@ class RuntimeStrategyControls:
     max_operations: int
     enabled_backends: tuple[str, ...]
     revisions: tuple[tuple[str, int], ...]
+    market_understanding_enabled: bool = False
 
 
 class RuntimeStrategyPolicy:
@@ -113,7 +122,7 @@ class RuntimeStrategyPolicy:
             ACTIVE_RESEARCH_SCOPE if evaluation_profile == "active_evidence_research/v1" else ()
         )))
         if evaluation_profile == "active_evidence_research/v1" and set(scope) != set(ACTIVE_RESEARCH_SCOPE):
-            raise ValueError("active research candidate scope must cover close, weekend, and holdings")
+            raise ValueError("active research candidate scope must cover every formal market task, weekend, and holdings")
         key = self.cell_key(policy_kind, stage)
         from .store import now
         with self.store.connection() as connection:
@@ -140,6 +149,34 @@ class RuntimeStrategyPolicy:
             row = connection.execute("SELECT * FROM runtime_strategy_cell WHERE cell_key=?", (key,)).fetchone()
         return dict(row)
 
+    def provision_market_understanding_candidate(self) -> dict[str, Any] | None:
+        """Create the single approved candidate definition without rewriting an operator's cell.
+
+        Its only treatment is the candidate-only evidence contract.  The research
+        backends and packet cutoff remain exactly the baseline's, so a paired run
+        can attribute a quality delta to market understanding rather than a data
+        source change.
+        """
+        baseline = {"enabled_backends": ["gateway", "market"], "market_understanding_enabled": False}
+        candidate = {"enabled_backends": ["gateway", "market"], "market_understanding_enabled": True}
+        key = self.cell_key("source_mix", "m0_research")
+        with self.store.connection() as connection:
+            existing = connection.execute("SELECT * FROM runtime_strategy_cell WHERE cell_key=?", (key,)).fetchone()
+        if existing:
+            if (
+                existing["mode"] == "shadow"
+                and json.loads(existing["baseline_json"]) == baseline
+                and json.loads(existing["candidate_json"] or "null") == candidate
+                and existing["evaluation_profile"] == "active_evidence_research/v1"
+                and set(json.loads(existing["applicable_tasks_json"] or "[]")) == set(ACTIVE_RESEARCH_SCOPE)
+            ):
+                return dict(existing)
+            return None
+        return self.register_shadow_candidate(
+            "source_mix", "m0_research", baseline, candidate,
+            evaluation_profile="active_evidence_research/v1",
+        )
+
     def controls(
         self, stage: str, *, timeout_seconds: int, search: bool, task_key: str | None = None,
     ) -> RuntimeStrategyControls:
@@ -147,7 +184,10 @@ class RuntimeStrategyPolicy:
         defaults = {
             "stage_budget": {"timeout_seconds": max(1, int(timeout_seconds))},
             "search_breadth": {"max_operations": 24 if search else 0},
-            "source_mix": {"enabled_backends": ["gateway", "market"] if search else []},
+            "source_mix": {
+                "enabled_backends": ["gateway", "market"] if search else [],
+                "market_understanding_enabled": False,
+            },
         }
         values, revisions = dict(defaults), []
         with self.store.connection() as connection:
@@ -172,6 +212,7 @@ class RuntimeStrategyPolicy:
             timeout_seconds=min(max(1, int(timeout_seconds)), int(values["stage_budget"]["timeout_seconds"])),
             max_operations=max(0, min(24, int(values["search_breadth"]["max_operations"]))),
             enabled_backends=enabled if search else (), revisions=tuple(sorted(revisions)),
+            market_understanding_enabled=bool(values["source_mix"].get("market_understanding_enabled")),
         )
 
     def shadow_controls(
@@ -192,15 +233,18 @@ class RuntimeStrategyPolicy:
             return RuntimeStrategyControls(
                 timeout_seconds=min(max(1, int(timeout_seconds)), int(value["timeout_seconds"])),
                 max_operations=controls.max_operations, enabled_backends=controls.enabled_backends, revisions=revisions,
+                market_understanding_enabled=controls.market_understanding_enabled,
             )
         if row["policy_kind"] == "search_breadth":
             return RuntimeStrategyControls(
                 timeout_seconds=controls.timeout_seconds, max_operations=max(0, min(24, int(value["max_operations"]))),
                 enabled_backends=controls.enabled_backends, revisions=revisions,
+                market_understanding_enabled=controls.market_understanding_enabled,
             )
         return RuntimeStrategyControls(
             timeout_seconds=controls.timeout_seconds, max_operations=controls.max_operations,
             enabled_backends=tuple(str(item) for item in value["enabled_backends"]) if search else (), revisions=revisions,
+            market_understanding_enabled=bool(value.get("market_understanding_enabled")),
         )
 
     def queue_shadows(
@@ -224,13 +268,17 @@ class RuntimeStrategyPolicy:
                 elif stage == "m1_judgment" and cycle["m1_publish_deadline"]:
                     value_window_end = str(cycle["m1_publish_deadline"])
             cells = connection.execute(
-                """SELECT cell_key FROM runtime_strategy_cell
+                """SELECT cell_key,evaluation_profile,applicable_tasks_json FROM runtime_strategy_cell
                      WHERE cell_key IN (?,?,?) AND mode='shadow' AND candidate_json IS NOT NULL
                      ORDER BY policy_kind""",
                 tuple(self.cell_key(kind, stage) for kind in ("stage_budget", "search_breadth", "source_mix")),
             ).fetchall()
             job_ids: list[str] = []
             for cell in cells:
+                if cycle and cell["evaluation_profile"] == "active_evidence_research/v1":
+                    scope = set(json.loads(cell["applicable_tasks_json"] or "[]"))
+                    if cycle["task_key"] not in scope:
+                        continue
                 job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"runtime-shadow|{cell['cell_key']}|{cycle_id}|{stage}|{baseline_attempt_id}"))
                 connection.execute(
                     """INSERT OR IGNORE INTO runtime_strategy_shadow_job(
@@ -451,7 +499,13 @@ class RuntimeStrategyPolicy:
     def _context_fingerprint(packet: dict[str, Any]) -> str:
         frozen = {
             key: value for key, value in packet.items()
-            if key not in {"sha256", "runtime_strategy_controls", "allowed_research_backends"}
+            # Evidence contract is the candidate treatment, rather than a market
+            # input.  It intentionally differs while all acquired facts and the
+            # frozen cutoff must remain identical.
+            if key not in {
+                "sha256", "runtime_strategy_controls", "allowed_research_backends",
+                "evidence_contract", "evidence_requirements",
+            }
         }
         return hashlib.sha256(
             json.dumps(frozen, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
@@ -465,6 +519,13 @@ class RuntimeStrategyPolicy:
             return
         if policy_kind == "search_breadth" and set(value) == {"max_operations"} and isinstance(value["max_operations"], int) and 0 <= value["max_operations"] <= 24:
             return
-        if policy_kind == "source_mix" and set(value) == {"enabled_backends"} and isinstance(value["enabled_backends"], list) and set(value["enabled_backends"]).issubset({"gateway", "market"}):
+        if (
+            policy_kind == "source_mix"
+            and set(value).issubset({"enabled_backends", "market_understanding_enabled"})
+            and "enabled_backends" in value
+            and isinstance(value["enabled_backends"], list)
+            and set(value["enabled_backends"]).issubset({"gateway", "market"})
+            and isinstance(value.get("market_understanding_enabled", False), bool)
+        ):
             return
         raise ValueError("invalid runtime strategy value")

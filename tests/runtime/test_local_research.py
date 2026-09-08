@@ -1875,6 +1875,7 @@ class LocalResearchTests(unittest.TestCase):
                 "breadth": {"up": 2218, "down": 2827, "flat": 166, "limit_up": 51, "limit_down": 8},
             }, ensure_ascii=False),
         })
+        ledger.extend(json.loads(json.dumps(ledger, ensure_ascii=False)))
         stale_close = "2026-09-02T07:00:00Z"
         stale_rows = json.loads(json.dumps(rows, ensure_ascii=False))
         for values in stale_rows.values():
@@ -1927,6 +1928,7 @@ class LocalResearchTests(unittest.TestCase):
             self.assertEqual(set(spec["entities"]), {
                 row["symbol"] for payload in payloads for row in payload[spec["field"]]
             })
+            self.assertEqual(len(spec["entities"]), len(result["results"]))
 
         candidate_contract = {
             "version": 4, "as_of": as_of, "requirements": [{
@@ -1962,9 +1964,11 @@ class LocalResearchTests(unittest.TestCase):
         backend = ToolCatalogMarketBackend(
             runner, contract=combined_contract, deadline=lambda: 10.0, daily_ledger=ledger,
         )
-        self.assertEqual("daily_evidence_ledger", backend(
+        breadth_result = backend(
             "market_breadth", {"_requirement_key": "market_breadth"},
-        )["source"])
+        )
+        self.assertEqual("daily_evidence_ledger", breadth_result["source"])
+        self.assertEqual(1, len(breadth_result["results"]))
         runner.reset_mock()
         research = LocalResearchChain(
             lambda *_: {"version": 1, "operations": []},

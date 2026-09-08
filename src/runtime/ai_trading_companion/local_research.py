@@ -542,6 +542,7 @@ class ToolCatalogMarketBackend:
             json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) for row in rows
         }
         results = []
+        emitted: set[tuple[str, str]] = set()
         for _, url, title, source_rows in candidates:
             source_rows = [
                 row for row in source_rows
@@ -550,6 +551,10 @@ class ToolCatalogMarketBackend:
             if not source_rows:
                 continue
             excerpt = json.dumps({field: source_rows, "finality": request.finality}, ensure_ascii=False, sort_keys=True)
+            identity = (url, excerpt)
+            if identity in emitted:
+                continue
+            emitted.add(identity)
             results.append({
                 "url": url, "title": title, "excerpt_text": excerpt,
                 "fact_as_of": request.required_at, "raw_artifact_ref": None,
@@ -608,11 +613,18 @@ class ToolCatalogMarketBackend:
         }
         if validate_capability_data(request, request.required_at, data) is not None:
             return None
-        results = [{
-            "url": url, "title": title,
-            "excerpt_text": json.dumps(payload, ensure_ascii=False, sort_keys=True),
-            "fact_as_of": request.required_at, "raw_artifact_ref": None,
-        } for url, title, payload in candidates]
+        results = []
+        emitted: set[tuple[str, str]] = set()
+        for url, title, payload in candidates:
+            excerpt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            identity = (url, excerpt)
+            if identity in emitted:
+                continue
+            emitted.add(identity)
+            results.append({
+                "url": url, "title": title, "excerpt_text": excerpt,
+                "fact_as_of": request.required_at, "raw_artifact_ref": None,
+            })
         return {
             "url": results[0]["url"], "text": results[0]["excerpt_text"],
             "source": "daily_evidence_ledger", "raw_artifact_ref": None, "results": results,

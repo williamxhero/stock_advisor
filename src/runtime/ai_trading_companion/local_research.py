@@ -2312,8 +2312,8 @@ def _public_gap_query(requirement_key: str, requirement: dict[str, Any]) -> str:
         "forum_and_sentiment": "论坛 股吧 市场情绪",
         "market_fund_flow": "板块 主力资金 净流入 净流出 金额 排名",
         "material_events_and_counterevidence": "政策 监管 风险 重要事件 反证",
-        "overseas_market_context": "Japan Korea market global risk A-share industry linkage",
-        "theme_business_and_expectations": "industry chain theme catalyst expectations priced in counterevidence",
+        "overseas_market_context": "日本股市 韩国股市 全球风险 A股 联动 产业竞争",
+        "theme_business_and_expectations": "产业链 题材 催化 预期 已计价 估值 反证",
     }.get(requirement_key, "可验证事实")
     entities = " ".join(str(value) for value in requirement.get("required_entities") or [] if str(value))
     return " ".join(value for value in (

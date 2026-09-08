@@ -101,6 +101,16 @@ def core_problems(core: dict, packet: dict) -> list[str]:
     }
     if material_event_refs and not material_event_refs.intersection(refs):
         problems.append("decision_omits_high_impact_event_evidence")
+    coverage = {
+        str(row.get("requirement_key") or ""): row
+        for row in (packet.get("evidence") or {}).get("coverage") or []
+        if isinstance(row, dict)
+    }
+    for key in ("overseas_market_context", "theme_business_and_expectations"):
+        row = coverage.get(key) or {}
+        required_refs = {str(ref) for ref in row.get("evidence_refs") or [] if str(ref)}
+        if row.get("status") == "covered" and required_refs and not required_refs.intersection(refs):
+            problems.append("decision_omits_market_context_evidence:" + key)
     conditions = core.get("transition_conditions") or []
     if {item.get("outcome") for item in conditions} != {"upgrade", "downgrade"}:
         problems.append("decision_missing_bidirectional_conditions")

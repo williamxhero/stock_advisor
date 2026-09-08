@@ -298,12 +298,14 @@ class EvidenceContractFactory:
                 "allowed_coverage": ["covered", "checked_no_change"],
                 "window": events_window,
                 "negative_query_terms": ["Japan market", "Korea market", "global risk", "A-share linkage"],
+                "evidence_terms": [["Japan", "日本"], ["Korea", "韩国"], ["A-share", "A股"]],
             },
             {
                 "key": "theme_business_and_expectations", "blocking": True,
                 "allowed_coverage": ["covered", "checked_no_change"],
                 "window": events_window,
                 "negative_query_terms": ["industry chain", "theme catalyst", "expectations", "counterevidence"],
+                "evidence_terms": [["industry", "行业", "产业链", "theme", "题材"], ["expectation", "预期", "catalyst", "催化", "valuation", "估值"]],
             },
             {
                 "key": "prior_market_understanding_changes", "blocking": True,

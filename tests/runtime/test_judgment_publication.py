@@ -368,6 +368,29 @@ def test_high_impact_event_must_reach_the_decision_core():
     assert "decision_omits_high_impact_event_evidence" not in core_problems(decision, frozen)
 
 
+def test_covered_overseas_and_theme_context_must_reach_the_decision_core():
+    frozen = packet()
+    frozen["evidence"]["sources"].extend([
+        {"evidence_ref": "ev_overseas", "excerpt": "Japan and Korea markets weakened"},
+        {"evidence_ref": "ev_theme", "excerpt": "industry theme expectations are already priced in"},
+    ])
+    frozen["evidence"]["coverage"] = [
+        {"requirement_key": "overseas_market_context", "status": "covered", "evidence_refs": ["ev_overseas"]},
+        {"requirement_key": "theme_business_and_expectations", "status": "covered", "evidence_refs": ["ev_theme"]},
+    ]
+
+    assert "decision_omits_market_context_evidence:overseas_market_context" in core_problems(core(), frozen)
+    decision = core()
+    decision["reasons"].extend([
+        {"fact": "Japan and Korea markets weakened", "evidence_refs": ["ev_overseas"], "mechanism": "risk appetite", "implication": "keep risk contained"},
+        {"fact": "industry theme expectations are already priced in", "evidence_refs": ["ev_theme"], "mechanism": "expectations", "implication": "do not chase"},
+    ])
+    assert not any(
+        problem.startswith("decision_omits_market_context_evidence:")
+        for problem in core_problems(decision, frozen)
+    )
+
+
 def test_event_transition_schema_rejects_an_unbound_event():
     schema = json.loads((SCHEMAS / "companion-m1-result-v4.schema.json").read_text(encoding="utf-8"))
     item_schema = schema["properties"]["semantic"]["properties"]["transition_conditions"]["items"]

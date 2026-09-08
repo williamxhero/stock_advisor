@@ -292,6 +292,8 @@ class EvidenceV3Tests(TestCase):
 
         self.assertEqual(["covered", "checked_no_change"], requirements["overseas_market_context"]["allowed_coverage"])
         self.assertEqual(["covered", "checked_no_change"], requirements["theme_business_and_expectations"]["allowed_coverage"])
+        self.assertEqual([["Japan", "日本"], ["Korea", "韩国"], ["A-share", "A股"]], requirements["overseas_market_context"]["evidence_terms"])
+        self.assertEqual(2, len(requirements["theme_business_and_expectations"]["evidence_terms"]))
         self.assertEqual("internal_runtime", requirements["prior_market_understanding_changes"]["evidence_class"])
         self.assertEqual(1, requirements["prior_market_understanding_changes"]["internal_record_count"])
         self.assertEqual("2026-08-26T06:30:00Z", requirements["overseas_market_context"]["window"]["end"])

@@ -14,6 +14,7 @@ from .stage_expression import (
     canonical_direction, normalize_stage_output, semantic_snapshot_conflicts,
     verified_weekly_market_comparison,
 )
+from .transition_conditions import is_valid_condition
 
 
 RESEARCH_STAGES = frozenset({"m0_research", "m1_research", "outcome_research", "chat_research"})
@@ -293,7 +294,7 @@ class CognitiveRouter:
             if semantic.get("qualified") and not conditions:
                 problems.append("qualified_judgment_lacks_joint_confirmation")
             for condition in conditions:
-                if not all(str(condition.get(key) or "").strip() for key in ("price", "breadth", "persistence")):
+                if not is_valid_condition(condition):
                     problems.append("judgment_transition_lacks_joint_confirmation")
                     break
             positions = [item for item in semantic.get("position_focus") or [] if isinstance(item, dict)]

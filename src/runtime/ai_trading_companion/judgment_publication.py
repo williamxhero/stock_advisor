@@ -19,6 +19,7 @@ from .opportunities import (
     is_premarket, plan_problems, followup_problems, review_result_problems,
     PLAN_INSTRUCTION, FOLLOWUP_INSTRUCTION, REVIEW_RESULT_INSTRUCTION,
 )
+from .transition_conditions import condition_text, is_valid_condition
 
 
 class JudgmentUnavailable(BrokerError):
@@ -47,6 +48,39 @@ def evidence_sources(packet: dict) -> dict[str, dict]:
             if isinstance(row, dict) and row.get("evidence_ref")}
 
 
+def _with_event_transition_conditions(schema: dict[str, Any]) -> dict[str, Any]:
+    """Allow v2 event boundaries while preserving the legacy market condition."""
+    value = copy.deepcopy(schema)
+
+    def visit(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        properties = node.get("properties")
+        if isinstance(properties, dict) and isinstance(properties.get("transition_conditions"), dict):
+            conditions = properties["transition_conditions"]
+            legacy = copy.deepcopy(conditions.get("items") or {})
+            conditions["items"] = {"oneOf": [legacy, {
+                "type": "object", "additionalProperties": False,
+                "required": ["outcome", "kind", "event", "evidence_refs"],
+                "properties": {
+                    "outcome": {"type": "string", "enum": ["upgrade", "downgrade"]},
+                    "kind": {"type": "string", "const": "event"},
+                    "event": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "evidence_refs": {"type": "array", "minItems": 1, "maxItems": 6,
+                                      "items": {"type": "string", "minLength": 1}},
+                },
+            }]}
+        for child in node.values():
+            if isinstance(child, dict):
+                visit(child)
+            elif isinstance(child, list):
+                for item in child:
+                    visit(item)
+
+    visit(value)
+    return value
+
+
 def core_problems(core: dict, packet: dict) -> list[str]:
     sources = evidence_sources(packet)
     problems: list[str] = []
@@ -61,6 +95,8 @@ def core_problems(core: dict, packet: dict) -> list[str]:
     conditions = core.get("transition_conditions") or []
     if {item.get("outcome") for item in conditions} != {"upgrade", "downgrade"}:
         problems.append("decision_missing_bidirectional_conditions")
+    if any(not is_valid_condition(item) for item in conditions if isinstance(item, dict)):
+        problems.append("decision_invalid_transition_condition")
     private = (packet.get("business_context") or {}).get("private_context_before_h0") or {}
     if not private:
         private = (packet.get("business_context") or {}).get("portfolio") or {}
@@ -242,6 +278,12 @@ def _bounded_model_text(value: Any, limit: int) -> str:
     return text[:head] + marker + text[-(remaining - head):]
 
 
+def _render_condition(row: dict[str, Any]) -> dict[str, Any]:
+    if str(row.get("kind") or "") != "event":
+        return row
+    return {**row, "price": condition_text(row), "breadth": "", "persistence": ""}
+
+
 def render_core(core: dict) -> str:
     """Recovery prose contains only clauses from the reviewed, frozen decision."""
     if core.get("opportunity_plan"):
@@ -253,7 +295,7 @@ def render_core(core: dict) -> str:
     conditions = " ".join(
         ("我会上调判断的条件是" if row["outcome"] == "upgrade" else "我会下调判断的条件是")
         + "，".join(row[key].rstrip("。；，") for key in ("price", "breadth", "persistence")) + "。"
-        for row in core["transition_conditions"]
+        for row in [_render_condition(row) for row in core["transition_conditions"]]
     )
     paragraphs = [
         core["thesis"].rstrip("。") + "。" + core["action_reason"].rstrip("。") + "。",
@@ -370,7 +412,9 @@ def review_passed(review: dict, core_hash: str, draft_hash: str) -> bool:
 def publication_problems(output: dict, packet: dict) -> list[str]:
     core = output.get("decision_core") or {}
     name = "companion-m1-result-v5" if output.get("result_version") == 5 else "companion-m2-result-v4"
-    schema = json.loads((RuntimePaths.discover().contracts / (name + ".schema.json")).read_text(encoding="utf-8"))
+    schema = _with_event_transition_conditions(json.loads(
+        (RuntimePaths.discover().contracts / (name + ".schema.json")).read_text(encoding="utf-8")
+    ))
     if not _validate_schema(output, schema)["passed"]:
         return ["publication_invalid_schema"]
     digest = canonical_packet_hash(core)
@@ -439,7 +483,9 @@ class JudgmentPublicationPipeline:
     def _call(self, stage: str, cycle: dict, packet: dict, schema_name: str, deadline: float) -> tuple[dict, str]:
         if time.monotonic() >= deadline:
             raise TimeoutError("judgment publication deadline")
-        schema = json.loads((self.schemas / (schema_name + ".schema.json")).read_text(encoding="utf-8"))
+        schema = _with_event_transition_conditions(json.loads(
+            (self.schemas / (schema_name + ".schema.json")).read_text(encoding="utf-8")
+        ))
         digest = canonical_packet_hash(packet)
         audit_packet = {**packet, "sha256": digest}
         attempt = self.store.begin_attempt(

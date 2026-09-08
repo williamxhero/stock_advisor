@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ai_trading_companion.broker_client import BrokerResponse, canonical_packet_hash
+from ai_trading_companion.broker_client import BrokerResponse, _validate_schema, canonical_packet_hash
 from ai_trading_companion.judgment_publication import (
     JudgmentPublicationPipeline, JudgmentUnavailable, core_problems, model_business_context,
     model_evidence, render_core,
@@ -342,6 +342,28 @@ def test_shadow_never_reuses_production_core(tmp_path):
 def test_malformed_final_core_is_rejected_without_crashing():
     output = {"result_version": 5, "decision_core": {"thesis": "missing required fields"}}
     assert not CognitiveRouter().verify("m1_judgment", packet(), output)["passed"]
+
+
+def test_event_transition_is_evidence_bound_and_renders_without_market_proxy():
+    decision = core()
+    decision["transition_conditions"][0] = {
+        "outcome": "upgrade", "kind": "event", "event": "official order confirmation",
+        "evidence_refs": ["ev_market"],
+    }
+
+    assert not core_problems(decision, packet())
+    assert "official order confirmation" in render_core(decision)
+
+
+def test_event_transition_schema_rejects_an_unbound_event():
+    schema = json.loads((SCHEMAS / "companion-m1-result-v4.schema.json").read_text(encoding="utf-8"))
+    item_schema = schema["properties"]["semantic"]["properties"]["transition_conditions"]["items"]
+    valid = {"outcome": "upgrade", "kind": "event", "event": "official order confirmation",
+             "evidence_refs": ["ev_market"]}
+    invalid = {"outcome": "upgrade", "kind": "event", "event": "official order confirmation"}
+
+    assert _validate_schema(valid, item_schema)["passed"]
+    assert not _validate_schema(invalid, item_schema)["passed"]
 
 
 def test_recovery_conditions_do_not_duplicate_punctuation():

@@ -8,6 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .stage_output_compat import adapt_legacy_stage_output
+from .transition_conditions import condition_text
 
 
 @dataclass(frozen=True)
@@ -78,11 +79,7 @@ def _semantic_snapshot(semantic: dict[str, Any]) -> dict[str, Any]:
 
 
 def _condition_text(condition: dict[str, Any]) -> str:
-    return "，".join(
-        str(condition.get(key) or "").strip().rstrip("。！？；，,.!?; ")
-        for key in ("price", "breadth", "persistence")
-        if str(condition.get(key) or "").strip()
-    )
+    return condition_text(condition)
 
 
 def _clean_values(values: Any, limit: int) -> list[str]:

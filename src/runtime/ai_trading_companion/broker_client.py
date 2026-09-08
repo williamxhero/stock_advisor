@@ -362,6 +362,15 @@ def _contains_h0(value: Any) -> bool:
 def _validate_schema(value: Any, schema: dict[str, Any] | None, path: str = "$") -> dict[str, Any]:
     if schema is None:
         return {"passed": True, "problems": []}
+    if isinstance(schema.get("oneOf"), list):
+        alternatives = [_validate_schema(value, item, path) for item in schema["oneOf"] if isinstance(item, dict)]
+        matched = [item for item in alternatives if item["passed"]]
+        if len(matched) == 1:
+            return {"passed": True, "problems": []}
+        if not matched:
+            details = [problem for item in alternatives for problem in item["problems"]]
+            return {"passed": False, "problems": list(dict.fromkeys(details))}
+        return {"passed": False, "problems": [f"{path}: ambiguous oneOf"]}
     problems: list[str] = []
     expected = schema.get("type")
     valid = {"object": isinstance(value, dict), "array": isinstance(value, list), "string": isinstance(value, str),

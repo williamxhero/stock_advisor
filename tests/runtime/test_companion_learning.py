@@ -422,6 +422,29 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertIn("judgment_transition_lacks_joint_confirmation", weak_condition["problems"])
         self.assertIn("judgment_position_priority_is_cost_anchored", cost_anchored["problems"])
 
+    def test_v4_m1_accepts_an_evidence_bound_event_transition_without_market_proxy(self):
+        semantic = {
+            "summary": "An official clarification changes the earlier rumour state.",
+            "direction": "neutral", "qualified": True, "horizon": "next session",
+            "current_action": "observe", "key_evidence": ["clarification released"],
+            "transition_conditions": [{
+                "outcome": "upgrade", "kind": "event", "event": "official order confirmation",
+                "evidence_refs": ["ev_announcement"],
+            }, {
+                "outcome": "downgrade", "price": "index weakens",
+                "breadth": "decliners expand", "persistence": "through the close",
+            }],
+            "position_focus": [], "risks": [], "unknowns": [],
+        }
+
+        verdict = CognitiveRouter().verify("m1_judgment", {"task_key": "daily.execution.1430"}, {
+            "result_version": 4, "semantic": semantic,
+        })
+
+        self.assertTrue(verdict["passed"], verdict["problems"])
+        rendered = normalize_stage_output("m1_judgment", {"result_version": 4, "semantic": semantic})
+        self.assertIn("official order confirmation", rendered.text)
+
     def test_weekend_m1_requires_an_explicit_completed_week_comparison(self):
         sources = []
         for symbol, end in (("sh000001", 98.0), ("sz399001", 97.0), ("sz399006", 96.0)):

@@ -359,11 +359,40 @@ def _contains_h0(value: Any) -> bool:
     return False
 
 
-def _validate_schema(value: Any, schema: dict[str, Any] | None, path: str = "$") -> dict[str, Any]:
+def _validate_schema(
+    value: Any,
+    schema: dict[str, Any] | None,
+    path: str = "$",
+    *,
+    _root: dict[str, Any] | None = None,
+    _references: tuple[str, ...] = (),
+) -> dict[str, Any]:
     if schema is None:
         return {"passed": True, "problems": []}
+    root = schema if _root is None else _root
+    reference = schema.get("$ref")
+    if isinstance(reference, str):
+        if reference in _references:
+            return {"passed": False, "problems": [f"{path}: recursive schema reference {reference}"]}
+        resolved = _resolve_local_schema_reference(root, reference)
+        if resolved is None:
+            return {"passed": False, "problems": [f"{path}: unresolved schema reference {reference}"]}
+        referenced = _validate_schema(
+            value, resolved, path, _root=root, _references=(*_references, reference),
+        )
+        siblings = {key: item for key, item in schema.items() if key != "$ref"}
+        if not siblings:
+            return referenced
+        sibling_result = _validate_schema(
+            value, siblings, path, _root=root, _references=_references,
+        )
+        problems = [*referenced["problems"], *sibling_result["problems"]]
+        return {"passed": not problems, "problems": list(dict.fromkeys(problems))}
     if isinstance(schema.get("oneOf"), list):
-        alternatives = [_validate_schema(value, item, path) for item in schema["oneOf"] if isinstance(item, dict)]
+        alternatives = [
+            _validate_schema(value, item, path, _root=root, _references=_references)
+            for item in schema["oneOf"] if isinstance(item, dict)
+        ]
         matched = [item for item in alternatives if item["passed"]]
         if len(matched) == 1:
             return {"passed": True, "problems": []}
@@ -371,6 +400,15 @@ def _validate_schema(value: Any, schema: dict[str, Any] | None, path: str = "$")
             details = [problem for item in alternatives for problem in item["problems"]]
             return {"passed": False, "problems": list(dict.fromkeys(details))}
         return {"passed": False, "problems": [f"{path}: ambiguous oneOf"]}
+    if isinstance(schema.get("anyOf"), list):
+        alternatives = [
+            _validate_schema(value, item, path, _root=root, _references=_references)
+            for item in schema["anyOf"] if isinstance(item, dict)
+        ]
+        if any(item["passed"] for item in alternatives):
+            return {"passed": True, "problems": []}
+        details = [problem for item in alternatives for problem in item["problems"]]
+        return {"passed": False, "problems": list(dict.fromkeys(details))}
     problems: list[str] = []
     expected = schema.get("type")
     valid = {"object": isinstance(value, dict), "array": isinstance(value, list), "string": isinstance(value, str),
@@ -387,12 +425,47 @@ def _validate_schema(value: Any, schema: dict[str, Any] | None, path: str = "$")
             problems.extend(f"{path}.{key}: additional property" for key in value if key not in properties)
         for key, child in properties.items():
             if key in value and isinstance(child, dict):
-                problems.extend(_validate_schema(value[key], child, f"{path}.{key}")["problems"])
+                problems.extend(_validate_schema(
+                    value[key], child, f"{path}.{key}", _root=root, _references=_references,
+                )["problems"])
     if isinstance(value, list) and isinstance(schema.get("items"), dict):
         for index, item in enumerate(value):
-            problems.extend(_validate_schema(item, schema["items"], f"{path}[{index}]")["problems"])
+            problems.extend(_validate_schema(
+                item, schema["items"], f"{path}[{index}]", _root=root, _references=_references,
+            )["problems"])
     if "enum" in schema and value not in schema["enum"]:
         problems.append(f"{path}: not in enum")
     if "const" in schema and value != schema["const"]:
         problems.append(f"{path}: const mismatch")
+    if isinstance(value, str):
+        if isinstance(schema.get("minLength"), int) and len(value) < schema["minLength"]:
+            problems.append(f"{path}: shorter than minLength")
+        if isinstance(schema.get("maxLength"), int) and len(value) > schema["maxLength"]:
+            problems.append(f"{path}: longer than maxLength")
+    if isinstance(value, list):
+        if isinstance(schema.get("minItems"), int) and len(value) < schema["minItems"]:
+            problems.append(f"{path}: fewer than minItems")
+        if isinstance(schema.get("maxItems"), int) and len(value) > schema["maxItems"]:
+            problems.append(f"{path}: more than maxItems")
+        if schema.get("uniqueItems") is True:
+            fingerprints = [json.dumps(item, ensure_ascii=False, sort_keys=True) for item in value]
+            if len(fingerprints) != len(set(fingerprints)):
+                problems.append(f"{path}: duplicate items")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(schema.get("minimum"), (int, float)) and value < schema["minimum"]:
+            problems.append(f"{path}: below minimum")
+        if isinstance(schema.get("maximum"), (int, float)) and value > schema["maximum"]:
+            problems.append(f"{path}: above maximum")
     return {"passed": not problems, "problems": problems}
+
+
+def _resolve_local_schema_reference(root: dict[str, Any], reference: str) -> dict[str, Any] | None:
+    if not reference.startswith("#/"):
+        return None
+    current: Any = root
+    for raw_part in reference[2:].split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current if isinstance(current, dict) else None

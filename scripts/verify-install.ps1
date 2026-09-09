@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$InstallRoot = (Split-Path -Parent $PSScriptRoot),
-    [string]$CompanionHome = (Join-Path $env:LOCALAPPDATA 'AITradingCompanion'),
+    [string]$CompanionHome = 'D:\APP\AITradingCompanion',
     [string]$ExpectedRevision
 )
 

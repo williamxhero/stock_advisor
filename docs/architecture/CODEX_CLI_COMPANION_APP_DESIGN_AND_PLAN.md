@@ -2,7 +2,7 @@
 
 状态：canonical；2026-08-27 更新为“统一认知伙伴”。本文取代旧的分角色对外形象、独立持仓语义调用、普通聊天 per-cycle 和聊天自动修订正式判断设计。
 
-实现状态：2026-08-25 已完成并迁移为独立本机应用。SQLite 是事实源，`%LOCALAPPDATA%\AITradingCompanion\workspace\state\20_COMPANION_MEMORY.md` 是可重建投影；旧 Codex 自动化已退役，正式日程由本地服务执行。
+实现状态：2026-08-25 已完成并迁移为独立本机应用；2026-09-09 产品根迁移到 `D:\APP\AITradingCompanion`。SQLite 是事实源，`D:\APP\AITradingCompanion\workspace\state\20_COMPANION_MEMORY.md` 是可重建投影；旧 Codex 自动化已退役，正式日程由本地服务执行。
 
 ## 1. 产品目标
 

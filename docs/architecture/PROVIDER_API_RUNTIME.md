@@ -1,6 +1,6 @@
 # 小电脑 Provider Broker 运行时
 
-应用唯一的 LLM 边界是小电脑上的 Provider Broker：`<broker.url>/v1/generate` 与 `<broker.url>/v1/generate/stream`。`broker.url` 位于 `%LOCALAPPDATA%\AITradingCompanion\config\settings.local.json`，默认值是 `http://yosef-server:8817`；它只能是 Broker 根 URL，不能包含路径、认证信息或 Provider 直连参数，也不读取环境变量覆盖。
+应用唯一的 LLM 边界是小电脑上的 Provider Broker：`<broker.url>/v1/generate` 与 `<broker.url>/v1/generate/stream`。`broker.url` 位于 `D:\APP\AITradingCompanion\config\settings.local.json`，默认值是 `http://yosef-server:8817`；它只能是 Broker 根 URL，不能包含路径、认证信息或 Provider 直连参数，也不读取环境变量覆盖。
 
 请求只发送 `prompt`、`intellect`、`effort`、`deadline_ms` 和 `output_token_limit`。局域网接口不使用 Client Token 或 `Authorization`，也绝不发送 `model`。模型、Provider、竞速、升级、用量与成本路由全部由 Broker 负责。
 

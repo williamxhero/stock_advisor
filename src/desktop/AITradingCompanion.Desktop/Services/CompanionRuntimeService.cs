@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using AITradingCompanion.Core;
 
 namespace AITradingCompanion.Desktop.Services;
 
@@ -14,7 +15,7 @@ public static class CompanionRuntimeService
             throw new FileNotFoundException("伴生运行服务脚本不可读。", script);
         }
         var dataRoot = Environment.GetEnvironmentVariable("AI_TRADING_COMPANION_HOME")
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AITradingCompanion");
+            ?? ProductPaths.DefaultDataRoot;
         var heartbeat = Path.Combine(dataRoot, "runtime", "service-heartbeat.json");
         if (File.Exists(heartbeat) && File.GetLastWriteTimeUtc(heartbeat) >= DateTime.UtcNow.AddSeconds(-30))
         {

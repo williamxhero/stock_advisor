@@ -90,7 +90,7 @@ AI 正在流式回复时，用户仍可继续发送消息，但这些消息保�
 
 ## 本机运行时契约
 
-桌面端不得直接读取或写入业务主库，也不得直接访问 MemoryHub。运行时仍是持仓、成交、日程、任务、终止令牌和命令回执等当前业务事实的唯一写入者；桌面端只通过 `%LOCALAPPDATA%\AITradingCompanion\exchange` 的版本化 JSON 提交幂等命令、读取只读投影和接收回执。认证凭证不得写入 Exchange、日志、模型上下文或 MemoryHub。
+桌面端不得直接读取或写入业务主库，也不得直接访问 MemoryHub。运行时仍是持仓、成交、日程、任务、终止令牌和命令回执等当前业务事实的唯一写入者；桌面端只通过 `D:\APP\AITradingCompanion\exchange` 的版本化 JSON 提交幂等命令、读取只读投影和接收回执。认证凭证不得写入 Exchange、日志、模型上下文或 MemoryHub。
 
 正式用户与 AI 消息历史、跨任务长期记忆、判断—结果—复盘链及其双时间由独立 MemoryHub 拥有。Runtime 只通过版本化 MemoryHub interface 访问这些事实，并负责将只读 timeline 投影到 Exchange；MemoryHub 不拥有当前持仓、工作流或交易判断。迁移完成后 MemoryHub 是应用硬依赖，不允许静默回退到本地记忆形成第二套人格。
 

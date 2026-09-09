@@ -1,12 +1,12 @@
+using AITradingCompanion.Core;
+
 namespace AITradingCompanion.Desktop.Services;
 
 public sealed class AppPaths
 {
     public AppPaths(string? dataDirectory = null)
     {
-        DataDirectory = dataDirectory ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AITradingCompanion");
+        DataDirectory = ProductPaths.ResolveDataRoot(dataDirectory);
         var uiDirectory = Path.Combine(DataDirectory, "ui");
         RuntimeSettingsPath = Path.Combine(DataDirectory, "config", "settings.local.json");
         SettingsPath = Path.Combine(uiDirectory, "settings.json");

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$CompanionHome = (Join-Path $env:LOCALAPPDATA 'AITradingCompanion'),
+    [string]$CompanionHome = 'D:\APP\AITradingCompanion',
     [string]$LegacyRoot = (Split-Path -Parent $PSScriptRoot)
 )
 

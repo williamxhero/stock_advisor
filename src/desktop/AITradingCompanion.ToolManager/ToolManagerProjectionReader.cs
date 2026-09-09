@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.IO;
 using System.Linq;
+using AITradingCompanion.Core;
 
 namespace AITradingCompanion.ToolManager;
 
@@ -18,7 +19,7 @@ public sealed class ToolManagerProjectionReader
 
     public ToolManagerProjectionReader(string? dataDirectory = null)
     {
-        var root = dataDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AITradingCompanion");
+        var root = ProductPaths.ResolveDataRoot(dataDirectory);
         _projectionPath = Path.Combine(root, "exchange", "tool-manager", "projection.json");
     }
 

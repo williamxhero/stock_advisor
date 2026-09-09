@@ -8,7 +8,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ai_trading_companion.broker_client import BrokerError, BrokerRequest, ProviderBrokerClient, canonical_packet_hash
+from ai_trading_companion.broker_client import (
+    BrokerError,
+    BrokerRequest,
+    ProviderBrokerClient,
+    _validate_schema,
+    canonical_packet_hash,
+)
 from ai_trading_companion.config import load_settings, settings_path
 
 
@@ -121,6 +127,33 @@ class BrokerClientTests(unittest.TestCase):
             ["formal_reply_exposes_research_log"],
             raised.exception.verifier["business"]["problems"],
         )
+
+    def test_schema_validation_resolves_one_of_references_for_cognition_actions(self) -> None:
+        schema_path = Path(__file__).resolve().parents[2] / "resources" / "contracts" / "companion-cognition-result-v2.schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        output = {
+            "answer": None,
+            "needs_fresh_search": True,
+            "public_search_request": {"topics": ["隔夜消息"], "questions": ["今天怎么看"]},
+            "propositions": [],
+            "actions": [{
+                "action_type": "analysis.request",
+                "subject": "A股隔夜消息与今日市场",
+                "time_scope": "current_session",
+                "goal": "核验新信息并形成今日判断",
+                "source_span": {"message_id": "message-1", "start": 0, "end": 15, "quote": "有什么隔夜消息？今天你怎么看？"},
+            }],
+        }
+
+        self.assertEqual({"passed": True, "problems": []}, _validate_schema(output, schema))
+        output["actions"][0]["changes"] = []
+        self.assertFalse(_validate_schema(output, schema)["passed"])
+
+    def test_schema_validation_fails_closed_for_an_unresolved_reference(self) -> None:
+        result = _validate_schema({}, {"$ref": "#/$defs/missing", "$defs": {}})
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(["$: unresolved schema reference #/$defs/missing"], result["problems"])
 
     def test_unavailable_and_incomplete_stream_are_distinct(self) -> None:
         _BrokerHandler.mode = "unavailable"

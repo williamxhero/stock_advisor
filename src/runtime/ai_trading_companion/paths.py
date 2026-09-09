@@ -7,13 +7,7 @@ from pathlib import Path
 
 
 PRODUCT = "AITradingCompanion"
-
-
-def _local_app_data() -> Path:
-    value = os.environ.get("LOCALAPPDATA")
-    if not value:
-        raise RuntimeError("LOCALAPPDATA is required")
-    return Path(value)
+DEFAULT_HOME = Path("D:/APP") / PRODUCT
 
 
 @dataclass(frozen=True)
@@ -29,7 +23,7 @@ class RuntimePaths:
             package_root.parents[2],
         )
         install_root = Path(os.environ.get("AI_TRADING_COMPANION_INSTALL_ROOT", default_install)).resolve()
-        home = Path(os.environ.get("AI_TRADING_COMPANION_HOME", _local_app_data() / PRODUCT)).resolve()
+        home = Path(os.environ.get("AI_TRADING_COMPANION_HOME", DEFAULT_HOME)).resolve()
         return cls(install_root=install_root, home=home)
 
     @property

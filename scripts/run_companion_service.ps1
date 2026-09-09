@@ -9,7 +9,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $env:AI_TRADING_COMPANION_INSTALL_ROOT = $root
 if (-not $env:AI_TRADING_COMPANION_HOME) {
-    $env:AI_TRADING_COMPANION_HOME = Join-Path $env:LOCALAPPDATA 'AITradingCompanion'
+    $env:AI_TRADING_COMPANION_HOME = 'D:\APP\AITradingCompanion'
 }
 $runtimePackageRoot = if (Test-Path -LiteralPath (Join-Path $root 'src\runtime')) {
     Join-Path $root 'src\runtime'

@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Text.Json;
 using System.IO;
+using AITradingCompanion.Core;
 
 namespace AITradingCompanion.ToolManager;
 
@@ -18,7 +19,7 @@ public partial class MainWindow : Window
     private void SendTool(string type) { if (ToolsGrid.SelectedItem is ToolManagerTool tool) Send(new { type, capability = tool.Capability }); }
     private static void Send(object command)
     {
-        var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AITradingCompanion", "exchange", "to-runtime", "pending");
+        var root = Path.Combine(ProductPaths.ResolveDataRoot(), "exchange", "to-runtime", "pending");
         Directory.CreateDirectory(root);
         var payload = JsonSerializer.SerializeToUtf8Bytes(new { contract = "ai-trading-tool-manager-command/v1", command_id = Guid.NewGuid().ToString(), command });
         using var document = JsonDocument.Parse(payload);

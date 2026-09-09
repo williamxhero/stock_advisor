@@ -7,9 +7,9 @@
 ## 本地边界
 
 - 本项目的运行、修改和定时任务只允许使用 `D:\WILL\STOCK\stock_advisor` 内的本地文件。
-- 唯一运行时例外是独立产品目录 `%LOCALAPPDATA%\AITradingCompanion`：它保存用户数据、运行数据库、Exchange、草稿和日志；安装资源位于其 `app/` 子目录并只读。
+- 唯一运行时例外是独立产品目录 `D:\APP\AITradingCompanion`：它保存用户数据、运行数据库、Exchange、草稿和日志；安装资源位于其 `app/` 子目录并只读。
 - 迁移期只允许从 `%LOCALAPPDATA%\AIDecisionCenter` 和项目旧 `data/` 读取并复制历史；旧目录不得作为正式运行输入，也不得被自动删除。
-- 上述例外不得扩展到云端、网络服务、其他项目目录或共享数据库；桌面端和本地运行时唯一的交换 interface 是 `%LOCALAPPDATA%\AITradingCompanion\exchange` 的版本化 JSON。
+- 上述例外不得扩展到云端、网络服务、其他项目目录或共享数据库；桌面端和本地运行时唯一的交换 interface 是 `D:\APP\AITradingCompanion\exchange` 的版本化 JSON。
 - 不访问、不修改、不依赖任何云端任务、云端项目或云端聊天。
 - `archive/` 只用于历史溯源，正式运行不得从归档中读取业务规则或状态。
 

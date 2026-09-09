@@ -12,9 +12,9 @@
 - 单独迁移旧数据：`scripts/migrate-legacy.ps1`
 - 校验安装：`scripts/verify-install.ps1`
 
-安装版位于 `%LOCALAPPDATA%\AITradingCompanion\app`；用户数据、数据库、草稿、窗口状态、运行日志和 Exchange 位于 `%LOCALAPPDATA%\AITradingCompanion`，均不写回安装目录。
+安装版位于 `D:\APP\AITradingCompanion\app`；用户数据、数据库、草稿、窗口状态、运行日志和 Exchange 位于 `D:\APP\AITradingCompanion`，均不写回安装目录。安装器首次切换该路径时会停止旧进程、从 `%LOCALAPPDATA%\AITradingCompanion` 复制并核对正式数据，然后把旧目录改名保留为可恢复备份；不会自动删除历史数据。
 
-首次安装会创建隔离 Python 运行环境，并从 `scripts/requirements-runtime.txt` 安装本地交易日历依赖。LLM 统一通过小电脑的 Provider Broker 调用；Broker 根 URL 仅由 `%LOCALAPPDATA%\AITradingCompanion\config\settings.local.json` 的 `broker.url` 设置（默认 `http://yosef-server:8817`），不使用 CPA、Provider API Key 或本地模型配置。日程、投递、结构化持久化和故障恢复均由应用自己的确定性运行时负责；旧 Markdown/CSV 仅在迁移时一次性导入，正式运行不读取、不写入，也不从数据库重建这些文件。
+首次安装会创建隔离 Python 运行环境，并从 `scripts/requirements-runtime.txt` 安装本地交易日历依赖。LLM 统一通过小电脑的 Provider Broker 调用；Broker 根 URL 仅由 `D:\APP\AITradingCompanion\config\settings.local.json` 的 `broker.url` 设置（默认 `http://yosef-server:8817`），不使用 CPA、Provider API Key 或本地模型配置。日程、投递、结构化持久化和故障恢复均由应用自己的确定性运行时负责；旧 Markdown/CSV 仅在迁移时一次性导入，正式运行不读取、不写入，也不从数据库重建这些文件。
 
 ## 目录
 

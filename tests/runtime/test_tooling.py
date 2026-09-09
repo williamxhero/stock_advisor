@@ -17,6 +17,27 @@ from ai_trading_companion.tooling import FactRequest, ToolCatalog, ToolRunner
 
 
 class ToolRunnerTests(unittest.TestCase):
+    def test_builtin_startup_rebinds_managed_commands_after_runtime_root_moves(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            old_python = r"C:\Users\will\AppData\Local\AITradingCompanion\runtime\python\Scripts\python.exe"
+            new_python = r"D:\APP\AITradingCompanion\runtime\python\Scripts\python.exe"
+            with mock.patch("ai_trading_companion.builtin_tools.sys.executable", old_python):
+                ensure_builtin_tools(root)
+
+            with mock.patch("ai_trading_companion.builtin_tools.sys.executable", new_python):
+                ensure_builtin_tools(root)
+
+            capability_manifest = json.loads((
+                root / "cn_market_breadth" / "versions" / "1.1.18" / "manifest.json"
+            ).read_text(encoding="utf-8"))
+            adapter_manifest = json.loads((
+                root / "cn_market_breadth" / "adapters" / "markethub"
+                / "versions" / "1.1.18" / "manifest.json"
+            ).read_text(encoding="utf-8"))
+            self.assertEqual(new_python, capability_manifest["command"][0])
+            self.assertEqual(new_python, adapter_manifest["command"][0])
+
     def test_builtin_upgrade_promotes_only_a_previous_builtin_selection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "tools"

@@ -51,41 +51,23 @@ _ADAPTERS = {
 
 
 def ensure_builtin_tools(root: Path) -> None:
-    """Materialize immutable stdlib-only CLI packages without a resident service."""
+    """Materialize managed stdlib-only CLI packages without a resident service."""
     root = Path(root)
     for capability, mode in _CAPABILITIES.items():
         version_root = root / capability / "versions" / _VERSION
-        manifest = version_root / "manifest.json"
-        if not manifest.exists():
-            version_root.mkdir(parents=True, exist_ok=True)
-            (version_root / "tool.py").write_text(_CLI, encoding="utf-8")
-            manifest.write_text(json.dumps({
-                "contract": "ai-trading-tool-manifest/v1", "capability": capability,
-                "version": _VERSION, "state": "promoted",
-                "command": [sys.executable, "tool.py", mode],
-            }, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        _ensure_builtin_version(version_root, capability, mode)
         current = root / capability / "current.json"
         current.parent.mkdir(parents=True, exist_ok=True)
         _promote_builtin_current(current)
     for capability, adapters in _ADAPTERS.items():
         for adapter, mode in adapters.items():
             version_root = root / capability / "adapters" / adapter / "versions" / _VERSION
-            manifest = version_root / "manifest.json"
-            if not manifest.exists():
-                version_root.mkdir(parents=True, exist_ok=True)
-                (version_root / "tool.py").write_text(_CLI, encoding="utf-8")
-                manifest_payload = {
-                    "contract": "ai-trading-tool-manifest/v1", "capability": capability,
-                    "version": _VERSION, "state": "promoted",
-                    "command": [sys.executable, "tool.py", mode],
-                }
-                if capability == "cn_market_turnover_compare" and adapter == "official_exchanges":
-                    manifest_payload["egress"] = {
-                        "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
-                    }
-                manifest.write_text(json.dumps(
-                    manifest_payload, ensure_ascii=False, sort_keys=True,
-                ), encoding="utf-8")
+            egress = (
+                {"allowed_domains": ["query.sse.com.cn", "www.szse.cn"]}
+                if capability == "cn_market_turnover_compare" and adapter == "official_exchanges"
+                else None
+            )
+            _ensure_builtin_version(version_root, capability, mode, egress=egress)
         routing = root / capability / "routing.json"
         legacy_adapter_sets = (
             ({"eastmoney", "markethub"},)
@@ -102,6 +84,49 @@ def ensure_builtin_tools(root: Path) -> None:
                 "contract": "ai-trading-tool-routing/v1",
                 "candidates": [{"adapter": adapter, "version": _VERSION} for adapter in adapters],
             }, sort_keys=True), encoding="utf-8")
+
+
+def _ensure_builtin_version(
+    version_root: Path, capability: str, mode: str, *, egress: dict[str, object] | None = None,
+) -> None:
+    """Create a built-in version or rebind its generated interpreter after a root move."""
+    manifest = version_root / "manifest.json"
+    try:
+        existing = json.loads(manifest.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        existing = None
+    except json.JSONDecodeError:
+        return
+    expected_keys = {"contract", "capability", "version", "state", "command"}
+    if egress is not None:
+        expected_keys.add("egress")
+    managed = bool(
+        isinstance(existing, dict)
+        and set(existing) == expected_keys
+        and existing.get("contract") == "ai-trading-tool-manifest/v1"
+        and existing.get("capability") == capability
+        and existing.get("version") == _VERSION
+        and existing.get("state") == "promoted"
+        and isinstance(existing.get("command"), list)
+        and len(existing["command"]) == 3
+        and isinstance(existing["command"][0], str)
+        and existing["command"][1:] == ["tool.py", mode]
+        and existing.get("egress") == egress
+    )
+    if existing is not None and not managed:
+        return
+    version_root.mkdir(parents=True, exist_ok=True)
+    (version_root / "tool.py").write_text(_CLI, encoding="utf-8")
+    payload: dict[str, object] = {
+        "contract": "ai-trading-tool-manifest/v1", "capability": capability,
+        "version": _VERSION, "state": "promoted",
+        "command": [sys.executable, "tool.py", mode],
+    }
+    if egress is not None:
+        payload["egress"] = egress
+    manifest.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8",
+    )
 
 
 def _promote_builtin_current(current: Path) -> None:

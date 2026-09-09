@@ -1304,6 +1304,230 @@ class CompanionStore:
             "SELECT * FROM companion_fault_episode WHERE episode_id=?", (episode_id,)
         ).fetchone())
 
+    def reconcile_historical_fault_episodes(self, cycle_id: str) -> list[str]:
+        """Build the fault projection index for pre-contract records without deleting facts."""
+        conversation_failures = {
+            "chat.stream.failed", "chat_research.failed", "scheduled_conversation.failed",
+            "cognition.failed", "workflow_feedback.failed",
+        }
+        stage_failures = {
+            "research.failed": "m0",
+            "m0.invalidated": "m0",
+            "m1.failed": "m1",
+            "m2.deferred": "m2",
+            "outcome.failed": "outcome",
+            "cycle.missed": "cycle",
+        }
+
+        def json_object(raw: str | None) -> dict[str, Any]:
+            try:
+                value = json.loads(raw or "{}")
+            except (TypeError, ValueError):
+                return {}
+            return value if isinstance(value, dict) else {}
+
+        def string_list(value: Any) -> list[str]:
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    return []
+            if not isinstance(value, list):
+                return []
+            return [str(item) for item in value if isinstance(item, str) and item]
+
+        with self.connection() as connection:
+            faults = [dict(row) for row in connection.execute(
+                """SELECT a.* FROM narrative_artifact a
+                     WHERE a.cycle_id=? AND a.kind='system_fault'
+                       AND NOT EXISTS(
+                         SELECT 1 FROM companion_fault_record r
+                          WHERE r.artifact_id=a.artifact_id)
+                     ORDER BY a.sealed_at,a.revision,a.artifact_id""",
+                (cycle_id,),
+            )]
+            events_by_artifact: dict[str, dict[str, Any]] = {}
+            for row in connection.execute(
+                """SELECT event_type,payload_json,created_at FROM client_event_log
+                     WHERE cycle_id=? ORDER BY sequence""",
+                (cycle_id,),
+            ):
+                payload = json_object(row["payload_json"])
+                artifact_id = payload.get("source_artifact_id")
+                if isinstance(artifact_id, str) and artifact_id:
+                    events_by_artifact[artifact_id] = {
+                        "event_type": str(row["event_type"]),
+                        "payload": payload,
+                        "created_at": str(row["created_at"]),
+                    }
+
+            batches = [dict(row) for row in connection.execute(
+                """SELECT * FROM companion_message_batch
+                     WHERE cycle_id=? ORDER BY submitted_at,batch_id""",
+                (cycle_id,),
+            )]
+            streams = {
+                str(row["stream_id"]): dict(row) for row in connection.execute(
+                    "SELECT * FROM companion_stream_message WHERE cycle_id=?",
+                    (cycle_id,),
+                )
+            }
+            touched: set[str] = set()
+
+            for fault in faults:
+                artifact_id = str(fault["artifact_id"])
+                metadata = json_object(fault.get("metadata_json"))
+                event = events_by_artifact.get(artifact_id, {})
+                event_type = str(event.get("event_type") or "")
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                targets: list[dict[str, str]] = []
+
+                raw_targets = metadata.get("fault_targets")
+                if isinstance(raw_targets, list):
+                    for target in raw_targets:
+                        if not isinstance(target, dict):
+                            continue
+                        scope_kind = target.get("scope_kind")
+                        scope_key = target.get("scope_key")
+                        capability = target.get("capability")
+                        if all(isinstance(value, str) and value for value in (
+                            scope_kind, scope_key, capability,
+                        )):
+                            targets.append({
+                                "scope_kind": scope_kind,
+                                "scope_key": scope_key,
+                                "capability": capability,
+                            })
+
+                if not targets and event_type in conversation_failures:
+                    batch_ids: set[str] = set()
+                    batch_ids.update(string_list(metadata.get("batch_ids")))
+                    batch_ids.update(string_list(payload.get("batch_ids")))
+                    for candidate in (metadata.get("batch_id"), payload.get("batch_id")):
+                        if isinstance(candidate, str) and candidate:
+                            batch_ids.add(candidate)
+
+                    stream_payload = payload.get("stream")
+                    stream_id = metadata.get("stream_id") or payload.get("stream_id")
+                    if isinstance(stream_payload, dict):
+                        batch_ids.update(string_list(stream_payload.get("batch_ids")))
+                        stream_id = stream_id or stream_payload.get("stream_id")
+                    if isinstance(stream_id, str) and stream_id in streams:
+                        batch_ids.update(string_list(streams[stream_id]["batch_ids_json"]))
+
+                    if not batch_ids:
+                        failed_at = str(fault["sealed_at"])
+                        batch_ids.update(
+                            str(batch["batch_id"])
+                            for batch in batches
+                            if str(batch["submitted_at"]) <= failed_at
+                            and (
+                                batch.get("completed_at") is None
+                                or failed_at <= str(batch["completed_at"])
+                            )
+                        )
+                    if not batch_ids and len(batches) == 1:
+                        batch_ids.add(str(batches[0]["batch_id"]))
+                    targets.extend({
+                        "scope_kind": "batch",
+                        "scope_key": batch_id,
+                        "capability": "conversation_reply",
+                    } for batch_id in sorted(batch_ids))
+
+                if not targets and event_type in stage_failures:
+                    stage = stage_failures[event_type]
+                    targets.append({
+                        "scope_kind": "stage", "scope_key": stage, "capability": stage,
+                    })
+
+                if not targets:
+                    # No structural relation means no safe deduplication relation. Keeping
+                    # one episode per artifact avoids merging unrelated matching prose.
+                    targets.append({
+                        "scope_kind": "artifact",
+                        "scope_key": artifact_id,
+                        "capability": "legacy_fault",
+                    })
+
+                reason_category = str(
+                    metadata.get("reason_category")
+                    or payload.get("diagnostic_code")
+                    or "legacy_unclassified"
+                )
+                required_action = str(metadata.get("required_action") or "repair_required")
+                occurred_at = str(fault.get("occurred_at") or fault["sealed_at"])
+                for target in targets:
+                    user_impact = str(metadata.get("user_impact") or (
+                        "reply_incomplete"
+                        if target["capability"] == "conversation_reply"
+                        else "formal_stage_unavailable"
+                    ))
+                    episode = self.record_fault_episode(
+                        cycle_id,
+                        scope_kind=target["scope_kind"],
+                        scope_key=target["scope_key"],
+                        capability=target["capability"],
+                        artifact_id=artifact_id,
+                        reason_category=reason_category,
+                        user_impact=user_impact,
+                        required_action=required_action,
+                        occurred_at=occurred_at,
+                        connection=connection,
+                    )
+                    touched.add(str(episode["episode_id"]))
+
+            artifacts = {
+                str(row["artifact_id"]): dict(row) for row in connection.execute(
+                    "SELECT * FROM narrative_artifact WHERE cycle_id=?",
+                    (cycle_id,),
+                )
+            }
+            for batch in batches:
+                response_id = batch.get("response_artifact_id")
+                response = artifacts.get(str(response_id)) if response_id else None
+                if batch.get("state") != "completed" or response is None:
+                    continue
+                episode = connection.execute(
+                    """SELECT last_failed_at FROM companion_fault_episode
+                         WHERE cycle_id=? AND scope_kind='batch' AND scope_key=?
+                           AND capability='conversation_reply' AND state='active'""",
+                    (cycle_id, batch["batch_id"]),
+                ).fetchone()
+                if episode is None or str(response["sealed_at"]) < str(episode["last_failed_at"]):
+                    continue
+                self.resolve_fault_episodes(
+                    cycle_id,
+                    batch_ids=[str(batch["batch_id"])],
+                    resolution_artifact_id=str(response["artifact_id"]),
+                    resolved_at=str(response["sealed_at"]),
+                    connection=connection,
+                )
+
+            for stage in ("m0", "m1", "m2", "outcome"):
+                episode = connection.execute(
+                    """SELECT last_failed_at FROM companion_fault_episode
+                         WHERE cycle_id=? AND scope_kind='stage' AND scope_key=?
+                           AND state='active'""",
+                    (cycle_id, stage),
+                ).fetchone()
+                if episode is None:
+                    continue
+                resolution = connection.execute(
+                    """SELECT artifact_id,sealed_at FROM narrative_artifact
+                         WHERE cycle_id=? AND kind=? AND sealed_at>=?
+                         ORDER BY sealed_at,revision LIMIT 1""",
+                    (cycle_id, stage, episode["last_failed_at"]),
+                ).fetchone()
+                if resolution is not None:
+                    self.resolve_fault_episodes(
+                        cycle_id,
+                        stages=[stage],
+                        resolution_artifact_id=str(resolution["artifact_id"]),
+                        resolved_at=str(resolution["sealed_at"]),
+                        connection=connection,
+                    )
+            return sorted(touched)
+
     def fault_episodes(
         self,
         cycle_id: str,

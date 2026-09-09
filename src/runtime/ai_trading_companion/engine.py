@@ -1211,6 +1211,7 @@ class CompanionEngine:
         return artifact
 
     def _projection(self, cycle: dict[str, Any]) -> dict[str, Any]:
+        self.store.reconcile_historical_fault_episodes(cycle["cycle_id"])
         artifacts = self.store.artifacts(cycle["cycle_id"])
         removed_record_ids = set(
             self.store.removed_operational_record_ids(cycle["cycle_id"])

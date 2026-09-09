@@ -8,7 +8,7 @@ from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.store import CompanionStore
 
 
-PRODUCTION_CYCLE_ID = "ae19d3de-a0c2-480e-9b67-4bd4b2ddf8c5"
+PRODUCTION_CYCLE_ID = "ae19d3de-a0c2-480e-9021-7878251f500e"
 USER_TEXT = "\u8bf7\u6838\u9a8c\u4eca\u665a\u7684\u98ce\u9669\u3002"
 CHAT_FAULT_TEXT = "\u804a\u5929\u56de\u590d \u9047\u5230\u6280\u672f\u6545\u969c\uff0c\u672a\u80fd\u5b8c\u6210\u3002"
 RESEARCH_FAULT_TEXT = "\u516c\u5f00\u8865\u67e5 \u7684\u5173\u952e\u4e8b\u5b9e\u4ecd\u672a\u8fbe\u5230\u53ef\u6838\u9a8c\u6807\u51c6\u3002"

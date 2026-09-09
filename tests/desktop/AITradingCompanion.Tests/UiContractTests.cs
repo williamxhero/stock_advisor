@@ -151,6 +151,10 @@ public sealed class UiContractTests
         Assert.DoesNotContain("Text=\"对话\"", xaml, StringComparison.Ordinal);
         Assert.Contains("MainSendButton", xaml, StringComparison.Ordinal);
         Assert.Contains("MainCommitButton", xaml, StringComparison.Ordinal);
+        Assert.Contains("CleanupOperationalRecordsButton", xaml, StringComparison.Ordinal);
+        Assert.Contains("只清理故障报告", xaml, StringComparison.Ordinal);
+        Assert.Contains("只清理测试语句", xaml, StringComparison.Ordinal);
+        Assert.Contains("清理两类操作记录", xaml, StringComparison.Ordinal);
         Assert.Contains("Text=\"我的消息\"", xaml, StringComparison.Ordinal);
         Assert.Contains("TodayTasksListBox", xaml, StringComparison.Ordinal);
         Assert.DoesNotContain("Content=\"盘前\"", xaml, StringComparison.Ordinal);
@@ -168,6 +172,9 @@ public sealed class UiContractTests
         Assert.Contains("ScrollToEndAfterLayout(MyMessagesScrollViewer)", code, StringComparison.Ordinal);
         Assert.DoesNotContain("可鼠标框选后按 Ctrl+C", code, StringComparison.Ordinal);
         Assert.DoesNotContain("复制消息原文", code, StringComparison.Ordinal);
+        Assert.Contains("clear_operational_records", code, StringComparison.Ordinal);
+        Assert.Contains("companion-user-command/v1", code, StringComparison.Ordinal);
+        Assert.Contains("MessageBoxButton.YesNo", code, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -13,6 +13,12 @@ from .publication_registry import published_event_types
 from .stage_expression import normalize_stage_output
 from .models import TASK_POLICIES
 from .secret_guard import assert_safe
+from .store import (
+    CONVERSATION_FAULT_EVENT_TYPES,
+    FAULT_STAGE_BY_EVENT,
+    USER_VISIBLE_AI_ARTIFACT_KINDS,
+    is_structured_test_provenance,
+)
 from .task_profiles import ManualAnalysisProfileResolver
 
 
@@ -49,12 +55,14 @@ class CompanionEngine:
             return
         for message in messages:
             submitted_at = str(message.get("submitted_at") or message["known_at"])
+            provenance = json.loads(message.get("provenance_json") or "{}")
+            is_test = is_structured_test_provenance(provenance)
             self.memory.append({
                 "memory_space_id": self.memory_space_id,
                 "source_system": "stock-advisor",
                 "source_event_id": str(message["message_id"]),
                 "content_hash": "auto",
-                "episode_type": "user_message",
+                "episode_type": "test_utterance" if is_test else "user_message",
                 "body": str(message["body_text"]),
                 "occurred_at": str(message.get("occurred_at") or submitted_at),
                 "known_at": str(message.get("known_at") or submitted_at),
@@ -65,6 +73,7 @@ class CompanionEngine:
                     "message_id": message["message_id"], "cycle_id": cycle_id,
                     "batch_id": message.get("batch_id"), "phase": message.get("phase"),
                     "state": "submitted", "actor": "human",
+                    "provenance": provenance,
                 },
             })
 
@@ -231,13 +240,10 @@ class CompanionEngine:
     def research_failed(self, cycle_id: str, reason: str, *, details: dict[str, Any] | None = None) -> dict[str, Any]:
         message = self._stage_failure_message("M0", reason, details)
         cycle = self.store.transition(cycle_id, "failed")
-        presented = self.present_for_publication(message, iso(utc_now()), "system_fault")
-        self.emit(cycle, "research.failed", {
-            "cycle": cycle, "reason": presented.markdown,
-            "presentation": presented.metadata()["presentation"],
-            "message": presented.message(),
-            "diagnostic_code": self._diagnostic_code(reason),
-        })
+        self._emit_failure(
+            cycle, "research.failed", message, reason,
+            {"diagnostic_code": self._diagnostic_code(reason)},
+        )
         return cycle
 
     def research_retrying(self, cycle_id: str, reason: str, attempt: int) -> dict[str, Any]:
@@ -313,12 +319,20 @@ class CompanionEngine:
                 m1_publish_deadline=iso(publish), packet_hash=packet_hash,
                 m1_reserve_seconds=reserve_seconds, timing_policy_version=timing_version,
             )
+            resolved_fault_episode_ids = self.store.resolve_fault_episodes(
+                cycle_id,
+                stages=["m0"],
+                resolution_artifact_id=artifact["artifact_id"],
+                resolved_at=artifact["sealed_at"],
+                connection=connection,
+            )
             self._queue_event(cycle_id, "m0.ready", {
                 "cycle": cycle,
                 "m0": presented.markdown,
                 "presentation": presented.metadata()["presentation"],
                 "message": presented.message(),
                 "source_artifact_id": artifact["artifact_id"],
+                "resolved_fault_episode_ids": resolved_fault_episode_ids,
                 "h0_auto_submit_at": cycle["h0_auto_submit_at"],
                 "m1_publish_deadline": cycle["m1_publish_deadline"],
             }, connection=connection)
@@ -399,6 +413,8 @@ class CompanionEngine:
             if typ == "request_projection":
                 result = self._projection(cycle)
                 self.emit(cycle, "projection.ready", result)
+            elif typ == "clear_operational_records":
+                return self._clear_operational_records(cycle, command)
             elif typ == "invalidate_m0":
                 if cycle["state"] not in {"awaiting_h0", "voice_grace"}:
                     raise ValueError(f"M0 cannot be invalidated from state: {cycle['state']}")
@@ -416,7 +432,13 @@ class CompanionEngine:
             elif typ in {"begin_voice_capture", "begin_h0_edit"}:
                 result = self._begin_grace(cycle, typ)
             elif typ == "stage_message":
-                result = self._stage_message(cycle, str(command.get("text", "")), command.get("message_id"))
+                if command.get("provenance") is not None:
+                    raise ValueError("test provenance is reserved for trusted Runtime test and replay paths")
+                result = self._stage_message(
+                    cycle,
+                    str(command.get("text", "")),
+                    command.get("message_id"),
+                )
             elif typ == "edit_staged_message":
                 message = self.store.update_staged_message(cycle_id, str(command.get("message_id") or ""), str(command.get("text", "")))
                 self.emit(cycle, "message.edited", {"cycle": cycle, "message": message})
@@ -430,9 +452,16 @@ class CompanionEngine:
             elif typ in {"commit_h0", "skip_h0"}:
                 result = self._lock_h0(cycle, "manual")
             elif typ in {"submit_h0", "submit_voice_h0"}:
+                if command.get("provenance") is not None:
+                    raise ValueError("test provenance is reserved for trusted Runtime test and replay paths")
                 text = str(command.get("text", "")).strip()
                 if text:
-                    self._stage_message(cycle, text, command.get("message_id"), emit=False)
+                    self._stage_message(
+                        cycle,
+                        text,
+                        command.get("message_id"),
+                        emit=False,
+                    )
                 result = self._lock_h0(self.store.get_cycle(cycle_id), "legacy_submit")
             elif typ == "commit_chat_batch":
                 result = self._commit_chat(cycle)
@@ -450,6 +479,59 @@ class CompanionEngine:
         self.store.save_receipt(command["command_id"], cycle_id, typ, command, result)
         return result
 
+    def _clear_operational_records(
+        self, cycle: dict[str, Any], command: dict[str, Any],
+    ) -> dict[str, Any]:
+        if command.get("contract") != "companion-user-command/v1":
+            raise ValueError("cleanup requires companion-user-command/v1")
+        if command.get("confirmed") is not True:
+            raise ValueError("cleanup requires confirmed=true")
+        categories = command.get("categories")
+        if not isinstance(categories, list):
+            raise ValueError("cleanup categories must be a list")
+        record_ids = command.get("record_ids")
+        if record_ids is not None and not isinstance(record_ids, list):
+            raise ValueError("cleanup record_ids must be a list")
+        command_id = str(command["command_id"])
+        with self.store.connection() as connection:
+            previous = self.store.receipt(command_id, command, connection=connection)
+            if previous is not None:
+                return previous
+            cleanup = self.store.clear_operational_records(
+                cycle["cycle_id"],
+                categories=[str(value) for value in categories],
+                command_id=command_id,
+                record_ids=[str(value) for value in record_ids] if record_ids is not None else None,
+                connection=connection,
+            )
+            result = {
+                "contract": "companion-operational-record-cleanup-result/v1",
+                "command_id": command_id,
+                "cycle_id": cycle["cycle_id"],
+                "state": "completed",
+                **cleanup,
+            }
+            self.store.queue_event(
+                cycle["cycle_id"],
+                "operational_records.cleared",
+                {
+                    "cycle": cycle,
+                    "receipt": result,
+                    "removed_record_ids": cleanup["removed_record_ids"],
+                    "hidden_fault_episode_ids": cleanup["hidden_fault_episode_ids"],
+                },
+                connection=connection,
+            )
+            self.store.save_receipt(
+                command_id,
+                cycle["cycle_id"],
+                str(command["type"]),
+                command,
+                result,
+                connection=connection,
+            )
+        return result
+
     def _begin_grace(self, cycle: dict[str, Any], source: str) -> dict[str, Any]:
         deadline = parse(cycle["h0_auto_submit_at"]) if cycle.get("h0_auto_submit_at") else None
         publish = parse(cycle["m1_publish_deadline"]) if cycle.get("m1_publish_deadline") else None
@@ -462,12 +544,22 @@ class CompanionEngine:
             return result
         return {"accepted": False, "reason": "H0 window expired"}
 
-    def _stage_message(self, cycle: dict[str, Any], text: str, message_id: str | None, *, emit: bool = True) -> dict[str, Any]:
+    def _stage_message(
+        self,
+        cycle: dict[str, Any],
+        text: str,
+        message_id: str | None,
+        *,
+        emit: bool = True,
+    ) -> dict[str, Any]:
         if cycle.get("kind") == "daily_conversation":
             if cycle["state"] != "open":
                 raise ValueError("conversation is not open")
             assert_safe(text, boundary="user message storage")
-            message = self.store.stage_message(cycle["cycle_id"], text, "conversation", message_id=message_id)
+            message = self.store.stage_message(
+                cycle["cycle_id"], text, "conversation",
+                message_id=message_id,
+            )
             if emit:
                 self.emit(cycle, "message.staged", {"cycle": cycle, "message": message})
             return self._projection(cycle)
@@ -479,7 +571,10 @@ class CompanionEngine:
         # a later research packet.  The user can remove the secret and retry.
         assert_safe(text, boundary="user message storage")
         phase = "pre_m0" if cycle["state"] == "queued" else "h0" if not cycle.get("h0_locked_at") else "chat"
-        message = self.store.stage_message(cycle["cycle_id"], text, phase, message_id=message_id)
+        message = self.store.stage_message(
+            cycle["cycle_id"], text, phase,
+            message_id=message_id,
+        )
         if emit:
             self.emit(cycle, "message.staged", {"cycle": cycle, "message": message})
         return self._projection(cycle)
@@ -688,8 +783,22 @@ class CompanionEngine:
                 cycle_id, next_state, connection=connection, m1_completed_at=completed,
                 m2_started_at=completed if next_state == "synthesizing_m2" else None,
             )
+            resolved_fault_episode_ids = self.store.resolve_fault_episodes(
+                cycle_id,
+                stages=["m1"],
+                resolution_artifact_id=artifact["artifact_id"],
+                resolved_at=artifact["sealed_at"],
+                connection=connection,
+            )
             self._queue_event(
-                cycle_id, "m1.ready", {"cycle": cycle, "m1": presented.markdown, "presentation": presented.metadata()["presentation"], "message": presented.message(), "source_artifact_id": artifact["artifact_id"]},
+                cycle_id, "m1.ready", {
+                    "cycle": cycle,
+                    "m1": presented.markdown,
+                    "presentation": presented.metadata()["presentation"],
+                    "message": presented.message(),
+                    "source_artifact_id": artifact["artifact_id"],
+                    "resolved_fault_episode_ids": resolved_fault_episode_ids,
+                },
                 connection=connection,
             )
             if next_state == "synthesizing_m2":
@@ -914,8 +1023,22 @@ class CompanionEngine:
                 connection=connection,
             )
             cycle = self.store.transition(cycle_id, "complete", connection=connection, m2_completed_at=iso(utc_now()))
+            resolved_fault_episode_ids = self.store.resolve_fault_episodes(
+                cycle_id,
+                stages=["m2"],
+                resolution_artifact_id=artifact["artifact_id"],
+                resolved_at=artifact["sealed_at"],
+                connection=connection,
+            )
             self._queue_event(
-                cycle_id, "m2.ready", {"cycle": cycle, "m2": presented.markdown, "presentation": presented.metadata()["presentation"], "message": presented.message(), "source_artifact_id": artifact["artifact_id"]},
+                cycle_id, "m2.ready", {
+                    "cycle": cycle,
+                    "m2": presented.markdown,
+                    "presentation": presented.metadata()["presentation"],
+                    "message": presented.message(),
+                    "source_artifact_id": artifact["artifact_id"],
+                    "resolved_fault_episode_ids": resolved_fault_episode_ids,
+                },
                 connection=connection,
             )
         return cycle
@@ -965,22 +1088,31 @@ class CompanionEngine:
                     "published_message": presented.message(),
                 },
             })
+        batch_ids = reply_to_batch_ids or ([reply_to_batch_id] if reply_to_batch_id else [])
         artifact = self.store.append_artifact(
             cycle_id, kind, "model", presented.markdown, published_at,
             self._presentation_metadata({
                 "reply_to_batch_id": reply_to_batch_id, "stream_id": stream_id,
+                "reply_to_batch_ids": batch_ids,
                 "memory_message_id": memory_message_id,
                 "memory_episode_id": memory_receipt["episode_id"] if memory_receipt else None,
             }, presented),
         )
-        batch_ids = reply_to_batch_ids or ([reply_to_batch_id] if reply_to_batch_id else [])
+        resolved_fault_episode_ids: list[str] = []
         if complete_batches:
             self.store.mark_batches_responded(batch_ids, artifact["artifact_id"])
+            resolved_fault_episode_ids = self.store.resolve_fault_episodes(
+                cycle_id,
+                batch_ids=batch_ids,
+                resolution_artifact_id=artifact["artifact_id"],
+                resolved_at=artifact["sealed_at"],
+            )
         event_type = "premarket.reply.ready" if kind == "premarket_chat" else "chat.ready"
         self.emit(cycle, event_type, {
             "cycle": cycle, "text": presented.markdown, "presentation": presented.metadata()["presentation"], "reply_to_batch_id": reply_to_batch_id, "stream_id": stream_id,
             "message": presented.message(),
             "source_artifact_id": artifact["artifact_id"], "response_complete": complete_batches,
+            "resolved_fault_episode_ids": resolved_fault_episode_ids,
         })
         return cycle
 
@@ -1051,10 +1183,17 @@ class CompanionEngine:
                 },
             })
         stream = self.store.finish_stream_message(stream_id, error=reason)
-        presented = self.present_for_publication(self._user_fault_message(reason, "聊天回复"), iso(utc_now()), "system_fault")
-        self._append_published_memory(cycle, presented)
-        artifact = self.store.append_artifact(cycle_id, "system_fault", "system", presented.markdown, iso(utc_now()), self._presentation_metadata({"stream_id": stream_id, "reason_category": self._diagnostic_code(reason)}, presented))
-        self.emit(cycle, "chat.stream.failed", {"cycle": cycle, "stream": stream, "reason": presented.markdown, "presentation": presented.metadata()["presentation"], "message": presented.message(), "source_artifact_id": artifact["artifact_id"]})
+        self._emit_failure(
+            cycle,
+            "chat.stream.failed",
+            self._user_fault_message(reason, "聊天回复"),
+            reason,
+            {
+                "stream": stream,
+                "stream_id": stream_id,
+                "batch_ids": list(stream["batch_ids"]),
+            },
+        )
         return stream
 
     def judgment_revision_ready(self, cycle_id: str, text: str, revises_artifact_id: str) -> dict[str, Any]:
@@ -1078,11 +1217,12 @@ class CompanionEngine:
         return artifact
 
     def _projection(self, cycle: dict[str, Any]) -> dict[str, Any]:
+        self.store.reconcile_historical_fault_episodes(cycle["cycle_id"])
         artifacts = self.store.artifacts(cycle["cycle_id"])
-        ai_kinds = {
-            "m0", "m1", "m2", "ai_chat", "premarket_chat", "judgment_revision", "system_fault",
-            "outcome", "reflection", "recovery", "legacy_message",
-        }
+        removed_record_ids = set(
+            self.store.removed_operational_record_ids(cycle["cycle_id"])
+        )
+        ai_kinds = USER_VISIBLE_AI_ARTIFACT_KINDS | {"system_fault"}
         ai_messages = []
         local_message_ids: set[str] = set()
         for artifact in artifacts:
@@ -1090,13 +1230,20 @@ class CompanionEngine:
                 continue
             metadata = json.loads(artifact["metadata_json"] or "{}")
             published_message = metadata.get("published_message")
+            is_test_utterance = is_structured_test_provenance(metadata.get("provenance"))
             if (
-                artifact["kind"] not in {"ai_chat", "premarket_chat"}
+                (
+                    artifact["kind"] not in {"ai_chat", "premarket_chat"}
+                    or artifact["artifact_id"] in removed_record_ids
+                    or is_test_utterance
+                )
                 and isinstance(published_message, dict)
                 and published_message.get("message_id")
             ):
                 local_message_ids.add(str(published_message["message_id"]))
-            if artifact["kind"] == "system_fault" and metadata.get("retryable") is True:
+            if artifact["artifact_id"] in removed_record_ids or is_test_utterance:
+                continue
+            if artifact["kind"] == "system_fault":
                 continue
             item = {
                 "artifact_id": artifact["artifact_id"], "kind": artifact["kind"],
@@ -1106,14 +1253,19 @@ class CompanionEngine:
             if isinstance(published_message, dict):
                 item["message"] = published_message
             ai_messages.append(item)
+        messages = self.store.messages(cycle["cycle_id"])
         user_messages = [
             {
                 "message_id": message["message_id"], "state": message["state"], "phase": message["phase"],
                 "batch_id": message["batch_id"], "text": message["body_text"], "at": message["staged_at"],
                 "submitted_at": message["submitted_at"], "source_artifact_id": message["source_artifact_id"],
             }
-            for message in self.store.messages(cycle["cycle_id"])
+            for message in messages
             if message["state"] != "withdrawn"
+            and message["message_id"] not in removed_record_ids
+            and not is_structured_test_provenance(
+                json.loads(message.get("provenance_json") or "{}")
+            )
         ]
         if self.memory is not None:
             timeline = [
@@ -1129,6 +1281,9 @@ class CompanionEngine:
                     "submitted_at": item.get("submitted_at"), "source_artifact_id": None,
                 }
                 for item in timeline if item.get("episode_type") == "user_message"
+                and not is_structured_test_provenance(
+                    (item.get("metadata") or {}).get("provenance")
+                )
             }
             user_messages = [
                 memory_users.get(str(message["message_id"]), message) for message in user_messages
@@ -1147,6 +1302,11 @@ class CompanionEngine:
                      if isinstance((item.get("metadata") or {}).get("published_message"), dict) else {}))
                 for item in timeline
                 if item.get("episode_type") == "ai_message"
+                and (item.get("metadata") or {}).get("kind") != "system_fault"
+                and not is_structured_test_provenance(
+                    (item.get("metadata") or {}).get("provenance")
+                )
+                and str((item.get("metadata") or {}).get("message_id") or "") not in removed_record_ids
                 and str((item.get("metadata") or {}).get("message_id") or "") not in local_message_ids
             ]
             ai_messages = local_non_chat + memory_ai
@@ -1156,7 +1316,12 @@ class CompanionEngine:
                 "artifact_id": message["source_artifact_id"], "at": message["submitted_at"] or message["staged_at"],
                 "text": message["body_text"], "counts_for_m1": message["phase"] == "h0" and message["state"] == "submitted",
             }
-            for message in self.store.messages(cycle["cycle_id"], state="submitted")
+            for message in messages
+            if message["state"] == "submitted"
+            if message["message_id"] not in removed_record_ids
+            and not is_structured_test_provenance(
+                json.loads(message.get("provenance_json") or "{}")
+            )
         ]
         return {
             "cycle": cycle,
@@ -1164,8 +1329,10 @@ class CompanionEngine:
             "m1": latest["m1"]["text"] if latest["m1"] else None,
             "m2": latest["m2"]["text"] if latest["m2"] else None,
             "ai_messages": ai_messages,
+            "fault_episodes": self._fault_episode_projection(cycle["cycle_id"]),
             "user_messages": user_messages,
             "stream_messages": self.store.stream_messages(cycle["cycle_id"]),
+            "removed_operational_record_ids": sorted(removed_record_ids),
             "judgments": judgments,
             "has_h0": bool(cycle.get("has_h0")),
         }
@@ -1228,18 +1395,139 @@ class CompanionEngine:
     def _emit_failure(
         self, cycle: dict[str, Any], event_type: str, message: str, reason: str, extra: dict[str, Any] | None = None,
     ) -> None:
-        presented = self.present_for_publication(message, iso(utc_now()), "system_fault")
-        self._append_published_memory(cycle, presented)
-        artifact = self.store.append_artifact(
-            cycle["cycle_id"], "system_fault", "system", presented.markdown, iso(utc_now()),
-            self._presentation_metadata({"reason_category": self._diagnostic_code(reason), **(extra or {})}, presented),
+        occurred_at = iso(utc_now())
+        extra = dict(extra or {})
+        presented = self.present_for_publication(message, occurred_at, "system_fault")
+        reason_category = str(extra.get("diagnostic_code") or self._diagnostic_code(reason))
+        targets = self._fault_targets(cycle, event_type, extra)
+        episode_ids = [
+            self.store.fault_episode_id(
+                cycle["cycle_id"], target["scope_kind"], target["scope_key"], target["capability"],
+            )
+            for target in targets
+        ]
+        required_action = (
+            "wait_for_retry"
+            if extra.get("retryable") is True
+            or reason_category in {
+                "broker_unavailable", "broker_timeout", "broker_stream_incomplete",
+                "network_unavailable", "timeout",
+            }
+            else "repair_required"
+        )
+        with self.store.connection() as connection:
+            artifact = self.store.append_artifact(
+                cycle["cycle_id"], "system_fault", "system", presented.markdown, occurred_at,
+                self._presentation_metadata({
+                    **extra,
+                    "record_class": "fault_report",
+                    "fault_contract": "companion-fault-episode/v1",
+                    "fault_episode_ids": episode_ids,
+                    "fault_targets": targets,
+                    "reason_category": reason_category,
+                    "user_impact": "reply_incomplete" if any(
+                        target["capability"] == "conversation_reply" for target in targets
+                    ) else "formal_stage_unavailable",
+                    "required_action": required_action,
+                }, presented),
+                connection=connection,
+            )
+            for target in targets:
+                self.store.record_fault_episode(
+                    cycle["cycle_id"],
+                    scope_kind=target["scope_kind"],
+                    scope_key=target["scope_key"],
+                    capability=target["capability"],
+                    artifact_id=artifact["artifact_id"],
+                    reason_category=reason_category,
+                    user_impact=(
+                        "reply_incomplete"
+                        if target["capability"] == "conversation_reply"
+                        else "formal_stage_unavailable"
+                    ),
+                    required_action=required_action,
+                    occurred_at=occurred_at,
+                    connection=connection,
+                )
+        fault_episodes = self._fault_episode_projection(
+            cycle["cycle_id"], include_resolved=True, episode_ids=episode_ids,
         )
         self.emit(cycle, event_type, {
             "cycle": cycle, "reason": presented.markdown,
             "presentation": presented.metadata()["presentation"], "source_artifact_id": artifact["artifact_id"],
             "message": presented.message(),
-            "diagnostic_code": self._diagnostic_code(reason), **(extra or {}),
+            "diagnostic_code": reason_category,
+            "fault_episodes": fault_episodes,
+            **extra,
         })
+
+    def _fault_targets(
+        self, cycle: dict[str, Any], event_type: str, extra: dict[str, Any],
+    ) -> list[dict[str, str]]:
+        batch_ids = sorted({
+            str(value) for value in extra.get("batch_ids") or [] if str(value)
+        })
+        if event_type in CONVERSATION_FAULT_EVENT_TYPES and not batch_ids:
+            batch_ids = sorted({
+                str(batch["batch_id"])
+                for phase in ("conversation", "chat")
+                for batch in self.store.pending_message_batches(cycle["cycle_id"], phase)
+            })
+        if batch_ids:
+            return [
+                {
+                    "scope_kind": "batch",
+                    "scope_key": batch_id,
+                    "capability": "conversation_reply",
+                }
+                for batch_id in batch_ids
+            ]
+        stage = FAULT_STAGE_BY_EVENT.get(event_type, event_type.removesuffix(".failed"))
+        return [{"scope_kind": "stage", "scope_key": stage, "capability": stage}]
+
+    def _fault_episode_projection(
+        self,
+        cycle_id: str,
+        *,
+        include_resolved: bool = False,
+        episode_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        artifacts = {
+            str(artifact["artifact_id"]): artifact
+            for artifact in self.store.artifacts(cycle_id)
+        }
+        projected: list[dict[str, Any]] = []
+        for episode in self.store.fault_episodes(
+            cycle_id, include_resolved=include_resolved, episode_ids=episode_ids,
+        ):
+            artifact = artifacts.get(str(episode["current_artifact_id"]))
+            if artifact is None:
+                continue
+            metadata = json.loads(artifact["metadata_json"] or "{}")
+            item = {
+                "contract": "companion-fault-episode/v1",
+                "episode_id": episode["episode_id"],
+                "state": episode["state"],
+                "scope_kind": episode["scope_kind"],
+                "scope_key": episode["scope_key"],
+                "capability": episode["capability"],
+                "attempt_count": episode["attempt_count"],
+                "first_failed_at": episode["first_failed_at"],
+                "last_failed_at": episode["last_failed_at"],
+                "occurred_at": episode["last_failed_at"],
+                "current_artifact_id": episode["current_artifact_id"],
+                "reason_category": episode["current_reason_category"],
+                "user_impact": episode["current_user_impact"],
+                "required_action": episode["current_required_action"],
+                "resolved_at": episode["resolved_at"],
+                "resolution_artifact_id": episode["resolution_artifact_id"],
+                "text": artifact["body_markdown"],
+            }
+            published_message = metadata.get("published_message")
+            if isinstance(published_message, dict):
+                item["message"] = published_message
+            projected.append(item)
+        return projected
 
     @staticmethod
     def _with_revision_continuity(previous: str, revision: str) -> str:

@@ -61,6 +61,7 @@ public partial class MainWindow : Window, IDisposable
     private string? _voiceContextFile;
     private bool _suppressDraftUpdate;
     private bool _inputActionInFlight;
+    private bool _cleanupInFlight;
     private bool _disposed;
 
     public MainWindow(MainViewModel viewModel, AppPaths paths)
@@ -156,6 +157,64 @@ public partial class MainWindow : Window, IDisposable
         catch (Exception exception)
         {
             MessageBox.Show(this, $"无法启动朗读：{exception.Message}", "AI交易伙伴", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void CleanupOperationalRecordsButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { ContextMenu: { } menu }) return;
+        menu.PlacementTarget = CleanupOperationalRecordsButton;
+        menu.IsOpen = true;
+    }
+
+    private async void ClearFaultReports_Click(object sender, RoutedEventArgs e) =>
+        await ClearOperationalRecordsAsync(["fault_report"], "故障报告");
+
+    private async void ClearTestUtterances_Click(object sender, RoutedEventArgs e) =>
+        await ClearOperationalRecordsAsync(["test_utterance"], "结构化测试语句");
+
+    private async void ClearAllOperationalRecords_Click(object sender, RoutedEventArgs e) =>
+        await ClearOperationalRecordsAsync(
+            ["fault_report", "test_utterance"],
+            "故障报告和结构化测试语句");
+
+    private async Task ClearOperationalRecordsAsync(string[] categories, string label)
+    {
+        if (_companionProjection is null
+            || _companionProjection.TaskKey != "conversation.daily"
+            || _cleanupInFlight) return;
+        var confirmation = MessageBox.Show(
+            this,
+            $"将清理当前对话中的{label}。正常消息、正式判断、已显示的流式正文和底层诊断审计都会保留。是否继续？",
+            "清理操作记录",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning);
+        if (confirmation != MessageBoxResult.Yes) return;
+        _cleanupInFlight = true;
+        CleanupStatusText.Text = "正在提交清理请求…";
+        UpdateInputState();
+        try
+        {
+            await _companionExchange.SendAsync(new
+            {
+                contract = "companion-user-command/v1",
+                command_id = Guid.NewGuid().ToString(),
+                cycle_id = _companionProjection.CycleId,
+                type = "clear_operational_records",
+                confirmed = true,
+                categories,
+            });
+            CleanupStatusText.Text = "清理请求已提交";
+        }
+        catch (Exception exception)
+        {
+            CleanupStatusText.Text = "清理请求失败";
+            _viewModel.ReportInboxFailure(exception);
+        }
+        finally
+        {
+            _cleanupInFlight = false;
+            UpdateInputState();
         }
     }
 
@@ -386,6 +445,16 @@ public partial class MainWindow : Window, IDisposable
             : CompanionEventProjection.ProjectForTask(events, taskKey);
         if (projection?.ScheduledFor is { } projectionScheduled && !_viewModel.IsCurrentTradingDate(projectionScheduled)) projection = null;
         _companionProjection = projection;
+        if (projection is null)
+        {
+            CleanupStatusText.Text = string.Empty;
+        }
+        else if (projection.LastCleanupReceipt is { } cleanup)
+        {
+            CleanupStatusText.Text =
+                $"已清理 {cleanup.DeletedFaultReports + cleanup.DeletedTestUtterances} 条"
+                + (cleanup.Rejected > 0 ? $"，拒绝 {cleanup.Rejected} 条受保护记录" : string.Empty);
+        }
         SwitchDraft(taskKey == "conversation.daily" && projection is not null ? CompanionDraftStore.ConversationDraftKey : projection?.CycleId);
         if (projection is null)
         {
@@ -867,6 +936,8 @@ public partial class MainWindow : Window, IDisposable
             && CompanionInputPolicy.CanCommit(_companionProjection?.State, h0Locked, staged,
                 hasDraftText: !string.IsNullOrWhiteSpace(MainJudgmentInputBox.Text));
         MainVoiceButton.IsEnabled = hasCycle && supportsMessaging && _voiceState != VoiceInputState.Transcribing;
+        CleanupOperationalRecordsButton.IsEnabled = !_cleanupInFlight
+            && _companionProjection?.TaskKey == "conversation.daily";
         MainVoiceButton.Content = _voiceState switch
         {
             VoiceInputState.Recording => "停止并转写",

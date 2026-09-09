@@ -17,7 +17,10 @@ public sealed record CompanionAiTimelineEntry(
     string Text,
     DateTimeOffset? StartedAt = null,
     DateTimeOffset? CompletedAt = null,
-    IReadOnlyList<CompanionMessagePart>? Parts = null);
+    IReadOnlyList<CompanionMessagePart>? Parts = null,
+    string? SourceArtifactId = null,
+    string? FaultScopeKind = null,
+    string? FaultScopeKey = null);
 
 public sealed record CompanionTimelineEntry(
     DateTimeOffset At,
@@ -109,6 +112,7 @@ public static class CompanionEventProjection
         var isCompanionThinking = false;
         var ai = new Dictionary<string, CompanionAiTimelineEntry>(StringComparer.Ordinal);
         var users = new Dictionary<string, CompanionTimelineEntry>(StringComparer.Ordinal);
+        var resolvedFaultEpisodeIds = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var item in cycleEvents)
         {
@@ -147,6 +151,7 @@ public static class CompanionEventProjection
                     break;
                 case "m0.ready":
                     ai.Remove("action-pending-m0");
+                    ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, "m0");
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "m0", ReadPublishedAt(payload, item.At),
                         ReadPublishedText(payload, "m0"), m0StartedAt, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
@@ -189,15 +194,13 @@ public static class CompanionEventProjection
                     break;
                 case "m1.ready":
                     ai.Remove("action-pending-m1");
-                    foreach (var fault in ai.Where(pair => pair.Value.Kind == "fault").Select(pair => pair.Key).ToArray())
-                        ai.Remove(fault);
+                    ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, "m1");
                     errorText = null;
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "m1", ReadPublishedAt(payload, item.At),
                         ReadPublishedText(payload, "m1"), m1StartedAt, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "m1.recovered":
-                    foreach (var fault in ai.Where(pair => pair.Value.Kind == "fault").Select(pair => pair.Key).ToArray())
-                        ai.Remove(fault);
+                    ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, "m1");
                     errorText = null;
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id") ?? $"recovery-{item.At:O}"), "recovery", ReadPublishedAt(payload, item.At),
                         ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
@@ -216,14 +219,14 @@ public static class CompanionEventProjection
                     break;
                 case "m2.ready":
                     ai.Remove("action-pending-m2");
-                    foreach (var fault in ai.Where(pair => pair.Value.Kind == "fault").Select(pair => pair.Key).ToArray())
-                        ai.Remove(fault);
+                    ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, "m2");
                     errorText = null;
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "m2", ReadPublishedAt(payload, item.At),
                         ReadPublishedText(payload, "m2"), m2StartedAt, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "chat.ready":
                     isCompanionThinking = false;
+                    ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, null);
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "stream_id") ?? ReadString(payload, "source_artifact_id")), "chat", ReadPublishedAt(payload, item.At),
                         ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
@@ -247,8 +250,8 @@ public static class CompanionEventProjection
                     var failedText = ReadNestedString(payload, "stream", "text");
                     if (!string.IsNullOrWhiteSpace(failedStreamId) && !string.IsNullOrWhiteSpace(failedText))
                         UpsertAi(ai, failedStreamId, "chat_incomplete", item.At, failedText + "\n\n（未完成）", item.At, null);
-                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "fault", ReadPublishedAt(payload, item.At),
-                        ReadPublishedText(payload) ?? ReadString(payload, "reason"), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
+                    if (!ReadFaultEpisodes(payload, ai, resolvedFaultEpisodeIds))
+                        UpsertLegacyFault(ai, item, ReadPublishedText(payload) ?? ReadString(payload, "reason"));
                     break;
                 case "chat.research.terminated":
                     foreach (var pending in ai.Where(pair => pair.Value.Kind == "chat_pending").Select(pair => pair.Key).ToArray())
@@ -263,10 +266,12 @@ public static class CompanionEventProjection
                     UpsertAi(ai, $"chat-control-{item.At:O}", "chat_pending", item.At, "正在继续核验。", item.At, null);
                     break;
                 case "premarket.reply.ready":
+                    ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, null);
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "premarket", ReadPublishedAt(payload, item.At),
                         ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
                 case "outcome.ready":
+                    ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, "outcome");
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "outcome", ReadPublishedAt(payload, item.At),
                         ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
                     break;
@@ -281,7 +286,7 @@ public static class CompanionEventProjection
                 case "projection.ready":
                     ReadProjection(payload, ai, users, ref scheduledFor, ref autoSubmit, ref m1Deadline, ref h0LockedAt,
                         ref taskKey, ref trigger, ref requestedAt, ref taskProfileId, ref taskProfileDisplayName,
-                        ref isCompanionThinking);
+                        ref isCompanionThinking, resolvedFaultEpisodeIds);
                     break;
                 case "research.failed":
                 case "m0.invalidated":
@@ -292,18 +297,23 @@ public static class CompanionEventProjection
                     RemoveActionPending(ai);
                     errorText = ReadNestedString(payload, "message", "text_projection")
                         ?? ReadString(payload, "reason") ?? "这次研究没有完成。";
-                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id") ?? $"fault-{item.At:O}"), "fault", ReadPublishedAt(payload, item.At),
-                        errorText, item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
+                    if (!ReadFaultEpisodes(payload, ai, resolvedFaultEpisodeIds))
+                        UpsertLegacyFault(ai, item, errorText);
                     break;
                 case "m2.deferred":
                     errorText = ReadNestedString(payload, "message", "text_projection")
                         ?? ReadString(payload, "reason") ?? "这次综合判断要晚一点。";
-                    UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id") ?? $"fault-{item.At:O}"), "fault", ReadPublishedAt(payload, item.At),
-                        errorText, item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
+                    if (!ReadFaultEpisodes(payload, ai, resolvedFaultEpisodeIds))
+                        UpsertLegacyFault(ai, item, errorText);
                     break;
             }
         }
 
+        var visibleAiMessages = ai.Values
+            .OrderBy(message => message.At)
+            .ThenBy(message => message.ArtifactId, StringComparer.Ordinal)
+            .ToArray();
+        errorText = visibleAiMessages.LastOrDefault(message => message.Kind == "fault")?.Text;
         return new CompanionWorkspaceProjection(
             current.CycleId,
             scheduledFor,
@@ -312,7 +322,7 @@ public static class CompanionEventProjection
             h0LockedAt,
             state,
             errorText,
-            CollapseVisibleFaults(ai.Values),
+            visibleAiMessages,
             users.Values.OrderBy(message => message.At).ToArray(),
             taskKey,
             trigger,
@@ -323,51 +333,106 @@ public static class CompanionEventProjection
             isCompanionThinking);
     }
 
-    private static CompanionAiTimelineEntry[] CollapseVisibleFaults(
-        IEnumerable<CompanionAiTimelineEntry> messages)
+    private static bool ReadFaultEpisodes(
+        JsonElement payload,
+        Dictionary<string, CompanionAiTimelineEntry> ai,
+        HashSet<string> resolvedFaultEpisodeIds)
     {
-        var materialized = messages.ToArray();
-        var latestFaultIds = materialized
-            .Where(message => message.Kind == "fault")
-            .GroupBy(message => message.Text.Trim(), StringComparer.Ordinal)
-            .Select(group => group.OrderByDescending(message => message.At).First().ArtifactId)
-            .ToHashSet(StringComparer.Ordinal);
-        var ordered = materialized
-            .Where(message => message.Kind != "fault" || latestFaultIds.Contains(message.ArtifactId))
-            .OrderBy(message => message.At)
-            .ToArray();
-        var collapsed = new List<CompanionAiTimelineEntry>();
-        var faultRun = new List<CompanionAiTimelineEntry>();
-        foreach (var message in ordered)
+        if (!payload.TryGetProperty("fault_episodes", out var episodes)
+            || episodes.ValueKind != JsonValueKind.Array) return false;
+        foreach (var episode in episodes.EnumerateArray())
         {
-            if (message.Kind == "fault")
+            var episodeId = ReadString(episode, "episode_id");
+            if (string.IsNullOrWhiteSpace(episodeId)) continue;
+            if (ReadString(episode, "state") == "resolved")
             {
-                faultRun.Add(message);
+                resolvedFaultEpisodeIds.Add(episodeId);
+                ai.Remove(episodeId);
                 continue;
             }
-            FlushFaultRun();
-            collapsed.Add(message);
+            if (resolvedFaultEpisodeIds.Contains(episodeId)) continue;
+            var at = ReadDate(ReadString(episode, "last_failed_at"))
+                ?? ReadDate(ReadString(episode, "occurred_at"))
+                ?? DateTimeOffset.MinValue;
+            var text = ReadPublishedText(episode) ?? ReadString(episode, "text");
+            if (string.IsNullOrWhiteSpace(text)) continue;
+            ai[episodeId] = new CompanionAiTimelineEntry(
+                episodeId,
+                "fault",
+                at,
+                text,
+                ReadDate(ReadString(episode, "first_failed_at")) ?? at,
+                at,
+                ReadPublishedParts(episode),
+                ReadString(episode, "current_artifact_id"),
+                ReadString(episode, "scope_kind"),
+                ReadString(episode, "scope_key"));
         }
-        FlushFaultRun();
-        return collapsed.ToArray();
+        return true;
+    }
 
-        void FlushFaultRun()
+    private static void ResolveFaultEpisodes(
+        JsonElement payload,
+        Dictionary<string, CompanionAiTimelineEntry> ai,
+        HashSet<string> resolvedFaultEpisodeIds,
+        string? legacyStage)
+    {
+        var resolvedStructured = false;
+        if (payload.TryGetProperty("resolved_fault_episode_ids", out var ids)
+            && ids.ValueKind == JsonValueKind.Array)
         {
-            if (faultRun.Count == 0) return;
-            if (faultRun.Count == 1)
+            foreach (var id in ids.EnumerateArray())
             {
-                collapsed.Add(faultRun[0]);
-                faultRun.Clear();
-                return;
+                if (id.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(id.GetString()))
+                    continue;
+                resolvedStructured = true;
+                resolvedFaultEpisodeIds.Add(id.GetString()!);
+                ai.Remove(id.GetString()!);
             }
-            var latest = faultRun[^1];
-            var text = string.Join("\n\n", faultRun.Select(message =>
-                $"{message.At.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture)} · {message.Text.Trim()}"));
-            collapsed.Add(new CompanionAiTimelineEntry(
-                $"fault-group-{latest.ArtifactId}", "fault", latest.At, text,
-                faultRun[0].StartedAt, latest.CompletedAt));
-            faultRun.Clear();
         }
+        if (resolvedStructured || legacyStage is null) return;
+        foreach (var id in ai.Where(pair =>
+                     pair.Value.Kind == "fault"
+                     && pair.Value.FaultScopeKind == "stage"
+                     && pair.Value.FaultScopeKey == legacyStage)
+                 .Select(pair => pair.Key).ToArray())
+            ai.Remove(id);
+    }
+
+    private static void UpsertLegacyFault(
+        Dictionary<string, CompanionAiTimelineEntry> ai,
+        CompanionEvent item,
+        string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return;
+        var batchId = ReadFirstNestedArrayString(item.Payload, "stream", "batch_ids");
+        var streamId = ReadNestedString(item.Payload, "stream", "stream_id")
+            ?? ReadString(item.Payload, "stream_id");
+        var stage = item.Type switch
+        {
+            "research.failed" or "m0.invalidated" => "m0",
+            "m1.failed" => "m1",
+            "m2.deferred" => "m2",
+            "outcome.failed" => "outcome",
+            "chat.stream.failed" or "chat_research.failed" => "conversation_reply",
+            _ => item.Type.EndsWith(".failed", StringComparison.Ordinal)
+                ? item.Type[..^".failed".Length]
+                : item.Type,
+        };
+        var scopeKind = batchId is not null ? "batch" : streamId is not null ? "stream" : "stage";
+        var scopeKey = batchId ?? streamId ?? stage;
+        var id = $"legacy-fault:{item.CycleId}:{scopeKind}:{scopeKey}";
+        ai[id] = new CompanionAiTimelineEntry(
+            id,
+            "fault",
+            ReadPublishedAt(item.Payload, item.At),
+            text,
+            item.At,
+            ReadPublishedAt(item.Payload, item.At),
+            ReadPublishedParts(item.Payload),
+            ReadString(item.Payload, "source_artifact_id"),
+            scopeKind,
+            scopeKey);
     }
 
     private static void RemoveActionPending(Dictionary<string, CompanionAiTimelineEntry> ai)
@@ -389,7 +454,8 @@ public static class CompanionEventProjection
         ref DateTimeOffset? requestedAt,
         ref string? taskProfileId,
         ref string? taskProfileDisplayName,
-        ref bool isCompanionThinking)
+        ref bool isCompanionThinking,
+        HashSet<string> resolvedFaultEpisodeIds)
     {
         taskKey = ReadNestedString(payload, "cycle", "task_key") ?? taskKey;
         trigger = ReadNestedString(payload, "cycle", "trigger") ?? trigger;
@@ -404,6 +470,12 @@ public static class CompanionEventProjection
         var projectedM1CompletedAt = ReadDate(ReadNestedString(payload, "cycle", "m1_completed_at"));
         var projectedM2StartedAt = ReadDate(ReadNestedString(payload, "cycle", "m2_started_at"));
         var projectedM2CompletedAt = ReadDate(ReadNestedString(payload, "cycle", "m2_completed_at"));
+        if (payload.TryGetProperty("fault_episodes", out _))
+        {
+            foreach (var faultId in ai.Where(pair => pair.Value.Kind == "fault").Select(pair => pair.Key).ToArray())
+                ai.Remove(faultId);
+            ReadFaultEpisodes(payload, ai, resolvedFaultEpisodeIds);
+        }
         if (payload.TryGetProperty("ai_messages", out var aiMessages) && aiMessages.ValueKind == JsonValueKind.Array)
         {
             foreach (var message in aiMessages.EnumerateArray())
@@ -411,6 +483,7 @@ public static class CompanionEventProjection
                 var kind = ReadString(message, "kind") switch
                 {
                     "premarket_chat" => "premarket",
+                    "system_fault" => null,
                     { } value when CompanionMessagePublicationRegistry.CanReadKind(value) => value,
                     _ => null,
                 };
@@ -528,6 +601,18 @@ public static class CompanionEventProjection
 
     private static string? ReadNestedString(JsonElement element, string parent, string property) =>
         element.TryGetProperty(parent, out var nested) && nested.ValueKind == JsonValueKind.Object ? ReadString(nested, property) : null;
+
+    private static string? ReadFirstNestedArrayString(JsonElement element, string parent, string property)
+    {
+        if (!element.TryGetProperty(parent, out var nested)
+            || nested.ValueKind != JsonValueKind.Object
+            || !nested.TryGetProperty(property, out var values)
+            || values.ValueKind != JsonValueKind.Array) return null;
+        foreach (var value in values.EnumerateArray())
+            if (value.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(value.GetString()))
+                return value.GetString();
+        return null;
+    }
 
     private static string? ReadPublishedText(JsonElement element) =>
         ReadNestedString(element, "message", "text_projection") ?? ReadString(element, "text");

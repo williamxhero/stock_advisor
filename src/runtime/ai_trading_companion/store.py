@@ -172,6 +172,25 @@ class CompanionStore:
               stream_id TEXT NOT NULL REFERENCES companion_stream_message(stream_id),
               sequence INTEGER NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL,
               PRIMARY KEY(stream_id, sequence));
+            CREATE TABLE IF NOT EXISTS companion_fault_episode (
+              episode_id TEXT PRIMARY KEY,
+              cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              scope_kind TEXT NOT NULL, scope_key TEXT NOT NULL, capability TEXT NOT NULL,
+              state TEXT NOT NULL, current_artifact_id TEXT NOT NULL,
+              current_reason_category TEXT NOT NULL, current_user_impact TEXT NOT NULL,
+              current_required_action TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL, first_failed_at TEXT NOT NULL,
+              last_failed_at TEXT NOT NULL, resolved_at TEXT,
+              resolution_artifact_id TEXT,
+              UNIQUE(cycle_id,scope_kind,scope_key,capability));
+            CREATE INDEX IF NOT EXISTS ix_companion_fault_episode_cycle_state
+              ON companion_fault_episode(cycle_id,state,last_failed_at);
+            CREATE TABLE IF NOT EXISTS companion_fault_record (
+              episode_id TEXT NOT NULL REFERENCES companion_fault_episode(episode_id),
+              artifact_id TEXT NOT NULL REFERENCES narrative_artifact(artifact_id),
+              reason_category TEXT NOT NULL, user_impact TEXT NOT NULL,
+              required_action TEXT NOT NULL, occurred_at TEXT NOT NULL,
+              PRIMARY KEY(episode_id,artifact_id));
             CREATE TABLE IF NOT EXISTS llm_attempt (
               attempt_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               stage TEXT NOT NULL, attempt_number INTEGER NOT NULL, status TEXT NOT NULL,
@@ -330,7 +349,7 @@ class CompanionStore:
               claimed_at TEXT, completed_at TEXT, error TEXT);
             CREATE INDEX IF NOT EXISTS ix_capability_need_state_priority
               ON capability_need(state, urgency, updated_at);
-            PRAGMA user_version = 19;
+            PRAGMA user_version = 20;
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
@@ -1164,6 +1183,182 @@ class CompanionStore:
                 (cycle_id, kind),
             ).fetchone()
             return dict(row) if row else None
+
+    @staticmethod
+    def fault_episode_id(
+        cycle_id: str, scope_kind: str, scope_key: str, capability: str,
+    ) -> str:
+        identity = f"companion-fault/v1:{cycle_id}:{scope_kind}:{scope_key}:{capability}"
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, identity))
+
+    def record_fault_episode(
+        self,
+        cycle_id: str,
+        *,
+        scope_kind: str,
+        scope_key: str,
+        capability: str,
+        artifact_id: str,
+        reason_category: str,
+        user_impact: str,
+        required_action: str,
+        occurred_at: str,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        """Append one fault fact while retaining one stable user-facing episode."""
+        if connection is None:
+            with self.connection() as current:
+                return self.record_fault_episode(
+                    cycle_id,
+                    scope_kind=scope_kind,
+                    scope_key=scope_key,
+                    capability=capability,
+                    artifact_id=artifact_id,
+                    reason_category=reason_category,
+                    user_impact=user_impact,
+                    required_action=required_action,
+                    occurred_at=occurred_at,
+                    connection=current,
+                )
+        episode_id = self.fault_episode_id(cycle_id, scope_kind, scope_key, capability)
+        episode_inserted = connection.execute(
+            """INSERT OR IGNORE INTO companion_fault_episode(
+                 episode_id,cycle_id,scope_kind,scope_key,capability,state,
+                 current_artifact_id,current_reason_category,current_user_impact,
+                 current_required_action,attempt_count,first_failed_at,last_failed_at)
+               VALUES(?,?,?,?,?,'active',?,?,?,?,1,?,?)""",
+            (
+                episode_id, cycle_id, scope_kind, scope_key, capability,
+                artifact_id, reason_category, user_impact, required_action,
+                occurred_at, occurred_at,
+            ),
+        ).rowcount
+        inserted = connection.execute(
+            """INSERT OR IGNORE INTO companion_fault_record(
+                 episode_id,artifact_id,reason_category,user_impact,required_action,occurred_at)
+               VALUES(?,?,?,?,?,?)""",
+            (episode_id, artifact_id, reason_category, user_impact, required_action, occurred_at),
+        ).rowcount
+        if inserted and not episode_inserted:
+            current = connection.execute(
+                "SELECT state,last_failed_at,current_artifact_id FROM companion_fault_episode WHERE episode_id=?",
+                (episode_id,),
+            ).fetchone()
+            if current["state"] == "active" and (
+                occurred_at > current["last_failed_at"]
+                or (
+                    occurred_at == current["last_failed_at"]
+                    and artifact_id > current["current_artifact_id"]
+                )
+            ):
+                connection.execute(
+                    """UPDATE companion_fault_episode
+                       SET current_artifact_id=?,current_reason_category=?,
+                           current_user_impact=?,current_required_action=?,
+                           last_failed_at=?,attempt_count=attempt_count+1
+                       WHERE episode_id=?""",
+                    (
+                        artifact_id, reason_category, user_impact, required_action,
+                        occurred_at, episode_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE companion_fault_episode SET attempt_count=attempt_count+1 WHERE episode_id=?",
+                    (episode_id,),
+                )
+        return dict(connection.execute(
+            "SELECT * FROM companion_fault_episode WHERE episode_id=?", (episode_id,)
+        ).fetchone())
+
+    def fault_episodes(
+        self,
+        cycle_id: str,
+        *,
+        include_resolved: bool = False,
+        episode_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["cycle_id=?"]
+        values: list[Any] = [cycle_id]
+        if not include_resolved:
+            clauses.append("state='active'")
+        if episode_ids is not None:
+            normalized = sorted({str(value) for value in episode_ids if str(value)})
+            if not normalized:
+                return []
+            clauses.append(f"episode_id IN ({','.join('?' for _ in normalized)})")
+            values.extend(normalized)
+        with self.connection() as connection:
+            return [
+                dict(row) for row in connection.execute(
+                    f"""SELECT * FROM companion_fault_episode
+                         WHERE {' AND '.join(clauses)}
+                         ORDER BY last_failed_at,episode_id""",
+                    values,
+                )
+            ]
+
+    def resolve_fault_episodes(
+        self,
+        cycle_id: str,
+        *,
+        batch_ids: list[str] | None = None,
+        stages: list[str] | None = None,
+        resolution_artifact_id: str,
+        resolved_at: str,
+        connection: sqlite3.Connection | None = None,
+    ) -> list[str]:
+        """Resolve only episodes covered by the completed reply or formal stage."""
+        if connection is None:
+            with self.connection() as current:
+                return self.resolve_fault_episodes(
+                    cycle_id,
+                    batch_ids=batch_ids,
+                    stages=stages,
+                    resolution_artifact_id=resolution_artifact_id,
+                    resolved_at=resolved_at,
+                    connection=current,
+                )
+        targets: list[tuple[str, list[str]]] = []
+        normalized_batches = sorted({str(value) for value in batch_ids or [] if str(value)})
+        normalized_stages = sorted({str(value) for value in stages or [] if str(value)})
+        if normalized_batches:
+            targets.append(
+                (
+                    f"scope_kind='batch' AND scope_key IN ({','.join('?' for _ in normalized_batches)})",
+                    normalized_batches,
+                )
+            )
+        if normalized_stages:
+            targets.append(
+                (
+                    f"scope_kind='stage' AND scope_key IN ({','.join('?' for _ in normalized_stages)})",
+                    normalized_stages,
+                )
+            )
+        if not targets:
+            return []
+        condition = " OR ".join(f"({sql})" for sql, _ in targets)
+        values: list[Any] = [cycle_id]
+        for _, target_values in targets:
+            values.extend(target_values)
+        episode_ids = [
+            str(row["episode_id"]) for row in connection.execute(
+                f"""SELECT episode_id FROM companion_fault_episode
+                     WHERE cycle_id=? AND state='active' AND ({condition})
+                     ORDER BY episode_id""",
+                values,
+            )
+        ]
+        if episode_ids:
+            placeholders = ",".join("?" for _ in episode_ids)
+            connection.execute(
+                f"""UPDATE companion_fault_episode
+                     SET state='resolved',resolved_at=?,resolution_artifact_id=?
+                     WHERE episode_id IN ({placeholders}) AND state='active'""",
+                [resolved_at, resolution_artifact_id, *episode_ids],
+            )
+        return episode_ids
 
     def stage_message(self, cycle_id: str, text: str, phase: str, *, message_id: str | None = None) -> dict[str, Any]:
         if phase not in {"pre_m0", "h0", "chat", "conversation"}:

@@ -301,24 +301,48 @@ public sealed class CompanionEventProjectionTests
     }
 
     [Fact]
-    public void ConsecutiveFaultsShareOneCardAndRepeatedTextUsesLatestOccurrence()
+    public void FrozenMidnightRecoveryProjectsOneCurrentEpisodeThenOnlyTheCompleteReply()
     {
-        const string repeated = "M1 遇到技术故障，未能完成。详细诊断已保留在本地审计记录中。";
+        const string cycleId = "ae19d3de-a0c2-480e-9b67-4bd4b2ddf8c5";
+        const string episodeId = "fault-episode-midnight-reply";
         var events = new[]
         {
-            """{"contract":"companion-client-event/v1","event_id":"fault-1","cycle_id":"cycle-1","type":"m1.failed","created_at":"2026-08-31T07:48:43Z","payload":{"reason":"__REASON__","cycle":{"task_key":"daily.review.1520","state":"m1_retry_wait"}}}""".Replace("__REASON__", repeated, StringComparison.Ordinal),
-            """{"contract":"companion-client-event/v1","event_id":"fault-2","cycle_id":"cycle-1","type":"m1.failed","created_at":"2026-08-31T07:49:19Z","payload":{"reason":"__REASON__","cycle":{"task_key":"daily.review.1520","state":"m1_retry_wait"}}}""".Replace("__REASON__", repeated, StringComparison.Ordinal),
-            """{"contract":"companion-client-event/v1","event_id":"fault-other","cycle_id":"cycle-1","type":"m2.deferred","created_at":"2026-08-31T07:50:00Z","payload":{"reason":"M2 已延后。","cycle":{"task_key":"daily.review.1520","state":"m2_deferred"}}}"""
+            """{"contract":"companion-client-event/v1","event_id":"user","cycle_id":"__CYCLE__","type":"human.message_batch.accepted","created_at":"2026-09-08T16:00:00Z","payload":{"cycle":{"task_key":"conversation.daily","state":"open"},"messages":[{"message_id":"user-1","body_text":"请核验今晚的风险。","state":"submitted","phase":"conversation","submitted_at":"2026-09-08T16:00:00Z"}]}}""".Replace("__CYCLE__", cycleId, StringComparison.Ordinal),
+            Fault("chat-fault-1", "chat.stream.failed", "2026-09-08T16:00:01Z", 1, "聊天回复 遇到技术故障，未能完成。", "artifact-chat-1"),
+            Fault("chat-fault-2", "chat.stream.failed", "2026-09-08T16:00:02Z", 2, "聊天回复 遇到技术故障，未能完成。", "artifact-chat-2"),
+            Fault("research-fault-1", "chat_research.failed", "2026-09-08T16:00:03Z", 3, "公开补查 的关键事实仍未达到可核验标准。", "artifact-research-1"),
+            Fault("research-fault-2", "chat_research.failed", "2026-09-08T16:00:04Z", 4, "公开补查 的关键事实仍未达到可核验标准。", "artifact-research-2"),
+            Fault("research-fault-3", "chat_research.failed", "2026-09-08T16:00:05Z", 5, "公开补查 的关键事实仍未达到可核验标准。", "artifact-research-3"),
+            """{"contract":"companion-client-event/v1","event_id":"ready","cycle_id":"__CYCLE__","type":"chat.ready","created_at":"2026-09-08T16:00:06Z","payload":{"cycle":{"task_key":"conversation.daily","state":"open"},"resolved_fault_episode_ids":["__EPISODE__"],"source_artifact_id":"answer-1","message":{"contract":"companion-published-message/v2","message_id":"answer-1","sealed_at":"2026-09-08T16:00:06Z","kind":"ai_chat","parts":[{"kind":"speech","text":"完整回答。"}],"text_projection":"完整回答。"}}}"""
+                .Replace("__CYCLE__", cycleId, StringComparison.Ordinal)
+                .Replace("__EPISODE__", episodeId, StringComparison.Ordinal),
         };
 
-        var projection = CompanionEventProjection.ProjectForTask(events, "daily.review.1520");
+        var beforeRecovery = CompanionEventProjection.ProjectForCycle(events[..^1], cycleId);
+        var afterRecovery = CompanionEventProjection.ProjectForCycle(events, cycleId);
+        var shuffled = CompanionEventProjection.ProjectForCycle(events.Reverse().Concat(events), cycleId);
 
-        Assert.NotNull(projection);
-        var fault = Assert.Single(projection.AiMessages);
+        Assert.NotNull(beforeRecovery);
+        var fault = Assert.Single(beforeRecovery.AiMessages);
         Assert.Equal("fault", fault.Kind);
-        Assert.Equal(1, fault.Text.Split(repeated, StringSplitOptions.None).Length - 1);
-        Assert.Contains("M2 已延后。", fault.Text, StringComparison.Ordinal);
-        Assert.Equal(DateTimeOffset.Parse("2026-08-31T07:50:00Z", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind), fault.At);
+        Assert.Equal("公开补查 的关键事实仍未达到可核验标准。", fault.Text);
+        Assert.Equal(episodeId, fault.ArtifactId);
+        Assert.NotNull(afterRecovery);
+        Assert.Equal("完整回答。", Assert.Single(afterRecovery.AiMessages).Text);
+        Assert.Equal("完整回答。", Assert.Single(shuffled!.AiMessages).Text);
+        Assert.Equal("请核验今晚的风险。", Assert.Single(afterRecovery.UserMessages).Text);
+
+        static string Fault(
+            string eventId, string type, string at, int attempt, string text, string artifactId) =>
+            """{"contract":"companion-client-event/v1","event_id":"__EVENT__","cycle_id":"__CYCLE__","type":"__TYPE__","created_at":"__AT__","payload":{"cycle":{"task_key":"conversation.daily","state":"open"},"fault_episodes":[{"contract":"companion-fault-episode/v1","episode_id":"__EPISODE__","state":"active","scope_kind":"batch","scope_key":"batch-1","capability":"conversation_reply","attempt_count":__ATTEMPT__,"current_artifact_id":"__ARTIFACT__","occurred_at":"__AT__","message":{"contract":"companion-published-message/v2","message_id":"__ARTIFACT__","sealed_at":"__AT__","kind":"system_fault","parts":[{"kind":"speech","text":"__TEXT__"}],"text_projection":"__TEXT__"}}]}}"""
+                .Replace("__EVENT__", eventId, StringComparison.Ordinal)
+                .Replace("__CYCLE__", cycleId, StringComparison.Ordinal)
+                .Replace("__TYPE__", type, StringComparison.Ordinal)
+                .Replace("__AT__", at, StringComparison.Ordinal)
+                .Replace("__EPISODE__", episodeId, StringComparison.Ordinal)
+                .Replace("__ATTEMPT__", attempt.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal)
+                .Replace("__ARTIFACT__", artifactId, StringComparison.Ordinal)
+                .Replace("__TEXT__", text, StringComparison.Ordinal);
     }
 
     [Fact]

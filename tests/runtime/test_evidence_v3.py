@@ -1189,17 +1189,46 @@ class EvidenceV3Tests(TestCase):
             with self.assertRaisesRegex(ValueError, "already terminal"):
                 store.finish_attempt(attempt["attempt_id"], "failed", error="again")
 
-    def test_rejected_evidence_only_emits_failure_event(self):
+    def test_rejected_evidence_records_failure_event_and_only_operational_fault_artifact(self):
         with TemporaryDirectory() as temporary:
             store = CompanionStore(Path(temporary) / "companion.sqlite3")
             engine = CompanionEngine(store)
             cycle = engine.start_cycle("daily.execution.0945", "2026-08-26T09:45:00+08:00", self.as_of)
             engine.research_started(cycle["cycle_id"])
             engine.research_failed(cycle["cycle_id"], "evidence rejected", details={"problems": ["foreign ref"]})
-            self.assertEqual([], store.artifacts(cycle["cycle_id"]))
-            failed_event = next(event for event in store.pending_events() if event["event_type"] == "research.failed")
+
+            artifacts = store.artifacts(cycle["cycle_id"])
+            self.assertEqual(["system_fault"], [artifact["kind"] for artifact in artifacts])
+            fault = artifacts[0]
+            metadata = json.loads(fault["metadata_json"])
+            self.assertEqual("companion-fault-episode/v1", metadata["fault_contract"])
+            self.assertEqual("fault_report", metadata["record_class"])
+            self.assertEqual(
+                [{"capability": "m0", "scope_key": "m0", "scope_kind": "stage"}],
+                metadata["fault_targets"],
+            )
+            self.assertEqual("formal_stage_unavailable", metadata["user_impact"])
+
+            failed_events = [
+                event for event in store.pending_events()
+                if event["event_type"] == "research.failed"
+            ]
+            self.assertEqual(1, len(failed_events))
+            failed_event = failed_events[0]
             payload = json.loads(failed_event["payload_json"])
+            self.assertEqual(fault["artifact_id"], payload["source_artifact_id"])
             self.assertEqual("companion-published-message/v2", payload["message"]["contract"])
+            self.assertEqual("system_fault", payload["message"]["kind"])
+
+            projection = engine.command({
+                "contract": "companion-user-command/v1",
+                "command_id": "rejected-evidence-projection",
+                "cycle_id": cycle["cycle_id"],
+                "type": "request_projection",
+            })
+            self.assertIsNone(projection["m0"])
+            self.assertEqual([], projection["ai_messages"])
+            self.assertEqual(1, len(projection["fault_episodes"]))
             with store.connection() as connection:
                 checkpoint = connection.execute("SELECT 1 FROM stage_checkpoint WHERE cycle_id=?", (cycle["cycle_id"],)).fetchone()
             self.assertIsNone(checkpoint)

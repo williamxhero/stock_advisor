@@ -293,7 +293,7 @@ public sealed class UiContractTests
         Assert.Contains("IsSelectionEnabled = true", source, StringComparison.Ordinal);
         Assert.Contains("Focusable = true", source, StringComparison.Ordinal);
         Assert.Contains("Cursor = Cursors.IBeam", source, StringComparison.Ordinal);
-        Assert.Contains("ClipboardCopyService.CopyTextAsync(text)", source, StringComparison.Ordinal);
+        Assert.Contains("ClipboardCopyService.CopyTextAsync(text, new WindowInteropHelper(this).Handle)", source, StringComparison.Ordinal);
     }
 
     [Fact]

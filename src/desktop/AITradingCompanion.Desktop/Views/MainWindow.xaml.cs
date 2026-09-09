@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
@@ -723,7 +724,7 @@ public partial class MainWindow : Window, IDisposable
     private async void CopyMessage_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not Button { Tag: string text }) return;
-        try { await ClipboardCopyService.CopyTextAsync(text); }
+        try { await ClipboardCopyService.CopyTextAsync(text, new WindowInteropHelper(this).Handle); }
         catch (Exception exception)
         {
             MessageBox.Show(this, $"复制失败：{exception.Message}", "AI交易伙伴",

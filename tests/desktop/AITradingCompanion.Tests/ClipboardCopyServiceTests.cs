@@ -1,10 +1,27 @@
 using System.Runtime.InteropServices;
 using AITradingCompanion.Desktop.Services;
+using System.Windows.Interop;
+using FormsClipboard = System.Windows.Forms.Clipboard;
 
 namespace AITradingCompanion.Tests;
 
 public sealed class ClipboardCopyServiceTests
 {
+    [Fact]
+    public async Task CopiesUnicodeTextThroughTheWindowsClipboard()
+    {
+        const string expected = "复制中文、line two\n📈";
+
+        await RunInStaAsync(() =>
+        {
+            using var owner = new HwndSource(new HwndSourceParameters("ClipboardCopyServiceTests"));
+
+            ClipboardCopyService.CopyTextAsync(expected, owner.Handle).GetAwaiter().GetResult();
+
+            Assert.Equal(expected, FormsClipboard.GetText());
+        });
+    }
+
     [Fact]
     public async Task RetriesWhenOpenClipboardIsTemporarilyUnavailable()
     {
@@ -85,5 +102,25 @@ public sealed class ClipboardCopyServiceTests
         Assert.Equal(unchecked((int)0x800401D0), exception.HResult);
         Assert.Equal(21, attempts);
         Assert.Equal(20, delays);
+    }
+
+    private static Task RunInStaAsync(Action action)
+    {
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                action();
+                completion.SetResult();
+            }
+            catch (Exception exception)
+            {
+                completion.SetException(exception);
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        return completion.Task;
     }
 }

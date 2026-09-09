@@ -13,7 +13,12 @@ from .publication_registry import published_event_types
 from .stage_expression import normalize_stage_output
 from .models import TASK_POLICIES
 from .secret_guard import assert_safe
-from .store import is_structured_test_provenance
+from .store import (
+    CONVERSATION_FAULT_EVENT_TYPES,
+    FAULT_STAGE_BY_EVENT,
+    USER_VISIBLE_AI_ARTIFACT_KINDS,
+    is_structured_test_provenance,
+)
 from .task_profiles import ManualAnalysisProfileResolver
 
 
@@ -427,11 +432,12 @@ class CompanionEngine:
             elif typ in {"begin_voice_capture", "begin_h0_edit"}:
                 result = self._begin_grace(cycle, typ)
             elif typ == "stage_message":
+                if command.get("provenance") is not None:
+                    raise ValueError("test provenance is reserved for trusted Runtime test and replay paths")
                 result = self._stage_message(
                     cycle,
                     str(command.get("text", "")),
                     command.get("message_id"),
-                    provenance=command.get("provenance"),
                 )
             elif typ == "edit_staged_message":
                 message = self.store.update_staged_message(cycle_id, str(command.get("message_id") or ""), str(command.get("text", "")))
@@ -446,6 +452,8 @@ class CompanionEngine:
             elif typ in {"commit_h0", "skip_h0"}:
                 result = self._lock_h0(cycle, "manual")
             elif typ in {"submit_h0", "submit_voice_h0"}:
+                if command.get("provenance") is not None:
+                    raise ValueError("test provenance is reserved for trusted Runtime test and replay paths")
                 text = str(command.get("text", "")).strip()
                 if text:
                     self._stage_message(
@@ -453,7 +461,6 @@ class CompanionEngine:
                         text,
                         command.get("message_id"),
                         emit=False,
-                        provenance=command.get("provenance"),
                     )
                 result = self._lock_h0(self.store.get_cycle(cycle_id), "legacy_submit")
             elif typ == "commit_chat_batch":
@@ -544,7 +551,6 @@ class CompanionEngine:
         message_id: str | None,
         *,
         emit: bool = True,
-        provenance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if cycle.get("kind") == "daily_conversation":
             if cycle["state"] != "open":
@@ -552,7 +558,7 @@ class CompanionEngine:
             assert_safe(text, boundary="user message storage")
             message = self.store.stage_message(
                 cycle["cycle_id"], text, "conversation",
-                message_id=message_id, provenance=provenance,
+                message_id=message_id,
             )
             if emit:
                 self.emit(cycle, "message.staged", {"cycle": cycle, "message": message})
@@ -567,7 +573,7 @@ class CompanionEngine:
         phase = "pre_m0" if cycle["state"] == "queued" else "h0" if not cycle.get("h0_locked_at") else "chat"
         message = self.store.stage_message(
             cycle["cycle_id"], text, phase,
-            message_id=message_id, provenance=provenance,
+            message_id=message_id,
         )
         if emit:
             self.emit(cycle, "message.staged", {"cycle": cycle, "message": message})
@@ -1216,10 +1222,7 @@ class CompanionEngine:
         removed_record_ids = set(
             self.store.removed_operational_record_ids(cycle["cycle_id"])
         )
-        ai_kinds = {
-            "m0", "m1", "m2", "ai_chat", "premarket_chat", "judgment_revision", "system_fault",
-            "outcome", "reflection", "recovery", "legacy_message",
-        }
+        ai_kinds = USER_VISIBLE_AI_ARTIFACT_KINDS | {"system_fault"}
         ai_messages = []
         local_message_ids: set[str] = set()
         for artifact in artifacts:
@@ -1227,16 +1230,18 @@ class CompanionEngine:
                 continue
             metadata = json.loads(artifact["metadata_json"] or "{}")
             published_message = metadata.get("published_message")
+            is_test_utterance = is_structured_test_provenance(metadata.get("provenance"))
             if (
                 (
                     artifact["kind"] not in {"ai_chat", "premarket_chat"}
                     or artifact["artifact_id"] in removed_record_ids
+                    or is_test_utterance
                 )
                 and isinstance(published_message, dict)
                 and published_message.get("message_id")
             ):
                 local_message_ids.add(str(published_message["message_id"]))
-            if artifact["artifact_id"] in removed_record_ids:
+            if artifact["artifact_id"] in removed_record_ids or is_test_utterance:
                 continue
             if artifact["kind"] == "system_fault":
                 continue
@@ -1248,15 +1253,19 @@ class CompanionEngine:
             if isinstance(published_message, dict):
                 item["message"] = published_message
             ai_messages.append(item)
+        messages = self.store.messages(cycle["cycle_id"])
         user_messages = [
             {
                 "message_id": message["message_id"], "state": message["state"], "phase": message["phase"],
                 "batch_id": message["batch_id"], "text": message["body_text"], "at": message["staged_at"],
                 "submitted_at": message["submitted_at"], "source_artifact_id": message["source_artifact_id"],
             }
-            for message in self.store.messages(cycle["cycle_id"])
+            for message in messages
             if message["state"] != "withdrawn"
             and message["message_id"] not in removed_record_ids
+            and not is_structured_test_provenance(
+                json.loads(message.get("provenance_json") or "{}")
+            )
         ]
         if self.memory is not None:
             timeline = [
@@ -1272,6 +1281,9 @@ class CompanionEngine:
                     "submitted_at": item.get("submitted_at"), "source_artifact_id": None,
                 }
                 for item in timeline if item.get("episode_type") == "user_message"
+                and not is_structured_test_provenance(
+                    (item.get("metadata") or {}).get("provenance")
+                )
             }
             user_messages = [
                 memory_users.get(str(message["message_id"]), message) for message in user_messages
@@ -1291,6 +1303,9 @@ class CompanionEngine:
                 for item in timeline
                 if item.get("episode_type") == "ai_message"
                 and (item.get("metadata") or {}).get("kind") != "system_fault"
+                and not is_structured_test_provenance(
+                    (item.get("metadata") or {}).get("provenance")
+                )
                 and str((item.get("metadata") or {}).get("message_id") or "") not in removed_record_ids
                 and str((item.get("metadata") or {}).get("message_id") or "") not in local_message_ids
             ]
@@ -1301,8 +1316,12 @@ class CompanionEngine:
                 "artifact_id": message["source_artifact_id"], "at": message["submitted_at"] or message["staged_at"],
                 "text": message["body_text"], "counts_for_m1": message["phase"] == "h0" and message["state"] == "submitted",
             }
-            for message in self.store.messages(cycle["cycle_id"], state="submitted")
+            for message in messages
+            if message["state"] == "submitted"
             if message["message_id"] not in removed_record_ids
+            and not is_structured_test_provenance(
+                json.loads(message.get("provenance_json") or "{}")
+            )
         ]
         return {
             "cycle": cycle,
@@ -1445,14 +1464,10 @@ class CompanionEngine:
     def _fault_targets(
         self, cycle: dict[str, Any], event_type: str, extra: dict[str, Any],
     ) -> list[dict[str, str]]:
-        conversation_failures = {
-            "chat.stream.failed", "chat_research.failed", "scheduled_conversation.failed",
-            "cognition.failed", "workflow_feedback.failed",
-        }
         batch_ids = sorted({
             str(value) for value in extra.get("batch_ids") or [] if str(value)
         })
-        if event_type in conversation_failures and not batch_ids:
+        if event_type in CONVERSATION_FAULT_EVENT_TYPES and not batch_ids:
             batch_ids = sorted({
                 str(batch["batch_id"])
                 for phase in ("conversation", "chat")
@@ -1467,14 +1482,7 @@ class CompanionEngine:
                 }
                 for batch_id in batch_ids
             ]
-        stage = {
-            "research.failed": "m0",
-            "m0.invalidated": "m0",
-            "m1.failed": "m1",
-            "m2.deferred": "m2",
-            "outcome.failed": "outcome",
-            "cycle.missed": "cycle",
-        }.get(event_type, event_type.removesuffix(".failed"))
+        stage = FAULT_STAGE_BY_EVENT.get(event_type, event_type.removesuffix(".failed"))
         return [{"scope_kind": "stage", "scope_key": stage, "capability": stage}]
 
     def _fault_episode_projection(

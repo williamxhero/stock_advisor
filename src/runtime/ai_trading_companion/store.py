@@ -24,6 +24,33 @@ _USER_VISIBLE_CYCLE_SQL = """NOT (
 )"""
 
 _TEST_PROVENANCE_SOURCES = {"formal_test", "repair_probe", "frozen_replay"}
+CONVERSATION_FAULT_EVENT_TYPES = frozenset({
+    "chat.stream.failed", "chat_research.failed", "scheduled_conversation.failed",
+    "cognition.failed", "workflow_feedback.failed",
+})
+FAULT_STAGE_BY_EVENT = {
+    "research.failed": "m0",
+    "m0.invalidated": "m0",
+    "m1.failed": "m1",
+    "m2.deferred": "m2",
+    "outcome.failed": "outcome",
+    "cycle.missed": "cycle",
+}
+USER_VISIBLE_AI_ARTIFACT_KINDS = frozenset({
+    "m0", "m1", "m2", "ai_chat", "premarket_chat", "judgment_revision",
+    "outcome", "reflection", "recovery", "legacy_message",
+})
+
+
+def _structured_test_provenance_sql(json_expression: str, *, nested: bool) -> str:
+    root = "$.provenance" if nested else "$"
+    sources = ",".join(f"'{source}'" for source in sorted(_TEST_PROVENANCE_SOURCES))
+    return f"""(
+      json_valid(COALESCE({json_expression}, '{{}}'))
+      AND json_extract({json_expression}, '{root}.contract')='companion-test-provenance/v1'
+      AND json_extract({json_expression}, '{root}.source') IN ({sources})
+      AND TRIM(COALESCE(json_extract({json_expression}, '{root}.run_id'),''))!=''
+    )"""
 
 
 def normalize_test_provenance(value: dict[str, Any] | None) -> dict[str, str]:
@@ -654,8 +681,43 @@ class CompanionStore:
             clauses, values = ["1=1", _USER_VISIBLE_CYCLE_SQL], []
             if before: clauses.append("substr(c.scheduled_for,1,10)<?"); values.append(before)
             if search:
-                clauses.append("(c.task_key LIKE ? OR EXISTS(SELECT 1 FROM narrative_artifact a WHERE a.cycle_id=c.cycle_id AND a.body_markdown LIKE ?))")
-                values.extend([f"%{search}%", f"%{search}%"])
+                artifact_kinds = ",".join(
+                    f"'{kind}'" for kind in sorted(USER_VISIBLE_AI_ARTIFACT_KINDS)
+                )
+                artifact_is_test = _structured_test_provenance_sql(
+                    "a.metadata_json", nested=True,
+                )
+                message_is_test = _structured_test_provenance_sql(
+                    "m.provenance_json", nested=False,
+                )
+                clauses.append(f"""(
+                  c.task_key LIKE ?
+                  OR EXISTS(
+                    SELECT 1 FROM narrative_artifact a
+                     WHERE a.cycle_id=c.cycle_id AND a.body_markdown LIKE ?
+                       AND NOT EXISTS(
+                         SELECT 1 FROM companion_operational_record_tombstone t
+                          WHERE t.record_id=a.artifact_id)
+                       AND (
+                         (a.kind IN ({artifact_kinds}) AND NOT {artifact_is_test})
+                         OR (
+                           a.kind='system_fault' AND EXISTS(
+                             SELECT 1 FROM companion_fault_episode f
+                              WHERE f.cycle_id=a.cycle_id AND f.state='active'
+                                AND f.current_artifact_id=a.artifact_id)
+                         )
+                       )
+                  )
+                  OR EXISTS(
+                    SELECT 1 FROM companion_message m
+                     WHERE m.cycle_id=c.cycle_id AND m.body_text LIKE ?
+                       AND m.state='submitted' AND NOT {message_is_test}
+                       AND NOT EXISTS(
+                         SELECT 1 FROM companion_operational_record_tombstone t
+                          WHERE t.record_id=m.message_id)
+                  )
+                )""")
+                values.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
             clauses.append("NOT EXISTS(SELECT 1 FROM companion_cycle_visibility v WHERE v.cycle_id=c.cycle_id AND v.dismissed_at IS NOT NULL)")
             rows = c.execute(f"""WITH ranked AS (
               SELECT c.*,COUNT(DISTINCT a.artifact_id) artifact_count,COUNT(DISTINCT m.message_id) message_count,
@@ -1306,19 +1368,6 @@ class CompanionStore:
 
     def reconcile_historical_fault_episodes(self, cycle_id: str) -> list[str]:
         """Build the fault projection index for pre-contract records without deleting facts."""
-        conversation_failures = {
-            "chat.stream.failed", "chat_research.failed", "scheduled_conversation.failed",
-            "cognition.failed", "workflow_feedback.failed",
-        }
-        stage_failures = {
-            "research.failed": "m0",
-            "m0.invalidated": "m0",
-            "m1.failed": "m1",
-            "m2.deferred": "m2",
-            "outcome.failed": "outcome",
-            "cycle.missed": "cycle",
-        }
-
         def json_object(raw: str | None) -> dict[str, Any]:
             try:
                 value = json.loads(raw or "{}")
@@ -1399,7 +1448,7 @@ class CompanionStore:
                                 "capability": capability,
                             })
 
-                if not targets and event_type in conversation_failures:
+                if not targets and event_type in CONVERSATION_FAULT_EVENT_TYPES:
                     batch_ids: set[str] = set()
                     batch_ids.update(string_list(metadata.get("batch_ids")))
                     batch_ids.update(string_list(payload.get("batch_ids")))
@@ -1434,8 +1483,8 @@ class CompanionStore:
                         "capability": "conversation_reply",
                     } for batch_id in sorted(batch_ids))
 
-                if not targets and event_type in stage_failures:
-                    stage = stage_failures[event_type]
+                if not targets and event_type in FAULT_STAGE_BY_EVENT:
+                    stage = FAULT_STAGE_BY_EVENT[event_type]
                     targets.append({
                         "scope_kind": "stage", "scope_key": stage, "capability": stage,
                     })

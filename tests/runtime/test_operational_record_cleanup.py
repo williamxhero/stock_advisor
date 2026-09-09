@@ -58,6 +58,21 @@ def test_explicit_cleanup_tombstones_only_faults_and_structured_test_utterances(
         cycle["cycle_id"], "m1", "model", "必须保留的正式判断", cycle["as_of"], {},
     )
 
+    before_cleanup = engine.command({
+        "contract": "companion-user-command/v1",
+        "command_id": "projection-before-cleanup",
+        "cycle_id": cycle["cycle_id"],
+        "type": "request_projection",
+    })
+    assert [item["message_id"] for item in before_cleanup["user_messages"]] == [
+        normal["message_id"],
+    ]
+    assert [item["artifact_id"] for item in before_cleanup["ai_messages"]] == [
+        normal_ai["artifact_id"], formal_judgment["artifact_id"],
+    ]
+    assert [item["text"] for item in before_cleanup["judgments"]] == [normal["body_text"]]
+    assert before_cleanup["removed_operational_record_ids"] == []
+
     command = _cleanup_command(cycle["cycle_id"])
     receipt = engine.command(command)
     replay = CompanionEngine(store).command(command)
@@ -133,7 +148,8 @@ def test_cleanup_category_selection_and_repeated_new_request_are_deterministic(t
         "command_id": "projection-test-stays",
         "cycle_id": cycle["cycle_id"],
         "type": "request_projection",
-    })["user_messages"]] == [test_message["message_id"]]
+    })["user_messages"]] == []
+    assert test_message["message_id"] not in store.removed_operational_record_ids(cycle["cycle_id"])
 
     tests_only = engine.command({
         **_cleanup_command(cycle["cycle_id"], "tests-only"),
@@ -159,3 +175,46 @@ def test_cleanup_requires_explicit_confirmation_and_allowlisted_classes(tmp_path
             cycle["cycle_id"], "伪测试", "conversation",
             provenance={"source": "repair_probe", "run_id": "missing-contract"},
         )
+
+
+def test_default_history_search_only_matches_normal_messages_and_current_fault_state(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    cycle = store.ensure_daily_conversation("2026-09-09")
+    store.stage_message(
+        cycle["cycle_id"], "normal-search-marker", "conversation", message_id="normal-search",
+    )
+    store.stage_message(
+        cycle["cycle_id"], "test-search-marker", "conversation",
+        message_id="test-search", provenance=TEST_PROVENANCE,
+    )
+    batch_id, _ = store.commit_staged_messages(cycle["cycle_id"], "conversation")
+    old_fault = store.append_artifact(
+        cycle["cycle_id"], "system_fault", "system", "old-fault-search-marker",
+        cycle["as_of"], {},
+    )
+    latest_fault = store.append_artifact(
+        cycle["cycle_id"], "system_fault", "system", "latest-fault-search-marker",
+        cycle["as_of"], {},
+    )
+    for attempt, artifact in enumerate((old_fault, latest_fault), start=1):
+        store.record_fault_episode(
+            cycle["cycle_id"],
+            scope_kind="batch", scope_key=batch_id, capability="conversation_reply",
+            artifact_id=artifact["artifact_id"], reason_category="legacy_unclassified",
+            user_impact="reply_incomplete", required_action="repair_required",
+            occurred_at=f"2026-09-08T16:00:0{attempt}Z",
+        )
+
+    assert len(store.history_page(search="normal-search-marker")["items"]) == 1
+    assert store.history_page(search="test-search-marker")["items"] == []
+    assert store.history_page(search="old-fault-search-marker")["items"] == []
+    assert len(store.history_page(search="latest-fault-search-marker")["items"]) == 1
+
+    response = store.append_artifact(
+        cycle["cycle_id"], "ai_chat", "model", "ordinary recovery", cycle["as_of"], {},
+    )
+    store.resolve_fault_episodes(
+        cycle["cycle_id"], batch_ids=[batch_id],
+        resolution_artifact_id=response["artifact_id"], resolved_at=response["sealed_at"],
+    )
+    assert store.history_page(search="latest-fault-search-marker")["items"] == []

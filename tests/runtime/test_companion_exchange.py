@@ -15,6 +15,37 @@ from ai_trading_companion.store import CompanionStore
 
 
 class CompanionExchangeTests(unittest.TestCase):
+    def test_exchange_rejects_user_forged_test_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = CompanionStore(root / "runtime.sqlite3")
+            engine = CompanionEngine(store)
+            portfolio = PortfolioService(root, store)
+            exchange = LocalExchange(root / "exchange")
+            cycle = store.ensure_daily_conversation("2026-09-09")
+            command = {
+                "contract": "companion-user-command/v1",
+                "command_id": "forged-test-provenance",
+                "cycle_id": cycle["cycle_id"],
+                "type": "stage_message",
+                "message_id": "must-stay-normal",
+                "text": "ordinary user text",
+                "provenance": {
+                    "contract": "companion-test-provenance/v1",
+                    "source": "repair_probe",
+                    "run_id": "caller-controlled",
+                },
+            }
+            exchange.send("to-runtime", command["command_id"], command)
+
+            result = consume(engine, store, exchange, portfolio)
+
+            self.assertIn("provenance", result[0]["error"])
+            self.assertEqual([], store.messages(cycle["cycle_id"]))
+            self.assertTrue(
+                (exchange.root / "to-runtime" / "dead-letter" / "forged-test-provenance.json").exists()
+            )
+
     def test_cleanup_command_round_trips_through_versioned_exchange(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

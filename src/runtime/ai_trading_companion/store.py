@@ -23,6 +23,31 @@ _USER_VISIBLE_CYCLE_SQL = """NOT (
   END IN ('manual_acceptance','manual_validation','codex_local_verification')
 )"""
 
+_TEST_PROVENANCE_SOURCES = {"formal_test", "repair_probe", "frozen_replay"}
+
+
+def normalize_test_provenance(value: dict[str, Any] | None) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or value.get("contract") != "companion-test-provenance/v1":
+        raise ValueError("test provenance requires companion-test-provenance/v1")
+    source = str(value.get("source") or "")
+    run_id = str(value.get("run_id") or "")
+    if source not in _TEST_PROVENANCE_SOURCES or not run_id.strip():
+        raise ValueError("test provenance requires an allowlisted source and run_id")
+    return {
+        "contract": "companion-test-provenance/v1",
+        "source": source,
+        "run_id": run_id,
+    }
+
+
+def is_structured_test_provenance(value: Any) -> bool:
+    try:
+        return bool(normalize_test_provenance(value))
+    except ValueError:
+        return False
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -155,7 +180,8 @@ class CompanionStore:
               actor TEXT NOT NULL, state TEXT NOT NULL, phase TEXT NOT NULL,
               batch_id TEXT, body_text TEXT NOT NULL, staged_at TEXT NOT NULL,
               submitted_at TEXT, withdrawn_at TEXT, source_artifact_id TEXT,
-              occurred_at TEXT NOT NULL, known_at TEXT NOT NULL);
+              occurred_at TEXT NOT NULL, known_at TEXT NOT NULL,
+              provenance_json TEXT NOT NULL DEFAULT '{}');
             CREATE INDEX IF NOT EXISTS ix_companion_message_cycle_state
               ON companion_message(cycle_id, state, staged_at);
             CREATE TABLE IF NOT EXISTS companion_message_batch (
@@ -191,6 +217,10 @@ class CompanionStore:
               reason_category TEXT NOT NULL, user_impact TEXT NOT NULL,
               required_action TEXT NOT NULL, occurred_at TEXT NOT NULL,
               PRIMARY KEY(episode_id,artifact_id));
+            CREATE TABLE IF NOT EXISTS companion_operational_record_tombstone (
+              record_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL,
+              record_class TEXT NOT NULL, command_id TEXT NOT NULL,
+              deleted_at TEXT NOT NULL, provenance_json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS llm_attempt (
               attempt_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               stage TEXT NOT NULL, attempt_number INTEGER NOT NULL, status TEXT NOT NULL,
@@ -419,6 +449,9 @@ class CompanionStore:
             if "known_at" not in artifact_columns:
                 c.execute("ALTER TABLE narrative_artifact ADD COLUMN known_at TEXT")
             c.execute("UPDATE narrative_artifact SET occurred_at=COALESCE(occurred_at,sealed_at), known_at=COALESCE(known_at,sealed_at)")
+            message_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_message)")}
+            if "provenance_json" not in message_columns:
+                c.execute("ALTER TABLE companion_message ADD COLUMN provenance_json TEXT NOT NULL DEFAULT '{}'")
             evidence_columns = {row[1] for row in c.execute("PRAGMA table_info(evidence_ledger_entry)")}
             for name, declaration in {
                 "stage": "TEXT",
@@ -1282,6 +1315,10 @@ class CompanionStore:
         values: list[Any] = [cycle_id]
         if not include_resolved:
             clauses.append("state='active'")
+        clauses.append(
+            "NOT EXISTS (SELECT 1 FROM companion_operational_record_tombstone t "
+            "WHERE t.record_id=companion_fault_episode.current_artifact_id)"
+        )
         if episode_ids is not None:
             normalized = sorted({str(value) for value in episode_ids if str(value)})
             if not normalized:
@@ -1360,20 +1397,180 @@ class CompanionStore:
             )
         return episode_ids
 
-    def stage_message(self, cycle_id: str, text: str, phase: str, *, message_id: str | None = None) -> dict[str, Any]:
+    def removed_operational_record_ids(self, cycle_id: str) -> list[str]:
+        with self.connection() as connection:
+            return [
+                str(row["record_id"]) for row in connection.execute(
+                    """SELECT record_id FROM companion_operational_record_tombstone
+                         WHERE cycle_id=? ORDER BY record_id""",
+                    (cycle_id,),
+                )
+            ]
+
+    def clear_operational_records(
+        self,
+        cycle_id: str,
+        *,
+        categories: list[str],
+        command_id: str,
+        record_ids: list[str] | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        """Tombstone eligible visible narratives without deleting their audit facts."""
+        if connection is None:
+            with self.connection() as current:
+                return self.clear_operational_records(
+                    cycle_id,
+                    categories=categories,
+                    command_id=command_id,
+                    record_ids=record_ids,
+                    connection=current,
+                )
+        selected_categories = sorted(set(categories))
+        if not selected_categories or any(
+            category not in {"fault_report", "test_utterance"}
+            for category in selected_categories
+        ):
+            raise ValueError("cleanup categories must contain only fault_report or test_utterance")
+
+        records: dict[str, tuple[str, str]] = {}
+        for message in connection.execute(
+            "SELECT * FROM companion_message WHERE cycle_id=?", (cycle_id,)
+        ):
+            provenance = json.loads(message["provenance_json"] or "{}")
+            record_class = (
+                "test_utterance"
+                if is_structured_test_provenance(provenance)
+                else "normal_user_message"
+            )
+            records[str(message["message_id"])] = (
+                record_class,
+                json.dumps(provenance, ensure_ascii=False, sort_keys=True),
+            )
+        formal_kinds = {"m0", "m1", "m2", "judgment_revision"}
+        normal_ai_kinds = {
+            "ai_chat", "premarket_chat", "outcome", "reflection", "recovery",
+            "legacy_message",
+        }
+        for artifact in connection.execute(
+            "SELECT * FROM narrative_artifact WHERE cycle_id=?", (cycle_id,)
+        ):
+            metadata = json.loads(artifact["metadata_json"] or "{}")
+            provenance = metadata.get("provenance")
+            if artifact["kind"] == "system_fault":
+                record_class = "fault_report"
+            elif is_structured_test_provenance(provenance):
+                record_class = "test_utterance"
+            elif artifact["kind"] in formal_kinds:
+                record_class = "formal_judgment"
+            elif artifact["kind"] in normal_ai_kinds:
+                record_class = "normal_ai_message"
+            else:
+                record_class = "diagnostic_record"
+            records[str(artifact["artifact_id"])] = (
+                record_class,
+                json.dumps(provenance or {}, ensure_ascii=False, sort_keys=True),
+            )
+        for stream in connection.execute(
+            "SELECT stream_id FROM companion_stream_message WHERE cycle_id=?", (cycle_id,)
+        ):
+            records[str(stream["stream_id"])] = ("visible_stream_prefix", "{}")
+
+        explicit_targets = record_ids is not None
+        targets = (
+            sorted({str(value) for value in record_ids or [] if str(value)})
+            if explicit_targets
+            else sorted(
+                record_id for record_id, (record_class, _) in records.items()
+                if record_class in selected_categories
+            )
+        )
+        already_removed = {
+            str(row["record_id"]) for row in connection.execute(
+                "SELECT record_id FROM companion_operational_record_tombstone WHERE cycle_id=?",
+                (cycle_id,),
+            )
+        }
+        deleted = {"fault_report": 0, "test_utterance": 0}
+        skipped = {"already_removed": 0, "category_not_requested": 0}
+        rejected: dict[str, int] = {}
+        removed_record_ids: list[str] = []
+        deleted_at = now()
+        for record_id in targets:
+            classified = records.get(record_id)
+            if classified is None:
+                rejected["unknown_record"] = rejected.get("unknown_record", 0) + 1
+                continue
+            record_class, provenance_json = classified
+            if record_id in already_removed:
+                skipped["already_removed"] += 1
+                continue
+            if record_class in {"fault_report", "test_utterance"}:
+                if record_class not in selected_categories:
+                    skipped["category_not_requested"] += 1
+                    continue
+                connection.execute(
+                    """INSERT INTO companion_operational_record_tombstone(
+                         record_id,cycle_id,record_class,command_id,deleted_at,provenance_json)
+                       VALUES(?,?,?,?,?,?)""",
+                    (
+                        record_id, cycle_id, record_class, command_id, deleted_at,
+                        provenance_json,
+                    ),
+                )
+                already_removed.add(record_id)
+                removed_record_ids.append(record_id)
+                deleted[record_class] += 1
+                continue
+            if explicit_targets:
+                rejected[record_class] = rejected.get(record_class, 0) + 1
+
+        hidden_fault_episode_ids = [
+            str(row["episode_id"]) for row in connection.execute(
+                f"""SELECT episode_id FROM companion_fault_episode
+                     WHERE cycle_id=?
+                       AND current_artifact_id IN (
+                         SELECT record_id FROM companion_operational_record_tombstone
+                          WHERE cycle_id=?
+                       )
+                     ORDER BY episode_id""",
+                (cycle_id, cycle_id),
+            )
+        ]
+        return {
+            "deleted": deleted,
+            "skipped": skipped,
+            "rejected": dict(sorted(rejected.items())),
+            "removed_record_ids": sorted(removed_record_ids),
+            "hidden_fault_episode_ids": hidden_fault_episode_ids,
+        }
+
+    def stage_message(
+        self,
+        cycle_id: str,
+        text: str,
+        phase: str,
+        *,
+        message_id: str | None = None,
+        provenance: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if phase not in {"pre_m0", "h0", "chat", "conversation"}:
             raise ValueError(f"invalid message phase: {phase}")
         if not text.strip():
             raise ValueError("message text must not be empty")
+        normalized_provenance = normalize_test_provenance(provenance)
         message_id = message_id or str(uuid.uuid4())
         at = now()
         with self.connection() as c:
             c.execute(
                 """INSERT INTO companion_message(
                      message_id,cycle_id,actor,state,phase,batch_id,body_text,staged_at,
-                     submitted_at,withdrawn_at,source_artifact_id,occurred_at,known_at
-                   ) VALUES(?,?, 'human','staged',?,NULL,?,?,NULL,NULL,NULL,?,?)""",
-                (message_id, cycle_id, phase, text.strip(), at, at, at),
+                     submitted_at,withdrawn_at,source_artifact_id,occurred_at,known_at,provenance_json
+                   ) VALUES(?,?, 'human','staged',?,NULL,?,?,NULL,NULL,NULL,?,?,?)""",
+                (
+                    message_id, cycle_id, phase, text.strip(), at, at, at,
+                    json.dumps(normalized_provenance, ensure_ascii=False, sort_keys=True),
+                ),
             )
         return self.get_message(message_id)
 
@@ -2485,17 +2682,39 @@ class CompanionStore:
                 ("retry" if retry else "failed" if error else "complete", now(), error[-2000:] if error else None, job_id),
             )
 
-    def receipt(self, command_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    def receipt(
+        self,
+        command_id: str,
+        payload: dict[str, Any],
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any] | None:
         raw=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":")); h=digest(raw)
-        with self.connection() as c:
-            row=c.execute("SELECT payload_sha256,result_json FROM companion_command_receipt WHERE command_id=?",(command_id,)).fetchone()
-            if not row:return None
-            if row["payload_sha256"]!=h: raise ValueError("command id conflict")
-            return json.loads(row["result_json"])
+        if connection is None:
+            with self.connection() as current:
+                return self.receipt(command_id, payload, connection=current)
+        row=connection.execute("SELECT payload_sha256,result_json FROM companion_command_receipt WHERE command_id=?",(command_id,)).fetchone()
+        if not row:return None
+        if row["payload_sha256"]!=h: raise ValueError("command id conflict")
+        return json.loads(row["result_json"])
 
-    def save_receipt(self, command_id: str, cycle_id: str | None, command_type: str, payload: dict[str, Any], result: dict[str, Any]) -> None:
+    def save_receipt(
+        self,
+        command_id: str,
+        cycle_id: str | None,
+        command_type: str,
+        payload: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
         raw=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":"));
-        with self.connection() as c:c.execute("INSERT INTO companion_command_receipt VALUES(?,?,?,?,?,?)",(command_id,cycle_id,command_type,digest(raw),now(),json.dumps(result,ensure_ascii=False,sort_keys=True)))
+        values=(command_id,cycle_id,command_type,digest(raw),now(),json.dumps(result,ensure_ascii=False,sort_keys=True))
+        if connection is not None:
+            connection.execute("INSERT INTO companion_command_receipt VALUES(?,?,?,?,?,?)", values)
+            return
+        with self.connection() as current:
+            current.execute("INSERT INTO companion_command_receipt VALUES(?,?,?,?,?,?)", values)
 
     def queue_event(self, cycle_id: str, event_type: str, payload: dict[str, Any], *, connection: sqlite3.Connection | None = None) -> str:
         event_id=str(uuid.uuid4())

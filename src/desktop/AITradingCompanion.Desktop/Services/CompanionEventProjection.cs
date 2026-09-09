@@ -31,6 +31,13 @@ public sealed record CompanionTimelineEntry(
     string State = "submitted",
     string Phase = "h0");
 
+public sealed record CompanionCleanupReceipt(
+    string CommandId,
+    int DeletedFaultReports,
+    int DeletedTestUtterances,
+    int AlreadyRemoved,
+    int Rejected);
+
 public sealed record CompanionWorkspaceProjection(
     string CycleId,
     DateTimeOffset? ScheduledFor,
@@ -47,7 +54,8 @@ public sealed record CompanionWorkspaceProjection(
     string? TaskProfileId = null,
     string? TaskProfileDisplayName = null,
     bool IsDismissed = false,
-    bool IsCompanionThinking = false)
+    bool IsCompanionThinking = false,
+    CompanionCleanupReceipt? LastCleanupReceipt = null)
 {
     public bool IsH0Locked => H0LockedAt is not null;
     public bool HasStagedMessages => UserMessages.Any(message => message.State == "staged");
@@ -113,10 +121,14 @@ public static class CompanionEventProjection
         var ai = new Dictionary<string, CompanionAiTimelineEntry>(StringComparer.Ordinal);
         var users = new Dictionary<string, CompanionTimelineEntry>(StringComparer.Ordinal);
         var resolvedFaultEpisodeIds = new HashSet<string>(StringComparer.Ordinal);
+        var removedRecordIds = new HashSet<string>(StringComparer.Ordinal);
+        CompanionCleanupReceipt? lastCleanupReceipt = null;
 
         foreach (var item in cycleEvents)
         {
             var payload = item.Payload;
+            ReadStringArray(payload, "removed_operational_record_ids", removedRecordIds);
+            ReadStringArray(payload, "removed_record_ids", removedRecordIds);
             state = ReadCycleString(payload, "state") ?? state;
             taskKey = ReadCycleString(payload, "task_key") ?? taskKey;
             trigger = ReadCycleString(payload, "trigger") ?? trigger;
@@ -288,6 +300,11 @@ public static class CompanionEventProjection
                         ref taskKey, ref trigger, ref requestedAt, ref taskProfileId, ref taskProfileDisplayName,
                         ref isCompanionThinking, resolvedFaultEpisodeIds);
                     break;
+                case "operational_records.cleared":
+                    ReadStringArray(payload, "hidden_fault_episode_ids", resolvedFaultEpisodeIds);
+                    foreach (var episodeId in resolvedFaultEpisodeIds) ai.Remove(episodeId);
+                    lastCleanupReceipt = ReadCleanupReceipt(payload) ?? lastCleanupReceipt;
+                    break;
                 case "research.failed":
                 case "m0.invalidated":
                 case "cycle.missed":
@@ -310,6 +327,9 @@ public static class CompanionEventProjection
         }
 
         var visibleAiMessages = ai.Values
+            .Where(message => !removedRecordIds.Contains(message.ArtifactId))
+            .Where(message => message.SourceArtifactId is null
+                || !removedRecordIds.Contains(message.SourceArtifactId))
             .OrderBy(message => message.At)
             .ThenBy(message => message.ArtifactId, StringComparer.Ordinal)
             .ToArray();
@@ -323,14 +343,19 @@ public static class CompanionEventProjection
             state,
             errorText,
             visibleAiMessages,
-            users.Values.OrderBy(message => message.At).ToArray(),
+            users.Values
+                .Where(message => message.MessageId is null
+                    || !removedRecordIds.Contains(message.MessageId))
+                .OrderBy(message => message.At)
+                .ToArray(),
             taskKey,
             trigger,
             requestedAt,
             taskProfileId,
             taskProfileDisplayName,
             isDismissed,
-            isCompanionThinking);
+            isCompanionThinking,
+            lastCleanupReceipt);
     }
 
     private static bool ReadFaultEpisodes(
@@ -601,6 +626,49 @@ public static class CompanionEventProjection
 
     private static string? ReadNestedString(JsonElement element, string parent, string property) =>
         element.TryGetProperty(parent, out var nested) && nested.ValueKind == JsonValueKind.Object ? ReadString(nested, property) : null;
+
+    private static void ReadStringArray(
+        JsonElement element,
+        string property,
+        HashSet<string> destination)
+    {
+        if (!element.TryGetProperty(property, out var values)
+            || values.ValueKind != JsonValueKind.Array) return;
+        foreach (var value in values.EnumerateArray())
+            if (value.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(value.GetString()))
+                destination.Add(value.GetString()!);
+    }
+
+    private static CompanionCleanupReceipt? ReadCleanupReceipt(JsonElement payload)
+    {
+        if (!payload.TryGetProperty("receipt", out var receipt)
+            || receipt.ValueKind != JsonValueKind.Object
+            || ReadString(receipt, "contract") != "companion-operational-record-cleanup-result/v1"
+            || string.IsNullOrWhiteSpace(ReadString(receipt, "command_id"))) return null;
+        var deletedFaults = ReadNestedInt(receipt, "deleted", "fault_report");
+        var deletedTests = ReadNestedInt(receipt, "deleted", "test_utterance");
+        var alreadyRemoved = ReadNestedInt(receipt, "skipped", "already_removed");
+        var rejected = 0;
+        if (receipt.TryGetProperty("rejected", out var rejectedCounts)
+            && rejectedCounts.ValueKind == JsonValueKind.Object)
+            rejected = rejectedCounts.EnumerateObject()
+                .Where(property => property.Value.TryGetInt32(out _))
+                .Sum(property => property.Value.GetInt32());
+        return new CompanionCleanupReceipt(
+            ReadString(receipt, "command_id")!,
+            deletedFaults,
+            deletedTests,
+            alreadyRemoved,
+            rejected);
+    }
+
+    private static int ReadNestedInt(JsonElement element, string parent, string property) =>
+        element.TryGetProperty(parent, out var nested)
+        && nested.ValueKind == JsonValueKind.Object
+        && nested.TryGetProperty(property, out var value)
+        && value.TryGetInt32(out var result)
+            ? result
+            : 0;
 
     private static string? ReadFirstNestedArrayString(JsonElement element, string parent, string property)
     {

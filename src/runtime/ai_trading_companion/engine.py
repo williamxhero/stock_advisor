@@ -13,6 +13,7 @@ from .publication_registry import published_event_types
 from .stage_expression import normalize_stage_output
 from .models import TASK_POLICIES
 from .secret_guard import assert_safe
+from .store import is_structured_test_provenance
 from .task_profiles import ManualAnalysisProfileResolver
 
 
@@ -49,12 +50,14 @@ class CompanionEngine:
             return
         for message in messages:
             submitted_at = str(message.get("submitted_at") or message["known_at"])
+            provenance = json.loads(message.get("provenance_json") or "{}")
+            is_test = is_structured_test_provenance(provenance)
             self.memory.append({
                 "memory_space_id": self.memory_space_id,
                 "source_system": "stock-advisor",
                 "source_event_id": str(message["message_id"]),
                 "content_hash": "auto",
-                "episode_type": "user_message",
+                "episode_type": "test_utterance" if is_test else "user_message",
                 "body": str(message["body_text"]),
                 "occurred_at": str(message.get("occurred_at") or submitted_at),
                 "known_at": str(message.get("known_at") or submitted_at),
@@ -65,6 +68,7 @@ class CompanionEngine:
                     "message_id": message["message_id"], "cycle_id": cycle_id,
                     "batch_id": message.get("batch_id"), "phase": message.get("phase"),
                     "state": "submitted", "actor": "human",
+                    "provenance": provenance,
                 },
             })
 
@@ -404,6 +408,8 @@ class CompanionEngine:
             if typ == "request_projection":
                 result = self._projection(cycle)
                 self.emit(cycle, "projection.ready", result)
+            elif typ == "clear_operational_records":
+                return self._clear_operational_records(cycle, command)
             elif typ == "invalidate_m0":
                 if cycle["state"] not in {"awaiting_h0", "voice_grace"}:
                     raise ValueError(f"M0 cannot be invalidated from state: {cycle['state']}")
@@ -421,7 +427,12 @@ class CompanionEngine:
             elif typ in {"begin_voice_capture", "begin_h0_edit"}:
                 result = self._begin_grace(cycle, typ)
             elif typ == "stage_message":
-                result = self._stage_message(cycle, str(command.get("text", "")), command.get("message_id"))
+                result = self._stage_message(
+                    cycle,
+                    str(command.get("text", "")),
+                    command.get("message_id"),
+                    provenance=command.get("provenance"),
+                )
             elif typ == "edit_staged_message":
                 message = self.store.update_staged_message(cycle_id, str(command.get("message_id") or ""), str(command.get("text", "")))
                 self.emit(cycle, "message.edited", {"cycle": cycle, "message": message})
@@ -437,7 +448,13 @@ class CompanionEngine:
             elif typ in {"submit_h0", "submit_voice_h0"}:
                 text = str(command.get("text", "")).strip()
                 if text:
-                    self._stage_message(cycle, text, command.get("message_id"), emit=False)
+                    self._stage_message(
+                        cycle,
+                        text,
+                        command.get("message_id"),
+                        emit=False,
+                        provenance=command.get("provenance"),
+                    )
                 result = self._lock_h0(self.store.get_cycle(cycle_id), "legacy_submit")
             elif typ == "commit_chat_batch":
                 result = self._commit_chat(cycle)
@@ -455,6 +472,59 @@ class CompanionEngine:
         self.store.save_receipt(command["command_id"], cycle_id, typ, command, result)
         return result
 
+    def _clear_operational_records(
+        self, cycle: dict[str, Any], command: dict[str, Any],
+    ) -> dict[str, Any]:
+        if command.get("contract") != "companion-user-command/v1":
+            raise ValueError("cleanup requires companion-user-command/v1")
+        if command.get("confirmed") is not True:
+            raise ValueError("cleanup requires confirmed=true")
+        categories = command.get("categories")
+        if not isinstance(categories, list):
+            raise ValueError("cleanup categories must be a list")
+        record_ids = command.get("record_ids")
+        if record_ids is not None and not isinstance(record_ids, list):
+            raise ValueError("cleanup record_ids must be a list")
+        command_id = str(command["command_id"])
+        with self.store.connection() as connection:
+            previous = self.store.receipt(command_id, command, connection=connection)
+            if previous is not None:
+                return previous
+            cleanup = self.store.clear_operational_records(
+                cycle["cycle_id"],
+                categories=[str(value) for value in categories],
+                command_id=command_id,
+                record_ids=[str(value) for value in record_ids] if record_ids is not None else None,
+                connection=connection,
+            )
+            result = {
+                "contract": "companion-operational-record-cleanup-result/v1",
+                "command_id": command_id,
+                "cycle_id": cycle["cycle_id"],
+                "state": "completed",
+                **cleanup,
+            }
+            self.store.queue_event(
+                cycle["cycle_id"],
+                "operational_records.cleared",
+                {
+                    "cycle": cycle,
+                    "receipt": result,
+                    "removed_record_ids": cleanup["removed_record_ids"],
+                    "hidden_fault_episode_ids": cleanup["hidden_fault_episode_ids"],
+                },
+                connection=connection,
+            )
+            self.store.save_receipt(
+                command_id,
+                cycle["cycle_id"],
+                str(command["type"]),
+                command,
+                result,
+                connection=connection,
+            )
+        return result
+
     def _begin_grace(self, cycle: dict[str, Any], source: str) -> dict[str, Any]:
         deadline = parse(cycle["h0_auto_submit_at"]) if cycle.get("h0_auto_submit_at") else None
         publish = parse(cycle["m1_publish_deadline"]) if cycle.get("m1_publish_deadline") else None
@@ -467,12 +537,23 @@ class CompanionEngine:
             return result
         return {"accepted": False, "reason": "H0 window expired"}
 
-    def _stage_message(self, cycle: dict[str, Any], text: str, message_id: str | None, *, emit: bool = True) -> dict[str, Any]:
+    def _stage_message(
+        self,
+        cycle: dict[str, Any],
+        text: str,
+        message_id: str | None,
+        *,
+        emit: bool = True,
+        provenance: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if cycle.get("kind") == "daily_conversation":
             if cycle["state"] != "open":
                 raise ValueError("conversation is not open")
             assert_safe(text, boundary="user message storage")
-            message = self.store.stage_message(cycle["cycle_id"], text, "conversation", message_id=message_id)
+            message = self.store.stage_message(
+                cycle["cycle_id"], text, "conversation",
+                message_id=message_id, provenance=provenance,
+            )
             if emit:
                 self.emit(cycle, "message.staged", {"cycle": cycle, "message": message})
             return self._projection(cycle)
@@ -484,7 +565,10 @@ class CompanionEngine:
         # a later research packet.  The user can remove the secret and retry.
         assert_safe(text, boundary="user message storage")
         phase = "pre_m0" if cycle["state"] == "queued" else "h0" if not cycle.get("h0_locked_at") else "chat"
-        message = self.store.stage_message(cycle["cycle_id"], text, phase, message_id=message_id)
+        message = self.store.stage_message(
+            cycle["cycle_id"], text, phase,
+            message_id=message_id, provenance=provenance,
+        )
         if emit:
             self.emit(cycle, "message.staged", {"cycle": cycle, "message": message})
         return self._projection(cycle)
@@ -1128,6 +1212,9 @@ class CompanionEngine:
 
     def _projection(self, cycle: dict[str, Any]) -> dict[str, Any]:
         artifacts = self.store.artifacts(cycle["cycle_id"])
+        removed_record_ids = set(
+            self.store.removed_operational_record_ids(cycle["cycle_id"])
+        )
         ai_kinds = {
             "m0", "m1", "m2", "ai_chat", "premarket_chat", "judgment_revision", "system_fault",
             "outcome", "reflection", "recovery", "legacy_message",
@@ -1140,11 +1227,16 @@ class CompanionEngine:
             metadata = json.loads(artifact["metadata_json"] or "{}")
             published_message = metadata.get("published_message")
             if (
-                artifact["kind"] not in {"ai_chat", "premarket_chat"}
+                (
+                    artifact["kind"] not in {"ai_chat", "premarket_chat"}
+                    or artifact["artifact_id"] in removed_record_ids
+                )
                 and isinstance(published_message, dict)
                 and published_message.get("message_id")
             ):
                 local_message_ids.add(str(published_message["message_id"]))
+            if artifact["artifact_id"] in removed_record_ids:
+                continue
             if artifact["kind"] == "system_fault":
                 continue
             item = {
@@ -1163,6 +1255,7 @@ class CompanionEngine:
             }
             for message in self.store.messages(cycle["cycle_id"])
             if message["state"] != "withdrawn"
+            and message["message_id"] not in removed_record_ids
         ]
         if self.memory is not None:
             timeline = [
@@ -1197,6 +1290,7 @@ class CompanionEngine:
                 for item in timeline
                 if item.get("episode_type") == "ai_message"
                 and (item.get("metadata") or {}).get("kind") != "system_fault"
+                and str((item.get("metadata") or {}).get("message_id") or "") not in removed_record_ids
                 and str((item.get("metadata") or {}).get("message_id") or "") not in local_message_ids
             ]
             ai_messages = local_non_chat + memory_ai
@@ -1207,6 +1301,7 @@ class CompanionEngine:
                 "text": message["body_text"], "counts_for_m1": message["phase"] == "h0" and message["state"] == "submitted",
             }
             for message in self.store.messages(cycle["cycle_id"], state="submitted")
+            if message["message_id"] not in removed_record_ids
         ]
         return {
             "cycle": cycle,
@@ -1217,6 +1312,7 @@ class CompanionEngine:
             "fault_episodes": self._fault_episode_projection(cycle["cycle_id"]),
             "user_messages": user_messages,
             "stream_messages": self.store.stream_messages(cycle["cycle_id"]),
+            "removed_operational_record_ids": sorted(removed_record_ids),
             "judgments": judgments,
             "has_h0": bool(cycle.get("has_h0")),
         }

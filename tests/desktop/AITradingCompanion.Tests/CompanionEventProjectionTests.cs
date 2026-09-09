@@ -359,4 +359,27 @@ public sealed class CompanionEventProjectionTests
         Assert.NotNull(projection);
         Assert.Equal(["outcome", "reflection"], projection.AiMessages.Select(message => message.Kind));
     }
+
+    [Fact]
+    public void CleanupEventRemovesOnlyNamedOperationalRecordsAndProjectsItsReceipt()
+    {
+        const string cycleId = "conversation-1";
+        var events = new[]
+        {
+            """{"contract":"companion-client-event/v1","event_id":"messages","cycle_id":"conversation-1","type":"projection.ready","created_at":"2026-09-09T00:00:00Z","payload":{"cycle":{"task_key":"conversation.daily","state":"open"},"user_messages":[{"message_id":"normal-user","state":"submitted","phase":"conversation","text":"正常问题","at":"2026-09-09T00:00:00Z"},{"message_id":"test-user","state":"submitted","phase":"conversation","text":"测试问题","at":"2026-09-09T00:00:01Z"}],"ai_messages":[{"artifact_id":"normal-ai","kind":"ai_chat","at":"2026-09-09T00:00:02Z","text":"正常回答"},{"artifact_id":"test-ai","kind":"ai_chat","at":"2026-09-09T00:00:03Z","text":"测试回答"}],"fault_episodes":[{"contract":"companion-fault-episode/v1","episode_id":"fault-1","state":"active","scope_kind":"batch","scope_key":"batch-1","capability":"conversation_reply","attempt_count":1,"current_artifact_id":"fault-artifact","last_failed_at":"2026-09-09T00:00:04Z","text":"当前故障"}],"stream_messages":[{"stream_id":"visible-prefix","state":"failed","text":"已经显示的前缀。","created_at":"2026-09-09T00:00:01Z"}]}}""",
+            """{"contract":"companion-client-event/v1","event_id":"cleanup","cycle_id":"conversation-1","type":"operational_records.cleared","created_at":"2026-09-09T00:00:05Z","payload":{"cycle":{"task_key":"conversation.daily","state":"open"},"removed_record_ids":["fault-artifact","test-user","test-ai"],"hidden_fault_episode_ids":["fault-1"],"receipt":{"contract":"companion-operational-record-cleanup-result/v1","command_id":"cleanup-1","cycle_id":"conversation-1","state":"completed","deleted":{"fault_report":1,"test_utterance":2},"skipped":{"already_removed":0},"rejected":{}}}}"""
+        };
+
+        var projection = CompanionEventProjection.ProjectForCycle(events, cycleId);
+
+        Assert.NotNull(projection);
+        Assert.Equal("正常问题", Assert.Single(projection.UserMessages).Text);
+        Assert.Equal(
+            ["已经显示的前缀。\n\n（未完成）", "正常回答"],
+            projection.AiMessages.Select(message => message.Text));
+        Assert.NotNull(projection.LastCleanupReceipt);
+        Assert.Equal("cleanup-1", projection.LastCleanupReceipt.CommandId);
+        Assert.Equal(1, projection.LastCleanupReceipt.DeletedFaultReports);
+        Assert.Equal(2, projection.LastCleanupReceipt.DeletedTestUtterances);
+    }
 }

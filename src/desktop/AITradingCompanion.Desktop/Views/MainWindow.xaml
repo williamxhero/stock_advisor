@@ -187,7 +187,23 @@
                     <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="1" /><RowDefinition Height="*" /></Grid.RowDefinitions>
                     <Grid>
                         <TextBlock Text="AI的消息" FontSize="20" FontWeight="SemiBold" />
-                        <Button x:Name="ReadAloudButton" Content="朗读" Click="ReadAloudButton_Click" Padding="10,6" HorizontalAlignment="Right" />
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                            <TextBlock x:Name="CleanupStatusText" Foreground="{StaticResource SecondaryTextBrush}"
+                                       FontSize="{StaticResource UiAuxiliaryFontSize}" VerticalAlignment="Center"
+                                       Margin="0,0,8,0" />
+                            <Button x:Name="CleanupOperationalRecordsButton" Content="清理操作记录"
+                                    Click="CleanupOperationalRecordsButton_Click" Padding="10,6"
+                                    Margin="0,0,8,0" IsEnabled="False">
+                                <Button.ContextMenu>
+                                    <ContextMenu>
+                                        <MenuItem Header="只清理故障报告" Click="ClearFaultReports_Click" />
+                                        <MenuItem Header="只清理测试语句" Click="ClearTestUtterances_Click" />
+                                        <MenuItem Header="清理两类操作记录" Click="ClearAllOperationalRecords_Click" />
+                                    </ContextMenu>
+                                </Button.ContextMenu>
+                            </Button>
+                            <Button x:Name="ReadAloudButton" Content="朗读" Click="ReadAloudButton_Click" Padding="10,6" />
+                        </StackPanel>
                     </Grid>
                     <Border Grid.Row="1" Background="{StaticResource BorderBrush}" Margin="0,10,0,0" />
                     <ScrollViewer x:Name="AiTimelineScrollViewer" Grid.Row="2" Margin="0,12,0,0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">

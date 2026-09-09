@@ -15,6 +15,54 @@ from ai_trading_companion.store import CompanionStore
 
 
 class CompanionExchangeTests(unittest.TestCase):
+    def test_cleanup_command_round_trips_through_versioned_exchange(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = CompanionStore(root / "runtime.sqlite3")
+            engine = CompanionEngine(store)
+            portfolio = PortfolioService(root, store)
+            exchange = LocalExchange(root / "exchange")
+            cycle = store.ensure_daily_conversation("2026-09-09")
+            store.stage_message(
+                cycle["cycle_id"], "保留的正常消息", "conversation",
+                message_id="normal-message",
+            )
+            batch_id, _ = store.commit_staged_messages(cycle["cycle_id"], "conversation")
+            stream = engine.chat_stream_started(cycle["cycle_id"], [batch_id], "ai_chat")
+            engine.chat_stream_failed(cycle["cycle_id"], stream["stream_id"], "network")
+            command = {
+                "contract": "companion-user-command/v1",
+                "command_id": "exchange-cleanup-1",
+                "cycle_id": cycle["cycle_id"],
+                "type": "clear_operational_records",
+                "confirmed": True,
+                "categories": ["fault_report"],
+            }
+            exchange.send("to-runtime", command["command_id"], command)
+
+            results = consume(engine, store, exchange, portfolio)
+
+            self.assertEqual("companion-operational-record-cleanup-result/v1", results[0]["contract"])
+            self.assertEqual(1, results[0]["deleted"]["fault_report"])
+            self.assertTrue(
+                (exchange.root / "to-runtime" / "processed" / "exchange-cleanup-1.json").exists()
+            )
+            projected_events = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (exchange.root / "to-client" / "pending").glob("*.json")
+            ]
+            cleanup_event = next(
+                event for event in projected_events
+                if event.get("type") == "operational_records.cleared"
+            )
+            self.assertEqual("exchange-cleanup-1", cleanup_event["payload"]["receipt"]["command_id"])
+            self.assertEqual([], engine.command({
+                "contract": "companion-user-command/v1",
+                "command_id": "exchange-cleanup-projection",
+                "cycle_id": cycle["cycle_id"],
+                "type": "request_projection",
+            })["fault_episodes"])
+
     def test_gateway_commit_dispatches_conversation_cognition_without_blocking_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -1313,7 +1313,7 @@ def run_research(
         result = engine.research_ready(
             cycle["cycle_id"], "Fixture 模式：这里会显示自然、无方向的 M0 客观观察。",
             evidence_attempt_id=_fixture_attempt(store, cycle["cycle_id"], "m0_research", evidence_hash, evidence),
-            compose_attempt_id=_fixture_attempt(store, cycle["cycle_id"], "m0_compose", compose_hash, {"semantic": {"summary": "Fixture 模式：这里会显示自然、无方向的 M0 客观观察。", "observations": [], "risks": [], "unknowns": []}}),
+            compose_attempt_id=_fixture_attempt(store, cycle["cycle_id"], "m0_compose", compose_hash, {"result_version": 3, "semantic": {"summary": {"text": "Fixture 模式：这里会显示自然、无方向的 M0 客观观察。", "evidence_refs": []}, "observations": [], "connections": [], "attention": [], "unknowns": []}}),
             evidence_packet_hash=evidence_hash, packet_hash=compose_hash,
         )
         publish_observatory_evaluation(store, cycle["cycle_id"])

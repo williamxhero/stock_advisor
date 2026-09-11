@@ -1,14 +1,41 @@
 {
-  "$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,
-  "required":["result_version","semantic"],"properties":{
-    "result_version":{"type":"integer","const":3},
-    "semantic":{"type":"object","additionalProperties":false,"required":["summary","observations","risks","unknowns"],"properties":{
-      "summary":{"type":"string","minLength":1,"maxLength":240},
-      "observations":{"type":"array","maxItems":3,"items":{"type":"string","minLength":1,"maxLength":180}},
-      "connections":{"type":"array","maxItems":2,"items":{"type":"string","minLength":1,"maxLength":180}},
-      "attention":{"type":"array","maxItems":1,"items":{"type":"string","minLength":1,"maxLength":180}},
-      "risks":{"type":"array","maxItems":1,"items":{"type":"string","minLength":1,"maxLength":180}},
-      "unknowns":{"type":"array","maxItems":1,"items":{"type":"string","minLength":1,"maxLength":180}}
-    }}
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["result_version", "semantic"],
+  "properties": {
+    "result_version": {"type": "integer", "const": 3},
+    "semantic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "observations", "connections", "attention", "unknowns"],
+      "properties": {
+        "summary": {"$ref": "#/$defs/summary_item"},
+        "observations": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/observation_item"}},
+        "connections": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/observation_item"}},
+        "attention": {"type": "array", "maxItems": 1, "items": {"$ref": "#/$defs/observation_item"}},
+        "unknowns": {"type": "array", "maxItems": 1, "items": {"$ref": "#/$defs/observation_item"}}
+      }
+    }
+  },
+  "$defs": {
+    "summary_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text", "evidence_refs"],
+      "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 240},
+        "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "observation_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text", "evidence_refs"],
+      "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 180},
+        "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    }
   }
 }

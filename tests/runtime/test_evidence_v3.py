@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
+from jsonschema import Draft202012Validator
+
 from ai_trading_companion.__main__ import (
     M1_MAX_JUDGMENT_ATTEMPTS,
     _call_stage,
@@ -28,6 +30,99 @@ from ai_trading_companion.store import CompanionStore
 
 
 class EvidenceV3Tests(TestCase):
+    def test_m0_schema_requires_traceable_natural_observation_items(self):
+        schema = json.loads((Path(__file__).parents[2] / "resources" / "contracts" / "companion-m0-result-v3.schema.json").read_text(encoding="utf-8"))
+        valid = {
+            "result_version": 3,
+            "semantic": {
+                "summary": {"text": "市场概括", "evidence_refs": ["delta-1"]},
+                "observations": [{"text": "新增事件", "evidence_refs": ["delta-1"]}],
+                "connections": [{"text": "事件与盘面存在联系", "evidence_refs": ["delta-1"]}],
+                "attention": [{"text": "留意后续核验", "evidence_refs": ["delta-1"]}],
+                "unknowns": [{"text": "传播范围仍未知", "evidence_refs": ["delta-1"]}],
+            },
+        }
+
+        self.assertEqual([], list(Draft202012Validator(schema).iter_errors(valid)))
+        invalid = json.loads(json.dumps(valid, ensure_ascii=False))
+        invalid["semantic"]["summary"] = "市场概括"
+        invalid["semantic"]["risks"] = []
+        self.assertTrue(list(Draft202012Validator(schema).iter_errors(invalid)))
+
+    def test_m0_emitter_orders_natural_sections_without_exposing_evidence_refs(self):
+        rendered = express_stage_semantics("m0", {
+            "summary": {"text": "市场概括", "evidence_refs": ["delta-1"]},
+            "observations": [{"text": "新变化", "evidence_refs": ["delta-2"]}],
+            "connections": [{"text": "关键联系", "evidence_refs": ["delta-2"]}],
+            "attention": [{"text": "轻度关注", "evidence_refs": ["delta-2"]}],
+            "unknowns": [{"text": "必要不确定性", "evidence_refs": ["delta-2"]}],
+        })
+
+        self.assertLess(rendered.index("市场概括"), rendered.index("新变化"))
+        self.assertLess(rendered.index("新变化"), rendered.index("关键联系"))
+        self.assertLess(rendered.index("关键联系"), rendered.index("轻度关注"))
+        self.assertLess(rendered.index("轻度关注"), rendered.index("必要不确定性"))
+        self.assertNotIn("evidence_refs", rendered)
+
+    def test_m0_verifier_rejects_foreign_refs_and_single_article_propagation_breadth(self):
+        packet = {"stage": "m0_compose", "evidence": {
+            "sources": [{"evidence_ref": "delta-1"}],
+            "high_impact_events": [{
+                "event_id": "rumor-1", "summary": "某政策消息",
+                "truth_status": "unverified", "propagation_status": "observed",
+                "truth_evidence_refs": ["delta-1"],
+                "propagation_evidence_refs": ["delta-1"],
+                "origin_evidence_refs": ["delta-1"],
+            }],
+        }}
+        output = {"result_version": 3, "semantic": {
+            "summary": {"text": "市场概括", "evidence_refs": ["outside"]},
+            "observations": [{"text": "某政策消息尚未证实，但正在市场广泛传播", "evidence_refs": ["delta-1"]}],
+            "connections": [], "attention": [], "unknowns": [],
+        }}
+
+        verdict = CognitiveRouter().verify("m0_compose", packet, output)
+
+        self.assertIn("m0_evidence_ref_not_in_frozen_packet:outside", verdict["problems"])
+        self.assertIn("m0_propagation_breadth_not_supported", verdict["problems"])
+
+    def test_m0_verifier_reports_market_news_delta_page_guard_breach(self):
+        packet = {"stage": "m0_compose", "evidence": {
+            "market_news_delta": {"pagination": {"max_pages": 32, "pages": 33}},
+        }}
+        output = {"result_version": 3, "semantic": {
+            "summary": {"text": "市场概括", "evidence_refs": []},
+            "observations": [], "connections": [], "attention": [], "unknowns": [],
+        }}
+
+        verdict = CognitiveRouter().verify("m0_compose", packet, output)
+
+        self.assertIn("m0_news_delta_pagination_limit_exceeded", verdict["problems"])
+
+    def test_m0_verifier_does_not_claim_delta_comparison_without_a_predecessor(self):
+        packet = {"stage": "m0_compose", "evidence": {
+            "market_news_delta": {"predecessor_missing": True},
+        }}
+        output = {"result_version": 3, "semantic": {
+            "summary": {"text": "市场概括", "evidence_refs": []},
+            "observations": [{"text": "较前序新增政策消息", "evidence_refs": []}],
+            "connections": [], "attention": [], "unknowns": [],
+        }}
+
+        verdict = CognitiveRouter().verify("m0_compose", packet, output)
+
+        self.assertIn("m0_delta_comparison_without_predecessor", verdict["problems"])
+
+    def test_m0_verifier_rejects_prediction_opportunity_sorting_and_trading_language(self):
+        output = {"result_version": 3, "semantic": {
+            "summary": {"text": "预计市场将上涨，以下是机会排序并建议买入", "evidence_refs": []},
+            "observations": [], "connections": [], "attention": [], "unknowns": [],
+        }}
+
+        verdict = CognitiveRouter().verify("m0_compose", {"stage": "m0_compose"}, output)
+
+        self.assertIn("m0_contains_direction_or_action", verdict["problems"])
+
     def test_m0_expression_does_not_turn_missing_fact_into_delivery_status(self):
         rendered = express_stage_semantics("m0", {
             "summary": "收盘市场整体偏弱。",
@@ -64,7 +159,7 @@ class EvidenceV3Tests(TestCase):
         }
 
         output = safe_stage_output("m0_compose", packet=packet)
-        rendered = " ".join([output["semantic"]["summary"], *output["semantic"]["observations"]])
+        rendered = express_stage_semantics("m0", output["semantic"])
 
         self.assertIn("3942.09", rendered)
         self.assertIn("上涨1805家、下跌3275家", rendered)
@@ -97,7 +192,7 @@ class EvidenceV3Tests(TestCase):
         }
 
         output = safe_stage_output("m0_compose", packet=packet)
-        rendered = " ".join([output["semantic"]["summary"], *output["semantic"]["observations"]])
+        rendered = express_stage_semantics("m0", output["semantic"])
 
         self.assertIn("截至14:30", rendered)
         self.assertIn("上涨3132家、下跌1966家", rendered)

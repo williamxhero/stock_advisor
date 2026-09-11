@@ -39,7 +39,7 @@ def canonical_direction(value: Any) -> str:
 
 def _semantic_snapshot(semantic: dict[str, Any]) -> dict[str, Any]:
     direction = canonical_direction(semantic.get("direction"))
-    summary = str(semantic.get("summary") or "").strip()
+    summary = _m0_item_text(semantic.get("summary"))
     positions = [item for item in semantic.get("position_focus") or [] if isinstance(item, dict)]
     subjects = list(dict.fromkeys([
         *re.findall(r"(?<!\d)\d{6}(?!\d)", summary),
@@ -90,6 +90,21 @@ def _clean_values(values: Any, limit: int) -> list[str]:
 
 def _sentence_piece(value: Any) -> str:
     return str(value or "").strip().rstrip("。！？；，,.!?; ")
+
+
+def _m0_item_text(value: Any) -> str:
+    """Read user-facing M0 text while keeping evidence refs internal."""
+    if isinstance(value, dict):
+        return str(value.get("text") or "").strip()
+    # Read-only compatibility for pre-v3 callers; provider output is checked
+    # against the structured v3 schema before it can be accepted.
+    return str(value or "").strip()
+
+
+def _m0_item_values(values: Any, limit: int) -> list[str]:
+    return list(dict.fromkeys(
+        _m0_item_text(value) for value in values or [] if _m0_item_text(value)
+    ))[:limit]
 
 
 def _action_label(action: str) -> str:
@@ -174,6 +189,10 @@ def _verified_market_snapshot_summary(packet: dict[str, Any] | None) -> dict[str
         return format(value, ".15g") if isinstance(value, float) else str(value)
 
     value = packet or {}
+    evidence_refs = [
+        str(row.get("evidence_ref")) for row in value.get("verified_fact_digest") or []
+        if isinstance(row, dict) and str(row.get("evidence_ref") or "").strip()
+    ]
     as_of = str(value.get("as_of") or "")
     try:
         snapshot_time = datetime.fromisoformat(as_of.replace("Z", "+00:00")).astimezone(
@@ -219,31 +238,38 @@ def _verified_market_snapshot_summary(packet: dict[str, Any] | None) -> dict[str
         if up > down else "下跌家数多于上涨家数"
         if down > up else "上涨与下跌家数相当"
     )
-    observations = ["市场广度：" + "、".join(breadth_parts) + f"；{breadth_view}。"]
-    event_observation = _verified_event_observation(value)
+    observations = [{
+        "text": "市场广度：" + "、".join(breadth_parts) + f"；{breadth_view}。",
+        "evidence_refs": evidence_refs,
+    }]
+    event_observation, event_refs = _verified_event_observation(value)
     if event_observation:
-        observations.insert(0, event_observation)
+        observations.insert(0, {"text": event_observation, "evidence_refs": event_refs or evidence_refs})
     selected_quotes = sorted(
         (row for row in quotes if row.get("price") is not None and row.get("change_percent") is not None),
         key=lambda row: abs(float(row.get("change_percent") or 0)), reverse=True,
     )[:2]
     if selected_quotes:
-        observations.append("持仓表现有分化：" + "，".join(
-            f"{row.get('name') or row.get('symbol')}{quote_verb}{number(row.get('price'))}（{number(row.get('change_percent'))}%）"
-            for row in selected_quotes
-        ) + "。")
+        observations.append({
+            "text": "持仓表现有分化：" + "，".join(
+                f"{row.get('name') or row.get('symbol')}{quote_verb}{number(row.get('price'))}（{number(row.get('change_percent'))}%）"
+                for row in selected_quotes
+            ) + "。",
+            "evidence_refs": evidence_refs,
+        })
     return {
         "result_version": 3,
         "semantic": {
-            "summary": f"{stage_label}，三大指数：{index_text}。",
+            "summary": {"text": f"{stage_label}，三大指数：{index_text}。", "evidence_refs": evidence_refs},
             "observations": observations,
-            "risks": [],
+            "connections": [],
+            "attention": [],
             "unknowns": [],
         },
     }
 
 
-def _verified_event_observation(packet: dict[str, Any]) -> str:
+def _verified_event_observation(packet: dict[str, Any]) -> tuple[str, list[str]]:
     """State one material event faithfully when the model reply needs a safe M0 fallback."""
     evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
     for event in evidence.get("high_impact_events") or []:
@@ -260,8 +286,12 @@ def _verified_event_observation(packet: dict[str, Any]) -> str:
             if truth == "unverified" else f"关于{summary}的说法已被否认"
         )
         propagation_text = "；其传播已在本轮市场材料中被观察到" if propagation == "observed" else ""
-        return factual + propagation_text + "。"
-    return ""
+        refs = list(dict.fromkeys([
+            str(ref) for key in ("truth_evidence_refs", "propagation_evidence_refs", "origin_evidence_refs")
+            for ref in event.get(key) or [] if str(ref).strip()
+        ]))
+        return factual + propagation_text + "。", refs
+    return "", []
 
 
 def verified_weekly_market_comparison(packet: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -548,10 +578,11 @@ def safe_stage_output(
         return {
             "result_version": 3,
             "semantic": {
-                "summary": "眼下公开信息还在核对，先只保留客观观察。",
-                "observations": ["现有证据不足以确认盘面强弱是否已经扩散。"],
-                "risks": [],
-                "unknowns": ["后续成交和市场广度能否形成一致。"],
+                "summary": {"text": "眼下公开信息还在核对，先只保留客观观察。", "evidence_refs": []},
+                "observations": [{"text": "现有证据不足以确认盘面强弱是否已经扩散。", "evidence_refs": []}],
+                "connections": [],
+                "attention": [],
+                "unknowns": [{"text": "后续成交和市场广度能否形成一致。", "evidence_refs": []}],
             },
         }
     if stage in {"m1_judgment", "m2"}:
@@ -619,26 +650,27 @@ def _candidate_research_clause(value: Any) -> str:
 
 def express_stage_semantics(stage: str, semantic: dict[str, Any]) -> str:
     """Deterministically adapt frozen stage semantics into an expression draft."""
-    summary = str(semantic.get("summary") or "").strip()
+    summary = _m0_item_text(semantic.get("summary"))
     if not summary:
         raise ValueError(f"{stage} semantic summary is required")
     if stage in {"m1", "m2"} and "current_action" in semantic:
         return _v4_judgment_expression(semantic)
     paragraphs = [summary]
     if stage == "m0":
-        observations = [str(value).strip() for value in semantic.get("observations") or [] if str(value).strip()][:3]
-        connections = [str(value).strip() for value in semantic.get("connections") or [] if str(value).strip()][:2]
-        attention = [str(value).strip() for value in semantic.get("attention") or [] if str(value).strip()][:1]
-        risks = [str(value).strip() for value in semantic.get("risks") or [] if str(value).strip()][:1]
-        unknowns = [str(value).strip() for value in semantic.get("unknowns") or [] if str(value).strip()][:1]
+        observations = _m0_item_values(semantic.get("observations"), 3)
+        connections = _m0_item_values(semantic.get("connections"), 2)
+        attention = _m0_item_values(semantic.get("attention"), 1)
+        # Read-only compatibility for old in-process callers. New provider
+        # output cannot contain this field under the v3 schema.
+        if not attention:
+            attention = _m0_item_values(semantic.get("risks"), 1)
+        unknowns = _m0_item_values(semantic.get("unknowns"), 1)
         if observations:
             paragraphs.append("。".join(_sentence_piece(value) for value in observations) + "。")
         if connections:
             paragraphs.append("我把几条线索放在一起看：" + "；".join(_sentence_piece(value) for value in connections) + "。")
         if attention:
             paragraphs.append("接下来我会留意" + _sentence_piece(attention[0]) + "。")
-        if risks:
-            paragraphs.append("要留意" + _sentence_piece(risks[0]) + "。")
         if unknowns:
             unknown = _sentence_piece(unknowns[0])
             if unknown.startswith("缺少"):

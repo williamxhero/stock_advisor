@@ -175,6 +175,7 @@ class CognitiveRouter:
                     "fallback": bool((output.get("publication") or {}).get("fallback"))}
         normalized = normalize_stage_output(stage, output)
         if stage == "m0_compose":
+            problems.extend(_m0_semantic_problems(packet, output, normalized.text))
             problems.extend(observation_problems(packet, output))
             calendar = packet.get("calendar_context") if isinstance(packet.get("calendar_context"), dict) else {}
             body = "".join(normalized.text.split()).lower()
@@ -182,6 +183,8 @@ class CognitiveRouter:
                 "建议买入", "建议卖出", "建议加仓", "建议减仓", "不新增仓", "不加仓", "不减仓", "不清仓",
                 "买入股数", "卖出股数", "持有观察", "今日动作",
                 "看多", "看空", "偏多", "偏空", "做多", "做空", "bullish", "bearish",
+                "机会排序", "机会优先级", "预计上涨", "预计下跌", "将上涨", "将下跌",
+                "会上涨", "会下跌", "目标价", "上行空间", "下行空间", "方向预测",
             )):
                 problems.append("m0_contains_direction_or_action")
             if calendar.get("is_xshg_trading_day") is True and any(marker in body for marker in (
@@ -767,6 +770,141 @@ def _m0_covered_gap_problems(packet: dict[str, Any], body: str) -> list[str]:
         ):
             problems.append(f"m0_claims_covered_evidence_gap:{key}")
     return problems
+
+
+def _m0_frozen_evidence_refs(packet: dict[str, Any]) -> set[str]:
+    """Return only opaque refs present in the frozen M0 evidence packet."""
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    refs: set[str] = set()
+    for source in evidence.get("sources") or []:
+        if isinstance(source, dict) and str(source.get("evidence_ref") or "").strip():
+            refs.add(str(source["evidence_ref"]))
+    for row in packet.get("verified_fact_digest") or []:
+        if isinstance(row, dict) and str(row.get("evidence_ref") or "").strip():
+            refs.add(str(row["evidence_ref"]))
+    return refs
+
+
+def _m0_market_news_delta(packet: dict[str, Any]) -> dict[str, Any] | None:
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    for candidate in (
+        evidence.get("market_news_delta"),
+        packet.get("market_news_delta"),
+        (packet.get("public_research_scope") or {}).get("market_news_delta")
+        if isinstance(packet.get("public_research_scope"), dict) else None,
+    ):
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
+def _m0_news_delta_pagination_problems(packet: dict[str, Any]) -> list[str]:
+    """Expose a diagnosable breach when a frozen delta carries page metadata."""
+    delta = _m0_market_news_delta(packet)
+    if not isinstance(delta, dict):
+        return []
+    pagination = delta.get("pagination")
+    if pagination is None:
+        return []
+    if not isinstance(pagination, dict):
+        return ["m0_news_delta_pagination_metadata_invalid"]
+    try:
+        max_pages = int(pagination.get("max_pages"))
+        pages = int(pagination.get("pages"))
+    except (TypeError, ValueError):
+        return ["m0_news_delta_pagination_metadata_invalid"]
+    problems = []
+    if max_pages != 32:
+        problems.append("m0_news_delta_pagination_guard_invalid")
+    if pages > max_pages:
+        problems.append("m0_news_delta_pagination_limit_exceeded")
+    return problems
+
+
+def _m0_item_text(value: Any) -> str:
+    return str(value.get("text") or "").strip() if isinstance(value, dict) else str(value or "").strip()
+
+
+def _m0_semantic_problems(packet: dict[str, Any], output: dict[str, Any], text: str) -> list[str]:
+    """Validate the public M0 shape and its binding to the frozen evidence."""
+    semantic = output.get("semantic") if isinstance(output.get("semantic"), dict) else {}
+    if output.get("result_version") != 3:
+        return []
+    problems: list[str] = []
+    problems.extend(_m0_news_delta_pagination_problems(packet))
+    expected = {"summary", "observations", "connections", "attention", "unknowns"}
+    extra = sorted(set(semantic) - expected)
+    problems.extend(f"m0_schema_forbids_field:{key}" for key in extra)
+    limits = {"observations": 3, "connections": 2, "attention": 1, "unknowns": 1}
+    refs = _m0_frozen_evidence_refs(packet)
+    for key in expected:
+        values = [semantic.get(key)] if key == "summary" else semantic.get(key)
+        if key != "summary" and not isinstance(values, list):
+            problems.append(f"m0_{key}_must_be_array")
+            continue
+        if key == "summary" and not isinstance(semantic.get(key), dict):
+            problems.append("m0_summary_item_invalid")
+            continue
+        if key != "summary" and len(values) > limits[key]:
+            problems.append(f"m0_{key}_limit_exceeded")
+        for item in values:
+            if not isinstance(item, dict) or not _m0_item_text(item):
+                problems.append(f"m0_{key}_item_invalid")
+                continue
+            item_refs = item.get("evidence_refs")
+            if not isinstance(item_refs, list):
+                problems.append(f"m0_{key}_evidence_refs_invalid")
+                continue
+            problems.extend(
+                f"m0_evidence_ref_not_in_frozen_packet:{ref}"
+                for ref in item_refs if str(ref) not in refs
+            )
+    problems.extend(_m0_predecessor_problems(packet, semantic))
+    event_problems = _m0_event_semantic_problems(packet, text)
+    problems.extend(event_problems)
+    return list(dict.fromkeys(problems))
+
+
+def _m0_event_semantic_problems(packet: dict[str, Any], body: str) -> list[str]:
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    problems: list[str] = []
+    for event in evidence.get("high_impact_events") or []:
+        if not isinstance(event, dict):
+            continue
+        summary = str(event.get("summary") or "").strip()
+        if not summary or summary[:8].casefold() not in body.casefold():
+            continue
+        truth = str(event.get("truth_status") or "")
+        propagation = str(event.get("propagation_status") or "")
+        if propagation == "observed":
+            if "传播" not in body:
+                problems.append("m0_omits_observed_market_propagation")
+            if truth == "unverified" and not any(term in body for term in ("未证实", "未经证实", "尚未证实")):
+                problems.append("m0_presents_unverified_event_as_fact")
+            if truth == "refuted" and not any(term in body for term in ("已被否认", "被否认", "已证伪", "被证伪")):
+                problems.append("m0_omits_event_refutation")
+            broad = ("广泛传播", "普遍传播", "多平台传播", "全市场传播", "广为传播")
+            if any(term in body for term in broad) and len(event.get("propagation_evidence_refs") or []) < 2:
+                problems.append("m0_propagation_breadth_not_supported")
+        elif any(term in body for term in ("广泛传播", "普遍传播", "多平台传播", "全市场传播", "广为传播")):
+            problems.append("m0_claims_unobserved_propagation")
+    return problems
+
+
+def _m0_predecessor_problems(packet: dict[str, Any], semantic: dict[str, Any]) -> list[str]:
+    """Prevent a missing predecessor from becoming an invented comparison."""
+    delta = _m0_market_news_delta(packet)
+    if not isinstance(delta, dict) or delta.get("predecessor_missing") is not True:
+        return []
+    comparison_terms = ("较前序", "相比前序", "相较前序", "新增", "变化", "环比")
+    body = " ".join(
+        _m0_item_text(semantic.get(key)) if key == "summary"
+        else " ".join(_m0_item_text(item) for item in semantic.get(key) or [])
+        for key in ("summary", "observations", "connections", "attention", "unknowns")
+    )
+    if any(term in body for term in comparison_terms) and not any(term in body for term in ("无法比较", "不能比较", "无法确认变化")):
+        return ["m0_delta_comparison_without_predecessor"]
+    return []
 
 
 def _m0_has_status(body: str, status: str) -> bool:

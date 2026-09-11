@@ -13,6 +13,11 @@
 - 不访问、不修改、不依赖任何云端任务、云端项目或云端聊天。
 - `archive/` 只用于历史溯源，正式运行不得从归档中读取业务规则或状态。
 
+## 正式发布目录
+
+- Windows Release 产物唯一放在 `D:\APP\AITradingCompanion\release\win-x64\AITradingCompanion`；正式安装目录是 `D:\APP\AITradingCompanion\app`。
+- 新 task、发布验证和启动入口都必须使用上述 D 盘目录；`C:\Users\will\AppData\Local\AITradingCompanion*` 仅可作为历史迁移备份读取，不得作为发布或正式运行目录。
+
 ## 本地调度与运行时
 
 - 正式日程唯一来源是 `resources/schedules/tasks.json`；交易日判定由运行时的本地 XSHG 日历完成。不得重新引入 Codex heartbeat、线程投递或 Inbox 作为业务调度链路。

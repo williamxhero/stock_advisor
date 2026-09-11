@@ -31,6 +31,9 @@ class _BrokerHandler(BaseHTTPRequestHandler):
         if self.mode == "unavailable":
             self.send_response(503); self.send_header("Content-Type", "application/json"); self.end_headers()
             self.wfile.write(b'{"attempts":[{"provider":"upstream","status":"failed"}]}'); return
+        if self.mode == "gateway_timeout":
+            self.send_response(504); self.send_header("Content-Type", "application/json"); self.end_headers()
+            self.wfile.write(b'{"status":"timed_out","error":"client deadline exceeded"}'); return
         if self.mode == "effort_unsupported":
             self.send_response(400); self.send_header("Content-Type", "application/json"); self.end_headers()
             self.wfile.write(b'{"error":"unsupported effort xhigh"}'); return
@@ -164,6 +167,12 @@ class BrokerClientTests(unittest.TestCase):
         with self.assertRaises(BrokerError) as incomplete:
             self.client.invoke(self.request(stream=True))
         self.assertEqual(incomplete.exception.category, "broker_stream_incomplete")
+
+    def test_gateway_timeout_is_distinct_from_generic_http_failure(self) -> None:
+        _BrokerHandler.mode = "gateway_timeout"
+        with self.assertRaisesRegex(BrokerError, "HTTP 504") as raised:
+            self.client.invoke(self.request())
+        self.assertEqual("broker_timeout", raised.exception.category)
 
     def test_unsupported_effort_is_a_distinct_capability_fault(self) -> None:
         _BrokerHandler.mode = "effort_unsupported"

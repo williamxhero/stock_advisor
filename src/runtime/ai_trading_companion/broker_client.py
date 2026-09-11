@@ -296,6 +296,7 @@ def _http_error(error: HTTPError) -> BrokerError:
     )
     category = (
         "broker_effort_unsupported" if effort_rejected
+        else "broker_timeout" if error.code == 504
         else "broker_unavailable" if error.code == 503
         else "broker_protocol" if error.code == 400
         else "broker_http"

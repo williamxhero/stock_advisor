@@ -603,6 +603,8 @@ def _validate_capability_result(request: FactRequest, output: dict[str, Any]) ->
         return _validate_market_fund_flow_snapshot(request, output["data"], str(output["fact_as_of"]))
     if request.capability == "cn_market_event_snapshot":
         return _validate_market_event_snapshot(request, output["data"], str(output["fact_as_of"]))
+    if request.capability == "market_news_delta":
+        return _validate_market_news_delta(request, output["data"], str(output["fact_as_of"]))
     if request.capability == "cn_equity_announcement_snapshot":
         return _validate_equity_announcement_snapshot(request, output["data"], str(output["fact_as_of"]))
     if request.capability == "cn_market_index_batch":
@@ -1028,6 +1030,37 @@ def _validate_market_event_snapshot(
             ):
                 return "tool_market_event_result_invalid"
     return None
+
+
+def _validate_market_news_delta(
+    request: FactRequest, data: dict[str, Any], fact_as_of: str,
+) -> str | None:
+    """Validate the formal predecessor delta while preserving explicit recovery state."""
+    previous_text = str(request.inputs.get("previous_as_of") or "")
+    current_text = str(request.inputs.get("current_as_of") or "")
+    missing = bool(request.context.get("predecessor_missing"))
+    if not previous_text or not current_text:
+        return "tool_market_event_window_invalid"
+    if not isinstance(data.get("predecessor_missing"), bool) or data["predecessor_missing"] != missing:
+        return "tool_market_event_predecessor_invalid"
+    if data.get("current_as_of") != current_text:
+        return "tool_market_event_predecessor_invalid"
+    if missing and data.get("predecessor_as_of") is None:
+        try:
+            observed = _parse_timestamp(fact_as_of)
+            current = _parse_timestamp(current_text)
+        except ValueError:
+            return "tool_market_event_window_invalid"
+        if observed != current or data.get("articles") != [] or data.get("matched_count") != 0:
+            return "tool_market_event_predecessor_invalid"
+        return None
+    if data.get("previous_as_of") != previous_text:
+        return "tool_market_event_predecessor_invalid"
+    compat = replace(
+        request, capability="cn_market_event_snapshot",
+        inputs={**request.inputs, "start_at": previous_text, "end_at": current_text},
+    )
+    return _validate_market_event_snapshot(compat, data, fact_as_of)
 
 
 def _valid_public_source_urls(value: Any) -> bool:

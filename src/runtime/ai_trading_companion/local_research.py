@@ -40,7 +40,7 @@ RESEARCH_PLAN_SCHEMA: dict[str, Any] = {
                 "operation": {"type": "string", "enum": [
                     "market_snapshot", "market_breadth", "turnover_compare", "sector_snapshot",
                     "fund_flow_snapshot", "sentiment_snapshot", "holding_snapshot", "current_bar",
-                    "market_event_snapshot", "announcement_snapshot",
+                    "market_news_delta", "announcement_snapshot",
                     "web_search", "web_read", "web_browser",
                 ]},
                 "arguments": {
@@ -53,6 +53,9 @@ RESEARCH_PLAN_SCHEMA: dict[str, Any] = {
                         "symbol": {"type": ["string", "null"]},
                         "render": {"type": ["string", "null"]},
                         "session_id": {"type": ["string", "null"]},
+                        "previous_as_of": {"type": ["string", "null"]},
+                        "current_as_of": {"type": ["string", "null"]},
+                        "stock_codes": {"type": ["array", "null"], "items": {"type": "string"}},
                         "actions": {"type": ["array", "null"], "items": {
                             "type": "object", "additionalProperties": False,
                             "required": ["type", "url", "ref", "element", "ms", "pixels"],
@@ -95,7 +98,7 @@ _OPERATIONS = {
     "market": {
         "market_snapshot", "market_breadth", "turnover_compare", "sector_snapshot",
         "fund_flow_snapshot", "sentiment_snapshot", "holding_snapshot", "current_bar",
-        "market_event_snapshot", "announcement_snapshot",
+        "market_news_delta", "market_event_snapshot", "announcement_snapshot",
     },
     "gateway": {"web_search", "web_read", "web_browser"},
 }
@@ -366,6 +369,7 @@ class ToolCatalogMarketBackend:
             "turnover_compare": "cn_market_turnover_compare",
             "sector_snapshot": "cn_market_sector_snapshot",
             "fund_flow_snapshot": "cn_market_fund_flow_snapshot",
+            "market_news_delta": "market_news_delta",
             "market_event_snapshot": "cn_market_event_snapshot",
             "sentiment_snapshot": "cn_market_breadth",
             "holding_snapshot": "cn_equity_quote_batch",
@@ -415,12 +419,18 @@ class ToolCatalogMarketBackend:
                     "start_date": start_date,
                     "end_date": end_date,
                 })
-        elif operation == "market_event_snapshot":
+        elif operation in {"market_news_delta", "market_event_snapshot"}:
             inputs = {
                 "start_at": str(window.get("start") or ""),
                 "end_at": str(window.get("end") or ""),
                 "stock_codes": [str(value) for value in requirement.get("required_entities") or [] if str(value)],
             }
+            if operation == "market_news_delta":
+                inputs = {
+                    "previous_as_of": str(requirement.get("previous_as_of") or "") or str(window.get("start") or ""),
+                    "current_as_of": str(requirement.get("current_as_of") or "") or str(window.get("end") or ""),
+                    "stock_codes": inputs["stock_codes"],
+                }
         elif operation == "market_snapshot":
             inputs = {"symbols": ["000001", "399001", "399006"]}
         elif operation == "sector_snapshot":
@@ -434,7 +444,13 @@ class ToolCatalogMarketBackend:
         request = FactRequest(
             contract_version=1, capability=capability, required_at=required_at,
             deadline_seconds=max(0.1, min(25.0, float(self.deadline()))), inputs=inputs,
-            context={"window_start": str(window.get("start") or required_at), "cycle_id": self.cycle_id},
+            context={
+                "window_start": str(window.get("start") or required_at), "cycle_id": self.cycle_id,
+                "previous_as_of": inputs.get("previous_as_of"),
+                "current_as_of": inputs.get("current_as_of") or required_at,
+                "predecessor_missing": bool(requirement.get("predecessor_missing")),
+                "recovered_from": requirement.get("recovered_from"),
+            },
             freshness_seconds=900.0 if finality == "intraday" else 0.0, finality=finality,
         )
         resolution = self.runner.resolve_with_fallback(request)
@@ -2291,13 +2307,21 @@ def _public_failure_message(as_of: str, gap_states: list[dict[str, Any]]) -> str
 def _operation(
     requirement_key: str, backend: str, operation: str, *,
     query: str | None = None, url: str | None = None,
+    previous_as_of: str | None = None, current_as_of: str | None = None,
+    stock_codes: list[str] | None = None,
 ) -> dict[str, Any]:
+    arguments = {
+        "query": query, "categories": "news" if query else None, "url": url,
+        "symbol": None, "render": None, "session_id": None, "actions": None,
+    }
+    if operation == "market_news_delta":
+        arguments.update({
+            "previous_as_of": previous_as_of, "current_as_of": current_as_of,
+            "stock_codes": stock_codes,
+        })
     return {
         "requirement_key": requirement_key, "backend": backend, "operation": operation,
-        "arguments": {
-            "query": query, "categories": "news" if query else None, "url": url,
-            "symbol": None, "render": None, "session_id": None, "actions": None,
-        },
+        "arguments": arguments,
         "fallback_backends": [],
     }
 
@@ -2431,8 +2455,20 @@ def _merge_mandatory_operations(
     material_events = requirements.get("material_events_and_counterevidence") or {}
     if "checked_no_change" in set(material_events.get("allowed_coverage") or []):
         required.append(_operation(
-            "material_events_and_counterevidence", "market", "market_event_snapshot",
+            "material_events_and_counterevidence", "market", "market_news_delta",
+            previous_as_of=material_events.get("previous_as_of"),
+            current_as_of=material_events.get("current_as_of"),
+            stock_codes=[str(value) for value in material_events.get("required_entities") or [] if str(value)],
         ))
+    if "events_and_counterevidence" in requirements:
+        event_delta = requirements["events_and_counterevidence"]
+        if "checked_no_change" in set(event_delta.get("allowed_coverage") or []):
+            required.append(_operation(
+                "events_and_counterevidence", "market", "market_news_delta",
+                previous_as_of=event_delta.get("previous_as_of"),
+                current_as_of=event_delta.get("current_as_of"),
+                stock_codes=[str(value) for value in event_delta.get("required_entities") or [] if str(value)],
+            ))
     event_requirement = requirements.get("portfolio_events_and_counterevidence") or {}
     if [str(value) for value in event_requirement.get("required_entities") or [] if str(value)]:
         required.append(_operation(

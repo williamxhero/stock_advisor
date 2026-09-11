@@ -17,6 +17,7 @@ _INTRADAY_EVENT_ANCHORS = {
     "daily.execution.0945": time(9, 0),
     "daily.execution.1030": time(9, 45),
     "daily.execution.1430": time(10, 30),
+    "daily.review.1520": time(14, 30),
 }
 
 
@@ -161,6 +162,7 @@ class EvidenceContractFactory:
             close_text = self._iso(close)
             prior_close_text = self._iso(self._latest_completed_close(close - timedelta(seconds=1)))
             context = internal_context or {}
+            event_window = self._formal_delta_window(task_key, as_of, context)
             holdings = [str(value) for value in context.get("portfolio_entities") or [] if str(value)]
             entity_names = {
                 code: str((context.get("portfolio_entity_names") or {}).get(code) or "")
@@ -233,6 +235,14 @@ class EvidenceContractFactory:
                     "window": {"start": prior_close_text, "end": self._iso(as_of), "mode": "after_start_to_end"},
                 },
             ]
+            for index in (4, 7):
+                requirements[index]["window"] = dict(event_window["window"])
+                requirements[index].update({
+                    "previous_as_of": event_window["previous_as_of"],
+                    "current_as_of": event_window["current_as_of"],
+                    "predecessor_missing": event_window["predecessor_missing"],
+                    "recovered_from": event_window["recovered_from"],
+                })
             return [
                 *requirements,
                 *self._market_understanding_requirements(
@@ -262,19 +272,13 @@ class EvidenceContractFactory:
     def _scheduled_intraday_requirements(
         self, task_key: str, as_of: datetime, internal_context: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        local = as_of.astimezone(_SHANGHAI)
-        event_start = datetime.combine(
-            local.date(), _INTRADAY_EVENT_ANCHORS[task_key], _SHANGHAI,
-        ).astimezone(ZoneInfo("UTC"))
         market_start = as_of - _INTRADAY_MARKET_MAX_AGE
         market_window = {
             "start": self._iso(market_start), "end": self._iso(as_of),
             "mode": "after_start_to_end",
         }
-        events_window = {
-            "start": self._iso(event_start), "end": self._iso(as_of),
-            "mode": "after_start_to_end",
-        }
+        delta = self._formal_delta_window(task_key, as_of, internal_context)
+        events_window = delta["window"]
         return self._with_portfolio_requirements([
             {
                 "key": "current_market_state", "blocking": True,
@@ -286,8 +290,40 @@ class EvidenceContractFactory:
                 "allowed_coverage": ["covered", "checked_no_change"],
                 "window": events_window,
                 "negative_query_terms": ["公告", "政策", "风险"],
+                "previous_as_of": delta["previous_as_of"],
+                "current_as_of": delta["current_as_of"],
+                "predecessor_as_of": delta["predecessor_as_of"],
+                "predecessor_missing": delta["predecessor_missing"],
+                "recovered_from": delta["recovered_from"],
             },
         ], market_window=market_window, events_window=events_window, internal_context=internal_context)
+
+    def _formal_delta_window(
+        self, task_key: str, as_of: datetime, internal_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build a formal predecessor-to-current window from frozen runtime context."""
+        local = as_of.astimezone(_SHANGHAI)
+        anchor = datetime.combine(
+            local.date(), _INTRADAY_EVENT_ANCHORS[task_key], _SHANGHAI,
+        ).astimezone(ZoneInfo("UTC"))
+        predecessor_text = str(internal_context.get("predecessor_as_of") or "").strip()
+        predecessor_as_of: datetime | None = None
+        if predecessor_text:
+            try:
+                predecessor_as_of = self._aware(predecessor_text)
+            except (TypeError, ValueError):
+                predecessor_text = ""
+        predecessor_missing = bool(internal_context.get("predecessor_missing"))
+        current_text = self._iso(as_of)
+        start_text = predecessor_text or self._iso(anchor)
+        return {
+            "window": {"start": start_text, "end": current_text, "mode": "after_start_to_end"},
+            "previous_as_of": predecessor_text or None,
+            "current_as_of": current_text,
+            "predecessor_as_of": self._iso(predecessor_as_of) if predecessor_as_of else None,
+            "predecessor_missing": predecessor_missing or predecessor_as_of is None,
+            "recovered_from": str(internal_context.get("predecessor_artifact_id") or "") or None,
+        }
 
     @staticmethod
     def _market_understanding_requirements(

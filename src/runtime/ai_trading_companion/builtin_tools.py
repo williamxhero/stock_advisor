@@ -25,6 +25,7 @@ _CAPABILITIES = {
     "cn_market_sector_snapshot": "cn_market_sector_snapshot",
     "cn_market_fund_flow_snapshot": "cn_market_fund_flow_snapshot_eastmoney_history",
     "cn_market_event_snapshot": "cn_market_event_snapshot",
+    "market_news_delta": "market_news_delta",
     "cn_equity_announcement_snapshot": "cn_equity_announcement_snapshot",
 }
 _ADAPTERS = {
@@ -2260,6 +2261,37 @@ def main() -> None:
             safe_url(inputs.get("base_url") or "http://yosef-server:8815"), symbols,
             start_date, end_date, str(request.get("required_at") or ""),
         )
+        result(payload, fact_as_of=fact_as_of)
+        return
+    if mode == "market_news_delta":
+        context = request.get("context") if isinstance(request.get("context"), dict) else {}
+        previous_as_of = str(inputs.get("previous_as_of") or "")
+        current_as_of = str(inputs.get("current_as_of") or request.get("required_at") or "")
+        if not previous_as_of or not current_as_of:
+            fail(64, "previous_as_of and current_as_of are required")
+        if context.get("predecessor_missing") and not context.get("recovered_from"):
+            payload = {
+                "source": "frozen_predecessor_recovery",
+                "source_urls": ["http://yosef-server:8815/api/articles/range"],
+                "start_at": current_as_of, "end_at": current_as_of,
+                "previous_as_of": None, "current_as_of": current_as_of,
+                "predecessor_as_of": None, "predecessor_missing": True,
+                "recovered_from": None, "articles": [], "matched_count": 0,
+            }
+            result(payload, fact_as_of=current_as_of)
+            return
+        payload, fact_as_of = market_event_snapshot_payload(
+            safe_url(inputs.get("base_url") or "http://yosef-server:8815"),
+            previous_as_of, current_as_of,
+            [str(value) for value in inputs.get("stock_codes") or [] if str(value).strip()],
+        )
+        payload.update({
+            "previous_as_of": previous_as_of,
+            "current_as_of": current_as_of,
+            "predecessor_as_of": previous_as_of,
+            "predecessor_missing": bool(context.get("predecessor_missing")),
+            "recovered_from": str(context.get("recovered_from") or "") or None,
+        })
         result(payload, fact_as_of=fact_as_of)
         return
     if mode == "cn_market_event_snapshot":

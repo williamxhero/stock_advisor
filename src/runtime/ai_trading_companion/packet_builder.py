@@ -18,6 +18,12 @@ from .opportunities import is_premarket, OBSERVATION_INSTRUCTION, REVIEW_RESULT_
 
 
 PUBLIC_STAGES = {"m0_research", "m1_research", "outcome_research", "chat_research"}
+_FORMAL_PREDECESSORS = {
+    "daily.execution.0945": ("daily.opportunity.0900",),
+    "daily.execution.1030": ("daily.execution.0945", "daily.opportunity.0900"),
+    "daily.execution.1430": ("daily.execution.1030", "daily.execution.0945", "daily.opportunity.0900"),
+    "daily.review.1520": ("daily.execution.1430", "daily.execution.1030", "daily.execution.0945", "daily.opportunity.0900"),
+}
 
 
 class RuntimePacketBuilder:
@@ -107,6 +113,10 @@ class RuntimePacketBuilder:
             else:
                 packet["evidence_requirements"] = self._evidence_requirements(cycle, stage)
             packet["public_research_scope"] = self._public_scope(cycle, stage, evidence, context, packet_as_of, memory_cards)
+            if stage == "m0_research":
+                predecessor = self._formal_predecessor_context(cycle, packet_as_of)
+                if predecessor is not None:
+                    packet["public_research_scope"]["market_news_delta"] = predecessor
         else:
             packet["protocol"] = self._protocol(cycle, stage)
             if stage in {"m1_judgment", "m2"}:
@@ -309,7 +319,46 @@ class RuntimePacketBuilder:
                 ("daily.execution.0945", "daily.execution.1030", "daily.execution.1430"),
             )
             context["prior_judgment_count"] = len(judgments)
+            predecessor = self._formal_predecessor_context(cycle, packet_as_of)
+            if predecessor is not None:
+                context.update({
+                    key: predecessor.get(key)
+                    for key in (
+                        "predecessor_task_key", "predecessor_as_of", "predecessor_artifact_id",
+                        "predecessor_artifact_sha256", "predecessor_missing", "recovered_from",
+                    )
+                })
         return context
+
+    def _formal_predecessor_context(self, cycle: dict[str, Any], packet_as_of: str) -> dict[str, Any] | None:
+        task_key = str(cycle.get("task_key") or "")
+        candidates = _FORMAL_PREDECESSORS.get(task_key)
+        if not candidates:
+            return None
+        finder = getattr(self.store, "latest_frozen_evidence_before", None)
+        if not callable(finder):
+            return {
+                "predecessor_task_key": None, "predecessor_as_of": None,
+                "predecessor_artifact_id": None, "predecessor_artifact_sha256": None,
+                "predecessor_missing": True, "recovered_from": None,
+            }
+        row = finder(cycle["scheduled_for"][:10], packet_as_of, candidates, packet_as_of)
+        if row is None:
+            return {
+                "predecessor_task_key": None, "predecessor_as_of": None,
+                "predecessor_artifact_id": None, "predecessor_artifact_sha256": None,
+                "predecessor_missing": True, "recovered_from": None,
+            }
+        direct = str(row.get("task_key") or "") == candidates[0]
+        return {
+            "predecessor_task_key": str(row.get("task_key") or "") or None,
+            "predecessor_as_of": str(row.get("as_of") or "") or None,
+            "predecessor_artifact_id": str(row.get("artifact_id") or "") or None,
+            "predecessor_artifact_sha256": str(row.get("body_sha256") or "") or None,
+            "predecessor_missing": not direct,
+            "recovered_from": str(row.get("artifact_id") or "") or None,
+            "predecessor_evidence": row.get("evidence") if isinstance(row.get("evidence"), dict) else {},
+        }
 
     def _prior_market_understanding(self, cycle: dict[str, Any], packet_as_of: str) -> list[dict[str, Any]]:
         """Give a formal decision its same-day frozen predecessors, never mutable prose."""

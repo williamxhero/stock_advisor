@@ -2474,6 +2474,35 @@ class CompanionStore:
             return None
         return {"cycle_id": row["cycle_id"], "known_at": row["m0_known_at"], "summary": row["m0_text"]}
 
+    def latest_frozen_evidence_before(
+        self, trading_date: str, known_at: str, task_keys: tuple[str, ...], as_of: str,
+    ) -> dict[str, Any] | None:
+        """Return the newest immutable formal evidence for the first available task key."""
+        if not task_keys:
+            return None
+        with self.connection() as c:
+            for task_key in task_keys:
+                row = c.execute(
+                    """SELECT c.cycle_id,c.task_key,c.scheduled_for,a.artifact_id,a.kind,
+                              a.body_markdown,a.body_sha256,a.as_of,a.known_at
+                       FROM companion_cycle c JOIN narrative_artifact a ON a.cycle_id=c.cycle_id
+                       WHERE substr(c.scheduled_for,1,10)=? AND c.task_key=?
+                         AND a.kind='evidence' AND julianday(a.known_at)<=julianday(?)
+                         AND julianday(a.as_of)<=julianday(?)
+                         AND COALESCE(c.schedule_snapshot_json,'') NOT LIKE '%diagnostic_rerun%'
+                       ORDER BY julianday(a.known_at) DESC,julianday(a.as_of) DESC LIMIT 1""",
+                    (trading_date, task_key, known_at, as_of),
+                ).fetchone()
+                if row is None:
+                    continue
+                result = dict(row)
+                try:
+                    result["evidence"] = json.loads(result["body_markdown"])
+                except (TypeError, ValueError):
+                    result["evidence"] = {}
+                return result
+        return None
+
     def frozen_judgments_before(self, trading_date: str, known_at: str, task_keys: tuple[str, ...]) -> list[dict[str, Any]]:
         if not task_keys:
             return []

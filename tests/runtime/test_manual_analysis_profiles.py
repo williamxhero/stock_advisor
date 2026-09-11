@@ -350,6 +350,42 @@ class ManualAnalysisProfileResolverTests(TestCase):
         self.assertEqual("2026-08-31T01:45:00Z", events["window"]["start"])
         self.assertEqual(["公告", "政策", "风险"], events["negative_query_terms"])
 
+    def test_intraday_contract_uses_the_frozen_formal_predecessor_as_delta_start(self) -> None:
+        contract = EvidenceContractFactory(_Calendar()).build(
+            task_key="daily.execution.1030", stage="m0_research",
+            as_of="2026-08-31T02:30:00Z",
+            internal_context={
+                "predecessor_task_key": "daily.execution.0945",
+                "predecessor_as_of": "2026-08-31T02:17:04Z",
+                "predecessor_artifact_id": "evidence-0945",
+                "predecessor_artifact_sha256": "a" * 64,
+                "predecessor_missing": False,
+            },
+        )
+
+        events = next(item for item in contract["requirements"] if item["key"] == "material_events_and_counterevidence")
+
+        self.assertEqual({
+            "start": "2026-08-31T02:17:04Z", "end": "2026-08-31T02:30:00Z",
+            "mode": "after_start_to_end",
+        }, events["window"])
+        self.assertEqual("2026-08-31T02:17:04Z", events["previous_as_of"])
+        self.assertEqual("2026-08-31T02:30:00Z", events["current_as_of"])
+        self.assertFalse(events["predecessor_missing"])
+
+    def test_intraday_contract_exposes_missing_predecessor_without_claiming_a_delta(self) -> None:
+        contract = EvidenceContractFactory(_Calendar()).build(
+            task_key="daily.execution.1430", stage="m0_research",
+            as_of="2026-08-31T06:30:00Z",
+            internal_context={"predecessor_missing": True},
+        )
+
+        events = next(item for item in contract["requirements"] if item["key"] == "material_events_and_counterevidence")
+
+        self.assertTrue(events["predecessor_missing"])
+        self.assertIsNone(events["predecessor_as_of"])
+        self.assertEqual("2026-08-31T06:30:00Z", events["current_as_of"])
+
     def test_weekend_request_creates_a_distinct_outlook_cycle_and_packet(self) -> None:
         calendar = _Calendar()
         with TemporaryDirectory() as temporary:

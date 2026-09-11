@@ -18,6 +18,33 @@ from ai_trading_companion.tooling import FactRequest, ToolCatalog, ToolRunner
 
 
 class ToolRunnerTests(unittest.TestCase):
+    def test_builtin_market_news_delta_capability_is_promoted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+
+            ensure_builtin_tools(root)
+
+            tool = ToolCatalog(root).resolve("market_news_delta")
+            self.assertEqual("market_news_delta", tool.capability)
+
+    def test_market_news_delta_does_not_fabricate_facts_without_a_predecessor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            current = "2026-09-05T06:30:00Z"
+
+            result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                1, "market_news_delta", current, 8.0,
+                {"previous_as_of": current, "current_as_of": current, "stock_codes": []},
+                context={"predecessor_missing": True}, finality="intraday",
+            ))
+
+            self.assertTrue(result.succeeded, result.error_code)
+            self.assertTrue(result.data["predecessor_missing"])
+            self.assertIsNone(result.data["predecessor_as_of"])
+            self.assertEqual([], result.data["articles"])
+            self.assertEqual(0, result.data["matched_count"])
+
     def test_builtin_startup_rebinds_managed_commands_after_runtime_root_moves(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "tools"

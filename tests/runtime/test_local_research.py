@@ -364,7 +364,7 @@ class LocalResearchTests(unittest.TestCase):
                     "url": "https://sector.example.test/all", "title": "板块全量分布",
                     "excerpt_text": json.dumps(payload, ensure_ascii=False), "fact_as_of": close,
                 }]}
-            if operation in {"fund_flow_snapshot", "market_event_snapshot"}:
+            if operation in {"fund_flow_snapshot", "market_news_delta", "market_event_snapshot"}:
                 raise RuntimeError("preferred structured source unavailable")
             if operation == "web_search":
                 return {"results": [{"url": urls[key], "title": key}]}
@@ -559,7 +559,7 @@ class LocalResearchTests(unittest.TestCase):
         typed = {(row["requirement_key"], row["operation"]) for row in plan["operations"]}
         self.assertIn(("market_fund_flow", "fund_flow_snapshot"), typed)
         self.assertIn(("themes_and_capacity_cores", "sector_snapshot"), typed)
-        self.assertIn(("material_events_and_counterevidence", "market_event_snapshot"), typed)
+        self.assertIn(("material_events_and_counterevidence", "market_news_delta"), typed)
         self.assertIn(("portfolio_events_and_counterevidence", "announcement_snapshot"), typed)
         self.assertFalse(any(
             row["requirement_key"] in {
@@ -706,23 +706,53 @@ class LocalResearchTests(unittest.TestCase):
 
         backend("fund_flow_snapshot", {"_requirement_key": "market_fund_flow"})
         backend("sector_snapshot", {"_requirement_key": "themes_and_capacity_cores"})
-        backend("market_event_snapshot", {"_requirement_key": "material_events_and_counterevidence"})
+        backend("market_news_delta", {"_requirement_key": "material_events_and_counterevidence"})
         backend("announcement_snapshot", {"_requirement_key": "portfolio_events_and_counterevidence"})
 
         requests = [call.args[0] for call in runner.resolve_with_fallback.call_args_list]
         self.assertEqual(
             [
                 "cn_market_fund_flow_snapshot", "cn_market_sector_snapshot",
-                "cn_market_event_snapshot", "cn_equity_announcement_snapshot",
+                "market_news_delta", "cn_equity_announcement_snapshot",
             ],
             [request.capability for request in requests],
         )
         self.assertTrue(requests[1].inputs["require_distribution"])
-        self.assertEqual("2026-08-31T07:00:00Z", requests[2].inputs["start_at"])
-        self.assertEqual("2026-09-05T02:00:00Z", requests[2].inputs["end_at"])
+        self.assertEqual("2026-08-31T07:00:00Z", requests[2].inputs["previous_as_of"])
+        self.assertEqual("2026-09-05T02:00:00Z", requests[2].inputs["current_as_of"])
         self.assertEqual(["603861"], requests[3].inputs["symbols"])
         self.assertEqual("2026-08-31", requests[3].inputs["start_date"])
         self.assertEqual("2026-09-05", requests[3].inputs["end_date"])
+
+    def test_market_news_delta_request_carries_predecessor_audit_context(self) -> None:
+        contract = {"version": 4, "as_of": "2026-09-05T02:30:00Z", "requirements": [{
+            "key": "material_events_and_counterevidence", "allowed_coverage": ["covered", "checked_no_change"],
+            "previous_as_of": "2026-09-05T02:17:04Z", "current_as_of": "2026-09-05T02:30:00Z",
+            "predecessor_missing": False, "recovered_from": "evidence-0945",
+            "window": {"mode": "after_start_to_end", "start": "2026-09-05T02:17:04Z", "end": "2026-09-05T02:30:00Z"},
+            "required_entities": ["603861"],
+        }]}
+        runner = mock.Mock()
+        runner.resolve_with_fallback.return_value = EvidenceResolution(
+            True, "market_news_delta", "1.0.0", "2026-09-05T02:30:00Z", "2026-09-05T02:30:01Z",
+            {"source": "test", "source_urls": ["https://example.test/source"], "source_evidence": [{
+                "url": "https://example.test/source", "fact_as_of": "2026-09-05T02:30:00Z", "data": {"summary": "test"},
+            }]}, "artifact:sha256:" + "e" * 64, None, ("tool_result_schema_valid",),
+        )
+        backend = ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0)
+
+        backend("market_news_delta", {"_requirement_key": "material_events_and_counterevidence"})
+
+        request = runner.resolve_with_fallback.call_args.args[0]
+        self.assertEqual("market_news_delta", request.capability)
+        self.assertEqual({
+            "previous_as_of": "2026-09-05T02:17:04Z",
+            "current_as_of": "2026-09-05T02:30:00Z",
+            "stock_codes": ["603861"],
+        }, request.inputs)
+        self.assertEqual({
+            "predecessor_missing": False, "recovered_from": "evidence-0945",
+        }, {key: request.context[key] for key in ("predecessor_missing", "recovered_from")})
 
     def test_forum_failure_keeps_technical_classification_and_has_a_bounded_retry(self) -> None:
         contract = {

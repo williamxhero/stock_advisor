@@ -1218,6 +1218,18 @@ def _latest_json_artifact(store: CompanionStore, cycle_id: str, kind: str) -> di
         return None
 
 
+def _latest_json_artifact_before(
+    store: CompanionStore, cycle_id: str, kind: str, as_of: str,
+) -> dict[str, Any] | None:
+    artifact = store.latest_artifact_before(cycle_id, kind, as_of)
+    if not artifact:
+        return None
+    try:
+        return json.loads(artifact["body_markdown"])
+    except json.JSONDecodeError:
+        return None
+
+
 def _fixture_attempt(store: CompanionStore, cycle_id: str, stage: str, packet_hash: str, output: dict[str, Any]) -> str:
     attempt = store.begin_attempt(cycle_id, stage, iso(datetime.now(timezone.utc)), packet_hash, runner_fingerprint="fixture-v1")
     store.finish_attempt(attempt["attempt_id"], "succeeded", output=output, verifier={"passed": True, "problems": [], "fixture": True})
@@ -1473,7 +1485,7 @@ def run_m1(
         return result
 
     policy = TASK_POLICIES[cycle["task_key"]]
-    prior_evidence = _latest_json_artifact(store, cycle_id, "evidence") or {}
+    prior_evidence = _latest_json_artifact_before(store, cycle_id, "evidence", cycle["as_of"]) or {}
     if not prior_evidence:
         raise EvidenceInsufficient({
             "passed": False, "problems": ["frozen_m0_evidence_missing"],

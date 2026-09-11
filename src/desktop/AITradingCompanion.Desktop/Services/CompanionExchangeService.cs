@@ -24,6 +24,9 @@ public sealed class CompanionExchangeService
         var target = Path.Combine(_paths.CompanionToRuntimePendingDirectory, $"{commandId}.json");
         if (File.Exists(target))
         {
+            var existing = await File.ReadAllTextAsync(target, cancellationToken).ConfigureAwait(false);
+            if (!string.Equals(existing, body, StringComparison.Ordinal))
+                throw new InvalidOperationException($"exchange command id conflict: {commandId}");
             return;
         }
 

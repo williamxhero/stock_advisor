@@ -1279,6 +1279,17 @@ class CompanionStore:
             ).fetchone()
             return dict(row) if row else None
 
+    def latest_artifact_before(self, cycle_id: str, kind: str, as_of: str) -> dict[str, Any] | None:
+        """Return the newest artifact whose factual clock is inside a frozen packet."""
+        with self.connection() as c:
+            row = c.execute(
+                """SELECT * FROM narrative_artifact
+                   WHERE cycle_id=? AND kind=? AND julianday(as_of)<=julianday(?)
+                   ORDER BY julianday(as_of) DESC, revision DESC LIMIT 1""",
+                (cycle_id, kind, as_of),
+            ).fetchone()
+            return dict(row) if row else None
+
     @staticmethod
     def fault_episode_id(
         cycle_id: str, scope_kind: str, scope_key: str, capability: str,

@@ -27,6 +27,32 @@ public sealed class CompanionExchangeServiceTests : IDisposable
         Assert.False(bytes.AsSpan().StartsWith(Encoding.UTF8.Preamble));
     }
 
+    [Fact]
+    public async Task ReusingCommandIdWithDifferentPayloadIsRejected()
+    {
+        var paths = new AppPaths(_directory);
+        var exchange = new CompanionExchangeService(paths);
+        var commandId = Guid.NewGuid().ToString();
+
+        await exchange.SendAsync(new
+        {
+            contract = "companion-user-command/v1",
+            command_id = commandId,
+            cycle_id = "cycle-1",
+            type = "begin_voice_capture",
+        });
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => exchange.SendAsync(new
+        {
+            contract = "companion-user-command/v1",
+            command_id = commandId,
+            cycle_id = "cycle-2",
+            type = "begin_voice_capture",
+        }));
+
+        Assert.Contains("conflict", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_directory)) Directory.Delete(_directory, recursive: true);

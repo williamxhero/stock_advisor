@@ -788,6 +788,72 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertNotIn(secret_h0, serialized)
         self.assertNotIn("local_inputs", packet)
 
+    def test_m1_judgment_binds_frozen_m0_and_public_evidence_and_ignores_later_content(self):
+        self.ready()
+        frozen_evidence = {
+            "schema_version": 3,
+            "as_of": "2026-08-25T01:45:00Z",
+            "sources": [{
+                "evidence_ref": "ev-frozen",
+                "excerpt": "frozen public market fact",
+                "analysis": "independent public evidence",
+            }],
+        }
+        frozen_evidence_artifact = self.store.append_artifact(
+            self.cycle["cycle_id"], "evidence", "model",
+            json.dumps(frozen_evidence, ensure_ascii=False), frozen_evidence["as_of"],
+            {"public_only": True}, known_at=frozen_evidence["as_of"],
+        )
+        self.stage("h0", "current H0 must never enter M1")
+        self.engine.command({"command_id": "commit-h0", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0"})
+
+        packet = packet_builder(self.store).build(
+            self.store.get_cycle(self.cycle["cycle_id"]), "m1_judgment", evidence=frozen_evidence,
+        )
+        packet_before_later_content = json.dumps(packet, ensure_ascii=False)
+
+        self.store.append_artifact(
+            self.cycle["cycle_id"], "evidence", "model", "future evidence must stay out of M1",
+            "2099-08-25T03:00:00Z", {"public_only": True}, known_at="2099-08-25T03:00:00Z",
+        )
+        self.store.append_artifact(
+            self.cycle["cycle_id"], "m2", "model", "H0-derived content must stay out of M1",
+            "2026-08-25T01:46:00Z", {}, known_at="2026-08-25T01:46:00Z",
+        )
+        self.store.append_artifact(
+            self.cycle["cycle_id"], "chat_human", "human", "ordinary chat must stay out of M1",
+            "2026-08-25T01:46:00Z", {}, known_at="2026-08-25T01:46:00Z",
+        )
+
+        later_packet = packet_builder(self.store).build(
+            self.store.get_cycle(self.cycle["cycle_id"]), "m1_judgment", evidence=frozen_evidence,
+        )
+        later_serialized = json.dumps(later_packet, ensure_ascii=False)
+        self.assertEqual(packet["sha256"], later_packet["sha256"])
+        self.assertIn("ev-frozen", packet_before_later_content)
+        self.assertNotIn("future evidence must stay out of M1", later_serialized)
+        self.assertNotIn("H0-derived content must stay out of M1", later_serialized)
+        self.assertNotIn("ordinary chat must stay out of M1", later_serialized)
+        self.assertEqual(self.store.latest_artifact(self.cycle["cycle_id"], "m0")["body_sha256"], packet["frozen_m0"]["sha256"])
+        self.assertEqual(self.store.latest_artifact(self.cycle["cycle_id"], "m0")["as_of"], packet["frozen_m0"]["as_of"])
+        self.assertEqual(frozen_evidence_artifact["artifact_id"], packet["frozen_public_evidence"]["artifact_id"])
+        self.assertEqual(frozen_evidence_artifact["sha256"], packet["frozen_public_evidence"]["sha256"])
+        self.assertEqual(["ev-frozen"], packet["frozen_public_evidence"]["evidence_refs"])
+
+    def test_m1_rejects_future_public_evidence_in_direct_packet_input(self):
+        self.ready()
+        self.stage("h0-future", "H0 remains private")
+        self.engine.command({"command_id": "commit-h0-future", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0"})
+
+        with self.assertRaisesRegex(ValueError, "future evidence"):
+            packet_builder(self.store).build(
+                self.store.get_cycle(self.cycle["cycle_id"]), "m1_judgment",
+                evidence={
+                    "as_of": "2099-08-25T03:00:00Z",
+                    "sources": [{"evidence_ref": "ev-future", "fact_as_of": "2099-08-25T03:00:00Z"}],
+                },
+            )
+
     def test_m1_research_reuses_the_frozen_m0_evidence_contract(self):
         frozen_contract = packet_builder(self.store).evidence_contract_factory.build(
             task_key=self.cycle["task_key"],

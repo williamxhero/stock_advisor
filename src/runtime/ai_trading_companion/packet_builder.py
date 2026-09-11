@@ -124,6 +124,12 @@ class RuntimePacketBuilder:
                 packet["risk_doctrine"] = {"revision": doctrine["revision"],
                                            "doctrine": doctrine.get("doctrine") or json.loads(doctrine["doctrine_json"])}
             packet["business_context"] = self._business_context(cycle, stage)
+            if stage == "m1_judgment":
+                evidence = self._validated_m1_evidence(evidence or {}, packet_as_of)
+                packet["frozen_m0"] = self._frozen_artifact_descriptor(cycle, "m0", packet_as_of)
+                packet["frozen_public_evidence"] = self._frozen_public_evidence_descriptor(
+                    cycle, evidence, packet_as_of,
+                )
             packet["evidence"] = evidence or {}
             if stage in {"m1_judgment", "m2"} and cycle["task_key"] in {
                 "daily.execution.0945", "daily.execution.1030", "daily.execution.1430", "daily.review.1520",
@@ -146,7 +152,9 @@ class RuntimePacketBuilder:
                         if isinstance(item, dict) and item.get("key") == "portfolio_market_state"
                     ), []),
                 }
-            packet["artifacts"] = self._stage_artifacts(cycle, stage)
+            packet["artifacts"] = self._stage_artifacts(
+                cycle, stage, evidence=evidence, packet_as_of=packet_as_of,
+            )
             packet["memories"] = memory_cards
             packet["active_workflow_policy"] = WorkflowEvolution(self.store).active_policy()
             if message_batch is not None:
@@ -545,7 +553,14 @@ class RuntimePacketBuilder:
             "historical_context_source": "memoryhub",
         }
 
-    def _stage_artifacts(self, cycle: dict[str, Any], stage: str) -> list[dict[str, Any]]:
+    def _stage_artifacts(
+        self,
+        cycle: dict[str, Any],
+        stage: str,
+        *,
+        evidence: dict[str, Any] | None = None,
+        packet_as_of: str | None = None,
+    ) -> list[dict[str, Any]]:
         allowed = {
             "m0_compose": {"pre_m0", "premarket_chat", "evidence"},
             "m1_judgment": {"m0", "evidence", "m1_evidence"},
@@ -554,15 +569,168 @@ class RuntimePacketBuilder:
             "reflection": {"m0", "h0", "m1", "m2", "outcome"},
             "workflow_feedback": {"m0", "h0", "m1", "m2", "ai_chat", "reflection"},
         }[stage]
+        artifacts = self.store.artifacts(cycle["cycle_id"])
+        if stage == "m1_judgment":
+            # M1 receives one immutable M0 and one immutable public evidence
+            # artifact.  In particular, never let a later retry, chat record,
+            # or newly appended evidence revision change an already frozen
+            # judgment input.
+            selected: list[dict[str, Any]] = []
+            m0 = next(
+                (
+                    item for item in reversed(artifacts)
+                    if item["kind"] == "m0" and self._artifact_is_visible_at(item, packet_as_of)
+                ),
+                None,
+            )
+            if m0 is not None:
+                selected.append(m0)
+            evidence_artifact = self._matching_public_evidence_artifact(
+                artifacts, evidence, packet_as_of,
+            )
+            if evidence_artifact is not None:
+                selected.append(evidence_artifact)
+            artifacts = selected
         return [
             {
                 "artifact_id": artifact["artifact_id"], "kind": artifact["kind"],
                 "body": artifact["body_markdown"], "sha256": artifact["body_sha256"],
                 "as_of": artifact["as_of"], "known_at": artifact.get("known_at"),
             }
-            for artifact in self.store.artifacts(cycle["cycle_id"])
+            for artifact in artifacts
             if artifact["kind"] in allowed
         ]
+
+    @staticmethod
+    def _artifact_is_visible_at(artifact: dict[str, Any], packet_as_of: str | None) -> bool:
+        if not packet_as_of:
+            return True
+        try:
+            artifact_time = datetime.fromisoformat(str(artifact.get("as_of") or "").replace("Z", "+00:00"))
+            cutoff = datetime.fromisoformat(str(packet_as_of).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return artifact_time <= cutoff
+
+    @classmethod
+    def _matching_public_evidence_artifact(
+        cls,
+        artifacts: list[dict[str, Any]],
+        evidence: dict[str, Any] | None,
+        packet_as_of: str | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(evidence, dict) or not evidence:
+            return None
+        # Prefer the original M0 evidence artifact over the M1 checkpoint
+        # copy.  Both carry the same frozen public evidence, but selecting one
+        # makes the packet identity independent of checkpoint bookkeeping.
+        for kind in ("evidence", "m1_evidence"):
+            for artifact in reversed(artifacts):
+                if (
+                    artifact["kind"] != kind
+                    or not cls._artifact_is_visible_at(artifact, packet_as_of)
+                    or not cls._is_public_evidence_artifact(artifact)
+                ):
+                    continue
+                try:
+                    if json.loads(artifact["body_markdown"]) == evidence:
+                        return artifact
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    @staticmethod
+    def _is_public_evidence_artifact(artifact: dict[str, Any]) -> bool:
+        try:
+            metadata = json.loads(artifact.get("metadata_json") or "{}")
+        except (TypeError, ValueError):
+            return False
+        return metadata.get("public_only") is True
+
+    def _frozen_artifact_descriptor(
+        self, cycle: dict[str, Any], kind: str, packet_as_of: str,
+    ) -> dict[str, Any]:
+        artifact = self.store.latest_artifact_before(cycle["cycle_id"], kind, packet_as_of)
+        if artifact is None:
+            # The store is deliberately consulted here rather than accepting a
+            # caller-supplied artifact identity.
+            return {
+                "artifact_id": None,
+                "sha256": None,
+                "as_of": None,
+                "known_at": None,
+            }
+        if not self._artifact_is_visible_at(artifact, packet_as_of):
+            raise ValueError(f"future {kind} artifact")
+        return {
+            "artifact_id": artifact["artifact_id"],
+            "sha256": artifact["body_sha256"],
+            "as_of": artifact["as_of"],
+            "known_at": artifact.get("known_at"),
+        }
+
+    @classmethod
+    def _validated_m1_evidence(
+        cls, evidence: dict[str, Any], packet_as_of: str,
+    ) -> dict[str, Any]:
+        """Keep M1 evidence public, frozen, and free of caller-only fields."""
+        if not evidence:
+            return {}
+        allowed = {
+            "schema_version", "as_of", "spoken_summary", "sources", "coverage",
+            "critical_gaps", "conflicts", "high_impact_events",
+        }
+        public = {key: value for key, value in evidence.items() if key in allowed}
+        cls._reject_future_evidence(evidence, packet_as_of)
+        sources = public.get("sources")
+        if isinstance(sources, list):
+            source_allowed = {"evidence_ref", "excerpt", "analysis"}
+            public["sources"] = [
+                {key: value for key, value in source.items() if key in source_allowed}
+                for source in sources if isinstance(source, dict)
+            ]
+        return public
+
+    @staticmethod
+    def _reject_future_evidence(evidence: dict[str, Any], packet_as_of: str) -> None:
+        try:
+            cutoff = datetime.fromisoformat(str(packet_as_of).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("invalid M1 packet as_of") from exc
+        values = [evidence.get("as_of")]
+        values.extend(
+            source.get(field)
+            for source in evidence.get("sources") or []
+            if isinstance(source, dict)
+            for field in ("fact_as_of", "known_at", "observed_at", "published_at")
+        )
+        for value in values:
+            if not value:
+                continue
+            try:
+                if datetime.fromisoformat(str(value).replace("Z", "+00:00")) > cutoff:
+                    raise ValueError("future evidence cannot enter M1")
+            except ValueError as exc:
+                if str(exc) == "future evidence cannot enter M1":
+                    raise
+
+    def _frozen_public_evidence_descriptor(
+        self, cycle: dict[str, Any], evidence: dict[str, Any], packet_as_of: str,
+    ) -> dict[str, Any]:
+        artifact = self._matching_public_evidence_artifact(
+            self.store.artifacts(cycle["cycle_id"]), evidence, packet_as_of,
+        )
+        return {
+            "artifact_id": artifact["artifact_id"] if artifact else None,
+            "sha256": artifact["body_sha256"] if artifact else None,
+            "as_of": evidence.get("as_of") or packet_as_of,
+            "known_at": artifact.get("known_at") if artifact else None,
+            "evidence_refs": [
+                str(source.get("evidence_ref"))
+                for source in evidence.get("sources") or []
+                if isinstance(source, dict) and source.get("evidence_ref")
+            ],
+        }
 
     @staticmethod
     def _memory_query_text(evidence: dict[str, Any] | None) -> str:

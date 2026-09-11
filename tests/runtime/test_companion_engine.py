@@ -686,6 +686,46 @@ Protocol: OpportunityDiscovery-v1.3
         faults = [row for row in self.store.artifacts(self.cycle["cycle_id"]) if row["kind"] == "system_fault"]
         self.assertEqual(1, len(faults))
 
+    def test_m1_judgment_boundary_failure_is_audited_before_stage_attempt(self):
+        self.ready()
+        self.store.append_artifact(
+            self.cycle["cycle_id"], "evidence", "runtime",
+            json.dumps({"schema_version": 4, "as_of": iso(self.now), "sources": []}), iso(self.now),
+        )
+        self.engine.command({
+            "command_id": "skip-before-judgment-boundary-fault",
+            "cycle_id": self.cycle["cycle_id"], "type": "skip_h0",
+        })
+        original_controls = __import__("ai_trading_companion.__main__", fromlist=["resolve_stage_controls"]).resolve_stage_controls
+
+        def fail_judgment_controls(store, stage, **kwargs):
+            if stage == "m1_judgment":
+                raise RuntimeError("synthetic judgment preflight failure")
+            return original_controls(store, stage, **kwargs)
+
+        m1_research_attempt = self.qualified("m1_research", "synthetic-m1-research", output={})
+        with patch(
+            "ai_trading_companion.__main__._formal_adaptive_research", return_value=None,
+        ), patch(
+            "ai_trading_companion.__main__._reuse_m0_evidence_attempt", return_value=m1_research_attempt,
+        ), patch(
+            "ai_trading_companion.__main__.CompanionStore.save_stage_checkpoint", return_value=None,
+        ), patch(
+            "ai_trading_companion.__main__._deadline_timeout", return_value=300,
+        ), patch(
+            "ai_trading_companion.__main__.resolve_stage_controls", side_effect=fail_judgment_controls,
+        ), self.assertRaisesRegex(RuntimeError, "synthetic judgment preflight failure"):
+            run_m1(self.engine, self.store, Mock(), self.cycle["cycle_id"], execute=True)
+
+        boundary = [
+            attempt for attempt in self.store.attempts(self.cycle["cycle_id"])
+            if attempt["stage"] == "m1_judgment_boundary"
+        ]
+        self.assertEqual(1, len(boundary))
+        self.assertEqual("failed", boundary[0]["status"])
+        self.assertEqual("RuntimeError", json.loads(boundary[0]["verifier_json"])["exception_type"])
+        self.assertEqual("waiting_for_repair", self.store.get_cycle(self.cycle["cycle_id"])["state"])
+
     def test_formal_memory_research_uses_a_deadline_sized_action_budget(self):
         result = Mock(snapshot={"snapshot_id": "snapshot"}, context=(), actions=())
         with patch("ai_trading_companion.__main__.AdaptiveMemoryResearch") as research:

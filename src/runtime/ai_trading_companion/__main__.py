@@ -1540,6 +1540,18 @@ def run_m1(
     frozen_expression_decision: dict[str, Any] | None = None
     local_packet: dict[str, Any] | None = None
     for number in range(1, M1_MAX_JUDGMENT_ATTEMPTS + 1):
+        # Keep a durable boundary record for failures that happen before
+        # _call_stage can create its normal m1_judgment attempt.  The raw
+        # exception stays in the local attempt audit; only safe metadata is
+        # passed to the user-facing fault projection below.
+        boundary_attempt = store.begin_attempt(
+            cycle_id, "m1_judgment_boundary", iso(datetime.now(timezone.utc)),
+            input_sha256=None, timeout_seconds=None,
+            routing_reason="M1 judgment runtime boundary",
+            runner_fingerprint="m1-runtime-boundary/v1",
+            input_packet={"stage": "m1_judgment", "outer_attempt_number": number},
+        )
+        boundary_finished = False
         try:
             cycle = engine.m1_judgment_started(cycle_id)
             # The multi-call pipeline replaces the old judgment retry loop's work,
@@ -1576,6 +1588,11 @@ def run_m1(
                 )
                 judgment, judgment_attempt_id = judgment_stage.output, judgment_stage.attempt_id
                 store.save_stage_checkpoint(cycle_id, "m1_judgment", local_packet["sha256"], judgment_attempt_id, judgment)
+            store.finish_attempt(
+                boundary_attempt["attempt_id"], "succeeded",
+                verifier={"passed": True, "boundary": "m1_judgment"},
+            )
+            boundary_finished = True
             m1_result = normalize_stage_output("m1_judgment", judgment)
             return engine.m1_ready(
                 cycle_id, m1_result.text, as_of=evidence.get("as_of"),
@@ -1584,15 +1601,35 @@ def run_m1(
                 snapshot=m1_result.snapshot, qualified=bool(m1_result.qualified),
             )
         except Exception as exc:
+            if not boundary_finished:
+                store.finish_attempt(
+                    boundary_attempt["attempt_id"],
+                    "timed_out" if isinstance(exc, TimeoutError) else "failed",
+                    error=str(exc),
+                    verifier={
+                        "passed": False,
+                        "boundary": "m1_judgment",
+                        "exception_type": type(exc).__name__,
+                    },
+                )
             try:
                 remaining = _deadline_timeout(store.get_cycle(cycle_id), 60)
             except TimeoutError:
                 remaining = 0
             retryable = _m1_should_retry(exc, attempt_number=number, remaining_seconds=remaining)
             details = getattr(exc, "verifier", None)
+            safe_boundary_details = {
+                "failure_stage": "m1_judgment",
+                "boundary_attempt_id": boundary_attempt["attempt_id"],
+                "boundary_exception_type": type(exc).__name__,
+            }
+            if isinstance(details, dict):
+                details = {**details, **safe_boundary_details}
+            else:
+                details = safe_boundary_details
             if isinstance(exc, JudgmentUnavailable):
                 engine.m1_failed(cycle_id, str(exc), retryable=False,
-                                 details={"problems": ["decision_core_unavailable"]})
+                                 details={"problems": ["decision_core_unavailable"], **safe_boundary_details})
                 raise
             if (
                 isinstance(exc, (BrokerError, TimeoutError, EvidenceInsufficient))

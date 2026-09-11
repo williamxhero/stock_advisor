@@ -29,11 +29,11 @@ class ToolRunnerTests(unittest.TestCase):
                 ensure_builtin_tools(root)
 
             capability_manifest = json.loads((
-                root / "cn_market_breadth" / "versions" / "1.1.18" / "manifest.json"
+                root / "cn_market_breadth" / "versions" / "1.1.19" / "manifest.json"
             ).read_text(encoding="utf-8"))
             adapter_manifest = json.loads((
                 root / "cn_market_breadth" / "adapters" / "markethub"
-                / "versions" / "1.1.18" / "manifest.json"
+                / "versions" / "1.1.19" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual(new_python, capability_manifest["command"][0])
             self.assertEqual(new_python, adapter_manifest["command"][0])
@@ -63,7 +63,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.18", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.19", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
             routing = json.loads(turnover_routing.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -72,7 +72,7 @@ class ToolRunnerTests(unittest.TestCase):
             )
             official_manifest = json.loads((
                 root / "cn_market_turnover_compare" / "adapters" / "official_exchanges"
-                / "versions" / "1.1.18" / "manifest.json"
+                / "versions" / "1.1.19" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual({
                 "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
@@ -1352,26 +1352,27 @@ class ToolRunnerTests(unittest.TestCase):
                 server.shutdown(); server.server_close()
 
     def test_builtin_market_event_snapshot_checks_each_source_and_freezes_the_window(self) -> None:
-        requested_sources: list[str] = []
+        requested_ranges: list[str] = []
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
                 query = parse_qs(urlsplit(self.path).query)
-                source = query.get("source", [""])[0]
-                requested_sources.append(source)
+                requested_ranges.append(self.path)
+                source_names = ["eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news"]
                 articles = [{
-                    "article_id": source + f":{index}", "published_at": "2026-09-04 15:30",
+                    "source_key": source_names[index % 3], "source_name": source_names[index % 3],
+                    "article_id": source_names[index % 3] + f":{index}", "published_at": "2026-09-04 15:30",
                     "title": f"A股收盘政策观察 {index}", "content": "市场风险与政策变化。" * 100,
-                    "source_url": f"https://example.test/{source}/{index}",
+                    "source_url": f"https://example.test/article/{index}",
                 } for index in range(40)]
                 articles.append({
-                    "article_id": source + ":future", "published_at": "2026-09-05 12:30",
+                    "source_key": "future", "article_id": "future", "published_at": "2026-09-05 12:30",
                     "title": "冻结时点之后", "content": "不得进入证据。",
-                    "source_url": f"https://example.test/{source}/future",
+                    "source_url": "https://example.test/future",
                 })
                 payload = {
-                    "source": source, "start_date": "2026-08-31", "end_date": "2026-09-05",
-                    "groups": [{"source_key": source, "count": len(articles), "articles": articles}],
+                    "start_date": "2026-08-31", "end_date": "2026-09-05", "articles": articles,
+                    "next_cursor": None,
                 }
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1393,12 +1394,9 @@ class ToolRunnerTests(unittest.TestCase):
                 ))
 
                 self.assertTrue(result.succeeded, result.error_code)
-                self.assertEqual(
-                    ["eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news"],
-                    requested_sources,
-                )
-                self.assertEqual(120, result.data["matched_count"])
-                self.assertEqual(15, len(result.data["articles"]))
+                self.assertEqual(1, len(requested_ranges))
+                self.assertEqual(40, result.data["matched_count"])
+                self.assertEqual(40, len(result.data["articles"]))
                 self.assertTrue(all(len(row["content"]) <= 600 for row in result.data["articles"]))
                 self.assertTrue(all("future" not in row["article_id"] for row in result.data["articles"]))
                 self.assertEqual("2026-09-05T02:00:00Z", result.fact_as_of)

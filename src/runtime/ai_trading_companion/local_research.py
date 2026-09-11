@@ -419,6 +419,7 @@ class ToolCatalogMarketBackend:
             inputs = {
                 "start_at": str(window.get("start") or ""),
                 "end_at": str(window.get("end") or ""),
+                "stock_codes": [str(value) for value in requirement.get("required_entities") or [] if str(value)],
             }
         elif operation == "market_snapshot":
             inputs = {"symbols": ["000001", "399001", "399006"]}

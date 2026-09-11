@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.18"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15", "1.1.16", "1.1.17"}
+_VERSION = "1.1.19"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15", "1.1.16", "1.1.17", "1.1.18"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -1721,7 +1721,7 @@ def announcement_snapshot_payload(
 
 
 def market_event_snapshot_payload(
-    base: str, start_at: str, end_at: str,
+    base: str, start_at: str, end_at: str, stock_codes: list[str] | None = None,
 ) -> tuple[dict[str, object], str]:
     try:
         start = dt.datetime.fromisoformat(start_at.replace("Z", "+00:00"))
@@ -1733,100 +1733,82 @@ def market_event_snapshot_payload(
     start = start.astimezone(dt.timezone.utc)
     end = end.astimezone(dt.timezone.utc)
     local_timezone = dt.timezone(dt.timedelta(hours=8))
-    sources = (
-        "eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news",
-    )
+    start_date = start.astimezone(local_timezone).date().isoformat()
+    end_date = end.astimezone(local_timezone).date().isoformat()
+    endpoint = base.rstrip("/") + "/api/articles/range"
+    page_size = 200
     normalized: list[dict[str, object]] = []
     source_urls: list[str] = []
-    source_checks: list[dict[str, object]] = []
-    for source in sources:
-        url, body = fetch(
-            base.rstrip("/") + "/api/articles/range?source=" + quote_plus(source)
-            + "&start_date=" + quote_plus(start.astimezone(local_timezone).date().isoformat())
-            + "&end_date=" + quote_plus(end.astimezone(local_timezone).date().isoformat())
-        )
-        try:
-            payload = json.loads(body)
-            groups = payload["groups"]
-            group = next(row for row in groups if isinstance(row, dict) and row.get("source_key") == source)
-            rows = group["articles"]
-            reported_count = int(group["count"])
-        except (KeyError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
-            fail(75, "market event service response is invalid")
-        if not isinstance(rows, list) or reported_count < len(rows):
-            fail(75, "market event service response is invalid")
-        matched: list[dict[str, object]] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            published_text = str(row.get("published_at") or "").strip()
+    seen: set[tuple[str, str]] = set()
+    pages = 0
+    query_targets: list[str | None] = [None, *[str(value).strip() for value in stock_codes or [] if str(value).strip()][:8]]
+    for stock in query_targets:
+        cursor: str | None = None
+        while True:
+            query = "?start_date=" + quote_plus(start_date) + "&end_date=" + quote_plus(end_date) + "&limit=" + str(page_size)
+            if stock:
+                query += "&stock=" + quote_plus(stock)
+            if cursor:
+                query += "&cursor=" + quote_plus(cursor)
+            url, body = fetch(endpoint + query)
             try:
-                published = dt.datetime.fromisoformat(published_text.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            if published.tzinfo is None:
-                published = published.replace(tzinfo=local_timezone)
-            published = published.astimezone(dt.timezone.utc)
-            if not start < published <= end:
-                continue
-            article_url = str(row.get("source_url") or row.get("detail_url") or "").strip()
-            parsed_article_url = urlparse(article_url)
-            if (
-                parsed_article_url.scheme not in {"http", "https"}
-                or not parsed_article_url.netloc
-                or parsed_article_url.username
-                or parsed_article_url.password
-            ):
-                continue
-            title = clean_text(row.get("title")).strip()[:300]
-            if not title:
-                continue
-            matched.append({
-                "source": source, "article_id": clean_text(row.get("article_id")).strip()[:200],
-                "published_at": published.isoformat().replace("+00:00", "Z"),
-                "title": title,
-                "content": clean_text(row.get("content") or row.get("subtitle")).strip()[:600],
-                "source_url": article_url,
-            })
-        relevance_terms = (
-            "A股", "沪指", "深证", "创业板", "市场", "收盘", "资金", "政策",
-            "证监会", "央行", "风险", "行业", "板块", "交易所",
-        )
-        matched.sort(
-            key=lambda item: sum(
-                term in (str(item["title"]) + str(item["content"]))
-                for term in relevance_terms
-            ),
-            reverse=True,
-        )
-        selected = matched[:5]
-        normalized.extend(selected)
-        source_urls.append(url)
-        source_checks.append({
-            "source": source, "source_url": url, "reported_count": reported_count,
-            "matched_count": len(matched), "selected_count": len(selected),
-        })
+                payload = json.loads(body)
+                rows = payload["articles"]
+                next_cursor = payload.get("next_cursor")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                fail(75, "market event service response is invalid")
+            if not isinstance(rows, list) or (next_cursor is not None and not isinstance(next_cursor, str)):
+                fail(75, "market event service response is invalid")
+            pages += 1
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                published_text = str(row.get("published_at") or "").strip()
+                try:
+                    published = dt.datetime.fromisoformat(published_text.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if published.tzinfo is None:
+                    published = published.replace(tzinfo=local_timezone)
+                published = published.astimezone(dt.timezone.utc)
+                if not start < published <= end:
+                    continue
+                article_url = str(row.get("source_url") or row.get("detail_url") or "").strip()
+                parsed_article_url = urlparse(article_url)
+                if parsed_article_url.scheme not in {"http", "https"} or not parsed_article_url.netloc or parsed_article_url.username or parsed_article_url.password:
+                    continue
+                title = clean_text(row.get("title")).strip()[:300]
+                if not title:
+                    continue
+                source = clean_text(row.get("source_key") or row.get("source")).strip()[:100]
+                article_id = clean_text(row.get("article_id")).strip()[:200]
+                identity = (source, article_id or article_url)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                item: dict[str, object] = {
+                    "source": source, "source_name": clean_text(row.get("source_name")).strip()[:100],
+                    "article_id": article_id, "published_at": published.isoformat().replace("+00:00", "Z"),
+                    "title": title, "content": clean_text(row.get("content") or row.get("subtitle")).strip()[:600],
+                    "source_url": article_url,
+                }
+                if isinstance(row.get("stock_match"), dict):
+                    item["stock_match"] = row["stock_match"]
+                normalized.append(item)
+            source_urls.append(url)
+            if not next_cursor:
+                break
+            if next_cursor == cursor or pages >= 100:
+                fail(75, "market event service cursor did not advance")
+            cursor = next_cursor
+    normalized.sort(key=lambda item: (str(item.get("published_at") or ""), str(item.get("source") or ""), str(item.get("article_id") or "")), reverse=True)
     fact_as_of = end.isoformat().replace("+00:00", "Z")
-    source_evidence: list[dict[str, object]] = [{
-        "url": row["source_url"], "fact_as_of": fact_as_of,
-        "data": {
-            "summary": (
-                f"checked {row['source']} for announcements, policy and risk events "
-                f"from {start_at} through {end_at}; matched {row['matched_count']} records"
-            ),
-            "checked_terms": ["公告", "政策", "风险"], "window_start": start_at,
-            "window_end": end_at, **row,
-        },
-    } for row in source_checks]
-    source_evidence.extend({
-        "url": row["source_url"], "fact_as_of": row["published_at"],
-        "data": {key: value for key, value in row.items() if key != "source_url"},
-    } for row in normalized)
+    source_evidence: list[dict[str, object]] = [{"url": row["source_url"], "fact_as_of": row["published_at"], "data": dict(row)} for row in normalized]
+    checked_source_names = ["cninfo_disclosure", "eastmoney_stock_report", "eastmoney_broker_report", "eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news"]
     return {
-        "checked_sources": list(sources), "start_at": start_at, "end_at": end_at,
-        "matched_count": sum(int(row["matched_count"]) for row in source_checks),
-        "articles": normalized, "source_checks": source_checks,
-        "source": "yosef_bounded_market_event_snapshot",
+        "checked_sources": checked_source_names, "start_at": start_at, "end_at": end_at,
+        "pages": pages, "matched_count": len(normalized), "articles": normalized,
+        "source": "yosef_articles_range_market_event_snapshot",
         "source_urls": [*source_urls, *(str(row["source_url"]) for row in normalized)],
         "source_evidence": source_evidence,
     }, fact_as_of
@@ -2138,6 +2120,7 @@ def main() -> None:
             fail(64, "start_at and end_at are required")
         payload, fact_as_of = market_event_snapshot_payload(
             safe_url(inputs.get("base_url") or "http://yosef-server:8815"), start_at, end_at,
+            [str(value) for value in inputs.get("stock_codes") or [] if str(value).strip()],
         )
         result(payload, fact_as_of=fact_as_of)
         return

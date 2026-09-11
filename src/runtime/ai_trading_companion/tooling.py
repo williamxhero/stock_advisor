@@ -929,9 +929,6 @@ def _validate_equity_announcement_snapshot(
 def _validate_market_event_snapshot(
     request: FactRequest, data: dict[str, Any], fact_as_of: str,
 ) -> str | None:
-    expected_sources = [
-        "eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news",
-    ]
     start_text = str(request.inputs.get("start_at") or "")
     end_text = str(request.inputs.get("end_at") or "")
     try:
@@ -945,23 +942,17 @@ def _validate_market_event_snapshot(
         or observed != end or observed > _parse_timestamp(request.required_at)
     ):
         return "tool_market_event_window_invalid"
-    if data.get("checked_sources") != expected_sources:
-        return "tool_market_event_sources_invalid"
-    checks = data.get("source_checks")
-    if (
-        not isinstance(checks, list)
-        or [row.get("source") for row in checks if isinstance(row, dict)] != expected_sources
-    ):
+    checked_sources = data.get("checked_sources")
+    expected_sources = ["cninfo_disclosure", "eastmoney_stock_report", "eastmoney_broker_report", "eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news"]
+    if checked_sources != expected_sources:
         return "tool_market_event_sources_invalid"
     if not str(data.get("source") or "").strip() or not _valid_public_source_urls(data.get("source_urls")):
         return "tool_market_source_urls_invalid"
     articles = data.get("articles")
-    if not isinstance(articles, list) or data.get("matched_count") != sum(
-        int(row.get("matched_count") or 0) for row in checks if isinstance(row, dict)
-    ):
+    if not isinstance(articles, list) or data.get("matched_count") != len(articles):
         return "tool_market_event_result_invalid"
     for row in articles:
-        if not isinstance(row, dict) or row.get("source") not in expected_sources:
+        if not isinstance(row, dict) or row.get("source") not in checked_sources:
             return "tool_market_event_result_invalid"
         try:
             published = _parse_timestamp(str(row.get("published_at") or ""))

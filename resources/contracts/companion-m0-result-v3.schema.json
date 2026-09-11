@@ -4,7 +4,9 @@
     "result_version":{"type":"integer","const":3},
     "semantic":{"type":"object","additionalProperties":false,"required":["summary","observations","risks","unknowns"],"properties":{
       "summary":{"type":"string","minLength":1,"maxLength":240},
-      "observations":{"type":"array","maxItems":2,"items":{"type":"string","minLength":1,"maxLength":180}},
+      "observations":{"type":"array","maxItems":3,"items":{"type":"string","minLength":1,"maxLength":180}},
+      "connections":{"type":"array","maxItems":2,"items":{"type":"string","minLength":1,"maxLength":180}},
+      "attention":{"type":"array","maxItems":1,"items":{"type":"string","minLength":1,"maxLength":180}},
       "risks":{"type":"array","maxItems":1,"items":{"type":"string","minLength":1,"maxLength":180}},
       "unknowns":{"type":"array","maxItems":1,"items":{"type":"string","minLength":1,"maxLength":180}}
     }}

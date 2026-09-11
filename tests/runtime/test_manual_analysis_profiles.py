@@ -343,11 +343,11 @@ class ManualAnalysisProfileResolverTests(TestCase):
         market, events = contract["requirements"]
 
         self.assertEqual({
-            "start": "2026-08-31T03:15:00Z",
+            "start": "2026-08-31T02:15:00Z",
             "end": "2026-08-31T04:51:12.238000Z",
             "mode": "after_start_to_end",
         }, market["window"])
-        self.assertEqual("2026-08-31T02:30:00Z", events["window"]["start"])
+        self.assertEqual("2026-08-31T01:45:00Z", events["window"]["start"])
         self.assertEqual(["公告", "政策", "风险"], events["negative_query_terms"])
 
     def test_weekend_request_creates_a_distinct_outlook_cycle_and_packet(self) -> None:

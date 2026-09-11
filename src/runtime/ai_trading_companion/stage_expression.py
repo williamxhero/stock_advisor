@@ -626,11 +626,17 @@ def express_stage_semantics(stage: str, semantic: dict[str, Any]) -> str:
         return _v4_judgment_expression(semantic)
     paragraphs = [summary]
     if stage == "m0":
-        observations = [str(value).strip() for value in semantic.get("observations") or [] if str(value).strip()][:2]
+        observations = [str(value).strip() for value in semantic.get("observations") or [] if str(value).strip()][:3]
+        connections = [str(value).strip() for value in semantic.get("connections") or [] if str(value).strip()][:2]
+        attention = [str(value).strip() for value in semantic.get("attention") or [] if str(value).strip()][:1]
         risks = [str(value).strip() for value in semantic.get("risks") or [] if str(value).strip()][:1]
         unknowns = [str(value).strip() for value in semantic.get("unknowns") or [] if str(value).strip()][:1]
         if observations:
             paragraphs.append("。".join(_sentence_piece(value) for value in observations) + "。")
+        if connections:
+            paragraphs.append("我把几条线索放在一起看：" + "；".join(_sentence_piece(value) for value in connections) + "。")
+        if attention:
+            paragraphs.append("接下来我会留意" + _sentence_piece(attention[0]) + "。")
         if risks:
             paragraphs.append("要留意" + _sentence_piece(risks[0]) + "。")
         if unknowns:

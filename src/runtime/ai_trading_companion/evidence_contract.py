@@ -388,11 +388,11 @@ class EvidenceContractFactory:
                 "end": self._iso(as_of),
                 "mode": "after_start_to_end",
             }
-            events_start = self._manual_intraday_anchor(as_of)
+            events_start = self._previous_intraday_anchor(as_of)
         elif evidence_family == "morning_close":
             local = as_of.astimezone(_SHANGHAI)
-            market_start = datetime.combine(local.date(), time(11, 15), _SHANGHAI).astimezone(ZoneInfo("UTC"))
-            events_start = datetime.combine(local.date(), time(10, 30), _SHANGHAI).astimezone(ZoneInfo("UTC"))
+            market_start = datetime.combine(local.date(), time(10, 15), _SHANGHAI).astimezone(ZoneInfo("UTC"))
+            events_start = datetime.combine(local.date(), time(9, 45), _SHANGHAI).astimezone(ZoneInfo("UTC"))
             market_window = {
                 "start": self._iso(market_start),
                 "end": self._iso(as_of),
@@ -498,6 +498,14 @@ class EvidenceContractFactory:
         local = as_of.astimezone(_SHANGHAI)
         anchors = (time(9, 0), time(9, 45), time(10, 30), time(14, 30))
         selected = max((anchor for anchor in anchors if anchor <= local.time()), default=time(9, 0))
+        return datetime.combine(local.date(), selected, _SHANGHAI).astimezone(ZoneInfo("UTC"))
+
+    @staticmethod
+    def _previous_intraday_anchor(as_of: datetime) -> datetime:
+        local = as_of.astimezone(_SHANGHAI)
+        anchors = (time(9, 0), time(9, 45), time(10, 30), time(14, 30))
+        prior = [anchor for anchor in anchors if anchor < local.time()]
+        selected = max(prior, default=time(9, 0))
         return datetime.combine(local.date(), selected, _SHANGHAI).astimezone(ZoneInfo("UTC"))
 
     def _latest_completed_close(self, as_of: datetime) -> datetime:

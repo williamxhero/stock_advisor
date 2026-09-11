@@ -7,7 +7,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$output = Join-Path $projectRoot "dist\$Runtime\AITradingCompanion"
+$releaseRoot = 'D:\APP\AITradingCompanion\release'
+$output = Join-Path $releaseRoot "$Runtime\AITradingCompanion"
 $outputParent = Split-Path -Parent $output
 $revision = (& git -C $projectRoot rev-parse HEAD 2>$null)
 if (-not $revision) { throw 'A formal package requires a Git source revision.' }

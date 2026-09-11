@@ -12,7 +12,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 & (Join-Path $root 'scripts\publish.ps1') -Runtime $Runtime -NoRestore
-$source = Join-Path $root "dist\$Runtime\AITradingCompanion"
+$source = Join-Path 'D:\APP\AITradingCompanion\release' "$Runtime\AITradingCompanion"
 $companionHome = [System.IO.Path]::GetFullPath($CompanionHome)
 $previousCompanionHome = [System.IO.Path]::GetFullPath($PreviousCompanionHome)
 $app = Join-Path $companionHome 'app'

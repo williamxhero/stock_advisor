@@ -507,7 +507,7 @@ class EvidenceV3Tests(TestCase):
             {"start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z", "mode": "exact"},
             requirements["indices_close"]["window"],
         )
-        self.assertEqual("2026-08-26T07:00:00Z", requirements["events_and_counterevidence"]["window"]["start"])
+        self.assertEqual("2026-08-27T06:30:00Z", requirements["events_and_counterevidence"]["window"]["start"])
         self.assertEqual("2026-08-27T07:20:02.555000Z", requirements["events_and_counterevidence"]["window"]["end"])
         self.assertEqual(
             {"start": "2026-08-27T07:00:00Z", "end": "2026-08-27T07:00:00Z", "mode": "exact"},

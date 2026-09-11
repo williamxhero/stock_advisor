@@ -6,6 +6,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,11 +30,11 @@ class ToolRunnerTests(unittest.TestCase):
                 ensure_builtin_tools(root)
 
             capability_manifest = json.loads((
-                root / "cn_market_breadth" / "versions" / "1.1.19" / "manifest.json"
+                root / "cn_market_breadth" / "versions" / "1.1.20" / "manifest.json"
             ).read_text(encoding="utf-8"))
             adapter_manifest = json.loads((
                 root / "cn_market_breadth" / "adapters" / "markethub"
-                / "versions" / "1.1.19" / "manifest.json"
+                / "versions" / "1.1.20" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual(new_python, capability_manifest["command"][0])
             self.assertEqual(new_python, adapter_manifest["command"][0])
@@ -63,7 +64,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.19", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.20", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
             routing = json.loads(turnover_routing.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -72,7 +73,7 @@ class ToolRunnerTests(unittest.TestCase):
             )
             official_manifest = json.loads((
                 root / "cn_market_turnover_compare" / "adapters" / "official_exchanges"
-                / "versions" / "1.1.19" / "manifest.json"
+                / "versions" / "1.1.20" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual({
                 "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
@@ -1400,6 +1401,222 @@ class ToolRunnerTests(unittest.TestCase):
                 self.assertTrue(all(len(row["content"]) <= 600 for row in result.data["articles"]))
                 self.assertTrue(all("future" not in row["article_id"] for row in result.data["articles"]))
                 self.assertEqual("2026-09-05T02:00:00Z", result.fact_as_of)
+            finally:
+                server.shutdown(); server.server_close()
+
+    def test_builtin_market_event_snapshot_merges_global_and_holding_pages_with_auditable_cutoff(self) -> None:
+        requests: list[dict[str, str]] = []
+        sources = [
+            "cninfo_disclosure", "eastmoney_stock_report", "eastmoney_broker_report",
+            "eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news",
+        ]
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                query = {key: values[0] for key, values in parse_qs(urlsplit(self.path).query).items()}
+                requests.append(query)
+                cursor = query.get("cursor", "")
+                stock = query.get("stock", "")
+                rows = [
+                    {
+                        "source_key": sources[0], "article_id": "global-1", "published_at": "2026-09-05T00:01:00+08:00",
+                        "title": "Global disclosure", "content": "global", "source_url": "https://example.test/global-1",
+                    },
+                    {
+                        "source_key": sources[1], "article_id": "holding-1", "published_at": "2026-09-05T09:00:00+08:00",
+                        "title": "Direct holding report", "content": "holding", "source_url": "https://example.test/holding-1",
+                        "stock_match": {"match_type": "direct", "stock_code": stock or "600000"},
+                    },
+                    {
+                        "source_key": sources[2], "article_id": "mentioned-1", "published_at": "2026-09-05T09:30:00+08:00",
+                        "title": "Mentioned holding report", "content": "mentioned", "source_url": "https://example.test/mentioned-1",
+                        "stock_match": {"match_type": "mentioned", "stock_code": stock or "600000"},
+                    },
+                    {
+                        "source_key": sources[3], "article_id": "at-current", "published_at": "2026-09-05T10:00:00+08:00",
+                        "title": "At current cutoff", "content": "current", "source_url": "https://example.test/at-current",
+                    },
+                    {
+                        "source_key": sources[4], "article_id": "before-previous", "published_at": "2026-09-04T23:00:00+08:00",
+                        "title": "Before previous cutoff", "content": "old", "source_url": "https://example.test/before-previous",
+                    },
+                    {
+                        "source_key": sources[4], "article_id": "in-window-4", "published_at": "2026-09-05T09:15:00+08:00",
+                        "title": "In-window source four", "content": "in-window", "source_url": "https://example.test/in-window-4",
+                    },
+                ]
+                if not cursor:
+                    rows.append({
+                        "source_key": sources[5], "article_id": "page-2", "published_at": "2026-09-05T09:45:00+08:00",
+                        "title": "Cursor page", "content": "page 2", "source_url": "https://example.test/page-2",
+                    })
+                payload = {"articles": rows, "next_cursor": None if cursor else "page-2"}
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"; ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_market_event_snapshot", "2026-09-05T10:00:00Z", 8.0, {
+                        "base_url": f"http://127.0.0.1:{server.server_port}",
+                        "start_at": "2026-09-04T16:00:00Z", "end_at": "2026-09-05T10:00:00Z",
+                        "stock_codes": ["600000", "000001"],
+                    }, finality="intraday",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual(6, len(requests))
+                self.assertTrue(all(request["limit"] == "200" for request in requests))
+                self.assertTrue(all(request["start_date"] == "2026-09-05" and request["end_date"] == "2026-09-05" for request in requests))
+                self.assertEqual(["", "page-2"], [request.get("cursor", "") for request in requests[:2]])
+                self.assertEqual(["", "600000", "000001"], [request.get("stock", "") for request in requests[::2]])
+                data = result.data
+                self.assertEqual("complete", data["status"])
+                self.assertTrue(data["complete"])
+                self.assertEqual(sources, data["coverage"]["expected_sources"])
+                self.assertEqual(sources, data["coverage"]["observed_sources"])
+                self.assertEqual(6, data["pagination"]["pages"])
+                self.assertEqual(200, data["pagination"]["limit"])
+                self.assertEqual("2026-09-04T16:00:00Z", data["cutoff"]["previous_as_of"])
+                self.assertEqual("2026-09-05T10:00:00Z", data["cutoff"]["current_as_of"])
+                articles = {row["article_id"]: row for row in data["articles"]}
+                self.assertEqual(6, len(articles))
+                self.assertEqual("direct", articles["holding-1"]["stock_match"]["match_type"])
+                self.assertEqual("mentioned", articles["mentioned-1"]["stock_match"]["match_type"])
+                self.assertNotIn("before-previous", articles)
+            finally:
+                server.shutdown(); server.server_close()
+
+    def test_builtin_market_event_snapshot_audits_malformed_and_repeated_cursor_pages(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                query = parse_qs(urlsplit(self.path).query)
+                stock = query.get("stock", [""])[0]
+                cursor = query.get("cursor", [""])[0]
+                if stock == "malformed":
+                    body = b'{"articles": {"not": "a list"}, "next_cursor": null}'
+                elif stock == "repeated":
+                    body = json.dumps({"articles": [], "next_cursor": cursor or "same"}).encode("utf-8")
+                elif stock == "timeout":
+                    time.sleep(6)
+                    body = b'{"articles": [], "next_cursor": null}'
+                else:
+                    body = json.dumps({"articles": [], "next_cursor": None}).encode("utf-8")
+                self.send_response(200); self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"; ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_market_event_snapshot", "2026-09-05T10:00:00Z", 20.0, {
+                        "base_url": f"http://127.0.0.1:{server.server_port}",
+                        "start_at": "2026-09-05T08:00:00Z", "end_at": "2026-09-05T10:00:00Z",
+                        "stock_codes": ["malformed", "repeated", "timeout"],
+                    }, finality="intraday",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("partial", result.data["status"])
+                self.assertEqual({"malformed_response", "repeated_cursor", "upstream_timeout"}, {
+                    row["kind"] for row in result.data["failures"]
+                })
+            finally:
+                server.shutdown(); server.server_close()
+
+    def test_builtin_market_event_snapshot_returns_partial_audit_on_upstream_failure(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            calls = 0
+
+            def do_GET(self) -> None:  # noqa: N802
+                Handler.calls += 1
+                if Handler.calls == 1:
+                    body = json.dumps({
+                        "articles": [{
+                            "source_key": "cninfo_disclosure", "article_id": "ok", "published_at": "2026-09-05T17:00:00+08:00",
+                            "title": "Known article", "source_url": "https://example.test/ok",
+                        }], "next_cursor": None,
+                    }).encode("utf-8")
+                    self.send_response(200)
+                else:
+                    body = b"upstream unavailable"
+                    self.send_response(503)
+                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"; ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_market_event_snapshot", "2026-09-05T10:00:00Z", 8.0, {
+                        "base_url": f"http://127.0.0.1:{server.server_port}",
+                        "start_at": "2026-09-05T08:00:00Z", "end_at": "2026-09-05T10:00:00Z",
+                        "stock_codes": ["600000"],
+                    }, finality="intraday",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("partial", result.data["status"])
+                self.assertFalse(result.data["complete"])
+                self.assertTrue(result.data["partial"])
+                self.assertTrue(result.data["failures"])
+                self.assertEqual("upstream_http_503", result.data["failures"][0]["kind"])
+                self.assertEqual(["eastmoney_stock_report", "eastmoney_broker_report", "eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news"], result.data["coverage"]["missing_sources"])
+            finally:
+                server.shutdown(); server.server_close()
+
+    def test_builtin_market_event_snapshot_stops_at_32_pages_and_rejects_malformed_identity(self) -> None:
+        requested_cursors: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                cursor = parse_qs(urlsplit(self.path).query).get("cursor", [""])[0]
+                requested_cursors.append(cursor)
+                payload = {"articles": [{
+                    "source_key": "cninfo_disclosure", "article_id": "", "published_at": "2026-09-05T09:00:00+08:00",
+                    "title": "Missing identity", "source_url": "https://example.test/missing-id",
+                }], "next_cursor": f"cursor-{len(requested_cursors) + 1}"}
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200); self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"; ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_market_event_snapshot", "2026-09-05T10:00:00Z", 8.0, {
+                        "base_url": f"http://127.0.0.1:{server.server_port}",
+                        "start_at": "2026-09-05T08:00:00Z", "end_at": "2026-09-05T10:00:00Z",
+                    }, finality="intraday",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual(32, len(requested_cursors))
+                self.assertEqual("partial", result.data["status"])
+                self.assertFalse(result.data["complete"])
+                self.assertIn("pagination_guard", {row["kind"] for row in result.data["failures"]})
+                self.assertEqual([], result.data["articles"])
             finally:
                 server.shutdown(); server.server_close()
 

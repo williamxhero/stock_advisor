@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.19"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15", "1.1.16", "1.1.17", "1.1.18"}
+_VERSION = "1.1.20"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15", "1.1.16", "1.1.17", "1.1.18", "1.1.19"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -178,6 +178,7 @@ import sys
 import tempfile
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote_plus, urlparse
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
@@ -265,6 +266,41 @@ def strip_html(value: str) -> str:
     value = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", " ", value)
     value = re.sub(r"(?s)<[^>]+>", " ", value)
     return " ".join(html.unescape(value).split())[:200_000]
+
+
+class ArticleRangeFetchError(RuntimeError):
+    def __init__(self, kind: str, detail: str = "") -> None:
+        super().__init__(detail or kind)
+        self.kind = kind
+
+
+def fetch_article_range_page(url: str) -> tuple[str, str]:
+    last_error: ArticleRangeFetchError | None = None
+    for _attempt in range(2):
+        try:
+            with urlopen(Request(url, headers={"User-Agent": "AITradingCompanion-ReadOnly/1"}), timeout=5) as response:
+                status = int(getattr(response, "status", 200))
+                if status >= 400:
+                    raise ArticleRangeFetchError(f"upstream_http_{status}")
+                raw = response.read(1_000_001)
+                if len(raw) > 1_000_000:
+                    raise ArticleRangeFetchError("response_too_large")
+                charset = response.headers.get_content_charset() or "utf-8"
+                return response.geturl(), raw.decode(charset, errors="replace")
+        except HTTPError as error:
+            status = int(getattr(error, "code", 0))
+            last_error = ArticleRangeFetchError(
+                f"upstream_http_{status}" if status else "upstream_http_error", str(error),
+            )
+        except (TimeoutError, URLError, OSError) as error:
+            reason = getattr(error, "reason", error)
+            kind = "upstream_timeout" if isinstance(error, TimeoutError) or isinstance(reason, TimeoutError) else "upstream_network_error"
+            last_error = ArticleRangeFetchError(kind, str(error))
+        except ArticleRangeFetchError as error:
+            last_error = error
+            if error.kind in {"response_too_large", "upstream_http_401", "upstream_http_402", "upstream_http_403"}:
+                break
+    raise last_error or ArticleRangeFetchError("upstream_network_error")
 
 
 def browser_executable() -> str | None:
@@ -1737,53 +1773,121 @@ def market_event_snapshot_payload(
     end_date = end.astimezone(local_timezone).date().isoformat()
     endpoint = base.rstrip("/") + "/api/articles/range"
     page_size = 200
+    max_pages = 32
+    sources = [
+        "cninfo_disclosure", "eastmoney_stock_report", "eastmoney_broker_report",
+        "eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news",
+    ]
     normalized: list[dict[str, object]] = []
     source_urls: list[str] = []
     seen: set[tuple[str, str]] = set()
     pages = 0
-    query_targets: list[str | None] = [None, *[str(value).strip() for value in stock_codes or [] if str(value).strip()][:8]]
+    failures: list[dict[str, object]] = []
+    cutoff = {
+        "previous_as_of": start_at, "current_as_of": end_at,
+        "window": "(previous_as_of,current_as_of]", "before_previous": 0,
+        "after_current": 0, "invalid_records": 0, "duplicate_records": 0,
+    }
+    source_counts = {source: 0 for source in sources}
+    query_targets: list[str | None] = [None, *dict.fromkeys(
+        str(value).strip() for value in stock_codes or [] if str(value).strip()
+    )]
+    query_checks: list[dict[str, object]] = []
     for stock in query_targets:
         cursor: str | None = None
+        query_pages = 0
+        query_status = "complete"
+        query_source_counts = {source: 0 for source in sources}
+        query_check: dict[str, object] = {
+            "scope": "global" if stock is None else "holding",
+            "stock_code": stock,
+            "limit": page_size, "pages": 0, "status": query_status,
+            "source_counts": query_source_counts,
+        }
+        query_checks.append(query_check)
         while True:
             query = "?start_date=" + quote_plus(start_date) + "&end_date=" + quote_plus(end_date) + "&limit=" + str(page_size)
             if stock:
                 query += "&stock=" + quote_plus(stock)
             if cursor:
                 query += "&cursor=" + quote_plus(cursor)
-            url, body = fetch(endpoint + query)
+            request_url = endpoint + query
+            source_urls.append(request_url)
+            try:
+                url, body = fetch_article_range_page(request_url)
+            except ArticleRangeFetchError as error:
+                query_status = "partial"
+                query_check["status"] = query_status
+                failure = {
+                    "kind": error.kind, "scope": query_check["scope"],
+                    "stock_code": stock, "cursor": cursor,
+                }
+                if str(error):
+                    failure["detail"] = str(error)[:300]
+                failures.append(failure)
+                break
             try:
                 payload = json.loads(body)
                 rows = payload["articles"]
                 next_cursor = payload.get("next_cursor")
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                fail(75, "market event service response is invalid")
+                query_status = "partial"
+                query_check["status"] = query_status
+                failures.append({
+                    "kind": "malformed_response", "scope": query_check["scope"],
+                    "stock_code": stock, "cursor": cursor,
+                })
+                break
             if not isinstance(rows, list) or (next_cursor is not None and not isinstance(next_cursor, str)):
-                fail(75, "market event service response is invalid")
+                query_status = "partial"
+                query_check["status"] = query_status
+                failures.append({
+                    "kind": "malformed_response", "scope": query_check["scope"],
+                    "stock_code": stock, "cursor": cursor,
+                })
+                break
             pages += 1
+            query_pages += 1
+            query_check["pages"] = query_pages
+            query_check["article_count"] = int(query_check.get("article_count") or 0) + len(rows)
             for row in rows:
                 if not isinstance(row, dict):
+                    cutoff["invalid_records"] = int(cutoff["invalid_records"]) + 1
                     continue
-                published_text = str(row.get("published_at") or "").strip()
+                source = clean_text(row.get("source_key")).strip()[:100]
+                article_id = clean_text(row.get("article_id")).strip()[:200]
+                published_text = clean_text(row.get("published_at")).strip()
+                if not source or not article_id or not published_text:
+                    cutoff["invalid_records"] = int(cutoff["invalid_records"]) + 1
+                    continue
                 try:
                     published = dt.datetime.fromisoformat(published_text.replace("Z", "+00:00"))
                 except ValueError:
+                    cutoff["invalid_records"] = int(cutoff["invalid_records"]) + 1
                     continue
                 if published.tzinfo is None:
                     published = published.replace(tzinfo=local_timezone)
                 published = published.astimezone(dt.timezone.utc)
-                if not start < published <= end:
+                if published <= start:
+                    cutoff["before_previous"] = int(cutoff["before_previous"]) + 1
+                    continue
+                if published > end:
+                    cutoff["after_current"] = int(cutoff["after_current"]) + 1
                     continue
                 article_url = str(row.get("source_url") or row.get("detail_url") or "").strip()
                 parsed_article_url = urlparse(article_url)
-                if parsed_article_url.scheme not in {"http", "https"} or not parsed_article_url.netloc or parsed_article_url.username or parsed_article_url.password:
-                    continue
                 title = clean_text(row.get("title")).strip()[:300]
-                if not title:
+                if (
+                    source not in sources or not article_url or not title
+                    or parsed_article_url.scheme not in {"http", "https"}
+                    or not parsed_article_url.netloc or parsed_article_url.username
+                    or parsed_article_url.password
+                ):
+                    cutoff["invalid_records"] = int(cutoff["invalid_records"]) + 1
                     continue
-                source = clean_text(row.get("source_key") or row.get("source")).strip()[:100]
-                article_id = clean_text(row.get("article_id")).strip()[:200]
-                identity = (source, article_id or article_url)
+                identity = (source, article_id)
                 if identity in seen:
+                    cutoff["duplicate_records"] = int(cutoff["duplicate_records"]) + 1
                     continue
                 seen.add(identity)
                 item: dict[str, object] = {
@@ -1793,21 +1897,66 @@ def market_event_snapshot_payload(
                     "source_url": article_url,
                 }
                 if isinstance(row.get("stock_match"), dict):
-                    item["stock_match"] = row["stock_match"]
+                    item["stock_match"] = dict(row["stock_match"])
                 normalized.append(item)
-            source_urls.append(url)
+                source_counts[source] += 1
+                query_source_counts[source] += 1
             if not next_cursor:
                 break
-            if next_cursor == cursor or pages >= 100:
-                fail(75, "market event service cursor did not advance")
+            if next_cursor == cursor:
+                query_status = "partial"
+                query_check["status"] = query_status
+                failures.append({
+                    "kind": "repeated_cursor", "scope": query_check["scope"],
+                    "stock_code": stock, "cursor": cursor,
+                })
+                break
+            if query_pages >= max_pages:
+                query_status = "partial"
+                query_check["status"] = query_status
+                failures.append({
+                    "kind": "pagination_guard", "scope": query_check["scope"],
+                    "stock_code": stock, "cursor": next_cursor, "max_pages": max_pages,
+                })
+                break
             cursor = next_cursor
     normalized.sort(key=lambda item: (str(item.get("published_at") or ""), str(item.get("source") or ""), str(item.get("article_id") or "")), reverse=True)
     fact_as_of = end.isoformat().replace("+00:00", "Z")
     source_evidence: list[dict[str, object]] = [{"url": row["source_url"], "fact_as_of": row["published_at"], "data": dict(row)} for row in normalized]
-    checked_source_names = ["cninfo_disclosure", "eastmoney_stock_report", "eastmoney_broker_report", "eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news"]
+    observed_sources = [source for source in sources if source_counts[source] > 0]
+    coverage = {
+        "expected_sources": sources, "observed_sources": observed_sources,
+        "missing_sources": [source for source in sources if source not in observed_sources],
+        "article_counts": source_counts,
+        "global_scan": query_checks[0],
+        "holding_scans": [row for row in query_checks[1:]],
+    }
+    pagination_complete = not failures and all(row.get("status") == "complete" for row in query_checks)
+    cutoff_complete = int(cutoff["invalid_records"]) == 0
+    complete = bool(
+        not coverage["missing_sources"] and pagination_complete and cutoff_complete
+        and not failures
+    )
     return {
-        "checked_sources": checked_source_names, "start_at": start_at, "end_at": end_at,
-        "pages": pages, "matched_count": len(normalized), "articles": normalized,
+        "checked_sources": sources, "start_at": start_at, "end_at": end_at,
+        "previous_as_of": start_at, "current_as_of": end_at,
+        "status": "complete" if complete else "partial", "complete": complete,
+        "partial": not complete, "pages": pages, "matched_count": len(normalized), "articles": normalized,
+        "coverage": coverage,
+        "pagination": {"limit": page_size, "pages": pages, "max_pages": max_pages, "complete": pagination_complete, "queries": query_checks},
+        "cutoff": {**cutoff, "complete": cutoff_complete}, "failures": failures,
+        "source_checks": [{
+            "source": source, "source_key": source, "article_count": source_counts[source],
+            "covered": source_counts[source] > 0,
+            "global": {
+                "status": query_checks[0]["status"],
+                "article_count": query_checks[0]["source_counts"][source],
+            },
+            "holdings": [{
+                "stock_code": row["stock_code"], "status": row["status"],
+                "article_count": row["source_counts"][source],
+            } for row in query_checks[1:]],
+        } for source in sources],
         "source": "yosef_articles_range_market_event_snapshot",
         "source_urls": [*source_urls, *(str(row["source_url"]) for row in normalized)],
         "source_evidence": source_evidence,

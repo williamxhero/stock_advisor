@@ -946,13 +946,67 @@ def _validate_market_event_snapshot(
     expected_sources = ["cninfo_disclosure", "eastmoney_stock_report", "eastmoney_broker_report", "eastmoney_daily_topic_report", "cls_depth_article", "ths_important_news"]
     if checked_sources != expected_sources:
         return "tool_market_event_sources_invalid"
+    status = data.get("status")
+    if (
+        status not in {"complete", "partial"}
+        or not isinstance(data.get("complete"), bool)
+        or not isinstance(data.get("partial"), bool)
+        or data["complete"] != (status == "complete")
+        or data["partial"] != (status == "partial")
+    ):
+        return "tool_market_event_audit_invalid"
+    coverage = data.get("coverage")
+    if (
+        not isinstance(coverage, dict)
+        or coverage.get("expected_sources") != expected_sources
+        or not isinstance(coverage.get("observed_sources"), list)
+        or not isinstance(coverage.get("missing_sources"), list)
+        or set(coverage["observed_sources"]) | set(coverage["missing_sources"]) != set(expected_sources)
+        or set(coverage["observed_sources"]) & set(coverage["missing_sources"])
+    ):
+        return "tool_market_event_coverage_invalid"
+    pagination = data.get("pagination")
+    if (
+        not isinstance(pagination, dict)
+        or pagination.get("limit") != 200
+        or pagination.get("max_pages") != 32
+        or pagination.get("pages") != data.get("pages")
+        or not isinstance(pagination.get("complete"), bool)
+        or not isinstance(pagination.get("queries"), list)
+    ):
+        return "tool_market_event_pagination_invalid"
+    cutoff = data.get("cutoff")
+    if (
+        not isinstance(cutoff, dict)
+        or cutoff.get("previous_as_of") != start_text
+        or cutoff.get("current_as_of") != end_text
+        or cutoff.get("window") != "(previous_as_of,current_as_of]"
+        or not isinstance(cutoff.get("complete"), bool)
+        or any(not isinstance(cutoff.get(key), int) or cutoff[key] < 0 for key in (
+            "before_previous", "after_current", "invalid_records", "duplicate_records",
+        ))
+    ):
+        return "tool_market_event_cutoff_invalid"
+    failures = data.get("failures")
+    source_checks = data.get("source_checks")
+    if (
+        not isinstance(failures, list)
+        or not isinstance(source_checks, list)
+        or [row.get("source_key") for row in source_checks if isinstance(row, dict)] != expected_sources
+        or (status == "complete" and failures)
+    ):
+        return "tool_market_event_audit_invalid"
     if not str(data.get("source") or "").strip() or not _valid_public_source_urls(data.get("source_urls")):
         return "tool_market_source_urls_invalid"
     articles = data.get("articles")
     if not isinstance(articles, list) or data.get("matched_count") != len(articles):
         return "tool_market_event_result_invalid"
+    identities: set[tuple[str, str]] = set()
     for row in articles:
-        if not isinstance(row, dict) or row.get("source") not in checked_sources:
+        if (
+            not isinstance(row, dict) or row.get("source") not in checked_sources
+            or not str(row.get("article_id") or "").strip()
+        ):
             return "tool_market_event_result_invalid"
         try:
             published = _parse_timestamp(str(row.get("published_at") or ""))
@@ -962,6 +1016,17 @@ def _validate_market_event_snapshot(
             return "tool_market_event_result_invalid"
         if not _valid_public_source_urls([row.get("source_url")]):
             return "tool_market_source_urls_invalid"
+        identity = (str(row["source"]), str(row["article_id"]))
+        if identity in identities:
+            return "tool_market_event_result_invalid"
+        identities.add(identity)
+        if "stock_match" in row:
+            match = row["stock_match"]
+            if not isinstance(match, dict) or (
+                match.get("match_type") is not None
+                and match.get("match_type") not in {"direct", "mentioned"}
+            ):
+                return "tool_market_event_result_invalid"
     return None
 
 

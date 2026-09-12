@@ -2852,6 +2852,20 @@ def consume(
         typ = command.get("type")
         prior_chat_stream_ids: set[str] = set()
         try:
+            # A command with an explicit causal sequence is never executed
+            # until its immediate predecessor has been durably acknowledged.
+            # If the predecessor is still being atomically published, return
+            # this command to pending; LocalExchange persists and bounds the
+            # recovery attempts across runtime restarts.
+            if not exchange.causal_predecessor_ready("to-runtime", command):
+                deferred = exchange.defer(
+                    "to-runtime", path,
+                    "causal predecessor is not yet visible or acknowledged",
+                )
+                if not deferred["deferred"]:
+                    deferred["error"] = deferred["reason"]
+                results.append(deferred)
+                continue
             if command.get("contract") == "memory-user-command/v1":
                 command_id = str(command.get("command_id") or "")
                 command_type = str(command.get("type") or "")

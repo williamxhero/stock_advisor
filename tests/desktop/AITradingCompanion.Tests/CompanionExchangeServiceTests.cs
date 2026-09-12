@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using AITradingCompanion.Desktop.Services;
 
 namespace AITradingCompanion.Tests;
@@ -51,6 +52,37 @@ public sealed class CompanionExchangeServiceTests : IDisposable
         }));
 
         Assert.Contains("conflict", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task CompanionCommandsCarryARestartSafeCausalSequencePerCycle()
+    {
+        var paths = new AppPaths(_directory);
+        var first = new CompanionExchangeService(paths);
+        await first.SendAsync(new
+        {
+            contract = "companion-user-command/v1",
+            command_id = "stage-1",
+            cycle_id = "cycle-causal",
+            type = "stage_message",
+        });
+
+        var restarted = new CompanionExchangeService(paths);
+        await restarted.SendAsync(new
+        {
+            contract = "companion-user-command/v1",
+            command_id = "commit-2",
+            cycle_id = "cycle-causal",
+            type = "commit_conversation_batch",
+        });
+
+        using var stage = JsonDocument.Parse(await File.ReadAllTextAsync(
+            Path.Combine(paths.CompanionToRuntimePendingDirectory, "stage-1.json")));
+        using var commit = JsonDocument.Parse(await File.ReadAllTextAsync(
+            Path.Combine(paths.CompanionToRuntimePendingDirectory, "commit-2.json")));
+        Assert.Equal("cycle-causal", stage.RootElement.GetProperty("causal_stream").GetString());
+        Assert.Equal(1, stage.RootElement.GetProperty("causal_sequence").GetInt32());
+        Assert.Equal(2, commit.RootElement.GetProperty("causal_sequence").GetInt32());
     }
 
     public void Dispose()

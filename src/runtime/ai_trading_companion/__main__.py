@@ -2821,6 +2821,42 @@ def _schedule_command(store: CompanionStore, command: dict[str, Any]) -> dict[st
     return result
 
 
+def _queue_command_receipt(
+    store: CompanionStore,
+    command: dict[str, Any],
+    state: str,
+    *,
+    reason: str | None = None,
+    attempts: int | None = None,
+) -> None:
+    """Publish only durable Runtime knowledge about a desktop command.
+
+    Enqueueing a JSON file is not submission.  The desktop can claim a command
+    was submitted only after this versioned receipt is emitted by Runtime.
+    """
+    cycle_id = str(command.get("cycle_id") or "")
+    if not cycle_id or command.get("contract") != "companion-user-command/v1":
+        return
+    receipt = {
+        "contract": "companion-command-receipt/v1",
+        "command_id": str(command.get("command_id") or ""),
+        "cycle_id": cycle_id,
+        "type": str(command.get("type") or ""),
+        "state": state,
+    }
+    if command.get("message_id"):
+        receipt["message_id"] = str(command["message_id"])
+    if command.get("causal_stream"):
+        receipt["causal_stream"] = str(command["causal_stream"])
+    if command.get("causal_sequence") is not None:
+        receipt["causal_sequence"] = command["causal_sequence"]
+    if reason:
+        receipt["reason"] = reason
+    if attempts is not None:
+        receipt["attempts"] = attempts
+    store.queue_event(cycle_id, "command.receipt", {"cycle": {"cycle_id": cycle_id}, "receipt": receipt})
+
+
 def consume(
     engine: CompanionEngine,
     store: CompanionStore,
@@ -2864,6 +2900,15 @@ def consume(
                 )
                 if not deferred["deferred"]:
                     deferred["error"] = deferred["reason"]
+                    _queue_command_receipt(
+                        store, command, "permanent_failure",
+                        reason=deferred["reason"], attempts=deferred["attempts"],
+                    )
+                else:
+                    _queue_command_receipt(
+                        store, command, "deferred",
+                        reason=deferred["reason"], attempts=deferred["attempts"],
+                    )
                 results.append(deferred)
                 continue
             if command.get("contract") == "memory-user-command/v1":
@@ -2902,6 +2947,13 @@ def consume(
                 results.append(result)
                 continue
             result = engine.command(command)
+            if exchange.take_recovered(str(command.get("command_id") or "")):
+                _queue_command_receipt(
+                    store, command, "recovered",
+                    reason="runtime restart recovered an in-flight exchange command",
+                )
+                flush(store, exchange)
+            _queue_command_receipt(store, command, "submitted")
             if cycle_id and typ in {
                 "commit_chat_batch", "commit_conversation_batch", "continue_chat_research",
             }:
@@ -2955,6 +3007,7 @@ def consume(
             if not acknowledged:
                 try:
                     exchange.reject("to-runtime", path, str(exc))
+                    _queue_command_receipt(store, command, "permanent_failure", reason=str(exc))
                 except Exception as reject_exc:
                     failure["failure_record_error"] = f"exchange reject failed: {reject_exc}"
             elif cycle_id and typ in {

@@ -38,6 +38,18 @@ public sealed record CompanionCleanupReceipt(
     int AlreadyRemoved,
     int Rejected);
 
+public sealed record CompanionCommandReceipt(
+    string CommandId,
+    string CycleId,
+    string Type,
+    string State,
+    DateTimeOffset At,
+    string? Reason = null,
+    int? Attempts = null,
+    string? MessageId = null,
+    string? CausalStream = null,
+    long? CausalSequence = null);
+
 public sealed record CompanionWorkspaceProjection(
     string CycleId,
     DateTimeOffset? ScheduledFor,
@@ -55,7 +67,8 @@ public sealed record CompanionWorkspaceProjection(
     string? TaskProfileDisplayName = null,
     bool IsDismissed = false,
     bool IsCompanionThinking = false,
-    CompanionCleanupReceipt? LastCleanupReceipt = null)
+    CompanionCleanupReceipt? LastCleanupReceipt = null,
+    IReadOnlyList<CompanionCommandReceipt> CommandReceipts = null!)
 {
     public bool IsH0Locked => H0LockedAt is not null;
     public bool HasStagedMessages => UserMessages.Any(message => message.State == "staged");
@@ -122,6 +135,7 @@ public static class CompanionEventProjection
         var users = new Dictionary<string, CompanionTimelineEntry>(StringComparer.Ordinal);
         var resolvedFaultEpisodeIds = new HashSet<string>(StringComparer.Ordinal);
         var removedRecordIds = new HashSet<string>(StringComparer.Ordinal);
+        var commandReceipts = new Dictionary<string, CompanionCommandReceipt>(StringComparer.Ordinal);
         CompanionCleanupReceipt? lastCleanupReceipt = null;
 
         foreach (var item in cycleEvents)
@@ -298,7 +312,11 @@ public static class CompanionEventProjection
                 case "projection.ready":
                     ReadProjection(payload, ai, users, ref scheduledFor, ref autoSubmit, ref m1Deadline, ref h0LockedAt,
                         ref taskKey, ref trigger, ref requestedAt, ref taskProfileId, ref taskProfileDisplayName,
-                        ref isCompanionThinking, resolvedFaultEpisodeIds);
+                        ref isCompanionThinking, resolvedFaultEpisodeIds, commandReceipts);
+                    break;
+                case "command.receipt":
+                    if (payload.TryGetProperty("receipt", out var receipt))
+                        UpsertCommandReceipt(commandReceipts, receipt, item.At, current.CycleId);
                     break;
                 case "operational_records.cleared":
                     ReadStringArray(payload, "hidden_fault_episode_ids", resolvedFaultEpisodeIds);
@@ -355,7 +373,8 @@ public static class CompanionEventProjection
             taskProfileDisplayName,
             isDismissed,
             isCompanionThinking,
-            lastCleanupReceipt);
+            lastCleanupReceipt,
+            commandReceipts.Values.OrderBy(receipt => receipt.At).ThenBy(receipt => receipt.CommandId, StringComparer.Ordinal).ToArray());
     }
 
     private static bool ReadFaultEpisodes(
@@ -480,7 +499,8 @@ public static class CompanionEventProjection
         ref string? taskProfileId,
         ref string? taskProfileDisplayName,
         ref bool isCompanionThinking,
-        HashSet<string> resolvedFaultEpisodeIds)
+        HashSet<string> resolvedFaultEpisodeIds,
+        Dictionary<string, CompanionCommandReceipt> commandReceipts)
     {
         taskKey = ReadNestedString(payload, "cycle", "task_key") ?? taskKey;
         trigger = ReadNestedString(payload, "cycle", "trigger") ?? trigger;
@@ -545,6 +565,11 @@ public static class CompanionEventProjection
                 UpsertAi(ai, id, state == "failed" ? "chat_incomplete" : "chat", at, text, at, state == "completed" ? ReadDate(ReadString(stream, "completed_at")) : null);
             }
         }
+        if (payload.TryGetProperty("command_receipts", out var receipts) && receipts.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var receipt in receipts.EnumerateArray())
+                UpsertCommandReceipt(commandReceipts, receipt, DateTimeOffset.MinValue, ReadString(payload, "cycle_id"));
+        }
     }
 
     private static void ReadUserMessages(
@@ -570,6 +595,7 @@ public static class CompanionEventProjection
         if (string.IsNullOrWhiteSpace(text)) return;
         var state = stateOverride ?? ReadString(message, "state") ?? "submitted";
         var phase = phaseOverride ?? ReadString(message, "phase") ?? "h0";
+        if (users.TryGetValue(id, out var existing) && existing.State != "staged") return;
         var at = ReadDate(ReadString(message, "submitted_at"))
             ?? ReadDate(ReadString(message, "staged_at"))
             ?? ReadDate(ReadString(message, "at"))
@@ -577,6 +603,35 @@ public static class CompanionEventProjection
         users[id] = new CompanionTimelineEntry(
             at, text, state == "submitted" && phase == "h0",
             ReadString(message, "source_artifact_id"), id, state, phase);
+    }
+
+    private static void UpsertCommandReceipt(
+        Dictionary<string, CompanionCommandReceipt> receipts,
+        JsonElement value,
+        DateTimeOffset fallbackAt,
+        string? fallbackCycleId)
+    {
+        if (value.ValueKind != JsonValueKind.Object) return;
+        var commandId = ReadString(value, "command_id");
+        var cycleId = ReadString(value, "cycle_id") ?? fallbackCycleId;
+        var type = ReadString(value, "type");
+        var state = ReadString(value, "state");
+        if (string.IsNullOrWhiteSpace(commandId) || string.IsNullOrWhiteSpace(cycleId)
+            || string.IsNullOrWhiteSpace(type) || string.IsNullOrWhiteSpace(state)) return;
+        var at = ReadDate(ReadString(value, "at"))
+            ?? ReadDate(ReadString(value, "created_at"))
+            ?? fallbackAt;
+        receipts[commandId] = new CompanionCommandReceipt(
+            commandId,
+            cycleId!,
+            type!,
+            state!,
+            at,
+            ReadString(value, "reason"),
+            ReadInt(value, "attempts"),
+            ReadString(value, "message_id"),
+            ReadString(value, "causal_stream"),
+            ReadLong(value, "causal_sequence"));
     }
 
     private static void UpsertAi(
@@ -669,6 +724,12 @@ public static class CompanionEventProjection
         && value.TryGetInt32(out var result)
             ? result
             : 0;
+
+    private static int? ReadInt(JsonElement element, string property) =>
+        element.TryGetProperty(property, out var value) && value.TryGetInt32(out var result) ? result : null;
+
+    private static long? ReadLong(JsonElement element, string property) =>
+        element.TryGetProperty(property, out var value) && value.TryGetInt64(out var result) ? result : null;
 
     private static string? ReadFirstNestedArrayString(JsonElement element, string parent, string property)
     {

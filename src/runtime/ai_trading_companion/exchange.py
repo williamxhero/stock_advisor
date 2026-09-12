@@ -20,6 +20,7 @@ class LocalExchange:
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
+        self._recovered_commands: set[str] = set()
 
     def ensure(self) -> None:
         for direction in ("to-client", "to-runtime"):
@@ -93,6 +94,12 @@ class LocalExchange:
             if target.exists():
                 try:
                     if target.read_bytes() == path.read_bytes():
+                        try:
+                            value = json.loads(target.read_text(encoding="utf-8-sig"))
+                            if isinstance(value, dict) and value.get("command_id"):
+                                self._recovered_commands.add(str(value["command_id"]))
+                        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                            pass
                         path.unlink()
                         continue
                 except OSError:
@@ -101,6 +108,12 @@ class LocalExchange:
                 continue
             try:
                 os.replace(path, target)
+                try:
+                    value = json.loads(target.read_text(encoding="utf-8-sig"))
+                    if isinstance(value, dict) and value.get("command_id"):
+                        self._recovered_commands.add(str(value["command_id"]))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    pass
             except FileNotFoundError:
                 continue
 
@@ -191,7 +204,22 @@ class LocalExchange:
                     return True
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
                 continue
+        dead_letter = self.root / direction / "dead-letter"
+        for path in dead_letter.glob("*.json"):
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8-sig"))
+                received = candidate.get("received") if isinstance(candidate, dict) else None
+                if isinstance(received, dict) and self._causal_fields(received) == (stream, sequence - 1):
+                    return True
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                continue
         return False
+
+    def take_recovered(self, command_id: str | None) -> bool:
+        if not command_id or command_id not in self._recovered_commands:
+            return False
+        self._recovered_commands.remove(command_id)
+        return True
 
     def defer(self, direction: str, claimed: Path, reason: str) -> dict[str, Any]:
         """Return a causally blocked command to pending, with a persisted bound."""

@@ -20,6 +20,7 @@ public sealed class AppPaths
         ProcessedDirectory = Path.Combine(InboxRoot, "processed");
         DeadLetterDirectory = Path.Combine(InboxRoot, "dead-letter");
         CompanionExchangeRoot = Path.Combine(DataDirectory, "exchange");
+        CompanionCausalSequenceDirectory = Path.Combine(CompanionExchangeRoot, "causal-sequences");
         CompanionToRuntimePendingDirectory = Path.Combine(CompanionExchangeRoot, "to-runtime", "pending");
         CompanionToClientPendingDirectory = Path.Combine(CompanionExchangeRoot, "to-client", "pending");
         CompanionToClientProcessedDirectory = Path.Combine(CompanionExchangeRoot, "to-client", "processed");
@@ -47,6 +48,7 @@ public sealed class AppPaths
 
     public string DeadLetterDirectory { get; }
     public string CompanionExchangeRoot { get; }
+    public string CompanionCausalSequenceDirectory { get; }
     public string CompanionToRuntimePendingDirectory { get; }
     public string CompanionToClientPendingDirectory { get; }
     public string CompanionToClientProcessedDirectory { get; }
@@ -62,6 +64,7 @@ public sealed class AppPaths
         Directory.CreateDirectory(ProcessedDirectory);
         Directory.CreateDirectory(DeadLetterDirectory);
         Directory.CreateDirectory(CompanionToRuntimePendingDirectory);
+        Directory.CreateDirectory(CompanionCausalSequenceDirectory);
         Directory.CreateDirectory(CompanionToClientPendingDirectory);
         Directory.CreateDirectory(CompanionToClientProcessedDirectory);
         Directory.CreateDirectory(CompanionAudioDirectory);

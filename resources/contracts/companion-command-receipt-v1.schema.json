@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["contract", "command_id", "cycle_id", "type", "state"],
+  "properties": {
+    "contract": { "const": "companion-command-receipt/v1" },
+    "command_id": { "type": "string", "minLength": 1 },
+    "cycle_id": { "type": "string", "minLength": 1 },
+    "type": { "type": "string", "minLength": 1 },
+    "state": { "enum": ["deferred", "recovered", "submitted", "permanent_failure"] },
+    "message_id": { "type": "string", "minLength": 1 },
+    "reason": { "type": "string" },
+    "attempts": { "type": "integer", "minimum": 1 },
+    "causal_stream": { "type": "string", "minLength": 1 },
+    "causal_sequence": { "type": "integer", "minimum": 1 }
+  },
+  "additionalProperties": false
+}

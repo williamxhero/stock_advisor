@@ -78,6 +78,63 @@ class CompanionExchangeTests(unittest.TestCase):
             self.assertEqual("submitted", store.messages(cycle["cycle_id"])[0]["state"])
             self.assertFalse((exchange.root / "to-runtime" / "pending" / "commit-late-stage.json").exists())
 
+    def test_runtime_projects_command_receipts_for_submitted_and_deferred_states(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, engine, portfolio, exchange = self._runtime(root)
+            cycle = store.ensure_daily_conversation("2026-09-09")
+            exchange.send("to-runtime", "commit-first", {
+                "contract": "companion-user-command/v1", "command_id": "commit-first",
+                "cycle_id": cycle["cycle_id"], "type": "commit_conversation_batch",
+                "causal_stream": cycle["cycle_id"], "causal_sequence": 2,
+            })
+
+            deferred = consume(engine, store, exchange, portfolio)
+
+            exchange.send("to-runtime", "stage-first", {
+                "contract": "companion-user-command/v1", "command_id": "stage-first",
+                "cycle_id": cycle["cycle_id"], "type": "stage_message", "message_id": "message-1",
+                "text": "先写入", "causal_stream": cycle["cycle_id"], "causal_sequence": 1,
+            })
+            with patch("ai_trading_companion.__main__.run_chat", return_value={"state": "queued"}):
+                submitted = consume(engine, store, exchange, portfolio)
+
+            receipts = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (exchange.root / "to-client" / "pending").glob("*.json")
+                if json.loads(path.read_text(encoding="utf-8")).get("type") == "command.receipt"
+            ]
+            states = {(item["payload"]["receipt"]["command_id"], item["payload"]["receipt"]["state"]) for item in receipts}
+            self.assertTrue(deferred[0]["deferred"])
+            self.assertTrue(submitted)
+            self.assertIn(("commit-first", "deferred"), states)
+            self.assertIn(("stage-first", "submitted"), states)
+
+    def test_runtime_projects_recovered_receipt_before_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, engine, portfolio, exchange = self._runtime(root)
+            cycle = store.ensure_daily_conversation("2026-09-09")
+            exchange.send("to-runtime", "restart-stage", {
+                "contract": "companion-user-command/v1", "command_id": "restart-stage",
+                "cycle_id": cycle["cycle_id"], "type": "stage_message", "message_id": "message-1",
+                "text": "重启后仍保留原文", "causal_stream": cycle["cycle_id"], "causal_sequence": 1,
+            })
+            claimed = exchange.receive("to-runtime")
+            self.assertEqual("restart-stage", claimed[0][1]["command_id"])
+
+            restarted = LocalExchange(root / "exchange")
+            consume(engine, store, restarted, portfolio)
+
+            receipts = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (restarted.root / "to-client" / "pending").glob("*.json")
+                if json.loads(path.read_text(encoding="utf-8")).get("type") == "command.receipt"
+            ]
+            states = [item["payload"]["receipt"]["state"] for item in receipts]
+            self.assertEqual({"recovered", "submitted"}, set(states))
+            self.assertEqual("重启后仍保留原文", store.get_message("message-1")["body_text"])
+
     def test_missing_causal_predecessor_becomes_auditable_after_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -101,6 +158,14 @@ class CompanionExchangeTests(unittest.TestCase):
             self.assertEqual(MAX_CAUSAL_RETRIES, audit["recovery"]["attempts"])
             self.assertTrue(audit["recovery"]["bounded"])
             self.assertEqual([], store.messages(cycle["cycle_id"]))
+            receipts = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (exchange.root / "to-client" / "pending").glob("*.json")
+                if json.loads(path.read_text(encoding="utf-8")).get("type") == "command.receipt"
+            ]
+            self.assertIn("permanent_failure", {
+                item["payload"]["receipt"]["state"] for item in receipts
+            })
 
     def test_processing_commands_are_recovered_after_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

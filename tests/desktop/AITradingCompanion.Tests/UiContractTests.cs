@@ -255,7 +255,7 @@ public sealed class UiContractTests
     }
 
     [Fact]
-    public void SubmittedMessagesStayLocallyNonStagedUntilTheRuntimeProjectionConfirmsThem()
+    public void SubmittedMessagesAreDrivenByRuntimeProjectionAndReceipts()
     {
         var root = new DirectoryInfo(AppContext.BaseDirectory);
         while (root is not null && !File.Exists(Path.Combine(root.FullName, "AITradingCompanion.sln"))) root = root.Parent;
@@ -263,9 +263,10 @@ public sealed class UiContractTests
         var code = File.ReadAllText(Path.Combine(root.FullName!,
             "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml.cs"));
 
-        Assert.Contains("_locallySubmittedMessageIds", code, StringComparison.Ordinal);
-        Assert.Contains("message with { State = \"submitted\" }", code, StringComparison.Ordinal);
-        Assert.Contains("message.State != \"staged\"", code, StringComparison.Ordinal);
+        Assert.DoesNotContain("_locallySubmittedMessageIds", code, StringComparison.Ordinal);
+        Assert.Contains("CommandReceipts", File.ReadAllText(Path.Combine(root.FullName!,
+            "src", "desktop", "AITradingCompanion.Desktop", "Services", "CompanionEventProjection.cs")), StringComparison.Ordinal);
+        Assert.Contains("message.State == \"staged\"", code, StringComparison.Ordinal);
     }
 
     [Fact]

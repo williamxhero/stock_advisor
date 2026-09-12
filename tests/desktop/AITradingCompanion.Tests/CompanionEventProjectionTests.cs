@@ -192,6 +192,40 @@ public sealed class CompanionEventProjectionTests
     }
 
     [Fact]
+    public void ProjectionRestoresVersionedCommandReceiptsWithoutClaimingSubmissionEarly()
+    {
+        var events = new[]
+        {
+            """{"contract":"companion-client-event/v1","event_id":"receipts","cycle_id":"c1","type":"projection.ready","created_at":"2026-09-12T01:02:00Z","payload":{"cycle":{"task_key":"daily.execution.0945","state":"awaiting_h0"},"user_messages":[{"message_id":"u1","state":"staged","phase":"h0","text":"待提交","at":"2026-09-12T01:01:00Z"}],"command_receipts":[{"command_id":"deferred-1","cycle_id":"c1","type":"stage_message","state":"deferred","at":"2026-09-12T01:02:01Z","reason":"前序命令尚未确认"},{"command_id":"recovered-1","cycle_id":"c1","type":"stage_message","state":"recovered","at":"2026-09-12T01:02:02Z"},{"command_id":"submitted-1","cycle_id":"c1","type":"stage_message","state":"submitted","at":"2026-09-12T01:02:03Z"},{"command_id":"failed-1","cycle_id":"c1","type":"commit_h0","state":"permanent_failure","at":"2026-09-12T01:02:04Z","reason":"前序命令永久失败"}]}}"""
+        };
+
+        var projection = CompanionEventProjection.ProjectForCycle(events, "c1");
+
+        Assert.NotNull(projection);
+        Assert.Equal("staged", Assert.Single(projection.UserMessages).State);
+        Assert.Equal(
+            ["deferred", "recovered", "submitted", "permanent_failure"],
+            projection.CommandReceipts.Select(receipt => receipt.State));
+    }
+
+    [Fact]
+    public void SubmittedMessageTextCannotBeRewrittenByALateStagedProjection()
+    {
+        var events = new[]
+        {
+            """{"contract":"companion-client-event/v1","event_id":"accepted","cycle_id":"c1","type":"human.message_batch.accepted","created_at":"2026-09-12T01:02:00Z","payload":{"cycle":{"task_key":"daily.execution.0945","state":"researching_m1"},"messages":[{"message_id":"u1","state":"submitted","phase":"h0","body_text":"已经提交的原文","submitted_at":"2026-09-12T01:02:00Z"}]}}""",
+            """{"contract":"companion-client-event/v1","event_id":"late-edit","cycle_id":"c1","type":"message.edited","created_at":"2026-09-12T01:03:00Z","payload":{"cycle":{"task_key":"daily.execution.0945","state":"researching_m1"},"message":{"message_id":"u1","state":"staged","phase":"h0","body_text":"不应覆盖原文","staged_at":"2026-09-12T01:03:00Z"}}}"""
+        };
+
+        var projection = CompanionEventProjection.ProjectForCycle(events, "c1");
+
+        Assert.NotNull(projection);
+        var message = Assert.Single(projection.UserMessages);
+        Assert.Equal("submitted", message.State);
+        Assert.Equal("已经提交的原文", message.Text);
+    }
+
+    [Fact]
     public void StreamingReplyShowsPendingNoticeUntilTheFirstVisibleTextArrives()
     {
         var started = """{"contract":"companion-client-event/v1","event_id":"started","cycle_id":"c1","type":"chat.stream.started","created_at":"2026-08-25T01:02:00Z","payload":{"cycle":{"task_key":"conversation.daily","state":"open"},"stream":{"stream_id":"s1","state":"streaming","created_at":"2026-08-25T01:02:00Z"}}}""";

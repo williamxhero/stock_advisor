@@ -977,12 +977,15 @@ public partial class MainWindow : Window, IDisposable
         WaveformLine.Points = points;
     });
 
-    private static string FormatTiming(CompanionAiTimelineEntry message)
+    internal static string FormatTiming(CompanionAiTimelineEntry message)
     {
         var started = (message.StartedAt ?? message.At).ToLocalTime().ToString("HH:mm", CultureInfo.InvariantCulture);
-        return message.CompletedAt is { } completedAt
+        var window = message.CompletedAt is { } completedAt
             ? $"{started} -> {completedAt.ToLocalTime():HH:mm}"
             : $"{started} -> ";
+        // Callers select a Stage; the Broker resolves the model, so the timeline
+        // labels each answer with the model that actually replied.
+        return string.IsNullOrWhiteSpace(message.Model) ? window : $"{window} {message.Model}";
     }
 
     private string BuildAsrContext()

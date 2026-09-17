@@ -737,6 +737,39 @@ def _prefetch_market_breadth() -> None:
         _BREADTH_PREFETCH_LOCK.release()
 
 
+def _stage_resolved(stage: "VerifiedStageResult | None") -> dict[str, Any]:
+    """Publication kwargs naming what the Broker actually answered with.
+
+    Callers select a Stage only; the resolved provider and model travel back as
+    message metadata so the companion UI can label the answer.
+    """
+    if stage is None or stage.broker is None:
+        return {}
+    return {"model": stage.broker.actual_model, "provider": stage.broker.provider}
+
+
+def _stage_output(value: "VerifiedStageResult | tuple[dict[str, Any], Any]") -> tuple[dict[str, Any], VerifiedStageResult | None]:
+    """Accept the current result object and the legacy tuple used by callers/tests."""
+    if isinstance(value, VerifiedStageResult):
+        return value.output, value
+    if isinstance(value, tuple) and value and isinstance(value[0], dict):
+        return value[0], None
+    raise TypeError("stage call returned an invalid verified result")
+
+
+def _publication_actual_model(
+    store: CompanionStore, cycle_id: str, publication: dict[str, Any],
+) -> str | None:
+    """Name the model that wrote reviewed prose instead of the pipeline label."""
+    wanted = [str(publication.get(key) or "") for key in ("expression_attempt_id", "core_attempt_id")]
+    attempts = {str(row["attempt_id"]): row for row in store.attempts(cycle_id)}
+    for attempt_id in wanted:
+        model = attempts.get(attempt_id, {}).get("model")
+        if model:
+            return str(model)
+    return None
+
+
 def _call_stage(
     store: CompanionStore,
     cycle: dict[str, Any],
@@ -964,7 +997,9 @@ def _call_stage(
             # All purchased work is accounted once on the individual subattempts.
             stage_audit = {"kind": "judgment_publication", **data["publication"]}
             usage = {}
-            actual_model = "runtime-reviewed-core" if data["publication"]["fallback"] else "reviewed-judgment-pipeline"
+            actual_model = _publication_actual_model(store, cycle["cycle_id"], data["publication"]) or (
+                "runtime-reviewed-core" if data["publication"]["fallback"] else "reviewed-judgment-pipeline"
+            )
         elif outcome is None:
             if not (
                 search and schema_name.startswith("companion-evidence-result-")
@@ -1749,6 +1784,7 @@ def run_reflection(
         for artifact in store.artifacts(cycle_id)
     ):
         return None
+    reflection_stage: VerifiedStageResult | None = None
     if not execute:
         data = {"answer": {"points": ["Fixture 模式：结果已记录，等待真实复盘。"], "material_ids": []}, "memory_tags": ["fixture"], "workflow_proposal": None}
     else:
@@ -1756,15 +1792,17 @@ def run_reflection(
             cycle, "reflection", context={"checkpoint_id": checkpoint_id},
             as_of=iso(datetime.now(timezone.utc)),
         )
-        data, _ = _call_stage(
+        reflection_result = _call_stage(
             store, cycle, "reflection", packet, "companion-reflection-result-v2.schema.json",
             search=False, timeout=int(TASK_POLICIES[cycle["task_key"]].m1_timeout.total_seconds()),
         )
+        data, reflection_stage = _stage_output(reflection_result)
     reflection = express_cognition_answer(data["answer"])
     artifact = engine.publish_proactive_message(
         cycle_id, "reflection", reflection,
         meaningful=not reflection.startswith("Fixture "),
         metadata={"checkpoint_id": checkpoint_id, "memory_tags": data.get("memory_tags") or []},
+        **_stage_resolved(reflection_stage),
     )
     proposal = None
     if data.get("workflow_proposal") and artifact:
@@ -1781,6 +1819,7 @@ def run_outcome(
     execute: bool,
 ) -> dict[str, Any]:
     cycle = store.get_cycle(checkpoint["cycle_id"])
+    outcome_stage: VerifiedStageResult | None = None
     if not execute:
         result = {
             "as_of": iso(datetime.now(timezone.utc)),
@@ -1803,15 +1842,19 @@ def run_outcome(
             },
             as_of=iso(datetime.now(timezone.utc)),
         )
-        result, _ = _call_stage(
+        outcome_result = _call_stage(
             store, cycle, "outcome_research", packet, "companion-outcome-result-v1.schema.json",
             search=True, timeout=300,
         )
+        result, outcome_stage = _stage_output(outcome_result)
     if not result.get("checkpoint_ready"):
         next_check = str(result.get("next_check_at") or iso(datetime.now(timezone.utc) + timedelta(hours=1)))
         store.defer_outcome(checkpoint["checkpoint_id"], next_check, result["summary"])
         return result
-    presented = engine.present_for_publication(str(result["summary"]), str(result.get("as_of") or cycle["as_of"]), "outcome")
+    presented = engine.present_for_publication(
+        str(result["summary"]), str(result.get("as_of") or cycle["as_of"]), "outcome",
+        **_stage_resolved(outcome_stage),
+    )
     result = {**result, "summary": presented.markdown, "presentation": presented.metadata()["presentation"], "published_message": presented.message()}
     artifact = JudgmentLifecycle(store).record_outcome(checkpoint, result)
     regime_metrics = result.get("market_regime") if isinstance(result.get("market_regime"), dict) else {}
@@ -1928,12 +1971,13 @@ def run_chat_research(
             cycle, "chat", evidence=evidence, message_batch=source["body_markdown"],
             context={"fresh_search_completed": True}, as_of=str(evidence.get("as_of") or iso(datetime.now(timezone.utc))),
         )
-        data, _ = _call_stage(
+        followup_result = _call_stage(
             store, cycle, "chat_followup", local_packet, "companion-chat-result-v2.schema.json",
             search=False, timeout=int(TASK_POLICIES.get(
                 cycle["task_key"], TASK_POLICIES["daily.execution.0945"],
             ).m1_timeout.total_seconds()),
         )
+        data, followup_stage = _stage_output(followup_result)
         reply = express_cognition_answer(data["answer"])
         material_registry = _frozen_material_registry([
             {
@@ -1948,12 +1992,14 @@ def run_chat_research(
         presented = engine.present_for_publication(
             reply, str(evidence.get("as_of") or iso(datetime.now(timezone.utc))), reply_kind,
             material_registry=material_registry,
+            **_stage_resolved(followup_stage),
         )
         revision = data.get("judgment_revision")
         if isinstance(revision, dict):
             engine.judgment_revision_ready(
                 cycle["cycle_id"], express_cognition_answer(revision["answer"]),
                 str(revision["revises_artifact_id"]),
+                **_stage_resolved(followup_stage),
             )
     # Ordinary conversation can inform later work, but never silently rewrites
     # a published M1/M2.  A formal rerun remains an explicit user action.
@@ -1987,6 +2033,7 @@ def run_pending_workflow_feedback(
             for artifact in store.artifacts(cycle["cycle_id"])
         ):
             continue
+        feedback_stage: VerifiedStageResult | None = None
         if not execute:
             data = {"answer": {"points": ["Fixture 模式：这条工作流反馈已记录。"], "material_ids": []}, "memory_tags": ["workflow_feedback"], "workflow_proposal": None}
         else:
@@ -1994,15 +2041,17 @@ def run_pending_workflow_feedback(
                 cycle, "workflow_feedback", context={"source_artifact_id": h0["artifact_id"]},
                 as_of=iso(datetime.now(timezone.utc)),
             )
-            data, _ = _call_stage(
+            feedback_result = _call_stage(
                 store, cycle, "workflow_feedback", packet, "companion-reflection-result-v2.schema.json",
                 search=False, timeout=int(TASK_POLICIES[cycle["task_key"]].m1_timeout.total_seconds()),
             )
+            data, feedback_stage = _stage_output(feedback_result)
         feedback = express_cognition_answer(data["answer"])
         artifact = engine.publish_proactive_message(
             cycle["cycle_id"], "ai_chat", feedback,
             meaningful=not feedback.startswith("Fixture "),
             metadata={"workflow_feedback_source": h0["artifact_id"], "memory_tags": data.get("memory_tags") or []},
+            **_stage_resolved(feedback_stage),
         )
         proposal = None
         if data.get("workflow_proposal") and artifact:
@@ -2506,6 +2555,7 @@ def run_unified_cognition(
             return {"cycle_id": cycle_id, "job_id": job["job_id"], "state": job["state"], "receipts": []}
     stream = None
     expression_profile: dict[str, Any] = {}
+    resolved_call: dict[str, Any] = {}
     try:
         if cancelled and cancelled():
             raise MemoryResearchError("memory research was terminated by the user")
@@ -2554,6 +2604,7 @@ def run_unified_cognition(
             if not isinstance(outcome.result, dict):
                 raise BrokerError("Broker produced no qualified cognition result", category="broker_output_invalid")
             data = outcome.result
+            resolved_call = {"model": outcome.actual_model, "provider": outcome.provider}
         if cancelled and cancelled():
             raise MemoryResearchError("memory research was terminated by the user")
         outcome = cognition.apply(cycle, source, messages, mode, data, memory_research=memory_research)
@@ -2590,6 +2641,7 @@ def run_unified_cognition(
             material_registry=material_registry,
             message_id=str(stream_identity["stream_id"]) if stream_identity else None,
             sealed_at=str(stream_identity["created_at"]) if stream_identity else None,
+            **resolved_call,
         )
         stream_id = None
         if stream:

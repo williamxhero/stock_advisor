@@ -112,6 +112,19 @@ Protocol: OpportunityDiscovery-v1.3
             presented.metadata()["published_message"],
         )
 
+    def test_presentation_carries_resolved_model_as_metadata_not_speech(self):
+        presented = present_message(
+            "我倾向于先等承接确认。",
+            as_of="2026-09-01T01:00:00Z",
+            kind="ai_chat",
+            model="deepseek-v4-pro",
+            provider="deepseek",
+        )
+
+        self.assertEqual("deepseek-v4-pro", presented.message()["model"])
+        self.assertEqual("deepseek", presented.message()["provider"])
+        self.assertNotIn("deepseek-v4-pro", presented.markdown)
+
     def test_own_message_is_released_as_natural_conversation(self):
         presented = present_message(
             "##盘前结论\ntime_scope: next_trading_session。 截至2026-08-31\n\n- 不预设反包\n- 不追高开",

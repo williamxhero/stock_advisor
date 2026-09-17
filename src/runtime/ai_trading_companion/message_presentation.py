@@ -76,9 +76,13 @@ class PresentedMessage:
     sealed_at: str = ""
     contract_version: int = 2
     qualification_problems: tuple[str, ...] = ()
+    # Execution provenance the caller resolved from a Stage alone.  It rides as
+    # message metadata so the UI can label the answer; it never enters speech.
+    model: str | None = None
+    provider: str | None = None
 
     def message(self) -> dict[str, Any]:
-        return {
+        message = {
             "contract": "companion-published-message/v2",
             "message_id": self.message_id,
             "sealed_at": self.sealed_at,
@@ -86,6 +90,11 @@ class PresentedMessage:
             "parts": list(self.parts),
             "text_projection": self.markdown,
         }
+        if self.model:
+            message["model"] = self.model
+        if self.provider:
+            message["provider"] = self.provider
+        return message
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -112,6 +121,8 @@ def present_message(
     expression_profile: dict[str, Any] | None = None,
     message_id: str | None = None,
     sealed_at: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
 ) -> PresentedMessage:
     """Prepare a message for a chat bubble without changing its judgment.
 
@@ -168,6 +179,7 @@ def present_message(
     return PresentedMessage(
         "\n\n".join(rendered), tuple(parts), kind=kind,
         message_id=message_id or str(uuid.uuid4()), sealed_at=sealed_at,
+        model=model, provider=provider,
     )
 
 

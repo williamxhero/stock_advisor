@@ -20,7 +20,8 @@ public sealed record CompanionAiTimelineEntry(
     IReadOnlyList<CompanionMessagePart>? Parts = null,
     string? SourceArtifactId = null,
     string? FaultScopeKind = null,
-    string? FaultScopeKey = null);
+    string? FaultScopeKey = null,
+    string? Model = null);
 
 public sealed record CompanionTimelineEntry(
     DateTimeOffset At,
@@ -179,7 +180,7 @@ public static class CompanionEventProjection
                     ai.Remove("action-pending-m0");
                     ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, "m0");
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "m0", ReadPublishedAt(payload, item.At),
-                        ReadPublishedText(payload, "m0"), m0StartedAt, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
+                        ReadPublishedText(payload, "m0"), m0StartedAt, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload), ReadPublishedModel(payload));
                     break;
                 case "brief.ready": // v1 compatibility
                     UpsertAi(ai, null, "m0", item.At, ReadString(payload, "brief"), m0StartedAt, item.At);
@@ -223,13 +224,13 @@ public static class CompanionEventProjection
                     ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, "m1");
                     errorText = null;
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "m1", ReadPublishedAt(payload, item.At),
-                        ReadPublishedText(payload, "m1"), m1StartedAt, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
+                        ReadPublishedText(payload, "m1"), m1StartedAt, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload), ReadPublishedModel(payload));
                     break;
                 case "m1.recovered":
                     ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, "m1");
                     errorText = null;
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id") ?? $"recovery-{item.At:O}"), "recovery", ReadPublishedAt(payload, item.At),
-                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
+                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload), ReadPublishedModel(payload));
                     break;
                 case "joint.ready": // v1 compatibility; this mixed H0 and the old model output.
                     UpsertAi(ai, null, "legacy_synthesis", item.At,
@@ -248,13 +249,13 @@ public static class CompanionEventProjection
                     ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, "m2");
                     errorText = null;
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "m2", ReadPublishedAt(payload, item.At),
-                        ReadPublishedText(payload, "m2"), m2StartedAt, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
+                        ReadPublishedText(payload, "m2"), m2StartedAt, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload), ReadPublishedModel(payload));
                     break;
                 case "chat.ready":
                     isCompanionThinking = false;
                     ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, null);
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "stream_id") ?? ReadString(payload, "source_artifact_id")), "chat", ReadPublishedAt(payload, item.At),
-                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
+                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload), ReadPublishedModel(payload));
                     break;
                 case "chat.stream.started":
                     isCompanionThinking = true;
@@ -294,20 +295,20 @@ public static class CompanionEventProjection
                 case "premarket.reply.ready":
                     ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, null);
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "premarket", ReadPublishedAt(payload, item.At),
-                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
+                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload), ReadPublishedModel(payload));
                     break;
                 case "outcome.ready":
                     ResolveFaultEpisodes(payload, ai, resolvedFaultEpisodeIds, "outcome");
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "outcome", ReadPublishedAt(payload, item.At),
-                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
+                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload), ReadPublishedModel(payload));
                     break;
                 case "reflection.ready":
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "reflection", ReadPublishedAt(payload, item.At),
-                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
+                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload), ReadPublishedModel(payload));
                     break;
                 case "judgment.revised":
                     UpsertAi(ai, ReadPublishedId(payload, ReadString(payload, "source_artifact_id")), "judgment_revision", ReadPublishedAt(payload, item.At),
-                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload));
+                        ReadPublishedText(payload), item.At, ReadPublishedAt(payload, item.At), ReadPublishedParts(payload), ReadPublishedModel(payload));
                     break;
                 case "projection.ready":
                     ReadProjection(payload, ai, users, ref scheduledFor, ref autoSubmit, ref m1Deadline, ref h0LockedAt,
@@ -538,7 +539,7 @@ public static class CompanionEventProjection
                 var started = kind == "m1" ? projectedM1StartedAt : kind == "m2" ? projectedM2StartedAt : at;
                 var completed = kind == "m1" ? projectedM1CompletedAt : kind == "m2" ? projectedM2CompletedAt : at;
                 UpsertAi(ai, ReadNestedString(message, "message", "message_id") ?? ReadString(message, "artifact_id"), kind, at, ReadPublishedText(message), started ?? at, completed ?? at,
-                    ReadPublishedParts(message));
+                    ReadPublishedParts(message), ReadPublishedModel(message));
             }
         }
         if (payload.TryGetProperty("user_messages", out var userMessages) && userMessages.ValueKind == JsonValueKind.Array)
@@ -642,7 +643,8 @@ public static class CompanionEventProjection
         string? text,
         DateTimeOffset? started,
         DateTimeOffset? completed,
-        IReadOnlyList<CompanionMessagePart>? parts = null)
+        IReadOnlyList<CompanionMessagePart>? parts = null,
+        string? model = null)
     {
         if (string.IsNullOrWhiteSpace(text)) return;
         var id = artifactId ?? $"{kind}-{at:O}";
@@ -651,8 +653,9 @@ public static class CompanionEventProjection
             started = existing.StartedAt ?? started;
             completed = existing.CompletedAt ?? completed;
             parts ??= existing.Parts;
+            model ??= existing.Model;
         }
-        ai[id] = new CompanionAiTimelineEntry(id, kind, at, text, started, completed, parts);
+        ai[id] = new CompanionAiTimelineEntry(id, kind, at, text, started, completed, parts, Model: model);
     }
 
     private static CompanionEvent? TryParse(string json)
@@ -766,6 +769,11 @@ public static class CompanionEventProjection
 
     private static string? ReadPublishedId(JsonElement element, string? fallback) =>
         ReadNestedString(element, "message", "message_id") ?? fallback;
+
+    // The Stage is what the runtime asked for; the model is what the Broker
+    // actually answered with.  Only the latter is useful beside the timestamp.
+    private static string? ReadPublishedModel(JsonElement element) =>
+        ReadNestedString(element, "message", "model");
 
     private static DateTimeOffset ReadPublishedAt(JsonElement element, DateTimeOffset fallback) =>
         ReadDate(ReadNestedString(element, "message", "sealed_at")) ?? fallback;

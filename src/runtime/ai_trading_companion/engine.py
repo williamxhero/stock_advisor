@@ -305,7 +305,10 @@ class CompanionEngine:
             auto_submit, publish = policy.deadlines(
                 cycle["scheduled_for"], ready_at, reserve=timedelta(seconds=reserve_seconds),
             )
-        presented = self.present_for_publication(m0, evidence_as_of or cycle["as_of"], "m0")
+        presented = self.present_for_publication(
+            m0, evidence_as_of or cycle["as_of"], "m0",
+            model=compose_attempt.get("model"), provider=compose_attempt.get("broker_provider"),
+        )
         self._append_published_memory(cycle, presented)
         with self.store.connection() as connection:
             artifact = self.store.append_artifact(
@@ -767,7 +770,10 @@ class CompanionEngine:
             raise ValueError(f"M1 cannot be published from: {cycle['state']}")
         completed = iso(utc_now())
         next_state = "synthesizing_m2" if bool(cycle.get("has_h0")) and verified_qualified else "complete"
-        presented = self.present_for_publication(m1, as_of or cycle["as_of"], "m1")
+        presented = self.present_for_publication(
+            m1, as_of or cycle["as_of"], "m1",
+            model=judgment_attempt.get("model"), provider=judgment_attempt.get("broker_provider"),
+        )
         self._append_published_memory(cycle, presented)
         with self.store.connection() as connection:
             artifact = self.store.append_artifact(
@@ -1010,7 +1016,10 @@ class CompanionEngine:
             raise ValueError("formal M2 already exists")
         if cycle["state"] not in {"synthesizing_m2", "m2_deferred"}:
             raise ValueError(f"M2 cannot be published from: {cycle['state']}")
-        presented = self.present_for_publication(m2, as_of or cycle["as_of"], "m2")
+        presented = self.present_for_publication(
+            m2, as_of or cycle["as_of"], "m2",
+            model=verified_attempt.get("model"), provider=verified_attempt.get("broker_provider"),
+        )
         self._append_published_memory(cycle, presented)
         with self.store.connection() as connection:
             artifact = self.store.append_artifact(
@@ -1062,13 +1071,17 @@ class CompanionEngine:
         reply_to_batch_ids: list[str] | None = None, stream_id: str | None = None, kind: str = "ai_chat",
         allow_structured_format: bool = False, presented: PresentedMessage | None = None,
         complete_batches: bool = True,
+        model: str | None = None, provider: str | None = None,
     ) -> dict[str, Any]:
         if kind not in {"ai_chat", "premarket_chat"}:
             raise ValueError(f"unsupported chat artifact kind: {kind}")
         if self.store.chat_research_terminated(cycle_id):
             raise RuntimeError("chat research was terminated; late result is not published")
         cycle = self.store.get_cycle(cycle_id)
-        presented = presented or self.present_for_publication(text, iso(utc_now()), kind, allow_structured_format=allow_structured_format)
+        presented = presented or self.present_for_publication(
+            text, iso(utc_now()), kind, allow_structured_format=allow_structured_format,
+            model=model, provider=provider,
+        )
         published_at = iso(utc_now())
         memory_message_id = stream_id or f"{cycle_id}:{kind}:{reply_to_batch_id or hashlib.sha256(presented.markdown.encode('utf-8')).hexdigest()}"
         memory_receipt = None
@@ -1125,6 +1138,7 @@ class CompanionEngine:
         meaningful: bool,
         required_confirmation: bool = False,
         metadata: dict[str, Any] | None = None,
+        model: str | None = None, provider: str | None = None,
     ) -> dict[str, Any] | None:
         """Publish a scheduled message only when it earns an interruption."""
         if not meaningful and not required_confirmation:
@@ -1132,7 +1146,7 @@ class CompanionEngine:
         cycle = self.store.get_cycle(cycle_id)
         message = text if meaningful else "我已经核对过了，暂时没有需要你据此调整的新信息。"
         event_type = {"outcome": "outcome.ready", "reflection": "reflection.ready"}.get(kind, "chat.ready")
-        presented = self.present_for_publication(message, iso(utc_now()), kind)
+        presented = self.present_for_publication(message, iso(utc_now()), kind, model=model, provider=provider)
         self._append_published_memory(cycle, presented)
         artifact = self.store.append_artifact(
             cycle_id, kind, "model", presented.markdown, iso(utc_now()),
@@ -1196,13 +1210,18 @@ class CompanionEngine:
         )
         return stream
 
-    def judgment_revision_ready(self, cycle_id: str, text: str, revises_artifact_id: str) -> dict[str, Any]:
+    def judgment_revision_ready(
+        self, cycle_id: str, text: str, revises_artifact_id: str, *,
+        model: str | None = None, provider: str | None = None,
+    ) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
         prior = next((artifact for artifact in self.store.artifacts(cycle_id) if artifact["artifact_id"] == revises_artifact_id), None)
         if prior is None:
             raise ValueError("judgment revision must reference an artifact in the same cycle")
         text = self._with_revision_continuity(prior["body_markdown"], text)
-        presented = self.present_for_publication(text, iso(utc_now()), "judgment_revision")
+        presented = self.present_for_publication(
+            text, iso(utc_now()), "judgment_revision", model=model, provider=provider,
+        )
         self._append_published_memory(cycle, presented)
         artifact = self.store.append_artifact(
             cycle_id, "judgment_revision", "model", presented.markdown, iso(utc_now()),
@@ -1372,6 +1391,7 @@ class CompanionEngine:
         material_registry: dict[str, dict[str, str]] | None = None,
         expression_profile: dict[str, Any] | None = None,
         message_id: str | None = None, sealed_at: str | None = None,
+        model: str | None = None, provider: str | None = None,
     ) -> PresentedMessage:
         draft = text
         for repair_count in range(3):
@@ -1381,6 +1401,7 @@ class CompanionEngine:
                     material_registry=material_registry,
                     expression_profile=expression_profile,
                     message_id=message_id, sealed_at=sealed_at,
+                    model=model, provider=provider,
                 )
             except MessageQualificationError as error:
                 if repair_count == 2:

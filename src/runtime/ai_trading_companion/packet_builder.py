@@ -536,6 +536,15 @@ class RuntimePacketBuilder:
                 "private_context_before_h0": json.loads(cycle["private_context_json"])
                 if cycle.get("private_context_json") else None,
             }
+        if stage == "m2":
+            fact_view = self.store.m2_portfolio_fact_view(cycle["cycle_id"])
+            if fact_view is None:
+                raise ValueError("M2 portfolio fact view has not been frozen")
+            return {
+                "fact_source": "runtime_database",
+                "portfolio_fact_view": fact_view,
+                "historical_context_source": "memoryhub",
+            }
         with self.store.connection() as connection:
             positions = [dict(row) for row in connection.execute(
                 "SELECT code,name,shares,average_cost,last_price,price_as_of,market_value,unrealized_pnl,updated_at "

@@ -116,9 +116,15 @@ def core_problems(core: dict, packet: dict) -> list[str]:
         problems.append("decision_missing_bidirectional_conditions")
     if any(not is_valid_condition(item) for item in conditions if isinstance(item, dict)):
         problems.append("decision_invalid_transition_condition")
-    private = (packet.get("business_context") or {}).get("private_context_before_h0") or {}
-    if not private:
-        private = (packet.get("business_context") or {}).get("portfolio") or {}
+    context = packet.get("business_context") or {}
+    # M2 has exactly one post-H0 portfolio authority.  The H0 artifact remains
+    # judgment context, never a competing current-holdings source.
+    if packet.get("stage") == "m2":
+        private = context.get("portfolio_fact_view") or {}
+        if not context.get("portfolio_fact_view"):
+            problems.append("decision_missing_portfolio_fact_view")
+    else:
+        private = context.get("private_context_before_h0") or context.get("portfolio") or {}
     active = {str(row.get("code") or row.get("symbol")) for row in private.get("positions", [])
               if isinstance(row, dict) and float(row.get("shares") or 0) > 0}
     positions = core.get("position_focus") or []
@@ -265,7 +271,12 @@ def model_business_context(packet: dict) -> dict:
     context = packet.get("business_context") or {}
     if not isinstance(context, dict):
         return {}
-    portfolio = context.get("private_context_before_h0") or context.get("portfolio") or {}
+    portfolio = (
+        context.get("private_context_before_h0")
+        or context.get("portfolio_fact_view")
+        or context.get("portfolio")
+        or {}
+    )
     if not isinstance(portfolio, dict):
         return {"fact_source": context.get("fact_source")}
     positions = []
@@ -281,10 +292,14 @@ def model_business_context(packet: dict) -> dict:
         "total_assets": portfolio.get("total_assets"),
         "frozen_at": portfolio.get("frozen_at"),
     }
-    return {
+    result = {
         "fact_source": context.get("fact_source"),
         "private_context_before_h0": {key: value for key, value in projected.items() if value is not None},
     }
+    if context.get("portfolio_fact_view"):
+        result["portfolio_fact_view_sha256"] = context["portfolio_fact_view"].get("fact_view_sha256")
+        result["portfolio_fact_view_source_artifact_id"] = context["portfolio_fact_view"].get("source_artifact_id")
+    return result
 
 
 def _bounded_model_text(value: Any, limit: int) -> str:

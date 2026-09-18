@@ -286,6 +286,11 @@ class CompanionStore:
               action_id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES companion_cognition_job(job_id),
               action_type TEXT NOT NULL, state TEXT NOT NULL, payload_sha256 TEXT NOT NULL,
               result_json TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS companion_m2_portfolio_fact_view (
+              cycle_id TEXT PRIMARY KEY REFERENCES companion_cycle(cycle_id),
+              source_artifact_id TEXT NOT NULL REFERENCES narrative_artifact(artifact_id),
+              view_json TEXT NOT NULL, fact_view_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS conversation_auto_submit_claim (
               task_key TEXT NOT NULL, scheduled_for TEXT NOT NULL, conversation_cycle_id TEXT NOT NULL,
               batch_id TEXT, claimed_at TEXT NOT NULL,
@@ -1986,6 +1991,67 @@ class CompanionStore:
         with self.connection() as c:
             row = c.execute("SELECT * FROM companion_action_receipt WHERE action_id=?", (action_id,)).fetchone()
         return dict(row) if row else None
+
+    def action_receipts_for_job(self, job_id: str) -> list[dict[str, Any]]:
+        with self.connection() as c:
+            return [dict(row) for row in c.execute(
+                "SELECT * FROM companion_action_receipt WHERE job_id=? ORDER BY created_at,action_id",
+                (job_id,),
+            )]
+
+    def cognition_job_for_source(self, source_artifact_id: str, mode: str) -> dict[str, Any] | None:
+        with self.connection() as c:
+            row = c.execute(
+                "SELECT * FROM companion_cognition_job WHERE source_artifact_id=? AND mode=?",
+                (source_artifact_id, mode),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def m2_portfolio_fact_view(self, cycle_id: str) -> dict[str, Any] | None:
+        with self.connection() as c:
+            row = c.execute(
+                "SELECT view_json,fact_view_sha256,source_artifact_id,created_at "
+                "FROM companion_m2_portfolio_fact_view WHERE cycle_id=?", (cycle_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        view = json.loads(row["view_json"])
+        if view.get("fact_view_sha256") != row["fact_view_sha256"]:
+            raise ValueError("stored M2 portfolio fact view hash mismatch")
+        return view
+
+    def freeze_m2_portfolio_fact_view(self, cycle_id: str, source_artifact_id: str, *, known_at: str) -> dict[str, Any]:
+        """Freeze the single Runtime portfolio source used by every M2 retry."""
+        existing = self.m2_portfolio_fact_view(cycle_id)
+        if existing is not None:
+            return existing
+        with self.connection() as c:
+            positions = [dict(row) for row in c.execute(
+                "SELECT code,name,shares,average_cost,last_price,price_as_of,market_value,unrealized_pnl,weight,updated_at "
+                "FROM portfolio_position WHERE shares>0 ORDER BY code"
+            )]
+            total_assets = c.execute(
+                "SELECT value FROM portfolio_meta WHERE key='total_assets'"
+            ).fetchone()
+            updated_at = max((str(row.get("updated_at") or "") for row in positions), default=known_at)
+            view = {
+                "fact_source": "runtime_database",
+                "source_artifact_id": source_artifact_id,
+                "known_at": known_at,
+                "updated_at": updated_at,
+                "positions": positions,
+                "total_assets": float(total_assets[0]) if total_assets else None,
+            }
+            canonical = json.dumps(view, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            view["fact_view_sha256"] = digest(canonical)
+            c.execute(
+                "INSERT OR IGNORE INTO companion_m2_portfolio_fact_view("
+                "cycle_id,source_artifact_id,view_json,fact_view_sha256,created_at) VALUES(?,?,?,?,?)",
+                (cycle_id, source_artifact_id,
+                 json.dumps(view, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                 view["fact_view_sha256"], now()),
+            )
+        return self.m2_portfolio_fact_view(cycle_id) or view
 
     def save_action_receipt(self, action_id: str, job_id: str, action_type: str, payload: dict[str, Any], state: str, result: dict[str, Any]) -> dict[str, Any]:
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

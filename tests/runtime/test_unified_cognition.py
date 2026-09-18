@@ -59,6 +59,22 @@ class UnifiedCognitionTests(unittest.TestCase):
 
         self.assertEqual("portfolio.apply", result["actions"][0]["action_type"])
 
+    def test_fixture_cognition_uses_complete_snapshot_for_broker_holding_table(self) -> None:
+        text = """今天全部持仓情况如下：
+| 证券代码 | 证券名称 | 当前拥股数 |
+| --- | --- | ---: |
+| 603179 | 新泉股份 | 300 |"""
+
+        result = UnifiedCognition.fixture_result([{
+            "message_id": "holdings", "body_text": text,
+        }], "h0")
+
+        action = result["actions"][0]
+        self.assertEqual("portfolio.replace_complete_snapshot", action["action_type"])
+        self.assertEqual("603179", action["changes"][0]["code"])
+        self.assertEqual("300", action["changes"][0]["evidence"]["shares"])
+        self.assertEqual(text, action["source_span"]["quote"])
+
     def test_complete_holdings_fact_rejects_a_reply_that_reintroduces_unreported_assets(self) -> None:
         text = "白云电器700股、力星股份200股、鼎捷数智100股，总资产229153元。以上是我目前所有持仓。"
         messages = [{"message_id": "holdings", "body_text": text}]

@@ -1050,6 +1050,10 @@ Protocol: OpportunityDiscovery-v1.3
             other["cycle_id"], "reflection", "model", future_text, "2026-08-25T03:00:00Z",
             known_at="2099-01-01T00:00:00Z",
         )
+        h0 = self.store.latest_artifact(cycle["cycle_id"], "h0")
+        self.store.freeze_m2_portfolio_fact_view(
+            cycle["cycle_id"], h0["artifact_id"], known_at=h0["known_at"],
+        )
 
         packet = RuntimePacketBuilder(PROJECT_ROOT / "resources", PROJECT_ROOT / "data", self.store).build(
             cycle, "m2", as_of=cycle["m1_completed_at"]

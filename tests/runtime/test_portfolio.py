@@ -4,7 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ai_trading_companion.portfolio import PortfolioService, explicit_fixture_extraction
+from ai_trading_companion.portfolio import (
+    PortfolioService, explicit_fixture_extraction, is_complete_portfolio_snapshot_statement,
+)
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.memoryhub_migration import LegacyWorkspaceImporter
 from ai_trading_companion.store import CompanionStore
@@ -178,6 +180,68 @@ class PortfolioServiceTests(unittest.TestCase):
         self.assertEqual("applied", result["state"])
         self.assertTrue(result["complete_snapshot"])
         self.assertEqual(["603179"], [item["code"] for item in self.service.snapshot()["positions"]])
+
+    def test_broker_current_holding_table_is_an_authoritative_complete_snapshot(self):
+        text = """今天全部持仓情况如下：
+| 证券代码 | 证券名称 | 当前拥股数 |
+| --- | --- | ---: |
+| 603179 | 新泉股份 | 300 |
+| 603993 | 洛阳钼业 | 0 |"""
+        changes = [
+            {"action": "position_correction", "code": "603179", "name": "新泉股份", "shares": 300,
+             "price": 38.1, "average_cost": 38.1, "occurred_at": None,
+             "evidence": {"instrument": "603179 | 新泉股份", "action": "当前拥股数", "shares": "300", "price": "38.1"}},
+            {"action": "position_correction", "code": "603993", "name": "洛阳钼业", "shares": 0,
+             "price": 18.27, "average_cost": 17.955, "occurred_at": None,
+             "evidence": {"instrument": "603993 | 洛阳钼业", "action": "当前拥股数", "shares": "0", "price": "18.27"}},
+        ]
+
+        self.assertTrue(is_complete_portfolio_snapshot_statement(text))
+        result = self.service.replace_complete_snapshot(text, changes, "cycle", "broker-table")
+
+        self.assertEqual("applied", result["state"])
+        self.assertEqual(["603179"], [item["code"] for item in self.service.snapshot()["positions"]])
+        replay = self.service.replace_complete_snapshot(text, changes, "cycle", "broker-table")
+        self.assertEqual(result["transaction_ids"], replay["transaction_ids"])
+
+    def test_broker_holding_table_cannot_omit_a_zero_share_row(self):
+        text = """今天全部持仓情况如下：
+证券代码 证券名称 市价 市值 当前拥股数 可用余额 成本价
+603179 新泉股份 38.1 11430 300 300 38.1
+603993 洛阳钼业 18.27 0 0 0 17.955"""
+        only_first_row = [{
+            "action": "position_correction", "code": "603179", "name": "新泉股份", "shares": 300,
+            "price": 38.1, "average_cost": 38.1, "occurred_at": None,
+            "evidence": {"instrument": "603179", "action": "当前拥股数", "shares": "300"},
+        }]
+
+        result = self.service.replace_complete_snapshot(text, only_first_row, "cycle", "omitted-table-row")
+
+        self.assertEqual("needs_input", result["state"])
+        self.assertIn("账户表格中每项持仓的代码、名称和当前拥股数", result["missing_fields"])
+
+    def test_20260918_1430_incident_table_is_a_complete_snapshot(self):
+        text = """今天全部持仓情况如下：
+
+操作 证券代码 证券名称 市价 市值 当前拥股数 可用余额 当日盈亏比(%) 当日盈亏 盈亏比例(%) 盈亏 冻结数量 当日买入 当日卖出 交易市场 持股天数 成本价 仓位占比(%)
+ 300421 力星股份 17.240 3448.000 200 200 2.99 100.00 -51.213 -3619.470 0 0 0 深圳Ａ股 86 35.337 1.55
+ 600487 亨通光电 69.450 0.000 0 0 2.37 162.00 0.000 122.350 0 0 100 上海Ａ股 2 0.000 0.00
+ 002150 正泰电源 21.250 0.000 0 0 1.17 96.00 0.000 136.700 0 0 400 深圳Ａ股 5 0.000 0.00
+ 603861 白云电器 11.200 4480.000 400 200 0.45 20.00 -47.100 -3988.860 200 200 0 上海Ａ股 78 21.172 2.02
+ 002456 欧菲光 7.000 2800.000 400 400 0.00 0.00 -0.325 -9.030 0 0 0 深圳Ａ股 5 7.023 1.26
+ 000625 长安汽车 7.130 0.000 0 0 -0.42 -12.00 0.000 -67.480 0 0 400 深圳Ａ股 5 0.000 0.00
+ 301091 深城交 19.280 5784.000 300 0 -0.55 -32.06 -0.552 -32.060 300 300 0 深圳Ａ股 -- 19.387 2.61
+ 600184 光电股份 21.880 0.000 0 0 -2.53 -112.00 0.000 66.770 0 0 200 上海Ａ股 5 0.000 0.00
+
+---
+我还是维持谨慎看多。"""
+
+        self.assertTrue(is_complete_portfolio_snapshot_statement(text))
+        parsed = explicit_fixture_extraction(text)
+        self.assertEqual(8, len(parsed["changes"]))
+        self.assertEqual({"300421", "603861", "002456", "301091"}, {
+            row["code"] for row in parsed["changes"] if row["shares"] > 0
+        })
 
     def test_negated_all_holdings_wording_does_not_replace_the_snapshot(self):
         changes = [{"action": "position_correction", "code": "603179", "name": "新泉股份", "shares": 300, "price": 38.1, "average_cost": 38.1, "occurred_at": None, "evidence": {"instrument": "603179 新泉股份", "action": "持有", "shares": "300股", "price": "38.1", "average_cost": "38.1", "total_assets": None}}]

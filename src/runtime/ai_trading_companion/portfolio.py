@@ -29,6 +29,62 @@ PORTFOLIO_WRITE_FACT = re.compile(
 )
 
 
+def complete_portfolio_table_rows(text: str) -> list[dict[str, Any]]:
+    """Return the minimally authoritative rows from a broker holding table.
+
+    A bare number is only a holding fact when the table itself names the
+    security-code, security-name and current-holding columns.  This prevents a
+    prose request mentioning "all holdings" from being mistaken for a snapshot.
+    """
+    lines = text.splitlines()
+    header_index = next((
+        index for index, line in enumerate(lines)
+        if "证券代码" in line and "证券名称" in line
+        and re.search(r"当前(?:拥|持)股数", line)
+    ), None)
+    if header_index is None:
+        return []
+    header = lines[header_index]
+    delimiter = "|" if "|" in header else None
+    header_cells = [cell.strip() for cell in header.strip().strip("|").split(delimiter)] if delimiter else header.split()
+    try:
+        code_column = header_cells.index("证券代码")
+        name_column = header_cells.index("证券名称")
+        holding_column = next(
+            index for index, cell in enumerate(header_cells)
+            if re.fullmatch(r"当前(?:拥|持)股数", cell)
+        )
+    except (ValueError, StopIteration):
+        return []
+    holding_offset = holding_column - code_column
+
+    def numeric_at(cells: list[str], code_index: int, column_name: str) -> float | None:
+        try:
+            offset = header_cells.index(column_name) - code_column
+            value = cells[code_index + offset].replace(",", "")
+            return float(value) if re.fullmatch(r"\d+(?:\.\d+)?", value) else None
+        except (ValueError, IndexError):
+            return None
+
+    rows: list[dict[str, Any]] = []
+    for line in lines[header_index + 1:]:
+        cells = [cell.strip() for cell in line.strip().strip("|").split(delimiter)] if delimiter else line.split()
+        # Markdown separator rows and later narrative paragraphs are not data.
+        code_index = next((index for index, cell in enumerate(cells) if re.fullmatch(r"\d{6}", cell)), None)
+        if code_index is None or len(cells) <= code_index + max(name_column - code_column, holding_offset):
+            continue
+        shares = cells[code_index + holding_offset].replace(",", "").strip()
+        name = cells[code_index + (name_column - code_column)]
+        if not re.fullmatch(r"\d+", shares) or not name:
+            continue
+        rows.append({
+            "code": cells[code_index], "name": name, "shares": int(shares), "line": line,
+            "price": numeric_at(cells, code_index, "市价"),
+            "average_cost": numeric_at(cells, code_index, "成本价"),
+        })
+    return rows
+
+
 def is_portfolio_statement(text: str) -> bool:
     return bool(STATE_TERMS.search(text))
 
@@ -43,7 +99,7 @@ def is_portfolio_write_statement(text: str) -> bool:
     action = re.search(r"买入|卖出|加仓|减仓|清仓", text)
     if action:
         return not is_future_action_statement(text)
-    return bool(PORTFOLIO_WRITE_FACT.search(text))
+    return bool(PORTFOLIO_WRITE_FACT.search(text) or complete_portfolio_table_rows(text))
 
 
 def has_complete_portfolio_scope(text: str) -> bool:
@@ -58,7 +114,7 @@ def is_complete_portfolio_snapshot_statement(text: str) -> bool:
     return bool(
         is_portfolio_statement(text)
         and has_complete_portfolio_scope(text)
-        and COMPLETE_PORTFOLIO_FACT.search(text)
+        and (COMPLETE_PORTFOLIO_FACT.search(text) or complete_portfolio_table_rows(text))
     )
 
 
@@ -247,6 +303,24 @@ class PortfolioService:
                 source_text, {"statement_type": "current_state", "changes": changes},
                 cycle_id, source_artifact_id, ["明确的完整账户或全部持仓范围"],
             )
+        table_rows = complete_portfolio_table_rows(source_text)
+        if table_rows:
+            expected = {row["code"]: (row["name"], row["shares"]) for row in table_rows}
+            supplied: dict[str, tuple[str, int]] = {}
+            for change in changes:
+                if change.get("action") == "asset_correction":
+                    continue
+                try:
+                    supplied[str(change.get("code") or "").strip()] = (
+                        str(change.get("name") or "").strip(), int(change.get("shares")),
+                    )
+                except (TypeError, ValueError):
+                    continue
+            if supplied != expected:
+                return self._record_needs_input(
+                    source_text, {"statement_type": "current_state", "changes": changes},
+                    cycle_id, source_artifact_id, ["账户表格中每项持仓的代码、名称和当前拥股数"],
+                )
         current = {row["code"]: row for row in self.snapshot()["positions"]}
         resolved: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -572,6 +646,18 @@ def explicit_fixture_extraction(text: str) -> dict[str, Any]:
     if not price_match:
         price_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*元", text)
     changes = []
+    # Fixture mode deliberately has no model.  It must nevertheless exercise
+    # the same deterministic account-table path as a verified cognition result.
+    if is_complete_portfolio_snapshot_statement(text):
+        for row in complete_portfolio_table_rows(text):
+            changes.append({
+                "action": "position_correction", "code": row["code"], "name": row["name"],
+                "shares": row["shares"], "price": row["price"], "average_cost": row["average_cost"],
+                "occurred_at": None,
+                "evidence": {"instrument": row["code"], "action": "当前拥股数",
+                             "shares": str(row["shares"]), "price": str(row["price"]) if row["price"] is not None else None},
+            })
+        return {"statement_type": "current_state", "changes": changes}
     if action_match:
         raw_action = action_match.group(1)
         action = "sell_all" if raw_action in {"清仓", "全部卖出"} else "buy" if raw_action in {"买入", "加仓"} else "sell"

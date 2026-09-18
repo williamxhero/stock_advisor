@@ -43,7 +43,7 @@ from .models import TASK_POLICIES
 from .observatory import EvaluationObservatory, EvaluationRequest, ExperimentRequest, ForecastRequest
 from .packet_builder import RuntimePacketBuilder
 from .paths import RuntimePaths
-from .portfolio import PortfolioService
+from .portfolio import PortfolioService, is_portfolio_write_statement
 from .preview import approve_bundle, build_bundle, find_source_cycle, launch_preview, seal_bundle, write_bundle
 from .scheduler import SHANGHAI, conversation_auto_submit_at, ensure_registered_policy, run_registry_schedule
 from .schedule_registry import ScheduleRegistry, _target_for_day
@@ -1697,10 +1697,70 @@ def run_m1(
     raise RuntimeError("M1 attempts exhausted")
 
 
+def _portfolio_signature(snapshot: dict[str, Any]) -> list[tuple[str, str, int]]:
+    return sorted(
+        (str(row.get("code") or ""), str(row.get("name") or ""), int(row.get("shares") or 0))
+        for row in snapshot.get("positions") or [] if isinstance(row, dict) and int(row.get("shares") or 0) > 0
+    )
+
+
+def _m2_portfolio_fact_gate(store: CompanionStore, cycle: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Close H0 portfolio facts before M2 can read a single frozen view."""
+    source = store.latest_artifact(cycle["cycle_id"], "h0")
+    if source is None:
+        return None, "h0_portfolio_fact_unavailable"
+    source_text = str(source.get("body_markdown") or "")
+    requires_receipt = is_portfolio_write_statement(source_text)
+    job = store.cognition_job_for_source(source["artifact_id"], "h0")
+    if requires_receipt:
+        if job is None or job.get("state") in {"queued", "running"}:
+            return None, "h0_portfolio_fact_unavailable"
+        if job.get("state") != "completed" or not job.get("result_json"):
+            return None, "h0_portfolio_fact_unavailable"
+        receipts = []
+        for row in store.action_receipts_for_job(job["job_id"]):
+            try:
+                receipt = json.loads(row["result_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(receipt, dict):
+                receipts.append(receipt)
+        if not receipts:
+            return None, "h0_portfolio_fact_unavailable"
+        portfolio_receipts = [
+            receipt for receipt in receipts if isinstance(receipt, dict)
+            and receipt.get("action_type") in {"portfolio.apply", "portfolio.replace_complete_snapshot"}
+        ]
+        if not portfolio_receipts or any(receipt.get("state") != "applied" for receipt in portfolio_receipts):
+            return None, "h0_portfolio_fact_unavailable"
+    view = store.freeze_m2_portfolio_fact_view(
+        cycle["cycle_id"], source["artifact_id"], known_at=str(source.get("known_at") or source["sealed_at"]),
+    )
+    if requires_receipt:
+        snapshots = [receipt.get("snapshot") for receipt in portfolio_receipts if isinstance(receipt.get("snapshot"), dict)]
+        if not snapshots or _portfolio_signature(snapshots[-1]) != _portfolio_signature(view):
+            return None, "h0_portfolio_fact_mismatch"
+    return view, None
+
+
+def _defer_m2_for_portfolio_fact(store: CompanionStore, cycle: dict[str, Any], reason: str) -> dict[str, Any]:
+    """Record one operational hold without turning repeated checks into user-fault spam."""
+    first_hold = cycle["state"] != "m2_deferred"
+    deferred = store.transition(cycle["cycle_id"], "m2_deferred")
+    if first_hold:
+        store.queue_event(cycle["cycle_id"], "m2.fact_deferred", {
+            "cycle": {"cycle_id": cycle["cycle_id"]}, "reason": reason,
+        })
+    return {**deferred, "m2_deferred_reason": reason}
+
+
 def run_m2(engine: CompanionEngine, store: CompanionStore, cycle_id: str, execute: bool) -> dict[str, Any]:
     cycle = store.get_cycle(cycle_id)
     if cycle["state"] not in {"synthesizing_m2", "m2_deferred"}:
         return cycle
+    _fact_view, fact_problem = _m2_portfolio_fact_gate(store, cycle)
+    if fact_problem:
+        return _defer_m2_for_portfolio_fact(store, cycle, fact_problem)
     if not execute:
         packet_hash = "fixture-m2"
         return engine.m2_ready(

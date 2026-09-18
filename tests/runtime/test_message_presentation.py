@@ -125,6 +125,16 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertEqual("deepseek", presented.message()["provider"])
         self.assertNotIn("deepseek-v4-pro", presented.markdown)
 
+    def test_presentation_does_not_expose_runtime_fallback_as_a_model(self):
+        presented = present_message(
+            "我先保留客观观察。",
+            as_of="2026-09-01T01:00:00Z",
+            kind="m0",
+            model="runtime-safe-fallback",
+        )
+
+        self.assertNotIn("model", presented.message())
+
     def test_own_message_is_released_as_natural_conversation(self):
         presented = present_message(
             "##盘前结论\ntime_scope: next_trading_session。 截至2026-08-31\n\n- 不预设反包\n- 不追高开",

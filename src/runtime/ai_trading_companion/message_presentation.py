@@ -34,6 +34,7 @@ _INTERNAL_FIELDS = {
     "task_key", "stage", "protocol", "reference_at", "model", "token",
     "状态", "status",
 }
+_NON_MODEL_LABELS = {"runtime-safe-fallback", "runtime-reviewed-core", "reviewed-judgment-pipeline"}
 _REPORT_LABELS = {
     "盘前研判", "盘前结论", "盘中结论", "执行结论", "执行回执", "盘前研究回执",
     "结论", "市场基线", "新增事件", "题材判断", "题材状态", "市场层", "组合处理",
@@ -90,7 +91,7 @@ class PresentedMessage:
             "parts": list(self.parts),
             "text_projection": self.markdown,
         }
-        if self.model:
+        if self.model and self.model not in _NON_MODEL_LABELS:
             message["model"] = self.model
         if self.provider:
             message["provider"] = self.provider

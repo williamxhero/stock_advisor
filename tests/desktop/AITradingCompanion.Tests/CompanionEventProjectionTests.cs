@@ -20,6 +20,16 @@ public sealed class CompanionEventProjectionTests
     }
 
     [Fact]
+    public void RuntimeFallbackIsNotPresentedAsAResolvedModel()
+    {
+        var at = DateTimeOffset.Parse("2026-09-01T14:40:00+08:00", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
+        var timing = MainWindow.FormatTiming(new CompanionAiTimelineEntry(
+            "fallback", "m0", at, "保底", at, at, Model: "runtime-safe-fallback"));
+
+        Assert.DoesNotContain("runtime-safe-fallback", timing, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void RuntimeExchangeDesktopReleaseFixtureUsesTheSealedV2Text()
     {
         var json = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "fixtures", "message-v2-runtime-exchange-desktop.json"));

@@ -985,7 +985,10 @@ public partial class MainWindow : Window, IDisposable
             : $"{started} -> ";
         // Callers select a Stage; the Broker resolves the model, so the timeline
         // labels each answer with the model that actually replied.
-        return string.IsNullOrWhiteSpace(message.Model) ? window : $"{window} {message.Model}";
+        return string.IsNullOrWhiteSpace(message.Model)
+            || message.Model is "runtime-safe-fallback" or "runtime-reviewed-core" or "reviewed-judgment-pipeline"
+            ? window
+            : $"{window} {message.Model}";
     }
 
     private string BuildAsrContext()

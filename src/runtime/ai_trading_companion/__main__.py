@@ -312,7 +312,26 @@ def _evidence_read_cutoff(packet: dict[str, Any], contract: dict[str, Any]) -> s
 
 
 def _m1_research_as_of(evidence: dict[str, Any], frozen_as_of: str | None) -> str:
-    """M1 judges the exact frozen M0 bundle and must preserve its timestamp."""
+    """M1 freezes M0 facts when the complete evidence bundle became known.
+
+    ``evidence.as_of`` is the market/fact clock, not the acquisition clock.
+    M0 sources are normally collected a few seconds after that timestamp;
+    using the fact clock as M1's visibility cutoff rejects valid M0 evidence.
+    """
+    candidates = [str(evidence.get("as_of") or "")]
+    for source in evidence.get("sources") or []:
+        if isinstance(source, dict):
+            candidates.extend(str(source.get(key) or "") for key in ("known_at", "observed_at"))
+    parsed = []
+    for value in candidates:
+        if not value:
+            continue
+        try:
+            parsed.append(datetime.fromisoformat(value.replace("Z", "+00:00")))
+        except ValueError:
+            continue
+    if parsed:
+        return iso(max(parsed)).replace(".000Z", "Z")
     return str(frozen_as_of or evidence.get("as_of") or iso(datetime.now(timezone.utc)))
 
 
@@ -1597,7 +1616,7 @@ def run_m1(
             )
             judgment_packet = builder.build(
                 cycle, "m1_judgment", evidence=evidence,
-                as_of=str(evidence.get("as_of") or iso(datetime.now(timezone.utc))),
+                as_of=research_as_of,
             )
             if verification_feedback is not None:
                 judgment_packet["verification_repair"] = {

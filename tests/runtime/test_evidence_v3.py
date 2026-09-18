@@ -365,6 +365,15 @@ class EvidenceV3Tests(TestCase):
             _m1_research_as_of({"as_of": "2026-08-31T05:25:57Z"}, None),
         )
 
+    def test_m1_visibility_cutoff_includes_source_acquisition_after_fact_clock(self):
+        self.assertEqual(
+            "2026-08-31T05:26:03Z",
+            _m1_research_as_of({
+                "as_of": "2026-08-31T05:25:57Z",
+                "sources": [{"known_at": "2026-08-31T05:26:03Z"}],
+            }, None),
+        )
+
     def test_1430_contract_requires_fresh_intraday_market_and_event_evidence(self):
         contract = EvidenceContractFactory(_WeekdayCalendar()).build(
             task_key="daily.execution.1430", stage="m0_research", as_of="2026-08-26T06:30:00Z",

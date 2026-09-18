@@ -773,7 +773,10 @@ public static class CompanionEventProjection
     // The Stage is what the runtime asked for; the model is what the Broker
     // actually answered with.  Only the latter is useful beside the timestamp.
     private static string? ReadPublishedModel(JsonElement element) =>
-        ReadNestedString(element, "message", "model");
+        ReadNestedString(element, "message", "model") is { } model
+            && model is not ("runtime-safe-fallback" or "runtime-reviewed-core" or "reviewed-judgment-pipeline")
+            ? model
+            : null;
 
     private static DateTimeOffset ReadPublishedAt(JsonElement element, DateTimeOffset fallback) =>
         ReadDate(ReadNestedString(element, "message", "sealed_at")) ?? fallback;

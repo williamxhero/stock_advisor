@@ -679,6 +679,10 @@ def frozen_minute(symbol: dict[str, str], required_at: str, minute_endpoint: obj
     return selected[1], selected[0].astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"), source_url
 
 
+class DailyCloseUnavailable(Exception):
+    """The provider has not yet published the requested equity daily bar."""
+
+
 def frozen_daily(
     symbol: dict[str, str], required_at: str, daily_endpoint: object = None,
 ) -> tuple[float, float, str, str]:
@@ -716,9 +720,9 @@ def frozen_daily(
         elif selected is None or day < selected[0]:
             previous = (day, close)
     if selected is None:
-        fail(75, "daily response has no quote for required trading date")
+        raise DailyCloseUnavailable("daily response has no quote for required trading date")
     if previous is None:
-        fail(75, "daily response has no previous close")
+        raise DailyCloseUnavailable("daily response has no previous close")
     quote_at = dt.datetime.combine(selected[0], dt.time(15, 0), cutoff.tzinfo)
     return (
         selected[1], previous[1], quote_at.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -743,7 +747,16 @@ def frozen_minute_payload(
             daily_endpoint is not None or minute_endpoint is None
         )
         if use_daily_close:
-            price, previous_close, quote_at, source_url = frozen_daily(symbol, required_at, daily_endpoint)
+            try:
+                price, previous_close, quote_at, source_url = frozen_daily(symbol, required_at, daily_endpoint)
+            except DailyCloseUnavailable:
+                # Some providers publish index closes before individual equity
+                # daily bars.  A closed 15:00 minute is still an admissible
+                # official-close fact, so use it as a bounded same-provider
+                # fallback instead of declaring the whole portfolio missing.
+                use_daily_close = False
+                price, quote_at, source_url = frozen_minute(symbol, required_at, minute_endpoint)
+                previous_close = float(item.get("previous_close") or 0)
         else:
             price, quote_at, source_url = frozen_minute(symbol, required_at, minute_endpoint)
             previous_close = float(item.get("previous_close") or 0)

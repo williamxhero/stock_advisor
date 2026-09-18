@@ -914,6 +914,53 @@ class ToolRunnerTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_official_close_equity_quote_falls_back_when_daily_bar_is_not_published(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/quote"):
+                    body = b'v_sh600000="1~Test~600000~9.20~9.00~~~~~~~~~~~~~~~~~~~~~~~~~~20260901154000";'
+                    content_type = "text/plain; charset=utf-8"
+                elif self.path.startswith("/daily"):
+                    body = json.dumps({"data": {"sh600000": {"qfqday": [["2026-08-29", "9.0", "8.90"]]}}}).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
+                else:
+                    body = json.dumps({"data": {"sh600000": {"data": {"data": [
+                        "1459 9.10 100 1000.0", "1500 9.15 120 1200.0",
+                    ]}}}}).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                result = ToolRunner(ToolCatalog(root)).resolve(FactRequest(
+                    1, "cn_equity_quote_batch", "2026-09-01T07:00:00Z", 4.0,
+                    {"symbols": ["600000"], "tencent_quote_url": base + "/quote?q=",
+                     "tencent_minute_url": base + "/minute?code=", "tencent_daily_url": base + "/daily?param="},
+                    finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                quote = result.data["quotes"][0]
+                self.assertEqual(9.15, quote["price"])
+                self.assertEqual("2026-09-01T07:00:00Z", quote["quote_at"])
+                self.assertEqual("tencent_minute", quote["source"])
+                self.assertEqual("official_close", result.data["finality"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_current_equity_bar_returns_a_fresh_forming_market_hub_interval(self) -> None:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802

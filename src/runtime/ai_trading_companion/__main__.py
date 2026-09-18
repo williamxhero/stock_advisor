@@ -1812,6 +1812,10 @@ def run_preview_worker(source_cycle_id: str, preview_id: str, known_at: str, bun
                 h0_artifact_id=h0["artifact_id"], has_h0=1, m1_started_at=known_at,
                 m1_publish_deadline=preview_deadline,
             )
+            # The replay must close the same deterministic H0 fact seam before
+            # M2.  It uses fixture cognition so the historical replay never
+            # invents a new model interpretation or mutates production facts.
+            process_h0_cognition(engine, store, portfolio, cycle["cycle_id"], False)
         else:
             cycle = store.transition(
                 cycle["cycle_id"], "researching_m1", h0_locked_at=known_at, has_h0=0,
@@ -2847,7 +2851,11 @@ def process_h0_cognition(
     batch_id = str(metadata.get("batch_id") or "")
     messages = store.messages_for_batches([batch_id]) if batch_id else []
     if not messages:
-        return None
+        messages = [{
+            "message_id": source["artifact_id"], "body_text": source["body_markdown"],
+            "known_at": source.get("known_at") or source.get("sealed_at"),
+            "batch_id": batch_id,
+        }]
     return run_unified_cognition(
         engine, store, portfolio, cycle_id, source, messages, [batch_id], execute,
         mode="h0",

@@ -682,7 +682,7 @@ public partial class MainWindow : Window, IDisposable
                 : string.Join('\u001d', message.Parts.Select(part => string.Join('\u001c',
                     part.Kind, part.Text, part.SourceTitle, part.SourceUrl, part.MaterialId)));
             yield return string.Join('\u001f', message.ArtifactId, message.Kind, message.At.UtcTicks,
-                message.Text, message.StartedAt?.UtcTicks, message.CompletedAt?.UtcTicks, parts);
+                message.Text, message.StartedAt?.UtcTicks, message.CompletedAt?.UtcTicks, message.Model, parts);
         }
     }
 

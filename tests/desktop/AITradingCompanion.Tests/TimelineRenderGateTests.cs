@@ -25,6 +25,7 @@ public sealed class TimelineRenderGateTests
             "src", "desktop", "AITradingCompanion.Desktop", "Views", "MainWindow.xaml.cs"));
 
         Assert.Contains("_aiTimelineRenderGate.ShouldRender(AiTimelineRenderKeys(orderedMessages))", source, StringComparison.Ordinal);
+        Assert.Contains("message.CompletedAt?.UtcTicks, message.Model, parts", source, StringComparison.Ordinal);
         Assert.Contains("_userTimelineRenderGate.ShouldRender(UserTimelineRenderKeys(messages))", source, StringComparison.Ordinal);
         Assert.Contains("_draftSaveTimer.Start();", source, StringComparison.Ordinal);
     }

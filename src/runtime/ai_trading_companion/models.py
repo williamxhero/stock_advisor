@@ -49,7 +49,7 @@ TASK_POLICIES = {
 
 TERMINAL_STATES = {"complete", "reflected", "failed", "skipped", "missed"}
 ACTIVE_STATES = {
-    "queued", "researching_m0", "awaiting_h0", "voice_grace", "h0_locked",
+    "queued", "researching_m0", "m0_retry_wait", "awaiting_h0", "voice_grace", "h0_locked",
     "researching_m1", "judging_m1", "m1_retry_wait", "m1_ready",
     "synthesizing_m2", "m2_deferred", "waiting_for_repair", "outcome_pending",
     "outcome_ready", "reflecting",

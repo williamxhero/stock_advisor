@@ -581,14 +581,22 @@ class ToolRunner:
 
     def _is_deterministic_failure(self, result: EvidenceResolution) -> bool:
         code = result.error_code or ""
-        if code in {"tool_timeout", "tool_network_transient"}:
+        # Exit 75 is the built-in provider contract for a bounded upstream
+        # failure or a source that has not published the requested observation
+        # yet.  It must not poison the candidate's health or open a circuit for
+        # the rest of the current cycle: a later retry or an independent route
+        # can still satisfy the same frozen request.
+        if code in {"tool_timeout", "tool_network_transient"} or result.exit_code == 75:
             return False
         if code == "tool_process_failed" and result.diagnostic_artifact_ref:
             try:
                 diagnostic = self.read_artifact(result.diagnostic_artifact_ref).decode("utf-8", errors="replace").lower()
             except Exception:
                 diagnostic = ""
-            if "network read failed" in diagnostic or "upstream http 5" in diagnostic:
+            if any(marker in diagnostic for marker in (
+                "network read failed", "upstream http 5", "no quote for required trading date",
+                "no previous close", "no quote at or before required_at", "does not meet close finality",
+            )):
                 return False
         return True
 

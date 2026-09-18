@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.20"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15", "1.1.16", "1.1.17", "1.1.18", "1.1.19"}
+_VERSION = "1.1.21"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15", "1.1.16", "1.1.17", "1.1.18", "1.1.19", "1.1.20"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -29,7 +29,7 @@ _CAPABILITIES = {
     "cn_equity_announcement_snapshot": "cn_equity_announcement_snapshot",
 }
 _ADAPTERS = {
-    "cn_equity_quote_batch": {"tencent": "cn_equity_quote_tencent", "sina": "cn_equity_quote_sina"},
+    "cn_equity_quote_batch": {"tencent": "cn_equity_quote_tencent", "sina": "cn_equity_quote_sina", "eastmoney": "cn_equity_quote_eastmoney"},
     "cn_equity_current_bar": {"markethub": "cn_equity_current_bar", "tencent": "cn_equity_current_bar_tencent"},
     "cn_market_index_batch": {"tencent": "cn_market_index_tencent", "sina": "cn_market_index_sina"},
     "cn_market_breadth": {"markethub": "cn_market_breadth_markethub", "eastmoney": "cn_market_breadth_eastmoney"},
@@ -786,6 +786,80 @@ def frozen_minute_payload(
     return {
         field: frozen, "finality": finality, "source": source,
         "source_urls": [str(item["url"]) for item in source_evidence], "source_evidence": source_evidence,
+    }, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def eastmoney_secid(symbol: dict[str, str]) -> str:
+    market = "1" if symbol["exchange"] == "SSE" else "0"
+    return market + "." + symbol["symbol"]
+
+
+def eastmoney_daily_payload(
+    symbols: list[dict[str, str]], required_at: str, endpoint: object, finality: str,
+) -> tuple[dict[str, object], str]:
+    """Read exact-date official closes from an independent history provider."""
+    try:
+        cutoff = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(
+            dt.timezone(dt.timedelta(hours=8)),
+        )
+    except ValueError:
+        fail(64, "required_at must be an ISO timestamp")
+    base = safe_url(endpoint or "https://push2his.eastmoney.com/api/qt/stock/kline/get")
+    begin = (cutoff.date() - dt.timedelta(days=30)).strftime("%Y%m%d")
+    end = (cutoff.date() + dt.timedelta(days=1)).strftime("%Y%m%d")
+    quotes: list[dict[str, object]] = []
+    source_urls: list[str] = []
+    latest: dt.datetime | None = None
+    for symbol in symbols:
+        separator = "&" if "?" in base else "?"
+        url = base + separator + (
+            "secid=" + eastmoney_secid(symbol) + "&klt=101&fqt=1&beg=" + begin + "&end=" + end
+            + "&fields1=f1%2Cf2%2Cf3%2Cf4%2Cf5%2Cf6&fields2=f51%2Cf52%2Cf53%2Cf54%2Cf55%2Cf56%2Cf57%2Cf58%2Cf59%2Cf60"
+        )
+        source_url, body = fetch(url)
+        source_urls.append(source_url)
+        try:
+            data = json.loads(body)["data"]
+            rows = data["klines"]
+            name = str(data.get("name") or symbol["symbol"])
+        except (KeyError, TypeError, json.JSONDecodeError):
+            fail(75, "Eastmoney daily response is not a valid historical quote")
+        selected: tuple[dt.date, float] | None = None
+        previous: tuple[dt.date, float] | None = None
+        for raw in rows if isinstance(rows, list) else []:
+            fields = str(raw).split(",") if isinstance(raw, str) else []
+            if len(fields) < 3:
+                continue
+            try:
+                day = dt.date.fromisoformat(fields[0])
+                close = float(fields[2])
+            except (TypeError, ValueError):
+                continue
+            if close <= 0 or day > cutoff.date():
+                continue
+            if day == cutoff.date():
+                selected = (day, close)
+            elif previous is None or day > previous[0]:
+                previous = (day, close)
+        if selected is None:
+            fail(75, "Eastmoney daily response has no quote for required trading date")
+        if previous is None:
+            fail(75, "Eastmoney daily response has no previous close")
+        quote_at_local = dt.datetime.combine(selected[0], dt.time(15, 0), cutoff.tzinfo)
+        quote_at = quote_at_local.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        change = round(selected[1] - previous[1], 4)
+        change_percent = round(change / previous[1] * 100, 4) if previous[1] > 0 else 0.0
+        quotes.append({
+            "symbol": symbol["symbol"], "name": name, "exchange": symbol["exchange"], "market": symbol["market"],
+            "price": selected[1], "previous_close": previous[1], "quote_at": quote_at,
+            "trading_date": selected[0].isoformat(), "change": change, "change_percent": change_percent,
+            "status": "closed", "source": "eastmoney_daily",
+        })
+        latest = max(latest, quote_at_local) if latest else quote_at_local
+    if latest is None:
+        fail(64, "at least one symbol is required")
+    return {
+        "quotes": quotes, "finality": finality, "source": "eastmoney_daily", "source_urls": source_urls,
     }, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
@@ -2113,7 +2187,7 @@ def main() -> None:
             fail(64, "symbols must be a non-empty array")
         result({"identities": [identity(symbol) for symbol in symbols], "source": "a_share_code_rules"})
         return
-    if mode in {"cn_equity_quote_batch", "cn_equity_quote_tencent", "cn_equity_quote_sina"}:
+    if mode in {"cn_equity_quote_batch", "cn_equity_quote_tencent", "cn_equity_quote_sina", "cn_equity_quote_eastmoney"}:
         symbols = inputs.get("symbols")
         if not isinstance(symbols, list) or not symbols:
             fail(64, "symbols must be a non-empty array")
@@ -2121,6 +2195,15 @@ def main() -> None:
         if finality not in {"intraday", "realtime", "close", "official_close"}:
             fail(64, "unsupported quote finality")
         normalized = [identity(symbol) for symbol in symbols]
+        if mode == "cn_equity_quote_eastmoney":
+            if finality not in {"close", "official_close"}:
+                fail(75, "Eastmoney historical quote adapter requires close finality")
+            payload, fact_as_of = eastmoney_daily_payload(
+                normalized, str(request.get("required_at") or ""),
+                inputs.get("eastmoney_history_url"), finality,
+            )
+            result(payload, fact_as_of=fact_as_of)
+            return
         if mode == "cn_equity_quote_sina":
             quote_url = safe_url(inputs.get("sina_quote_url") or "https://hq.sinajs.cn/list=")
             separator = "" if quote_url.endswith(("=", ",")) else "&list="

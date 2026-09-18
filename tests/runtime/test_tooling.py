@@ -57,11 +57,11 @@ class ToolRunnerTests(unittest.TestCase):
                 ensure_builtin_tools(root)
 
             capability_manifest = json.loads((
-                root / "cn_market_breadth" / "versions" / "1.1.20" / "manifest.json"
+                root / "cn_market_breadth" / "versions" / "1.1.21" / "manifest.json"
             ).read_text(encoding="utf-8"))
             adapter_manifest = json.loads((
                 root / "cn_market_breadth" / "adapters" / "markethub"
-                / "versions" / "1.1.20" / "manifest.json"
+                / "versions" / "1.1.21" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual(new_python, capability_manifest["command"][0])
             self.assertEqual(new_python, adapter_manifest["command"][0])
@@ -91,7 +91,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.20", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.21", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
             routing = json.loads(turnover_routing.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -100,7 +100,7 @@ class ToolRunnerTests(unittest.TestCase):
             )
             official_manifest = json.loads((
                 root / "cn_market_turnover_compare" / "adapters" / "official_exchanges"
-                / "versions" / "1.1.20" / "manifest.json"
+                / "versions" / "1.1.21" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual({
                 "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
@@ -705,6 +705,47 @@ class ToolRunnerTests(unittest.TestCase):
                 self.assertEqual("sina_quote", result.data["source"])
                 self.assertEqual("2026-09-01T15:01:00+08:00", result.data["quotes"][0]["quote_at"])
                 self.assertEqual(("tencent:tool_process_failed", "sina:succeeded"), result.attempts)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_quote_tool_falls_back_to_independent_eastmoney_history(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith(("/tencent", "/sina")):
+                    self.send_error(500, "provider unavailable")
+                    return
+                body = json.dumps({"data": {
+                    "code": "600000", "name": "浦发银行",
+                    "klines": ["2026-08-31,9.0,9.00,9.1,8.9,1,1,0,0,0,0", "2026-09-01,9.00,9.15,9.2,9.0,1,1,0,0,0,0"],
+                }}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                    1, "cn_equity_quote_batch", "2026-09-01T07:01:00Z", 8.0,
+                    {"symbols": ["600000"], "tencent_quote_url": base + "/tencent?q=",
+                     "sina_quote_url": base + "/sina?list=", "eastmoney_history_url": base + "/eastmoney"},
+                    context={"cycle_id": "eastmoney-fallback"}, finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("eastmoney_daily", result.data["source"])
+                self.assertEqual(9.15, result.data["quotes"][0]["price"])
+                self.assertEqual(("tencent:tool_process_failed", "sina:tool_process_failed", "eastmoney:succeeded"), result.attempts)
             finally:
                 server.shutdown()
                 server.server_close()

@@ -206,8 +206,8 @@ class CompanionEngine:
 
     def research_started(self, cycle_id: str, *, as_of: str | None = None) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
-        if cycle["state"] != "queued":
-            raise ValueError(f"cycle is not queued: {cycle['state']}")
+        if cycle["state"] not in {"queued", "m0_retry_wait"}:
+            raise ValueError(f"cycle is not queued or waiting for M0 retry: {cycle['state']}")
         batch_id, newly_submitted = self.store.commit_staged_messages(cycle_id, "pre_m0")
         messages = self.store.messages(cycle_id, state="submitted", phase="pre_m0")
         if messages and (newly_submitted or not self.store.latest_artifact(cycle_id, "pre_m0")):
@@ -236,6 +236,32 @@ class CompanionEngine:
         cycle = self.store.transition(cycle_id, "researching_m0", as_of=as_of or iso(utc_now()))
         self.emit(cycle, "m0.started", cycle)
         return cycle
+
+    def research_waiting(self, cycle_id: str, reason: str) -> dict[str, Any]:
+        """Persist a bounded M0 provider retry without publishing a fault."""
+        cycle = self.store.get_cycle(cycle_id)
+        if cycle["state"] not in {"researching_m0", "m0_retry_wait"}:
+            raise ValueError(f"cycle is not in M0 research: {cycle['state']}")
+        attempt = int(cycle.get("m0_retry_attempt") or 0) + 1
+        scheduled = parse(cycle["scheduled_for"])
+        policy = TASK_POLICIES[cycle["task_key"]]
+        auto_submit, _publish = policy.deadlines(cycle["scheduled_for"], scheduled)
+        deadline = parse(str(cycle.get("m0_retry_deadline") or iso(auto_submit)))
+        backoff = (30, 60, 120, 300)[min(attempt - 1, 3)]
+        retry_at = min(utc_now() + timedelta(seconds=backoff), deadline)
+        if retry_at >= deadline:
+            return self.research_failed(cycle_id, f"M0 外部数据在恢复截止时间前仍不可用：{reason}")
+        current = self.store.transition(
+            cycle_id, "m0_retry_wait", m0_retry_at=iso(retry_at),
+            m0_retry_deadline=iso(deadline), m0_retry_attempt=attempt,
+            m0_last_error=str(reason)[:2000],
+        )
+        self.emit(current, "research.retry_waiting", {
+            "cycle": current, "reason": self._user_fault_message(reason, "M0"),
+            "diagnostic_code": self._diagnostic_code(reason), "attempt": attempt,
+            "retry_at": current["m0_retry_at"], "deadline": current["m0_retry_deadline"],
+        })
+        return current
 
     def research_failed(self, cycle_id: str, reason: str, *, details: dict[str, Any] | None = None) -> dict[str, Any]:
         message = self._stage_failure_message("M0", reason, details)
@@ -568,7 +594,7 @@ class CompanionEngine:
             return self._projection(cycle)
         if cycle["state"] == "queued" and cycle["task_key"] != "daily.opportunity.0900":
             raise ValueError("pre-M0 messages belong to the daily opportunity cycle")
-        if cycle["state"] in {"researching_m0", "failed", "missed"}:
+        if cycle["state"] in {"researching_m0", "m0_retry_wait", "failed", "missed"}:
             raise ValueError("messages can only be staged after M0 is ready")
         # A blocked message is never persisted in a memory candidate or sent to
         # a later research packet.  The user can remove the secret and retry.

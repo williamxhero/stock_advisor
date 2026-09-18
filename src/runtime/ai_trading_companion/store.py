@@ -136,6 +136,8 @@ class CompanionStore:
               h0_artifact_id TEXT, has_h0 INTEGER NOT NULL DEFAULT 0,
               m1_started_at TEXT, m1_completed_at TEXT, m2_started_at TEXT, m2_completed_at TEXT,
               m1_reserve_seconds INTEGER, timing_policy_version INTEGER,
+              m0_retry_at TEXT, m0_retry_deadline TEXT, m0_retry_attempt INTEGER NOT NULL DEFAULT 0,
+              m0_last_error TEXT,
               private_context_json TEXT, private_context_sha256 TEXT, private_context_frozen_at TEXT,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
               UNIQUE(task_key, scheduled_for, revision));
@@ -441,6 +443,10 @@ class CompanionStore:
                 "evidence_contract_version": "INTEGER",
                 "evidence_contract_hash": "TEXT",
                 "evidence_contract_json": "TEXT",
+                "m0_retry_at": "TEXT",
+                "m0_retry_deadline": "TEXT",
+                "m0_retry_attempt": "INTEGER NOT NULL DEFAULT 0",
+                "m0_last_error": "TEXT",
             }.items():
                 if name not in cycle_columns:
                     c.execute(f"ALTER TABLE companion_cycle ADD COLUMN {name} {declaration}")
@@ -878,9 +884,10 @@ class CompanionStore:
                 """SELECT c.* FROM companion_cycle c
                    LEFT JOIN schedule_worker_claim w ON w.cycle_id=c.cycle_id
                    LEFT JOIN companion_cycle_visibility visibility ON visibility.cycle_id=c.cycle_id
-                   WHERE c.state='queued' AND w.cycle_id IS NULL AND visibility.cycle_id IS NULL
-                     AND COALESCE(c.work_start_at,c.scheduled_for) <= ?
-                   ORDER BY COALESCE(c.work_start_at,c.scheduled_for),c.created_at LIMIT ?""", (due_at, available)
+                   WHERE w.cycle_id IS NULL AND visibility.cycle_id IS NULL
+                     AND ((c.state='queued' AND COALESCE(c.work_start_at,c.scheduled_for) <= ?)
+                       OR (c.state='m0_retry_wait' AND c.m0_retry_at IS NOT NULL AND julianday(c.m0_retry_at) <= julianday(?)))
+                   ORDER BY COALESCE(c.m0_retry_at,c.work_start_at,c.scheduled_for),c.created_at LIMIT ?""", (due_at, due_at, available)
             ).fetchall()
             for row in rows:
                 c.execute("INSERT INTO schedule_worker_claim(cycle_id,claimed_at) VALUES(?,?)", (row["cycle_id"], claimed_at))
@@ -1064,7 +1071,7 @@ class CompanionStore:
                                   ORDER BY
                                       CASE WHEN c.work_start_at IS NOT NULL THEN 1 ELSE 0 END DESC,
                                       CASE WHEN c.state IN (
-                                          'queued','researching_m0','awaiting_h0','voice_grace',
+                                          'queued','researching_m0','m0_retry_wait','awaiting_h0','voice_grace',
                                           'h0_locked','researching_m1','judging_m1','m1_retry_wait',
                                           'synthesizing_m2','m2_deferred'
                                       ) THEN 1 ELSE 0 END DESC,
@@ -1231,6 +1238,7 @@ class CompanionStore:
             "as_of","human_deadline","voice_grace_deadline","m0_revealed_at","codex_session_id","packet_hash",
             "m1_publish_deadline","h0_auto_submit_at","h0_locked_at","h0_artifact_id","has_h0",
             "m1_started_at","m1_completed_at","m2_started_at","m2_completed_at",
+            "m0_retry_at","m0_retry_deadline","m0_retry_attempt","m0_last_error",
             "m1_reserve_seconds","timing_policy_version",
             "kind","work_start_at","private_context_json","private_context_sha256","private_context_frozen_at",
         }

@@ -123,6 +123,26 @@ def _is_expression_rejection(exc: Exception) -> bool:
     )
 
 
+def _m0_failure_is_retryable(exc: Exception) -> bool:
+    """Recognize provider availability gaps without retrying bad judgments forever."""
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, BrokerError):
+        return exc.category not in {
+            "broker_effort_unsupported", "broker_authentication", "broker_forbidden",
+            "broker_secret_rejected", "broker_output_invalid", "broker_protocol",
+        }
+    verifier = getattr(exc, "verifier", None)
+    haystack = " ".join(
+        str(value) for value in (str(exc), verifier) if value is not None
+    ).lower()
+    return any(marker in haystack for marker in (
+        "portfolio_market_state", "tool_process_failed", "tool_network_transient",
+        "network read failed", "upstream http 5", "no quote for required trading date",
+        "no previous close", "circuit_open", "provider unavailable", "temporarily unavailable",
+    ))
+
+
 def _m1_expression_invariants(exc: Exception) -> dict[str, Any] | None:
     """Keep a repair on the same decision while allowing its prose to change."""
     candidate = getattr(exc, "output", None)
@@ -1459,6 +1479,12 @@ def run_research(
                 salvageable_output, salvageable_verifier,
             )
             if isinstance(exc, EvidenceInsufficient):
+                if _m0_failure_is_retryable(exc):
+                    current = engine.research_waiting(cycle["cycle_id"], str(exc))
+                    publish_observatory_forecast(store, cycle["cycle_id"], trigger="stage:m0_retry_wait")
+                    if on_progress:
+                        on_progress()
+                    return current
                 engine.research_failed(cycle["cycle_id"], str(exc), details=exc.verifier)
                 publish_observatory_evaluation(store, cycle["cycle_id"])
                 if on_progress:
@@ -1490,6 +1516,12 @@ def run_research(
                 )
                 publish_observatory_evaluation(store, cycle["cycle_id"])
                 return ready
+            if _m0_failure_is_retryable(exc):
+                current = engine.research_waiting(cycle["cycle_id"], str(exc))
+                publish_observatory_forecast(store, cycle["cycle_id"], trigger="stage:m0_retry_wait")
+                if on_progress:
+                    on_progress()
+                return current
             engine.research_failed(cycle["cycle_id"], str(exc))
             publish_observatory_evaluation(store, cycle["cycle_id"])
             if on_progress:
@@ -2228,7 +2260,7 @@ def run_scheduled_cycle(
 ) -> dict[str, Any]:
     cycle = store.get_cycle(cycle_id)
     try:
-        if cycle["state"] != "queued":
+        if cycle["state"] not in {"queued", "m0_retry_wait"}:
             return cycle
         snapshot = json.loads(cycle.get("schedule_snapshot_json") or "{}")
         if snapshot:
@@ -2244,6 +2276,8 @@ def run_scheduled_cycle(
                 _prefetch_market_breadth()
                 return cycle
         result = run_research(engine, store, cycle, execute, lambda: flush(store, exchange))
+        if result["state"] == "m0_retry_wait":
+            return result
         process_h0_cognition(engine, store, portfolio, cycle_id, execute)
         return result
     except ValueError as exc:

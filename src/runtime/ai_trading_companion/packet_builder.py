@@ -702,7 +702,7 @@ class RuntimePacketBuilder:
             source.get(field)
             for source in evidence.get("sources") or []
             if isinstance(source, dict)
-            for field in ("fact_as_of", "known_at", "observed_at", "published_at")
+            for field in ("fact_as_of", "published_at")
         )
         for value in values:
             if not value:

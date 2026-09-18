@@ -23,6 +23,7 @@ from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.evidence_gate import EvidenceGate, EvidenceInsufficient
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.local_research import BrokerResearchPlanner
+from ai_trading_companion.packet_builder import RuntimePacketBuilder
 from ai_trading_companion.router import CognitiveRouter
 from ai_trading_companion.stage_expression import express_stage_semantics, safe_stage_output
 from ai_trading_companion.runtime_strategy_policy import RuntimeStrategyControls
@@ -365,14 +366,19 @@ class EvidenceV3Tests(TestCase):
             _m1_research_as_of({"as_of": "2026-08-31T05:25:57Z"}, None),
         )
 
-    def test_m1_visibility_cutoff_includes_source_acquisition_after_fact_clock(self):
-        self.assertEqual(
-            "2026-08-31T05:26:03Z",
-            _m1_research_as_of({
-                "as_of": "2026-08-31T05:25:57Z",
-                "sources": [{"known_at": "2026-08-31T05:26:03Z"}],
-            }, None),
-        )
+    def test_m1_allows_source_acquisition_after_its_frozen_fact_clock(self):
+        evidence = {
+            "as_of": "2026-08-31T05:25:57Z",
+            "sources": [{
+                "evidence_ref": "m0-source",
+                "fact_as_of": "2026-08-31T05:25:57Z",
+                "known_at": "2026-08-31T05:26:03Z",
+            }],
+        }
+
+        validated = RuntimePacketBuilder._validated_m1_evidence(evidence, "2026-08-31T05:25:57Z")
+
+        self.assertEqual("m0-source", validated["sources"][0]["evidence_ref"])
 
     def test_1430_contract_requires_fresh_intraday_market_and_event_evidence(self):
         contract = EvidenceContractFactory(_WeekdayCalendar()).build(

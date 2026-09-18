@@ -1017,6 +1017,55 @@ class ToolRunnerTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_official_close_index_uses_historical_daily_endpoint(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path.startswith("/index"):
+                    body = (
+                        'v_sh000001="1~上证指数~000001~3890.0~3875.0~~~~~~~~~~~~20260918093300";\n'
+                        'v_sz399001="51~深证成指~399001~14020.0~13872.0~~~~~~~~~~~~20260918093300";\n'
+                    ).encode("gb18030")
+                    content_type = "text/plain; charset=gb18030"
+                else:
+                    body = json.dumps({"data": {
+                        "sh000001": {"day": [["2026-09-16", "3900", "3880", "3910", "3870", "1"], ["2026-09-17", "3880", "3875.6", "3890", "3860", "1"]]},
+                        "sz399001": {"day": [["2026-09-16", "14100", "14000", "14120", "13900", "1"], ["2026-09-17", "14000", "13872.38", "14020", "13800", "1"]]},
+                    }}).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            ensure_builtin_tools(root)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                result = ToolRunner(ToolCatalog(root)).resolve_with_fallback(FactRequest(
+                    1, "cn_market_index_batch", "2026-09-17T07:00:00Z", 4.0,
+                    {
+                        "symbols": ["000001", "399001"],
+                        "index_url": f"{base}/index?q=",
+                        "tencent_daily_url": f"{base}/daily?param=",
+                    }, finality="official_close",
+                ))
+
+                self.assertTrue(result.succeeded, result.error_code)
+                self.assertEqual("2026-09-17T07:00:00Z", result.fact_as_of)
+                self.assertEqual([3875.6, 13872.38], [item["price"] for item in result.data["indices"]])
+                self.assertEqual([3880.0, 14000.0], [item["previous_close"] for item in result.data["indices"]])
+                self.assertEqual("tencent_daily", result.data["source"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_current_equity_bar_rejects_a_stale_observation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "tools"

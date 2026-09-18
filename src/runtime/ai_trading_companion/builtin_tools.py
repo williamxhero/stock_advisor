@@ -679,9 +679,56 @@ def frozen_minute(symbol: dict[str, str], required_at: str, minute_endpoint: obj
     return selected[1], selected[0].astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"), source_url
 
 
+def frozen_daily(
+    symbol: dict[str, str], required_at: str, daily_endpoint: object = None,
+) -> tuple[float, float, str, str]:
+    """Read a historical close by trading date, independent of the live tape."""
+    try:
+        cutoff = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(
+            dt.timezone(dt.timedelta(hours=8)),
+        )
+    except ValueError:
+        fail(64, "required_at must be an ISO timestamp")
+    start = cutoff.date() - dt.timedelta(days=14)
+    base = str(daily_endpoint or "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=")
+    param = f"{symbol['vendor_symbol']},day,{start.isoformat()},{cutoff.date().isoformat()},20,qfq"
+    source_url, body = fetch(base.replace("{symbol}", param) if "{symbol}" in base else base + param)
+    try:
+        payload = json.loads(body)
+        series = payload["data"][symbol["vendor_symbol"]]
+        rows = series.get("qfqday") or series.get("day")
+    except (KeyError, TypeError, json.JSONDecodeError):
+        fail(75, "daily response is not a valid historical quote")
+    selected: tuple[dt.date, float, float] | None = None
+    previous: tuple[dt.date, float] | None = None
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, list) or len(row) < 3:
+            continue
+        try:
+            day = dt.date.fromisoformat(str(row[0]))
+            close = float(row[2])
+        except (TypeError, ValueError):
+            continue
+        if close <= 0 or day > cutoff.date():
+            continue
+        if day == cutoff.date():
+            selected = (day, close, 0.0)
+        elif selected is None or day < selected[0]:
+            previous = (day, close)
+    if selected is None:
+        fail(75, "daily response has no quote for required trading date")
+    if previous is None:
+        fail(75, "daily response has no previous close")
+    quote_at = dt.datetime.combine(selected[0], dt.time(15, 0), cutoff.tzinfo)
+    return (
+        selected[1], previous[1], quote_at.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        source_url,
+    )
+
+
 def frozen_minute_payload(
     spot: dict[str, object], symbols: list[dict[str, str]], required_at: str, kind: str,
-    minute_endpoint: object = None, *, finality: str = "intraday",
+    minute_endpoint: object = None, *, finality: str = "intraday", daily_endpoint: object = None,
 ) -> tuple[dict[str, object], str]:
     field = "quotes" if kind == "equity" else "indices"
     records = {str(item.get("symbol") or ""): dict(item) for item in spot.get(field, []) if isinstance(item, dict)}
@@ -692,7 +739,14 @@ def frozen_minute_payload(
         item = records.get(symbol["symbol"])
         if item is None:
             fail(75, "spot quote is missing a requested symbol")
-        price, quote_at, source_url = frozen_minute(symbol, required_at, minute_endpoint)
+        use_daily_close = finality == "official_close" and (
+            daily_endpoint is not None or minute_endpoint is None
+        )
+        if use_daily_close:
+            price, previous_close, quote_at, source_url = frozen_daily(symbol, required_at, daily_endpoint)
+        else:
+            price, quote_at, source_url = frozen_minute(symbol, required_at, minute_endpoint)
+            previous_close = float(item.get("previous_close") or 0)
         moment = dt.datetime.fromisoformat(quote_at.replace("Z", "+00:00")).astimezone(dt.timezone(dt.timedelta(hours=8)))
         close_required = finality in {"close", "official_close"}
         session_closed = moment.time() >= dt.time(15, 0)
@@ -701,11 +755,12 @@ def frozen_minute_payload(
         item.update({
             "price": price, "quote_at": quote_at,
             "trading_date": moment.date().isoformat(),
-            "status": "closed" if session_closed else "trading", "source": "tencent_minute",
+            "status": "closed" if session_closed else "trading",
+            "source": "tencent_daily" if use_daily_close else "tencent_minute",
         })
-        previous_close = float(item.get("previous_close") or 0)
         if previous_close <= 0:
             fail(75, "minute quote has no valid previous close")
+        item["previous_close"] = previous_close
         item["change"] = round(price - previous_close, 4)
         item["change_percent"] = round((price - previous_close) / previous_close * 100, 4)
         frozen.append(item)
@@ -714,8 +769,9 @@ def frozen_minute_payload(
         source_evidence.append({"url": source_url, "fact_as_of": quote_at, "data": {field: [item], "finality": finality}})
     if latest is None:
         fail(75, "minute response has no usable quotes")
+    source = "tencent_daily" if use_daily_close else "tencent_minute"
     return {
-        field: frozen, "finality": finality, "source": "tencent_minute",
+        field: frozen, "finality": finality, "source": source,
         "source_urls": [str(item["url"]) for item in source_evidence], "source_evidence": source_evidence,
     }, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -2068,6 +2124,7 @@ def main() -> None:
             payload, fact_as_of = frozen_minute_payload(
                 payload, normalized, str(request.get("required_at") or ""), "equity",
                 inputs.get("tencent_minute_url"), finality=finality,
+                daily_endpoint=inputs.get("tencent_daily_url"),
             )
         result(payload, fact_as_of=fact_as_of)
         return
@@ -2127,6 +2184,7 @@ def main() -> None:
             payload, fact_as_of = frozen_minute_payload(
                 payload, normalized, str(request.get("required_at") or ""), "index",
                 inputs.get("tencent_minute_url"), finality=finality,
+                daily_endpoint=inputs.get("tencent_daily_url"),
             )
         result(payload, fact_as_of=fact_as_of)
         return

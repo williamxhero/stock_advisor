@@ -106,6 +106,25 @@ class ToolRunnerTests(unittest.TestCase):
                 "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
             }, official_manifest["egress"])
 
+    def test_builtin_upgrade_expands_managed_quote_routing_when_new_adapter_is_added(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "tools"
+            routing = root / "cn_equity_quote_batch" / "routing.json"
+            routing.parent.mkdir(parents=True)
+            routing.write_text(json.dumps({
+                "contract": "ai-trading-tool-routing/v1",
+                "candidates": [
+                    {"adapter": "tencent", "version": "1.1.20"},
+                    {"adapter": "sina", "version": "1.1.20"},
+                ],
+            }), encoding="utf-8")
+
+            ensure_builtin_tools(root)
+
+            selected = json.loads(routing.read_text(encoding="utf-8"))
+            self.assertEqual(["tencent", "sina", "eastmoney"], [row["adapter"] for row in selected["candidates"]])
+            self.assertTrue(all(row["version"] == "1.1.21" for row in selected["candidates"]))
+
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
         version_root = root / capability / "versions" / "1.0.0"
         version_root.mkdir(parents=True)

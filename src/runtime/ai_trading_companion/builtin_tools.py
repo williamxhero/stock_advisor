@@ -156,11 +156,13 @@ def _routing_is_managed_builtin(
     except json.JSONDecodeError:
         return False
     candidates = selected.get("candidates") if isinstance(selected, dict) else None
+    candidate_adapters = {
+        str(row.get("adapter") or "") for row in candidates if isinstance(row, dict)
+    }
     return bool(
         selected.get("contract") == "ai-trading-tool-routing/v1"
         and isinstance(candidates, list)
-        and {str(row.get("adapter") or "") for row in candidates if isinstance(row, dict)}
-        in (adapters, *legacy_adapter_sets)
+        and (candidate_adapters in (adapters, *legacy_adapter_sets) or candidate_adapters < adapters)
         and all(row.get("version") in _PREVIOUS_BUILTIN_VERSIONS for row in candidates if isinstance(row, dict))
     )
 

@@ -1073,6 +1073,29 @@ Protocol: OpportunityDiscovery-v1.3
         self.assertIn("输出格式配置错误", payload["reason"])
         self.assertNotIn("C:\\Users", payload["reason"])
 
+    def test_stale_m1_failure_cannot_revert_a_published_m1(self):
+        self.ready()
+        self.engine.command({"command_id": "commit-published", "cycle_id": self.cycle["cycle_id"], "type": "skip_h0"})
+        self.engine.m1_judgment_started(self.cycle["cycle_id"])
+        self.publish_m1("独立判断已经发布。")
+
+        result = self.engine.m1_failed(self.cycle["cycle_id"], "stale worker failed", retryable=False)
+
+        self.assertEqual("complete", result["state"])
+        self.assertFalse(any(event["event_type"] == "m1.failed" for event in self.store.pending_events()))
+
+    def test_repair_resume_restores_already_published_m1_without_republishing(self):
+        self.ready()
+        self.engine.command({"command_id": "commit-recover", "cycle_id": self.cycle["cycle_id"], "type": "skip_h0"})
+        self.engine.m1_judgment_started(self.cycle["cycle_id"])
+        self.publish_m1("独立判断已经发布。")
+        self.store.transition(self.cycle["cycle_id"], "waiting_for_repair")
+
+        result = self.engine.resume_m1_after_repair(self.cycle["cycle_id"])
+
+        self.assertEqual("complete", result["state"])
+        self.assertFalse(any(event["event_type"] == "m1.repair_retrying" for event in self.store.pending_events()))
+
     def test_m1_local_verifier_failure_has_an_honest_user_category(self):
         self.ready()
         self.engine.command({"command_id": "commit-verifier", "cycle_id": self.cycle["cycle_id"], "type": "commit_h0"})

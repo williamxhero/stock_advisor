@@ -735,6 +735,15 @@ class CompanionEngine:
         cycle = self.store.get_cycle(cycle_id)
         if cycle["state"] != "waiting_for_repair":
             return cycle
+        published = self.store.latest_artifact(cycle_id, "m1")
+        if published is not None:
+            snapshots = [row for row in self.store.judgment_snapshots(cycle_id) if row.get("kind") == "m1"]
+            qualified = bool(json.loads(snapshots[-1]["snapshot_json"]).get("qualified")) if snapshots else False
+            state = "synthesizing_m2" if bool(cycle.get("has_h0")) and qualified else "complete"
+            return self.store.transition(
+                cycle_id, state,
+                m1_completed_at=cycle.get("m1_completed_at") or published["sealed_at"],
+            )
         cycle = self.store.transition(cycle_id, "m1_retry_wait")
         self.emit(cycle, "m1.repair_retrying", {"cycle": cycle})
         return cycle
@@ -968,6 +977,11 @@ class CompanionEngine:
         return "\n\n".join(sections)
 
     def m1_failed(self, cycle_id: str, reason: str, *, retryable: bool, details: dict[str, Any] | None = None) -> dict[str, Any]:
+        # A second worker can finish after M1 has already been sealed.  A
+        # failure from that stale worker must never roll the published result
+        # back into repair state or append a contradictory fault message.
+        if self.store.latest_artifact(cycle_id, "m1") is not None:
+            return self.store.get_cycle(cycle_id)
         diagnostic_code = self._verifier_diagnostic_code(details) or self._diagnostic_code(str(reason))
         cycle = self.store.transition(cycle_id, "m1_retry_wait" if retryable else "waiting_for_repair")
         if retryable:

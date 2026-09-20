@@ -11,8 +11,10 @@ foreach ($required in @(
     'resources\schedules\tasks.json',
     'resources\contracts\companion-client-event-v1.schema.json',
     'resources\contracts\companion-decision-cycle-v1.schema.json',
+    'resources\contracts\evidence-snapshot-spec-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
+    'runtime\ai_trading_companion\evidence_snapshot.py',
     'runtime\ai_trading_companion\message_presentation.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'

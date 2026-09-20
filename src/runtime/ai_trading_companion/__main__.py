@@ -1306,6 +1306,38 @@ def _latest_json_artifact_before(
         return None
 
 
+def _evidence_snapshot_for_artifact(
+    store: CompanionStore,
+    cycle: dict[str, Any],
+    artifact: dict[str, Any] | None,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve the Runtime-owned baseline identity behind an evidence artifact."""
+    if artifact:
+        try:
+            metadata = json.loads(artifact.get("metadata_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+        snapshot_id = str(metadata.get("evidence_snapshot_id") or "")
+        if snapshot_id:
+            snapshot = store.evidence_snapshot(snapshot_id)
+            if snapshot is not None:
+                if snapshot["baseline"] != evidence:
+                    raise ValueError("evidence artifact does not match its immutable snapshot baseline")
+                return snapshot
+    # This path is for pre-snapshot databases and interrupted migrations.  It
+    # is deterministic for the visible artifact and immediately becomes the
+    # new immutable baseline for subsequent M1 packets.
+    return store.create_evidence_snapshot(
+        cycle["cycle_id"], evidence,
+        as_of=str(evidence.get("as_of") or cycle["as_of"]),
+        source_watermarks={"legacy_artifact": {
+            "artifact_id": str(artifact.get("artifact_id") if artifact else ""),
+            "sha256": str(artifact.get("body_sha256") if artifact else ""),
+        }},
+    )
+
+
 def _fixture_attempt(store: CompanionStore, cycle_id: str, stage: str, packet_hash: str, output: dict[str, Any]) -> str:
     attempt = store.begin_attempt(cycle_id, stage, iso(datetime.now(timezone.utc)), packet_hash, runner_fingerprint="fixture-v1")
     store.finish_attempt(attempt["attempt_id"], "succeeded", output=output, verifier={"passed": True, "problems": [], "fixture": True})
@@ -1395,7 +1427,11 @@ def run_research(
         if on_progress:
             on_progress()
         evidence = {"as_of": cycle["as_of"], "spoken_summary": "Fixture 模式：等待真实公开信息搜索。", "sources": [], "critical_gaps": []}
-        store.append_artifact(cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False), cycle["as_of"])
+        snapshot = store.create_evidence_snapshot(cycle["cycle_id"], evidence, as_of=cycle["as_of"], source_watermarks={"fixture": "fixture-v1"})
+        store.append_artifact(
+            cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False), cycle["as_of"],
+            {"public_only": True, "evidence_snapshot_id": snapshot["snapshot_id"], "evidence_snapshot_hash": snapshot["content_hash"]},
+        )
         evidence_hash = "fixture-m0-research"
         compose_hash = "fixture-m0-compose"
         result = engine.research_ready(
@@ -1464,10 +1500,29 @@ def run_research(
                 evidence_attempt_id = evidence_stage.attempt_id
                 store.save_stage_checkpoint(cycle["cycle_id"], "m0_research", public_packet["sha256"], evidence_attempt_id, evidence)
                 store.record_evidence(cycle, "m0_research", evidence)
-                store.append_artifact(
-                    cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False),
-                    evidence.get("as_of") or cycle["as_of"], {"public_only": True, "attempt_id": evidence_attempt_id},
-                )
+            if evidence is not None:
+                evidence_artifact = store.latest_artifact(cycle["cycle_id"], "evidence")
+                artifact_matches = False
+                if evidence_artifact is not None:
+                    try:
+                        artifact_matches = json.loads(evidence_artifact["body_markdown"]) == evidence
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        artifact_matches = False
+                if not artifact_matches:
+                    evidence_artifact_snapshot = store.latest_evidence_snapshot(cycle["cycle_id"])
+                    if evidence_artifact_snapshot is None or evidence_artifact_snapshot["baseline"] != evidence:
+                        evidence_artifact_snapshot = store.create_evidence_snapshot(
+                            cycle["cycle_id"], evidence, as_of=str(evidence.get("as_of") or cycle["as_of"]),
+                            source_watermarks={"replayed_evidence_artifact": public_packet["sha256"]},
+                        )
+                    store.append_artifact(
+                        cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False),
+                        evidence.get("as_of") or cycle["as_of"], {
+                            "public_only": True, "attempt_id": evidence_attempt_id,
+                            "evidence_snapshot_id": evidence_artifact_snapshot["snapshot_id"],
+                            "evidence_snapshot_hash": evidence_artifact_snapshot["content_hash"],
+                        },
+                    )
             local_packet = finalize_stage_packet(
                 builder.build(cycle, "m0_compose", evidence=evidence), compose_controls,
             )
@@ -1573,12 +1628,21 @@ def run_m1(
         return result
 
     policy = TASK_POLICIES[cycle["task_key"]]
-    prior_evidence = _latest_json_artifact_before(store, cycle_id, "evidence", cycle["as_of"]) or {}
+    prior_evidence_artifact = store.latest_artifact_before(cycle_id, "evidence", cycle["as_of"])
+    prior_evidence = {}
+    if prior_evidence_artifact:
+        try:
+            prior_evidence = json.loads(prior_evidence_artifact["body_markdown"])
+        except json.JSONDecodeError:
+            prior_evidence = {}
     if not prior_evidence:
         raise EvidenceInsufficient({
             "passed": False, "problems": ["frozen_m0_evidence_missing"],
             "missing_requirements": ["current_market_state", "material_events_and_counterevidence"],
         })
+    frozen_evidence_snapshot = _evidence_snapshot_for_artifact(
+        store, cycle, prior_evidence_artifact, prior_evidence,
+    )
     research_as_of = _m1_research_as_of(prior_evidence, frozen_as_of)
     research_timeout = int(policy.research_timeout.total_seconds())
     research_controls = resolve_stage_controls(
@@ -1615,7 +1679,12 @@ def run_m1(
             store.append_artifact(
                 cycle_id, "m1_evidence", "runtime", json.dumps(evidence, ensure_ascii=False),
                 str(evidence.get("as_of") or research_as_of),
-                {"public_only": True, "attempt_id": evidence_attempt_id, "reused_from": "m0_research"},
+                {
+                    "public_only": True, "attempt_id": evidence_attempt_id,
+                    "reused_from": "m0_research",
+                    "evidence_snapshot_id": frozen_evidence_snapshot["snapshot_id"],
+                    "evidence_snapshot_hash": frozen_evidence_snapshot["content_hash"],
+                },
             )
     except Exception as exc:
         details = getattr(exc, "verifier", None)

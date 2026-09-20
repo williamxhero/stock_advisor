@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "EvidenceSnapshotSpec/v1",
+  "title": "Runtime EvidenceSnapshotSpec/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "snapshot_id", "cycle_id", "as_of", "source_watermarks", "schema_version", "content_hash", "included_sources", "baseline", "version"],
+  "properties": {
+    "contract": {"const": "EvidenceSnapshotSpec/v1"},
+    "snapshot_id": {"type": "string", "minLength": 1},
+    "cycle_id": {"type": "string", "minLength": 1},
+    "as_of": {"type": "string", "minLength": 1},
+    "source_watermarks": {"type": "object"},
+    "schema_version": {"const": 1},
+    "content_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "included_sources": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "baseline": {"type": "object"},
+    "version": {"type": "integer", "minimum": 1},
+    "parent_snapshot_id": {"type": "string", "minLength": 1}
+  }
+}

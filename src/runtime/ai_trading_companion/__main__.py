@@ -1464,9 +1464,15 @@ def run_research(
                 evidence_attempt_id = evidence_stage.attempt_id
                 store.save_stage_checkpoint(cycle["cycle_id"], "m0_research", public_packet["sha256"], evidence_attempt_id, evidence)
                 store.record_evidence(cycle, "m0_research", evidence)
+                evidence_snapshot = store.shared_evidence_snapshot(
+                    cycle["cycle_id"], as_of=str(evidence.get("as_of") or cycle["as_of"]),
+                )
                 store.append_artifact(
                     cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False),
-                    evidence.get("as_of") or cycle["as_of"], {"public_only": True, "attempt_id": evidence_attempt_id},
+                    evidence.get("as_of") or cycle["as_of"], {
+                        "public_only": True, "attempt_id": evidence_attempt_id,
+                        "evidence_snapshot_id": evidence_snapshot["snapshot_id"] if evidence_snapshot else None,
+                    },
                 )
             local_packet = finalize_stage_packet(
                 builder.build(cycle, "m0_compose", evidence=evidence), compose_controls,
@@ -1615,7 +1621,12 @@ def run_m1(
             store.append_artifact(
                 cycle_id, "m1_evidence", "runtime", json.dumps(evidence, ensure_ascii=False),
                 str(evidence.get("as_of") or research_as_of),
-                {"public_only": True, "attempt_id": evidence_attempt_id, "reused_from": "m0_research"},
+                {
+                    "public_only": True, "attempt_id": evidence_attempt_id, "reused_from": "m0_research",
+                    "evidence_snapshot_id": (
+                        store.shared_evidence_snapshot(cycle_id, as_of=str(evidence.get("as_of") or research_as_of)) or {}
+                    ).get("snapshot_id"),
+                },
             )
     except Exception as exc:
         details = getattr(exc, "verifier", None)

@@ -70,6 +70,15 @@ class RuntimePacketBuilder:
             "scheduled_for": cycle["scheduled_for"],
             "calendar_context": self._calendar_context(cycle["scheduled_for"]),
         }
+        # M0 composition and M1 research/judgment receive the exact same
+        # Runtime-owned baseline descriptor.  The descriptor contains only
+        # immutable ledger references and watermarks, so later chat evidence
+        # cannot silently alter an already frozen judgment input.
+        evidence_snapshot = self.store.shared_evidence_snapshot(
+            cycle["cycle_id"], as_of=packet_as_of,
+        )
+        if evidence_snapshot is not None:
+            packet["evidence_snapshot"] = evidence_snapshot
         if cycle.get("task_profile_json"):
             packet["task_profile"] = json.loads(cycle["task_profile_json"])
         memory_cards = self._memory_cards(cycle, stage, packet_as_of, evidence)

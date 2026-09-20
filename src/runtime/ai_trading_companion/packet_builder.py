@@ -17,6 +17,7 @@ from .trading_calendar import TradingCalendarUnavailable
 from .opportunities import is_premarket, OBSERVATION_INSTRUCTION, REVIEW_RESULT_INSTRUCTION
 from .cycle_contract import memory_boundary
 from .decision_cycle import assert_m1_blind
+from .evidence_snapshot import descriptor as evidence_snapshot_descriptor
 
 
 PUBLIC_STAGES = {"m0_research", "m1_research", "outcome_research", "chat_research"}
@@ -115,6 +116,10 @@ class RuntimePacketBuilder:
             else:
                 packet["evidence_requirements"] = self._evidence_requirements(cycle, stage)
             packet["public_research_scope"] = self._public_scope(cycle, stage, evidence, context, packet_as_of, memory_cards)
+            if stage == "m1_research" and evidence:
+                packet["evidence_snapshot"] = self._evidence_snapshot_descriptor(
+                    cycle, evidence, packet_as_of,
+                )
             if stage == "m0_research":
                 predecessor = self._formal_predecessor_context(cycle, packet_as_of)
                 if predecessor is not None:
@@ -132,6 +137,9 @@ class RuntimePacketBuilder:
                 packet["frozen_public_evidence"] = self._frozen_public_evidence_descriptor(
                     cycle, evidence, packet_as_of,
                 )
+                packet["evidence_snapshot"] = self._evidence_snapshot_descriptor(
+                    cycle, evidence, packet_as_of,
+                )
             packet["evidence"] = evidence or {}
             if stage in {"m1_judgment", "m2"} and cycle["task_key"] in {
                 "daily.execution.0945", "daily.execution.1030", "daily.execution.1430", "daily.review.1520",
@@ -146,6 +154,9 @@ class RuntimePacketBuilder:
                     )
                 )
                 packet["verified_fact_digest"] = self._verified_fact_digest(evidence or {})
+                packet["evidence_snapshot"] = self._evidence_snapshot_descriptor(
+                    cycle, evidence or {}, packet_as_of,
+                )
                 packet["m0_compose_requirements"] = {
                     "instruction": "Mention at most two portfolio entities, and only when they materially support the main market observation; do not enumerate the remaining holdings. If a quote detail is stated, use the frozen price, previous close, change, change percentage, quote time and trading status exactly as supplied by verified_fact_digest. Render quote time as `北京时间HH:MM` using quote_at_china; never interpret a UTC `Z` clock as China local time. Do not publish a claim that a listed entity is uncovered.",
                     "maximum_entities_to_mention": 2,
@@ -732,17 +743,52 @@ class RuntimePacketBuilder:
         artifact = self._matching_public_evidence_artifact(
             self.store.artifacts(cycle["cycle_id"]), evidence, packet_as_of,
         )
+        snapshot = self._evidence_snapshot_descriptor(cycle, evidence, packet_as_of)
         return {
             "artifact_id": artifact["artifact_id"] if artifact else None,
             "sha256": artifact["body_sha256"] if artifact else None,
             "as_of": evidence.get("as_of") or packet_as_of,
             "known_at": artifact.get("known_at") if artifact else None,
+            "snapshot_id": snapshot.get("snapshot_id"),
+            "content_hash": snapshot.get("content_hash"),
             "evidence_refs": [
                 str(source.get("evidence_ref"))
                 for source in evidence.get("sources") or []
                 if isinstance(source, dict) and source.get("evidence_ref")
             ],
         }
+
+    def _evidence_snapshot_descriptor(
+        self, cycle: dict[str, Any], evidence: dict[str, Any], packet_as_of: str,
+    ) -> dict[str, Any]:
+        """Return the immutable public baseline shared by M0 and M1."""
+        artifact = self._matching_public_evidence_artifact(
+            self.store.artifacts(cycle["cycle_id"]), evidence, packet_as_of,
+        )
+        snapshot = None
+        if artifact:
+            try:
+                metadata = json.loads(artifact.get("metadata_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            snapshot_id = str(metadata.get("evidence_snapshot_id") or "")
+            if snapshot_id:
+                snapshot = self.store.evidence_snapshot(snapshot_id)
+                if snapshot is not None and snapshot["baseline"] != evidence:
+                    raise ValueError("evidence artifact does not match its immutable snapshot baseline")
+        if snapshot is None:
+            # Upgrade an older artifact at the Runtime boundary.  The source
+            # artifact itself is the deterministic watermark for this legacy
+            # recovery path; the resulting row is still append-only.
+            snapshot = self.store.create_evidence_snapshot(
+                cycle["cycle_id"], evidence,
+                as_of=str(evidence.get("as_of") or packet_as_of),
+                source_watermarks={"legacy_artifact": {
+                    "artifact_id": str(artifact.get("artifact_id") if artifact else ""),
+                    "sha256": str(artifact.get("body_sha256") if artifact else ""),
+                }},
+            )
+        return evidence_snapshot_descriptor(snapshot)
 
     @staticmethod
     def _memory_query_text(evidence: dict[str, Any] | None) -> str:

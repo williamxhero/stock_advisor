@@ -21,6 +21,12 @@ from .cycle_contract import (
 from .evidence_qualification import VERSION as QUALIFICATION_VERSION
 from .evidence_qualification import qualify_record
 from .evidence_spec import VERSION, from_observation, validate
+from .evidence_snapshot import (
+    VERSION as EVIDENCE_SNAPSHOT_VERSION,
+    build_snapshot,
+    source_watermarks_from_observations,
+    validate_snapshot,
+)
 from .secret_guard import assert_safe
 from .decision_cycle import (
     DECISION_CYCLE_CONTRACT,
@@ -360,6 +366,21 @@ class CompanionStore:
               PRIMARY KEY(cycle_id,evidence_id,stage));
             CREATE INDEX IF NOT EXISTS ix_evidence_cycle_use_evidence
               ON evidence_cycle_use(evidence_id,cycle_id,used_at);
+            CREATE TABLE IF NOT EXISTS evidence_snapshot (
+              snapshot_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              as_of TEXT NOT NULL, schema_version INTEGER NOT NULL, version INTEGER NOT NULL,
+              parent_snapshot_id TEXT, source_watermarks_json TEXT NOT NULL,
+              included_sources_json TEXT NOT NULL, baseline_json TEXT NOT NULL,
+              content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+              UNIQUE(cycle_id, content_hash), UNIQUE(cycle_id, version));
+            CREATE INDEX IF NOT EXISTS ix_evidence_snapshot_cycle
+              ON evidence_snapshot(cycle_id, version, created_at);
+            CREATE TRIGGER IF NOT EXISTS evidence_snapshot_no_update
+              BEFORE UPDATE ON evidence_snapshot
+              BEGIN SELECT RAISE(ABORT, 'evidence snapshots are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS evidence_snapshot_no_delete
+              BEFORE DELETE ON evidence_snapshot
+              BEGIN SELECT RAISE(ABORT, 'evidence snapshots are immutable'); END;
             CREATE TABLE IF NOT EXISTS judgment_snapshot (
               snapshot_id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL UNIQUE,
               cycle_id TEXT NOT NULL, kind TEXT NOT NULL, snapshot_json TEXT NOT NULL,
@@ -556,6 +577,20 @@ class CompanionStore:
                 if name not in evidence_columns:
                     c.execute(f"ALTER TABLE evidence_ledger_entry ADD COLUMN {name} {declaration}")
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_evidence_content ON evidence_ledger_entry(trading_date,source_url,content_sha256)")
+            c.execute("""CREATE TABLE IF NOT EXISTS evidence_snapshot (
+              snapshot_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              as_of TEXT NOT NULL, schema_version INTEGER NOT NULL, version INTEGER NOT NULL,
+              parent_snapshot_id TEXT, source_watermarks_json TEXT NOT NULL,
+              included_sources_json TEXT NOT NULL, baseline_json TEXT NOT NULL,
+              content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+              UNIQUE(cycle_id, content_hash), UNIQUE(cycle_id, version))""")
+            c.execute("CREATE INDEX IF NOT EXISTS ix_evidence_snapshot_cycle ON evidence_snapshot(cycle_id, version, created_at)")
+            c.execute("""CREATE TRIGGER IF NOT EXISTS evidence_snapshot_no_update
+              BEFORE UPDATE ON evidence_snapshot
+              BEGIN SELECT RAISE(ABORT, 'evidence snapshots are immutable'); END""")
+            c.execute("""CREATE TRIGGER IF NOT EXISTS evidence_snapshot_no_delete
+              BEFORE DELETE ON evidence_snapshot
+              BEGIN SELECT RAISE(ABORT, 'evidence snapshots are immutable'); END""")
             c.execute(
                 """INSERT OR IGNORE INTO companion_message_batch(batch_id,cycle_id,phase,state,submitted_at,completed_at,response_artifact_id)
                    SELECT m.batch_id,m.cycle_id,m.phase,
@@ -3417,6 +3452,113 @@ class CompanionStore:
             raise ValueError("unknown router policy cell")
         return dict(row)
 
+    @staticmethod
+    def _snapshot_from_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        value = dict(row)
+        snapshot = {
+            "contract": EVIDENCE_SNAPSHOT_VERSION,
+            "snapshot_id": value["snapshot_id"],
+            "cycle_id": value["cycle_id"],
+            "as_of": value["as_of"],
+            "schema_version": int(value["schema_version"]),
+            "version": int(value["version"]),
+            "source_watermarks": json.loads(value["source_watermarks_json"]),
+            "included_sources": json.loads(value["included_sources_json"]),
+            "baseline": json.loads(value["baseline_json"]),
+            "content_hash": value["content_hash"],
+        }
+        if value.get("parent_snapshot_id"):
+            snapshot["parent_snapshot_id"] = value["parent_snapshot_id"]
+        validate_snapshot(snapshot)
+        return snapshot
+
+    def create_evidence_snapshot(
+        self,
+        cycle_id: str,
+        evidence: dict[str, Any],
+        *,
+        as_of: str,
+        observations: list[dict[str, Any]] | None = None,
+        source_watermarks: dict[str, Any] | None = None,
+        parent_snapshot_id: str | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        """Persist one immutable evidence baseline and return its identity.
+
+        Retries of the same baseline are idempotent.  A changed baseline gets
+        a new content hash, snapshot id, and monotonic version; no UPDATE or
+        replacement path exists for a published snapshot.
+        """
+        watermarks = (
+            source_watermarks_from_observations(observations)
+            if source_watermarks is None else source_watermarks
+        )
+
+        def save(c: sqlite3.Connection) -> dict[str, Any]:
+            current = c.execute(
+                "SELECT * FROM evidence_snapshot WHERE cycle_id=? ORDER BY version DESC LIMIT 1",
+                (cycle_id,),
+            ).fetchone()
+            version = int(current["version"]) + 1 if current else 1
+            parent = parent_snapshot_id or (str(current["snapshot_id"]) if current else None)
+            candidate = build_snapshot(
+                cycle_id=cycle_id, as_of=as_of, evidence=evidence,
+                source_watermarks=watermarks, parent_snapshot_id=parent, version=version,
+            )
+            existing = c.execute(
+                "SELECT * FROM evidence_snapshot WHERE cycle_id=? AND content_hash=?",
+                (cycle_id, candidate["content_hash"]),
+            ).fetchone()
+            if existing:
+                return self._snapshot_from_row(existing)
+            c.execute(
+                """INSERT INTO evidence_snapshot(
+                     snapshot_id,cycle_id,as_of,schema_version,version,parent_snapshot_id,
+                     source_watermarks_json,included_sources_json,baseline_json,content_hash,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    candidate["snapshot_id"], candidate["cycle_id"], candidate["as_of"],
+                    candidate["schema_version"], candidate["version"], candidate.get("parent_snapshot_id"),
+                    json.dumps(candidate["source_watermarks"], ensure_ascii=False, sort_keys=True),
+                    json.dumps(candidate["included_sources"], ensure_ascii=False, sort_keys=True),
+                    json.dumps(candidate["baseline"], ensure_ascii=False, sort_keys=True),
+                    candidate["content_hash"], now(),
+                ),
+            )
+            self.queue_event(
+                cycle_id, "evidence.snapshot.created", {
+                    "contract": EVIDENCE_SNAPSHOT_VERSION,
+                    "snapshot": {key: value for key, value in candidate.items() if key != "baseline"},
+                }, connection=c,
+            )
+            return candidate
+
+        if connection is not None:
+            return save(connection)
+        with self.connection() as c:
+            return save(c)
+
+    def evidence_snapshot(self, snapshot_id: str) -> dict[str, Any] | None:
+        with self.connection() as c:
+            row = c.execute("SELECT * FROM evidence_snapshot WHERE snapshot_id=?", (snapshot_id,)).fetchone()
+        return self._snapshot_from_row(row) if row else None
+
+    def evidence_snapshots(self, cycle_id: str) -> list[dict[str, Any]]:
+        with self.connection() as c:
+            rows = c.execute(
+                "SELECT * FROM evidence_snapshot WHERE cycle_id=? ORDER BY version,created_at,snapshot_id",
+                (cycle_id,),
+            ).fetchall()
+        return [self._snapshot_from_row(row) for row in rows]
+
+    def latest_evidence_snapshot(self, cycle_id: str) -> dict[str, Any] | None:
+        with self.connection() as c:
+            row = c.execute(
+                "SELECT * FROM evidence_snapshot WHERE cycle_id=? ORDER BY version DESC LIMIT 1",
+                (cycle_id,),
+            ).fetchone()
+        return self._snapshot_from_row(row) if row else None
+
     def record_evidence(
         self, cycle: dict[str, Any], stage: str, evidence: dict[str, Any],
         observations: list[dict[str, Any]] | None = None,
@@ -3542,6 +3684,13 @@ class CompanionStore:
                        VALUES(?,?,?,?)""",
                     (cycle["cycle_id"], evidence_id, stage, known_at),
                 )
+            # The baseline is created by Runtime from the same deterministic
+            # evidence result and acquisition receipts.  Model-provided
+            # snapshot identities are never accepted as authoritative.
+            self.create_evidence_snapshot(
+                cycle["cycle_id"], evidence, as_of=str(evidence.get("as_of") or cycle["as_of"]),
+                observations=observations or [], connection=c,
+            )
         return inserted
 
     def evidence_for_day(self, trading_date: str, known_at: str, *, limit: int = 120) -> list[dict[str, Any]]:

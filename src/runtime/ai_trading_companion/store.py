@@ -5,20 +5,23 @@ import json
 import re
 import sqlite3
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from .cycle_contract import (
-    CompanionDecisionCycleSpec,
     SPEC_VERSION,
+    CompanionDecisionCycleSpec,
     validate_m1_blind_packet,
     validate_state,
 )
+from .evidence_qualification import VERSION as QUALIFICATION_VERSION
+from .evidence_qualification import qualify_record
+from .evidence_spec import VERSION, from_observation, validate
 from .secret_guard import assert_safe
-from .evidence_spec import VERSION, from_observation, qualify, validate
 from .decision_cycle import (
     DECISION_CYCLE_CONTRACT,
     DECISION_CYCLE_STAGES,
@@ -27,7 +30,6 @@ from .decision_cycle import (
     validate_stage,
     validate_stage_state,
 )
-
 
 _USER_VISIBLE_CYCLE_SQL = """NOT (
   c.kind='manual'
@@ -348,7 +350,8 @@ class CompanionStore:
               stage TEXT, content_sha256 TEXT, coverage_state TEXT NOT NULL DEFAULT 'observed',
               evidence_kind TEXT NOT NULL DEFAULT 'news_disclosure',
               truth_status TEXT NOT NULL DEFAULT 'unknown', propagation_status TEXT NOT NULL DEFAULT 'unknown',
-              provenance_json TEXT NOT NULL DEFAULT '{}', evidence_spec_json TEXT NOT NULL DEFAULT '{}');
+              provenance_json TEXT NOT NULL DEFAULT '{}', evidence_spec_json TEXT NOT NULL DEFAULT '{}',
+              qualification_spec_json TEXT NOT NULL DEFAULT '{}');
             CREATE TABLE IF NOT EXISTS evidence_cycle_use (
               cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               evidence_id TEXT NOT NULL REFERENCES evidence_ledger_entry(evidence_id),
@@ -548,6 +551,7 @@ class CompanionStore:
                 "propagation_status": "TEXT NOT NULL DEFAULT 'unknown'",
                 "provenance_json": "TEXT NOT NULL DEFAULT '{}'",
                 "evidence_spec_json": "TEXT NOT NULL DEFAULT '{}'",
+                "qualification_spec_json": "TEXT NOT NULL DEFAULT '{}'",
             }.items():
                 if name not in evidence_columns:
                     c.execute(f"ALTER TABLE evidence_ledger_entry ADD COLUMN {name} {declaration}")
@@ -2435,7 +2439,7 @@ class CompanionStore:
 
         hidden_fault_episode_ids = [
             str(row["episode_id"]) for row in connection.execute(
-                f"""SELECT episode_id FROM companion_fault_episode
+                """SELECT episode_id FROM companion_fault_episode
                      WHERE cycle_id=?
                        AND current_artifact_id IN (
                          SELECT record_id FROM companion_operational_record_tombstone
@@ -3458,7 +3462,7 @@ class CompanionStore:
                 if not body:
                     continue
                 assert_safe(body, boundary="evidence fact storage")
-                fingerprint = digest("\n".join((url, title, body)))
+                fingerprint = digest(f"{url}\n{title}\n{body}")
                 evidence_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{trading_date}|{url}|{fingerprint}"))
                 spec = bound.get("evidence_spec")
                 if not isinstance(spec, dict):
@@ -3469,7 +3473,10 @@ class CompanionStore:
                         "acquired_at": known_at,
                     })
                 validate(spec)
-                qualification = qualify(spec)
+                qualification = qualify_record(
+                    spec, as_of=evidence.get("as_of"),
+                    source_refs=(ref, str(source.get("url") or "")),
+                )
                 metadata = {
                     "task_key": cycle["task_key"],
                     "factual_reliability": source.get("factual_reliability"),
@@ -3485,15 +3492,17 @@ class CompanionStore:
                     """INSERT OR IGNORE INTO evidence_ledger_entry(
                          evidence_id,trading_date,cycle_id,source_url,source_title,body_text,
                          occurred_at,known_at,metadata_json,stage,content_sha256,coverage_state,
-                         evidence_kind,truth_status,propagation_status,provenance_json,evidence_spec_json)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         evidence_kind,truth_status,propagation_status,provenance_json,evidence_spec_json,
+                         qualification_spec_json)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (evidence_id, trading_date, cycle["cycle_id"], url, title, body,
                      spec.get("occurred_at"), spec.get("known_at") or known_at,
                      json.dumps(metadata, ensure_ascii=False, sort_keys=True), stage, fingerprint,
                      "observed", spec["kind"], spec["truth_status"],
                      spec["market_propagation"]["status"],
                      json.dumps(spec["provenance"], ensure_ascii=False, sort_keys=True),
-                     json.dumps(spec, ensure_ascii=False, sort_keys=True)),
+                     json.dumps(spec, ensure_ascii=False, sort_keys=True),
+                     json.dumps(qualification, ensure_ascii=False, sort_keys=True)),
                 ).rowcount
                 if changed:
                     inserted.append(evidence_id)
@@ -3502,6 +3511,7 @@ class CompanionStore:
                             "contract": VERSION, "evidence_id": evidence_id,
                             "cycle_id": cycle["cycle_id"], "stage": stage,
                             "record": spec, "qualification": qualification,
+                            "qualification_contract": QUALIFICATION_VERSION,
                         }, connection=c,
                     )
                 c.execute(

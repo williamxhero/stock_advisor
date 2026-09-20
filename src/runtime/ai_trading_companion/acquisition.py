@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .secret_guard import find_secrets
+from .evidence_qualification import qualify_record
 from .evidence_spec import from_observation
+from .secret_guard import find_secrets
 
 
 class AcquisitionBoundary:
@@ -74,6 +75,8 @@ class AcquisitionBoundary:
                 "known_at": acquired_at,
                 "evidence_kind": str(row.get("evidence_kind") or ""),
                 "source_reference": source_reference,
+                "screenshot_only": bool(row.get("screenshot_only")),
+                "source_strength": str(row.get("source_strength") or ""),
                 "propagation_impact": row.get("propagation_impact") if isinstance(row.get("propagation_impact"), dict) else {},
                 "propagation_observed_from": row.get("propagation_observed_from"),
                 "propagation_observed_to": row.get("propagation_observed_to"),
@@ -94,6 +97,9 @@ class AcquisitionBoundary:
         }
         for item in evidence_items:
             item["evidence_spec"] = from_observation(item, observation)
+            item["evidence_qualification"] = qualify_record(
+                item["evidence_spec"], source_refs=(item["evidence_ref"],)
+            )
         model_result = {"backend": str(result.get("backend") or name), "results": model_rows}
         if not model_rows and result.get("text"):
             model_result["text"] = str(result.get("text"))[:8000]

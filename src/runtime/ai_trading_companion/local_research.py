@@ -16,6 +16,8 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from .acquisition import AcquisitionBoundary
+from .evidence_qualification import qualify_record
+from .evidence_spec import from_observation
 from .evidence_gate import EvidenceGate
 from .broker_client import BrokerError, BrokerRequest, ProviderBrokerClient, canonical_packet_hash
 from .market_breadth_cache import MarketBreadthSnapshotCache
@@ -889,6 +891,7 @@ class LocalResearchChain:
                 )
                 _discard_unreadable_document_items(observation)
                 _normalize_public_read_fact_time(observation, contract, row["requirement_key"])
+                _refresh_evidence_specs(observation)
                 observation["backend"] = backend
                 _finish_tool_timing(observation, tool_started_at, tool_started_clock)
                 self._register_observation(observation)
@@ -1039,6 +1042,7 @@ class LocalResearchChain:
                     )
                     _discard_unreadable_document_items(observation)
                     _normalize_public_read_fact_time(observation, contract, row["requirement_key"])
+                    _refresh_evidence_specs(observation)
                     observation["backend"] = backend
                     _finish_tool_timing(observation, tool_started_at, tool_started_clock)
                     self._register_observation(observation)
@@ -1082,6 +1086,7 @@ class LocalResearchChain:
                         )
                         _discard_unreadable_document_items(observation)
                         _normalize_public_read_fact_time(observation, contract, row["requirement_key"])
+                        _refresh_evidence_specs(observation)
                         observation["backend"] = backend
                         _finish_tool_timing(observation, tool_started_at, tool_started_clock)
                         self._register_observation(observation)
@@ -2697,6 +2702,17 @@ def _normalize_public_read_fact_time(
         timestamp = published.isoformat().replace("+00:00", "Z")
         item["published_at"] = timestamp
         item["fact_as_of"] = timestamp
+
+
+def _refresh_evidence_specs(observation: dict[str, Any]) -> None:
+    """Rebind immutable evidence identity after deterministic page-time parsing."""
+    for item in observation.get("evidence_items") or []:
+        if not isinstance(item, dict):
+            continue
+        item["evidence_spec"] = from_observation(item, observation)
+        item["evidence_qualification"] = qualify_record(
+            item["evidence_spec"], source_refs=(str(item.get("evidence_ref") or ""),)
+        )
 
 
 def _discard_unreadable_document_items(observation: dict[str, Any]) -> None:

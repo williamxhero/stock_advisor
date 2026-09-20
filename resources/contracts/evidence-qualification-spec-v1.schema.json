@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvidenceQualificationSpec/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "qualification_id", "qualification_policy_version", "as_of", "input_record_refs", "source_conflict_refs", "state", "permitted_use", "reasons", "truth_status", "propagation_status"],
+  "properties": {
+    "contract": {"const": "EvidenceQualificationSpec/v1"},
+    "qualification_id": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "qualification_policy_version": {"const": "EvidenceQualificationPolicy/v1"},
+    "as_of": {"type": ["string", "null"]},
+    "input_record_refs": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["record_id", "source_refs"], "properties": {"record_id": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "source_refs": {"type": "array", "items": {"type": "string"}}, "memory_receipt": {"type": "object"}}}},
+    "source_conflict_refs": {"type": "array", "items": {"type": "string"}},
+    "state": {"enum": ["qualified", "degraded", "conflicted", "expired", "rejected"]},
+    "permitted_use": {"enum": ["external_fact", "source_report", "context_only", "propagation_only", "calculation", "research_only", "reasoning_only", "none"]},
+    "reasons": {"type": "array", "items": {"type": "string"}},
+    "truth_status": {"enum": ["verified", "unverified", "refuted", "conflicted", "unknown"]},
+    "propagation_status": {"enum": ["observed", "not_observed", "unknown"]}
+  }
+}

@@ -11,20 +11,20 @@ import sqlite3
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .config import settings_path
-from .cycle_contract import CompanionDecisionCycleSpec, SPEC_VERSION
+from .cycle_contract import SPEC_VERSION, CompanionDecisionCycleSpec
 from .decision_cycle import DECISION_CYCLE_STAGES
 from .evidence_gate import EvidenceGate
+from .evidence_qualification import VERSION as QUALIFICATION_VERSION
+from .evidence_qualification import validate_qualification
 from .evidence_spec import VERSION
 from .router import CognitiveRouter
 from .secret_guard import assert_safe
 from .stage_expression import normalize_stage_output
 from .store import CompanionStore, digest, now
-
 
 BUNDLE_SCHEMA_VERSION = 3
 PREVIEW_SIGNING_KEY_FIELD = "signing_key"
@@ -209,6 +209,14 @@ def build_bundle(
         stage_events = [dict(row) for row in connection.execute(
             "SELECT * FROM companion_stage_event WHERE cycle_id=? ORDER BY created_at,event_id", (preview_cycle_id,),
         )]
+    for entry in ledger:
+        try:
+            qualification = json.loads(entry.get("qualification_spec_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            qualification = {}
+        if qualification.get("contract") == QUALIFICATION_VERSION:
+            validate_qualification(qualification)
+        entry["qualification"] = qualification
     for checkpoint in checkpoints:
         checkpoint["output"] = json.loads(checkpoint.pop("output_json"))
     for snapshot in snapshots:
@@ -472,8 +480,8 @@ def approve_bundle(
                 """INSERT INTO evidence_ledger_entry(
                      evidence_id,trading_date,cycle_id,source_url,source_title,body_text,occurred_at,known_at,
                      metadata_json,stage,content_sha256,coverage_state,evidence_kind,truth_status,
-                     propagation_status,provenance_json,evidence_spec_json)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     propagation_status,provenance_json,evidence_spec_json,qualification_spec_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (evidence_id, original["trading_date"], cycle_id, original.get("source_url"), original.get("source_title"),
                  original["body_text"], original.get("occurred_at"), original.get("known_at") or bundle["known_at"],
                  original.get("metadata_json") or "{}", original.get("stage"), original.get("content_sha256"),
@@ -482,7 +490,8 @@ def approve_bundle(
                  original.get("truth_status") or "unknown",
                  original.get("propagation_status") or "unknown",
                  original.get("provenance_json") or "{}",
-                 evidence_spec_json),
+                 evidence_spec_json,
+                 original.get("qualification_spec_json") or json.dumps(original.get("qualification") or {}, ensure_ascii=False, sort_keys=True)),
             )
             try:
                 evidence_spec = json.loads(evidence_spec_json)

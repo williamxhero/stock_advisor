@@ -9,7 +9,8 @@ from typing import Any
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-from .evidence_spec import qualify, validate
+from .evidence_qualification import qualify_record
+from .evidence_spec import validate
 
 
 class EvidenceInsufficient(RuntimeError):
@@ -336,7 +337,15 @@ class _EvidenceGateV3:
                     # known_at is the MemoryHub receipt clock; historical
                     # replay may be acquired after its frozen as_of. The
                     # existing window checks below own look-ahead rejection.
-                    qualification = qualify(spec)
+                    qualification = qualify_record(
+                        spec, as_of=str(evidence.get("as_of") or "") or None,
+                        source_refs=(ref,), allow_post_cutoff_known_at=True,
+                        memory_receipt={
+                            "episode_id": str(item.get("memory_episode_id") or ""),
+                            "content_hash": str(item.get("memory_content_hash") or ""),
+                        } if item.get("memory_episode_id") else None,
+                    )
+                    item["evidence_qualification"] = qualification
                     if qualification["state"] in {"rejected", "expired", "conflicted"}:
                         problems.append("evidence_record_not_qualified:" + qualification["state"])
                     if qualification["propagation_status"] == "observed" and not spec.get("market_propagation", {}).get("impact"):
@@ -348,6 +357,25 @@ class _EvidenceGateV3:
             dict(row) for row in evidence.get("conflicts") or [] if isinstance(row, dict)
         ]
         conflicts = self._merge_conflicts(declared_conflicts, source_conflicts)
+        for ref, item in sources.items():
+            spec = item.get("evidence_spec")
+            if not isinstance(spec, dict):
+                continue
+            conflict_refs = [
+                candidate
+                for conflict in conflicts
+                if conflict.get("resolution") == "unresolved_equal_tier"
+                and ref in (conflict.get("competing_evidence_refs") or [])
+                for candidate in (conflict.get("competing_evidence_refs") or [])
+            ]
+            try:
+                item["evidence_qualification"] = qualify_record(
+                    spec, as_of=str(evidence.get("as_of") or "") or None,
+                    source_refs=(ref,), source_conflict_refs=conflict_refs,
+                    allow_post_cutoff_known_at=True,
+                )
+            except (AttributeError, TypeError, ValueError, KeyError):
+                continue
         coverage = {str(row.get("requirement_key") or ""): row for row in evidence.get("coverage") or [] if isinstance(row, dict)}
         missing: list[str] = []
         for requirement in contract.get("requirements") or []:
@@ -518,6 +546,7 @@ class _EvidenceGateV3:
             "problems": list(dict.fromkeys(problems)), "missing_requirements": list(dict.fromkeys(missing)),
             "attempted_backends": sorted({str(item.get("backend") or "") for item in current if item.get("backend")}),
             "successful_tool_results": len(current),
+            "qualification_contract": "EvidenceQualificationSpec/v1",
             "normalized_evidence": self._normalized(evidence, sources, conflicts),
         }
 

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
-from typing import Any, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
+from .evidence_qualification import qualify_record
+from .evidence_spec import VERSION, fingerprint, validate
 from .memory_port import MemoryPort
 from .secret_guard import assert_safe
-from .evidence_spec import VERSION, fingerprint, validate
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,16 @@ class MemoryEvidenceRegistrar:
             spec["known_at"] = known_at
             spec["record_id"] = fingerprint({k: v for k, v in spec.items() if k != "record_id"})
             validate(spec)
+        qualification = None
+        if spec:
+            qualification = qualify_record(
+                spec, as_of=known_at, source_refs=(source_event_id, url),
+                memory_receipt={
+                    "source_event_id": source_event_id,
+                    "content_hash": content_hash,
+                    "known_at": known_at,
+                },
+            )
         receipt = self.memory.append(
             {
                 "memory_space_id": memory_space_id,
@@ -55,6 +67,7 @@ class MemoryEvidenceRegistrar:
                     "url": url, "title": title,
                     "object_reference": object_reference,
                     **({"evidence_spec": spec} if spec else {}),
+                    **({"evidence_qualification": qualification} if qualification else {}),
                 },
             }
         )
@@ -65,5 +78,6 @@ class MemoryEvidenceRegistrar:
                 "memory_episode_id": receipt["episode_id"], "url": url,
                 "title": title, "text": body, "known_at": known_at,
                 "content_hash": content_hash,
+                **({"evidence_qualification": qualification} if qualification else {}),
             },
         )

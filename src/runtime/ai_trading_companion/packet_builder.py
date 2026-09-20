@@ -133,6 +133,26 @@ class RuntimePacketBuilder:
                     cycle, evidence, packet_as_of,
                 )
             packet["evidence"] = evidence or {}
+            if evidence:
+                snapshot = None
+                finder = getattr(self.store, "evidence_snapshot_for_stage", None)
+                if callable(finder):
+                    # M1 deliberately points at the M0 baseline.  Its own
+                    # research attempt is a replay/reference, not a second
+                    # mutable evidence world.
+                    snapshot = finder(cycle["cycle_id"], "m0_research", role="m0_baseline")
+                    if snapshot is None:
+                        snapshot = finder(cycle["cycle_id"], "m1_research")
+                if snapshot is not None:
+                    packet["evidence_snapshot"] = {
+                        "contract": snapshot["contract"],
+                        "snapshot_id": snapshot["snapshot_id"],
+                        "cycle_id": snapshot["cycle_id"],
+                        "as_of": snapshot["as_of"],
+                        "source_watermarks": snapshot["source_watermarks"],
+                        "schema_version": snapshot["schema_version"],
+                        "content_hash": snapshot["content_hash"],
+                    }
             if stage in {"m1_judgment", "m2"} and cycle["task_key"] in {
                 "daily.execution.0945", "daily.execution.1030", "daily.execution.1430", "daily.review.1520",
             }:

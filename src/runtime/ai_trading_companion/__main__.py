@@ -1463,10 +1463,21 @@ def run_research(
                 evidence = evidence_stage.output
                 evidence_attempt_id = evidence_stage.attempt_id
                 store.save_stage_checkpoint(cycle["cycle_id"], "m0_research", public_packet["sha256"], evidence_attempt_id, evidence)
-                store.record_evidence(cycle, "m0_research", evidence)
+            # Recovery may find a saved stage checkpoint from the small window
+            # between model completion and ledger/artifact persistence.  The
+            # idempotent ledger call closes that gap and freezes the baseline.
+            store.record_evidence(cycle, "m0_research", evidence)
+            evidence_snapshot = store.evidence_snapshot_for_stage(
+                cycle["cycle_id"], "m0_research", role="m0_baseline",
+            )
+            if not store.latest_artifact(cycle["cycle_id"], "evidence"):
                 store.append_artifact(
                     cycle["cycle_id"], "evidence", "model", json.dumps(evidence, ensure_ascii=False),
-                    evidence.get("as_of") or cycle["as_of"], {"public_only": True, "attempt_id": evidence_attempt_id},
+                    evidence.get("as_of") or cycle["as_of"], {
+                        "public_only": True, "attempt_id": evidence_attempt_id,
+                        "evidence_snapshot_id": evidence_snapshot["snapshot_id"] if evidence_snapshot else None,
+                        "evidence_baseline_id": evidence_snapshot["snapshot_id"] if evidence_snapshot else None,
+                    },
                 )
             local_packet = finalize_stage_packet(
                 builder.build(cycle, "m0_compose", evidence=evidence), compose_controls,
@@ -1612,10 +1623,24 @@ def run_m1(
             store.save_stage_checkpoint(
                 cycle_id, "m1_research", public_packet["sha256"], evidence_attempt_id, evidence,
             )
+        evidence_snapshot = store.evidence_snapshot_for_stage(
+            cycle_id, "m0_research", role="m0_baseline",
+        )
+        if evidence_snapshot is not None:
+            store.reference_evidence_snapshot(
+                cycle_id, evidence_snapshot["snapshot_id"],
+                stage="m1_research", role="shared_baseline",
+            )
+        if not store.latest_artifact(cycle_id, "m1_evidence"):
             store.append_artifact(
                 cycle_id, "m1_evidence", "runtime", json.dumps(evidence, ensure_ascii=False),
                 str(evidence.get("as_of") or research_as_of),
-                {"public_only": True, "attempt_id": evidence_attempt_id, "reused_from": "m0_research"},
+                {
+                    "public_only": True, "attempt_id": evidence_attempt_id,
+                    "reused_from": "m0_research",
+                    "evidence_snapshot_id": evidence_snapshot["snapshot_id"] if evidence_snapshot else None,
+                    "evidence_baseline_id": evidence_snapshot["snapshot_id"] if evidence_snapshot else None,
+                },
             )
     except Exception as exc:
         details = getattr(exc, "verifier", None)

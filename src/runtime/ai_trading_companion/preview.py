@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import settings_path
+from .cycle_contract import CompanionDecisionCycleSpec, SPEC_VERSION
 from .evidence_gate import EvidenceGate
 from .router import CognitiveRouter
 from .secret_guard import assert_safe
@@ -392,14 +393,32 @@ def approve_bundle(
         has_h0 = any(item["kind"] == "h0" for item in bundle["artifacts"])
         has_m2 = any(item["kind"] == "m2" for item in bundle["artifacts"])
         state = "complete" if has_m2 or not has_h0 else "m2_deferred"
+        contract = CompanionDecisionCycleSpec(
+            cycle_id=cycle_id,
+            task_key=str(source["task_key"]),
+            as_of=str(bundle["known_at"]),
+            scheduled_for=str(bundle["known_at"]),
+            schedule_id=source.get("schedule_id"),
+            schedule_revision=source.get("schedule_revision"),
+            schedule_snapshot=snapshot,
+        )
+        contract_raw = json.dumps(contract.to_dict(), ensure_ascii=False, sort_keys=True)
         connection.execute(
             """INSERT INTO companion_cycle(
-                 cycle_id,task_key,scheduled_for,as_of,state,revision,schedule_id,schedule_revision,
+                 cycle_id,task_key,scheduled_for,as_of,state,revision,
+                 cycle_spec_version,cycle_contract_json,cycle_contract_hash,
+                 schedule_id,schedule_revision,
                  schedule_snapshot_json,has_h0,m1_completed_at,m2_completed_at,created_at,updated_at)
-               VALUES(?,?,?,?,?,1,?,?,?,?,?,?,?,?)""",
+               VALUES(?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?)""",
             (cycle_id, source["task_key"], bundle["known_at"], bundle["known_at"], state,
+             SPEC_VERSION, contract_raw, digest(contract_raw),
              source.get("schedule_id"), source.get("schedule_revision"), json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
              int(has_h0), bundle["known_at"], bundle["known_at"] if has_m2 else None, at, at),
+        )
+        store._append_cycle_event(
+            connection, cycle_id, "cycle.created", to_state=state,
+            provenance={"source": "preview_approval", "source_cycle_id": source["cycle_id"], "preview_id": preview_id},
+            payload=contract.to_dict(),
         )
         artifact_map: dict[str, str] = {}
         for original in bundle["artifacts"]:

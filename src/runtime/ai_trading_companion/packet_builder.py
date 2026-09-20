@@ -15,6 +15,7 @@ from .models import TASK_POLICIES
 from .stage_expression import verified_weekly_market_comparison
 from .trading_calendar import TradingCalendarUnavailable
 from .opportunities import is_premarket, OBSERVATION_INSTRUCTION, REVIEW_RESULT_INSTRUCTION
+from .cycle_contract import memory_boundary
 
 
 PUBLIC_STAGES = {"m0_research", "m1_research", "outcome_research", "chat_research"}
@@ -197,9 +198,10 @@ class RuntimePacketBuilder:
         if self.memory is None:
             raise MemoryUnavailable("MemoryHub is required; local long-term memory fallback is disabled")
         access_stage = {"m2": "m2_synthesis", "outcome_research": "reflection"}.get(stage, stage)
+        memory_cycle_id, memory_as_of = memory_boundary(cycle, stage, packet_as_of)
         snapshot = self.memory.begin_snapshot({
-            "memory_space_id": self.memory_space_id, "as_of": packet_as_of,
-            "stage": access_stage, "cycle_id": cycle["cycle_id"],
+            "memory_space_id": self.memory_space_id, "as_of": memory_as_of,
+            "stage": access_stage, "cycle_id": memory_cycle_id,
         })
         bundle = self.memory.retrieve_bundle(
             str(snapshot["snapshot_id"]), self._memory_query_text(evidence), limit=80,

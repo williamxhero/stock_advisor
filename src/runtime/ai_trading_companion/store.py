@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
+from .cycle_contract import (
+    CompanionDecisionCycleSpec,
+    SPEC_VERSION,
+    validate_m1_blind_packet,
+    validate_state,
+)
 from .secret_guard import assert_safe
 
 
@@ -124,6 +130,8 @@ class CompanionStore:
             CREATE TABLE IF NOT EXISTS companion_cycle (
               cycle_id TEXT PRIMARY KEY, task_key TEXT NOT NULL, scheduled_for TEXT NOT NULL,
               as_of TEXT NOT NULL, state TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
+              cycle_spec_version TEXT NOT NULL DEFAULT 'CompanionDecisionCycleSpec/v1',
+              cycle_contract_json TEXT, cycle_contract_hash TEXT,
               kind TEXT NOT NULL DEFAULT 'scheduled', work_start_at TEXT,
               trigger TEXT NOT NULL DEFAULT 'scheduled', request_id TEXT,
               requested_at TEXT, request_source_json TEXT,
@@ -141,6 +149,14 @@ class CompanionStore:
               private_context_json TEXT, private_context_sha256 TEXT, private_context_frozen_at TEXT,
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
               UNIQUE(task_key, scheduled_for, revision));
+            CREATE TABLE IF NOT EXISTS companion_cycle_event (
+              event_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              sequence INTEGER NOT NULL, contract TEXT NOT NULL, event_type TEXT NOT NULL,
+              stage TEXT, from_state TEXT, to_state TEXT, attempt_id TEXT, reason TEXT,
+              provenance_json TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
+              UNIQUE(cycle_id, sequence));
+            CREATE INDEX IF NOT EXISTS ix_companion_cycle_event_cycle
+              ON companion_cycle_event(cycle_id, sequence);
             CREATE TABLE IF NOT EXISTS narrative_artifact (
               artifact_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               kind TEXT NOT NULL, revision INTEGER NOT NULL, actor TEXT NOT NULL, body_markdown TEXT NOT NULL,
@@ -413,7 +429,7 @@ class CompanionStore:
               claimed_at TEXT, completed_at TEXT, error TEXT);
             CREATE INDEX IF NOT EXISTS ix_capability_need_state_priority
               ON capability_need(state, urgency, updated_at);
-            PRAGMA user_version = 20;
+            PRAGMA user_version = 21;
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
@@ -571,6 +587,9 @@ class CompanionStore:
             c.execute("CREATE INDEX IF NOT EXISTS ix_portfolio_transaction_group ON portfolio_transaction(action_group_id,created_at)")
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
+                "cycle_spec_version": "TEXT NOT NULL DEFAULT 'CompanionDecisionCycleSpec/v1'",
+                "cycle_contract_json": "TEXT",
+                "cycle_contract_hash": "TEXT",
                 "schedule_id": "TEXT",
                 "schedule_revision": "INTEGER",
                 "schedule_snapshot_json": "TEXT",
@@ -589,6 +608,33 @@ class CompanionStore:
                          ON r.schedule_id=t.schedule_id AND r.revision=t.current_revision WHERE t.task_key=companion_cycle.task_key)
                    WHERE schedule_id IS NULL AND EXISTS (SELECT 1 FROM schedule_template t WHERE t.task_key=companion_cycle.task_key)"""
             )
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS companion_cycle_event (
+                     event_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+                     sequence INTEGER NOT NULL, contract TEXT NOT NULL, event_type TEXT NOT NULL,
+                     stage TEXT, from_state TEXT, to_state TEXT, attempt_id TEXT, reason TEXT,
+                     provenance_json TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                     UNIQUE(cycle_id, sequence))"""
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS ix_companion_cycle_event_cycle "
+                "ON companion_cycle_event(cycle_id, sequence)"
+            )
+            for row in c.execute(
+                "SELECT cycle_id,task_key,scheduled_for,as_of,schedule_id,schedule_revision,schedule_snapshot_json "
+                "FROM companion_cycle WHERE cycle_contract_json IS NULL"
+            ).fetchall():
+                contract = CompanionDecisionCycleSpec(
+                    cycle_id=str(row["cycle_id"]), task_key=str(row["task_key"]),
+                    as_of=str(row["as_of"]), scheduled_for=str(row["scheduled_for"]),
+                    schedule_id=row["schedule_id"], schedule_revision=row["schedule_revision"],
+                    schedule_snapshot=json.loads(row["schedule_snapshot_json"] or "null"),
+                )
+                raw = json.dumps(contract.to_dict(), ensure_ascii=False, sort_keys=True)
+                c.execute(
+                    "UPDATE companion_cycle SET cycle_spec_version=?,cycle_contract_json=?,cycle_contract_hash=? WHERE cycle_id=?",
+                    (SPEC_VERSION, raw, digest(raw), row["cycle_id"]),
+                )
 
     def submit_capability_need(self, request: dict[str, Any]) -> dict[str, Any]:
         """Runtime-owned write endpoint for a versioned, deduplicated tool need."""
@@ -934,6 +980,7 @@ class CompanionStore:
 
     def create_cycle(self, task_key: str, scheduled_for: str, as_of: str, *, schedule_id: str | None = None, schedule_revision: int | None = None, schedule_snapshot: dict[str, Any] | None = None, kind: str = "scheduled", work_start_at: str | None = None) -> dict[str, Any]:
         self.initialize(); cycle_id = str(uuid.uuid4()); at = now()
+        validate_state("queued")
         with self.connection() as c:
             c.execute("BEGIN IMMEDIATE")
             claimed = c.execute("SELECT cycle_id FROM companion_schedule_claim WHERE task_key=? AND scheduled_for=?", (task_key, scheduled_for)).fetchone()
@@ -947,13 +994,29 @@ class CompanionStore:
                 if existing:
                     cycle_id = existing["cycle_id"]
                 else:
+                    contract = CompanionDecisionCycleSpec(
+                        cycle_id=cycle_id,
+                        task_key=task_key,
+                        as_of=as_of,
+                        scheduled_for=scheduled_for,
+                        schedule_id=schedule_id,
+                        schedule_revision=schedule_revision,
+                        schedule_snapshot=schedule_snapshot,
+                    )
+                    contract_raw = json.dumps(contract.to_dict(), ensure_ascii=False, sort_keys=True)
                     c.execute(
                         """INSERT INTO companion_cycle(
                              cycle_id,task_key,scheduled_for,as_of,state,revision,kind,work_start_at,
+                             cycle_spec_version,cycle_contract_json,cycle_contract_hash,
                              schedule_id,schedule_revision,schedule_snapshot_json,created_at,updated_at
-                           ) VALUES(?,?,?,?, 'queued',1,?,?,?,?,?,?,?)""",
+                           ) VALUES(?,?,?,?, 'queued',1,?,?,?,?,?,?,?,?,?,?)""",
                         (cycle_id, task_key, scheduled_for, as_of, kind, work_start_at,
+                         SPEC_VERSION, contract_raw, digest(contract_raw),
                          schedule_id, schedule_revision, json.dumps(schedule_snapshot, ensure_ascii=False, sort_keys=True) if schedule_snapshot else None, at, at),
+                    )
+                    self._append_cycle_event(
+                        c, cycle_id, "cycle.created", to_state="queued",
+                        payload=contract.to_dict(),
                     )
                 c.execute("INSERT INTO companion_schedule_claim(task_key,scheduled_for,cycle_id,claimed_at) VALUES(?,?,?,?)", (task_key, scheduled_for, cycle_id, at))
         return self.get_cycle(cycle_id)
@@ -1005,15 +1068,27 @@ class CompanionStore:
                 value = datetime.fromisoformat(requested_at.replace("Z", "+00:00")) + timedelta(microseconds=offset)
                 scheduled_for = value.isoformat(timespec="microseconds")
 
+            contract = CompanionDecisionCycleSpec(
+                cycle_id=cycle_id,
+                task_key=task_key,
+                as_of=requested_at,
+                scheduled_for=scheduled_for,
+                schedule_id=None,
+                schedule_revision=None,
+                schedule_snapshot=None,
+            )
+            contract_raw = json.dumps(contract.to_dict(), ensure_ascii=False, sort_keys=True)
             c.execute(
                 """INSERT INTO companion_cycle(
                      cycle_id,task_key,scheduled_for,as_of,state,revision,kind,work_start_at,
+                     cycle_spec_version,cycle_contract_json,cycle_contract_hash,
                      trigger,request_id,requested_at,request_source_json,task_profile_id,task_profile_version,
                      task_profile_json,evidence_contract_version,evidence_contract_hash,evidence_contract_json,
                      created_at,updated_at
-                   ) VALUES(?,?,?,?, 'queued',1,'manual',?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    cycle_id, task_key, scheduled_for, requested_at, requested_at,
+                    cycle_id, task_key, scheduled_for, requested_at, "queued", 1, "manual", requested_at,
+                    SPEC_VERSION, contract_raw, digest(contract_raw),
                     "manual_chat", request_id, requested_at,
                     json.dumps(source, ensure_ascii=False, sort_keys=True), task_profile_id, task_profile_version,
                     json.dumps(task_profile, ensure_ascii=False, sort_keys=True) if task_profile else None,
@@ -1022,6 +1097,10 @@ class CompanionStore:
                     json.dumps(evidence_contract, ensure_ascii=False, sort_keys=True) if evidence_contract else None,
                     claimed_at, claimed_at,
                 ),
+            )
+            self._append_cycle_event(
+                c, cycle_id, "cycle.created", to_state="queued",
+                payload=contract.to_dict(),
             )
             c.execute(
                 "INSERT INTO companion_manual_analysis_claim(request_id,cycle_id,claimed_at) VALUES(?,?,?)",
@@ -1034,7 +1113,7 @@ class CompanionStore:
         self.initialize()
         raw = json.dumps(contract, ensure_ascii=False, sort_keys=True)
         with self.connection() as c:
-            row = c.execute("SELECT kind,state FROM companion_cycle WHERE cycle_id=?", (cycle_id,)).fetchone()
+            row = c.execute("SELECT * FROM companion_cycle WHERE cycle_id=?", (cycle_id,)).fetchone()
             if row is None:
                 raise ValueError("unknown manual analysis cycle")
             if row["kind"] != "manual" or row["state"] != "queued":
@@ -1044,6 +1123,8 @@ class CompanionStore:
                    evidence_contract_json=?,updated_at=?,revision=revision+1 WHERE cycle_id=?""",
                 (as_of, int(contract["version"]), str(contract["contract_hash"]), raw, now(), cycle_id),
             )
+            self._append_cycle_event(c, cycle_id, "evidence.contract_frozen", stage="evidence",
+                                     payload={"as_of": as_of, "contract_hash": contract["contract_hash"]})
         return self.get_cycle(cycle_id)
 
     def find_cycle(self, task_key: str, scheduled_for: str) -> dict[str, Any] | None:
@@ -1166,23 +1247,44 @@ class CompanionStore:
         snapshot.update({
             "diagnostic_rerun": True,
             "diagnostic_rerun_of": source_cycle_id,
+            "blind_source_cycle_id": source_cycle_id,
             "diagnostic_rerun_created_at": at,
             "original_scheduled_for": source["scheduled_for"],
         })
         cycle_id = str(uuid.uuid4())
+        contract = CompanionDecisionCycleSpec(
+            cycle_id=cycle_id,
+            task_key=str(source["task_key"]),
+            as_of=str(source["as_of"]),
+            scheduled_for=str(rerun_for),
+            schedule_id=source.get("schedule_id"),
+            schedule_revision=source.get("schedule_revision"),
+            schedule_snapshot=snapshot,
+        )
+        contract_raw = json.dumps(contract.to_dict(), ensure_ascii=False, sort_keys=True)
         with self.connection() as c:
             c.execute(
                 """INSERT INTO companion_cycle(
                      cycle_id,task_key,scheduled_for,as_of,state,revision,
+                     cycle_spec_version,cycle_contract_json,cycle_contract_hash,
                      schedule_id,schedule_revision,schedule_snapshot_json,
-                     h0_locked_at,has_h0,m1_started_at,created_at,updated_at
-                   ) VALUES(?,?,?,?, 'researching_m1',1,?,?,?,?,?,?,?,?)""",
+                     h0_locked_at,has_h0,m1_started_at,private_context_json,private_context_sha256,
+                     private_context_frozen_at,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    cycle_id, source["task_key"], rerun_for, source["as_of"],
+                    cycle_id, source["task_key"], rerun_for, source["as_of"], "researching_m1", 1,
+                    SPEC_VERSION, contract_raw, digest(contract_raw),
                     source.get("schedule_id"), source.get("schedule_revision"),
                     json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
-                    source.get("h0_locked_at"), int(source.get("has_h0") or 0), at, at, at,
+                    source.get("h0_locked_at"), int(source.get("has_h0") or 0), at,
+                    source.get("private_context_json"), source.get("private_context_sha256"),
+                    source.get("private_context_frozen_at"), at, at,
                 ),
+            )
+            self._append_cycle_event(
+                c, cycle_id, "cycle.created", to_state="researching_m1",
+                provenance={"source": "diagnostic_rerun", "source_cycle_id": source_cycle_id},
+                payload=contract.to_dict(),
             )
 
         copied_artifacts = {}
@@ -1217,6 +1319,16 @@ class CompanionStore:
         })
         cycle_id = str(uuid.uuid4())
         at = now()
+        contract = CompanionDecisionCycleSpec(
+            cycle_id=cycle_id,
+            task_key=str(source["task_key"]),
+            as_of=str(source["as_of"]),
+            scheduled_for=str(source["scheduled_for"]),
+            schedule_id=source.get("schedule_id"),
+            schedule_revision=source.get("schedule_revision"),
+            schedule_snapshot=snapshot,
+        )
+        contract_raw = json.dumps(contract.to_dict(), ensure_ascii=False, sort_keys=True)
         with self.connection() as c:
             revision = c.execute(
                 "SELECT COALESCE(MAX(revision),0)+1 FROM companion_cycle WHERE task_key=? AND scheduled_for=?",
@@ -1224,16 +1336,97 @@ class CompanionStore:
             ).fetchone()[0]
             c.execute(
                 """INSERT INTO companion_cycle(
-                     cycle_id,task_key,scheduled_for,as_of,state,revision,schedule_id,schedule_revision,
+                     cycle_id,task_key,scheduled_for,as_of,state,revision,
+                     cycle_spec_version,cycle_contract_json,cycle_contract_hash,
+                     schedule_id,schedule_revision,
                      schedule_snapshot_json,created_at,updated_at)
-                   VALUES(?,?,?,?, 'queued',?,?,?,?,?,?)""",
+                   VALUES(?,?,?,?, 'queued',?,?,?,?,?,?,?,?,?)""",
                 (cycle_id, source["task_key"], source["scheduled_for"], source["as_of"], revision,
+                 SPEC_VERSION, contract_raw, digest(contract_raw),
                  source.get("schedule_id"), source.get("schedule_revision"),
                  json.dumps(snapshot, ensure_ascii=False, sort_keys=True), at, at),
             )
+            self._append_cycle_event(
+                c, cycle_id, "cycle.created", to_state="queued",
+                provenance={"source": "preview_rerun", "source_cycle_id": source_cycle_id},
+                payload=contract.to_dict(),
+            )
         return self.get_cycle(cycle_id)
 
-    def transition(self, cycle_id: str, state: str, *, connection: sqlite3.Connection | None = None, **fields: Any) -> dict[str, Any]:
+    def _append_cycle_event(
+        self,
+        connection: sqlite3.Connection,
+        cycle_id: str,
+        event_type: str,
+        *,
+        stage: str | None = None,
+        from_state: str | None = None,
+        to_state: str | None = None,
+        attempt_id: str | None = None,
+        reason: str | None = None,
+        provenance: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        sequence = int(connection.execute(
+            "SELECT COALESCE(MAX(sequence),0)+1 FROM companion_cycle_event WHERE cycle_id=?",
+            (cycle_id,),
+        ).fetchone()[0])
+        event = {
+            "contract": SPEC_VERSION,
+            "event_type": event_type,
+            "cycle_id": cycle_id,
+            "sequence": sequence,
+            "stage": stage,
+            "from_state": from_state,
+            "to_state": to_state,
+            "attempt_id": attempt_id,
+            "reason": reason,
+            "provenance": provenance or {},
+            "payload": payload or {},
+        }
+        event_id = str(uuid.uuid4())
+        created_at = now()
+        connection.execute(
+            """INSERT INTO companion_cycle_event(
+                 event_id,cycle_id,sequence,contract,event_type,stage,from_state,to_state,
+                 attempt_id,reason,provenance_json,payload_json,created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                event_id, cycle_id, sequence, SPEC_VERSION, event_type, stage,
+                from_state, to_state, attempt_id, reason,
+                json.dumps(provenance or {}, ensure_ascii=False, sort_keys=True),
+                json.dumps(payload or {}, ensure_ascii=False, sort_keys=True), created_at,
+            ),
+        )
+        return {**event, "event_id": event_id, "created_at": created_at}
+
+    def cycle_events(self, cycle_id: str) -> list[dict[str, Any]]:
+        self.initialize()
+        with self.connection() as c:
+            rows = [dict(row) for row in c.execute(
+                "SELECT * FROM companion_cycle_event WHERE cycle_id=? ORDER BY sequence",
+                (cycle_id,),
+            )]
+        for row in rows:
+            row["provenance"] = json.loads(row.pop("provenance_json") or "{}")
+            row["payload"] = json.loads(row.pop("payload_json") or "{}")
+        return rows
+
+    def transition(
+        self,
+        cycle_id: str,
+        state: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+        event_type: str | None = None,
+        event_stage: str | None = None,
+        event_attempt_id: str | None = None,
+        event_reason: str | None = None,
+        event_provenance: dict[str, Any] | None = None,
+        event_payload: dict[str, Any] | None = None,
+        **fields: Any,
+    ) -> dict[str, Any]:
+        validate_state(state)
         allowed={
             "as_of","human_deadline","voice_grace_deadline","m0_revealed_at","codex_session_id","packet_hash",
             "m1_publish_deadline","h0_auto_submit_at","h0_locked_at","h0_artifact_id","has_h0",
@@ -1248,10 +1441,86 @@ class CompanionStore:
         for key,value in fields.items(): assignments.append(f"{key}=?"); values.append(value)
         values.append(cycle_id)
         if connection is not None:
+            current_row = connection.execute(
+                "SELECT state FROM companion_cycle WHERE cycle_id=?", (cycle_id,)
+            ).fetchone()
+            if current_row is None:
+                raise ValueError(f"unknown cycle: {cycle_id}")
+            from_state = str(current_row["state"])
+            validate_state(from_state)
             connection.execute(f"UPDATE companion_cycle SET {', '.join(assignments)}, revision=revision+1 WHERE cycle_id=?", values)
-            return self.get_cycle(cycle_id, connection=connection)
+            result = self.get_cycle(cycle_id, connection=connection)
+            self._append_cycle_event(
+                connection,
+                cycle_id,
+                event_type or f"cycle.state.{state}",
+                stage=event_stage,
+                from_state=from_state,
+                to_state=state,
+                attempt_id=event_attempt_id,
+                reason=event_reason,
+                provenance=event_provenance,
+                payload=event_payload or {"revision": result["revision"]},
+            )
+            return result
         with self.connection() as c:
-            return self.transition(cycle_id, state, connection=c, **fields)
+            return self.transition(
+                cycle_id, state, connection=c,
+                event_type=event_type, event_stage=event_stage,
+                event_attempt_id=event_attempt_id, event_reason=event_reason,
+                event_provenance=event_provenance, event_payload=event_payload,
+                **fields,
+            )
+
+    def record_cycle_event(self, cycle_id: str, event_type: str, *, stage: str | None = None,
+                           reason: str | None = None, attempt_id: str | None = None,
+                           provenance: dict[str, Any] | None = None,
+                           payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        with self.connection() as c:
+            cycle = self.get_cycle(cycle_id, connection=c)
+            return self._append_cycle_event(c, cycle_id, event_type, stage=stage,
+                                            from_state=cycle["state"], to_state=cycle["state"],
+                                            attempt_id=attempt_id, reason=reason,
+                                            provenance=provenance, payload=payload)
+
+    def retry_cycle(self, cycle_id: str, stage: str, reason: str, *,
+                    target_state: str | None = None, attempt_id: str | None = None,
+                    provenance: dict[str, Any] | None = None) -> dict[str, Any]:
+        from .cycle_contract import STAGES
+        if stage not in STAGES:
+            raise ValueError(f"unsupported cycle stage: {stage}")
+        if self.get_cycle(cycle_id).get("state") in {"complete", "reflected", "failed", "missed", "skipped"}:
+            raise ValueError("terminal cycle cannot be retried")
+        defaults = {"evidence": "m0_retry_wait", "m0": "m0_retry_wait", "h0": "awaiting_h0",
+                    "m1": "m1_retry_wait", "m2": "m2_deferred", "outcome": "outcome_pending",
+                    "reflection": "reflecting"}
+        return self.transition(cycle_id, target_state or defaults[stage], event_type="stage.retrying",
+                               event_stage=stage, event_attempt_id=attempt_id, event_reason=reason,
+                               event_provenance=provenance, event_payload={"stage": stage})
+
+    def recover_cycle(self, cycle_id: str, stage: str, *, target_state: str | None = None,
+                      reason: str = "runtime recovery", provenance: dict[str, Any] | None = None) -> dict[str, Any]:
+        from .cycle_contract import STAGES
+        if stage not in STAGES:
+            raise ValueError(f"unsupported cycle stage: {stage}")
+        if self.get_cycle(cycle_id).get("state") in {"complete", "reflected", "failed", "missed", "skipped"}:
+            raise ValueError("terminal cycle cannot be recovered")
+        defaults = {"evidence": "queued", "m0": "queued", "h0": "awaiting_h0", "m1": "researching_m1",
+                    "m2": "synthesizing_m2", "outcome": "outcome_pending", "reflection": "reflecting"}
+        return self.transition(cycle_id, target_state or defaults[stage], event_type="cycle.recovered",
+                               event_stage=stage, event_reason=reason, event_provenance=provenance,
+                               event_payload={"stage": stage})
+
+    def rollback_cycle(self, cycle_id: str, stage: str, reason: str, *,
+                       provenance: dict[str, Any] | None = None) -> dict[str, Any]:
+        from .cycle_contract import STAGES
+        if stage not in STAGES:
+            raise ValueError(f"unsupported cycle stage: {stage}")
+        rerun = self.create_diagnostic_cycle(cycle_id)
+        self.record_cycle_event(cycle_id, "stage.rolled_back", stage=stage, reason=reason,
+                                provenance=provenance,
+                                payload={"stage": stage, "rerun_cycle_id": rerun["cycle_id"]})
+        return rerun
 
     def append_artifact(self, cycle_id: str, kind: str, actor: str, body: str, as_of: str, metadata: dict[str, Any] | None=None, *, occurred_at: str | None=None, known_at: str | None=None, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
         if not body.strip(): raise ValueError("artifact body must not be empty")
@@ -1898,11 +2167,22 @@ class CompanionStore:
                    )""",
                 (cycle["cycle_id"], cycle["cycle_id"]),
             )
+            previous = [dict(row) for row in c.execute(
+                """SELECT cycle_id,revision FROM companion_cycle
+                   WHERE kind='daily_conversation' AND cycle_id!=? AND state='open'""",
+                (cycle["cycle_id"],),
+            )]
             c.execute(
                 """UPDATE companion_cycle SET state='closed',updated_at=?,revision=revision+1
                    WHERE kind='daily_conversation' AND cycle_id!=? AND state='open'""",
                 (now(), cycle["cycle_id"]),
             )
+            for previous_cycle in previous:
+                self._append_cycle_event(
+                    c, previous_cycle["cycle_id"], "cycle.state.closed",
+                    from_state="open", to_state="closed",
+                    payload={"revision": int(previous_cycle["revision"]) + 1},
+                )
         result = self.get_cycle(cycle["cycle_id"])
         result["_created"] = created
         return result
@@ -2437,6 +2717,8 @@ class CompanionStore:
         effort_policy_version: str | None = None, effort_input_fingerprint: str | None = None,
         input_packet: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if str(stage).startswith("m1") and input_packet is not None:
+            validate_m1_blind_packet(input_packet)
         attempt_id = str(uuid.uuid4())
         started = now()
         with self.connection() as c:

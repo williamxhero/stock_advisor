@@ -18,6 +18,7 @@ from typing import Any
 from .config import settings_path
 from .cycle_contract import CompanionDecisionCycleSpec, SPEC_VERSION
 from .evidence_gate import EvidenceGate
+from .evidence_spec import VERSION
 from .router import CognitiveRouter
 from .secret_guard import assert_safe
 from .stage_expression import normalize_stage_output
@@ -433,15 +434,40 @@ def approve_bundle(
             artifact_map[original["artifact_id"]] = imported["artifact_id"]
         for original in bundle.get("evidence_ledger") or []:
             evidence_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"preview-evidence|{preview_id}|{original['evidence_id']}"))
+            evidence_spec_json = str(original.get("evidence_spec_json") or "{}")
             connection.execute(
                 """INSERT INTO evidence_ledger_entry(
                      evidence_id,trading_date,cycle_id,source_url,source_title,body_text,occurred_at,known_at,
-                     metadata_json,stage,content_sha256,coverage_state)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     metadata_json,stage,content_sha256,coverage_state,evidence_kind,truth_status,
+                     propagation_status,provenance_json,evidence_spec_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (evidence_id, original["trading_date"], cycle_id, original.get("source_url"), original.get("source_title"),
-                 original["body_text"], original.get("occurred_at"), bundle["known_at"], original.get("metadata_json") or "{}",
-                 original.get("stage"), original.get("content_sha256"), original.get("coverage_state") or "observed"),
+                 original["body_text"], original.get("occurred_at"), original.get("known_at") or bundle["known_at"],
+                 original.get("metadata_json") or "{}", original.get("stage"), original.get("content_sha256"),
+                 original.get("coverage_state") or "observed",
+                 original.get("evidence_kind") or "news_disclosure",
+                 original.get("truth_status") or "unknown",
+                 original.get("propagation_status") or "unknown",
+                 original.get("provenance_json") or "{}",
+                 evidence_spec_json),
             )
+            try:
+                evidence_spec = json.loads(evidence_spec_json)
+            except json.JSONDecodeError:
+                evidence_spec = {}
+            if isinstance(evidence_spec, dict) and evidence_spec.get("contract") == VERSION:
+                try:
+                    metadata = json.loads(str(original.get("metadata_json") or "{}"))
+                except json.JSONDecodeError:
+                    metadata = {}
+                store.queue_event(
+                    cycle_id, "evidence.recorded", {
+                        "contract": VERSION, "evidence_id": evidence_id,
+                        "cycle_id": cycle_id, "stage": original.get("stage"),
+                        "record": evidence_spec,
+                        "qualification": metadata.get("qualification") if isinstance(metadata, dict) else {},
+                    }, connection=connection,
+                )
         attempt_map: dict[str, str] = {}
         for original in bundle["attempts"]:
             new_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"preview-attempt|{preview_id}|{original['attempt_id']}"))

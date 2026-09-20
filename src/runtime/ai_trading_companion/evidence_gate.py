@@ -9,6 +9,8 @@ from typing import Any
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
+from .evidence_spec import qualify, validate
+
 
 class EvidenceInsufficient(RuntimeError):
     def __init__(self, verifier: dict[str, Any]) -> None:
@@ -327,6 +329,20 @@ class _EvidenceGateV3:
                 if key != "acquired_at" and parsed and as_of and parsed > as_of:
                     problems.append("source_from_future" if key == "fact_as_of" else f"source_{key}_in_future")
             sources[ref] = {**item, "excerpt": excerpt, "analysis": str(source.get("analysis") or "")}
+            spec = item.get("evidence_spec")
+            if isinstance(spec, dict):
+                try:
+                    validate(spec)
+                    # known_at is the MemoryHub receipt clock; historical
+                    # replay may be acquired after its frozen as_of. The
+                    # existing window checks below own look-ahead rejection.
+                    qualification = qualify(spec)
+                    if qualification["state"] in {"rejected", "expired", "conflicted"}:
+                        problems.append("evidence_record_not_qualified:" + qualification["state"])
+                    if qualification["propagation_status"] == "observed" and not spec.get("market_propagation", {}).get("impact"):
+                        problems.append("observed_market_propagation_impact_missing")
+                except (AttributeError, TypeError, ValueError, KeyError) as exc:
+                    problems.append("evidence_record_invalid:" + str(exc))
         source_conflicts = self._source_conflicts(sources)
         declared_conflicts = [
             dict(row) for row in evidence.get("conflicts") or [] if isinstance(row, dict)

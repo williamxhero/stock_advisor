@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvidenceSpec/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "record_id", "kind", "source", "occurred_at", "known_at", "content", "truth_status", "market_propagation", "provenance", "external_fact"],
+  "properties": {
+    "contract": {"const": "EvidenceSpec/v1"},
+    "record_id": {"type": "string", "minLength": 64, "maxLength": 64},
+    "kind": {"enum": ["market_fact", "derived_calculation", "news_disclosure", "social_propagation", "source_opinion", "quant_research", "ai_reasoning", "ai_summary", "ai_conclusion"]},
+    "source": {"type": "object", "required": ["url", "title", "identity", "reference"], "properties": {"url": {"type": "string"}, "title": {"type": "string"}, "identity": {"type": "string"}, "reference": {"type": "object"}}, "additionalProperties": false},
+    "occurred_at": {"type": ["string", "null"]},
+    "known_at": {"type": "string"},
+    "content": {"type": "string", "minLength": 1},
+    "truth_status": {"enum": ["verified", "unverified", "refuted", "conflicted", "unknown"]},
+    "market_propagation": {"type": "object", "required": ["status", "impact"], "properties": {"status": {"enum": ["observed", "not_observed", "unknown"]}, "impact": {"type": "object"}}, "additionalProperties": false},
+    "provenance": {"type": "object", "required": ["origin", "attempt_id", "observation_id", "evidence_ref", "content_sha256"], "properties": {"origin": {"type": "string"}, "attempt_id": {"type": "string"}, "observation_id": {"type": "string"}, "evidence_ref": {"type": "string"}, "operation": {"type": "string"}, "backend": {"type": "string"}, "original_source": {"type": "string"}, "citation_chain": {"type": "array"}, "content_sha256": {"type": "string"}, "derivation": {"type": "object"}}, "additionalProperties": true},
+    "propositions": {"type": "array"},
+    "expires_at": {"type": ["string", "null"]},
+    "external_fact": {"type": "boolean"}
+  }
+}

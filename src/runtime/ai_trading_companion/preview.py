@@ -16,6 +16,7 @@ from typing import Any
 
 from .config import settings_path
 from .cycle_contract import SPEC_VERSION, CompanionDecisionCycleSpec
+from .decision_cycle import DECISION_CYCLE_STAGES
 from .evidence_gate import EvidenceGate
 from .evidence_qualification import VERSION as QUALIFICATION_VERSION
 from .evidence_qualification import validate_qualification
@@ -202,6 +203,12 @@ def build_bundle(
         ledger = [dict(row) for row in connection.execute(
             "SELECT * FROM evidence_ledger_entry WHERE cycle_id=? ORDER BY known_at,evidence_id", (preview_cycle_id,),
         )]
+        stage_runs = [dict(row) for row in connection.execute(
+            "SELECT * FROM companion_stage_run WHERE cycle_id=? ORDER BY stage,attempt", (preview_cycle_id,),
+        )]
+        stage_events = [dict(row) for row in connection.execute(
+            "SELECT * FROM companion_stage_event WHERE cycle_id=? ORDER BY created_at,event_id", (preview_cycle_id,),
+        )]
     for entry in ledger:
         try:
             qualification = json.loads(entry.get("qualification_spec_json") or "{}")
@@ -249,6 +256,12 @@ def build_bundle(
         "replay_mode": "original_cycle_inputs",
         "qualification_version": 2,
         "cycle_state": cycle["state"],
+        "cycle_spec_version": cycle.get("cycle_spec_version", 1),
+        "cycle_provenance_json": cycle.get("cycle_provenance_json") or "{}",
+        "private_context_json": cycle.get("private_context_json"),
+        "private_context_sha256": cycle.get("private_context_sha256"),
+        "private_context_frozen_at": cycle.get("private_context_frozen_at"),
+        "decision_cycle": store.decision_cycle_contract(preview_cycle_id),
         "preview_status": "passed" if {"evidence", "m0", "m1_evidence", "m1"}.issubset({item["kind"] for item in artifacts}) else "failed",
         "schedule_snapshot": json.loads(cycle.get("schedule_snapshot_json") or "{}"),
         "artifacts": artifacts,
@@ -259,6 +272,8 @@ def build_bundle(
         "evidence_ledger": ledger,
         "judgment_snapshots": snapshots,
         "evidence": evidence,
+        "stage_runs": stage_runs,
+        "stage_events": stage_events,
     }
     assert_safe(json.dumps(bundle, ensure_ascii=False), boundary="preview bundle")
     return seal_bundle(bundle)
@@ -298,6 +313,19 @@ def verify_bundle(
             raise ValueError("preview artifact belongs to another cycle")
         if artifact.get("body_sha256") != digest(str(artifact.get("body_markdown") or "")):
             raise ValueError(f"preview artifact hash mismatch: {artifact.get('kind')}")
+    stage_runs = bundle.get("stage_runs") or []
+    stage_run_ids = set()
+    for stage_run in stage_runs:
+        if stage_run.get("cycle_id") != bundle.get("preview_cycle_id"):
+            raise ValueError("preview stage run belongs to another cycle")
+        if stage_run.get("stage") not in DECISION_CYCLE_STAGES:
+            raise ValueError(f"unsupported preview stage: {stage_run.get('stage')}")
+        stage_run_ids.add(stage_run.get("stage_run_id"))
+    for stage_event in bundle.get("stage_events") or []:
+        if stage_event.get("cycle_id") != bundle.get("preview_cycle_id"):
+            raise ValueError("preview stage event belongs to another cycle")
+        if stage_event.get("stage") not in DECISION_CYCLE_STAGES or stage_event.get("stage_run_id") not in stage_run_ids:
+            raise ValueError("preview stage event references an unknown stage run")
     if not require_qualified:
         return
     if bundle.get("preview_status") != "passed":
@@ -416,13 +444,18 @@ def approve_bundle(
             """INSERT INTO companion_cycle(
                  cycle_id,task_key,scheduled_for,as_of,state,revision,
                  cycle_spec_version,cycle_contract_json,cycle_contract_hash,
+                 cycle_provenance_json,
                  schedule_id,schedule_revision,
-                 schedule_snapshot_json,has_h0,m1_completed_at,m2_completed_at,created_at,updated_at)
-               VALUES(?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?)""",
+                 schedule_snapshot_json,has_h0,m1_completed_at,m2_completed_at,
+                 private_context_json,private_context_sha256,private_context_frozen_at,created_at,updated_at)
+               VALUES(?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (cycle_id, source["task_key"], bundle["known_at"], bundle["known_at"], state,
              SPEC_VERSION, contract_raw, digest(contract_raw),
+             bundle.get("cycle_provenance_json") or source.get("cycle_provenance_json") or "{}",
              source.get("schedule_id"), source.get("schedule_revision"), json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
-             int(has_h0), bundle["known_at"], bundle["known_at"] if has_m2 else None, at, at),
+             int(has_h0), bundle["known_at"], bundle["known_at"] if has_m2 else None,
+             bundle.get("private_context_json"), bundle.get("private_context_sha256"),
+             bundle.get("private_context_frozen_at"), at, at),
         )
         store._append_cycle_event(
             connection, cycle_id, "cycle.created", to_state=state,
@@ -509,6 +542,54 @@ def approve_bundle(
                    VALUES(?,?,?,?,?,?,?)""",
                 (cycle_id, checkpoint["stage"], checkpoint["packet_sha256"], attempt_map[checkpoint["attempt_id"]],
                  raw_output, digest(raw_output), checkpoint.get("created_at") or at),
+            )
+        imported_stage_run_ids: dict[str, str] = {}
+        for original in bundle.get("stage_runs") or []:
+            original_id = str(original["stage_run_id"])
+            imported_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"preview-stage-run|{preview_id}|{original_id}"))
+            imported_stage_run_ids[original_id] = imported_id
+        if bundle.get("stage_runs"):
+            for original in bundle["stage_runs"]:
+                original_id = str(original["stage_run_id"])
+                rollback_of = original.get("rollback_of")
+                connection.execute(
+                    """INSERT INTO companion_stage_run(
+                         stage_run_id,cycle_id,stage,attempt,state,as_of,idempotency_key,started_at,
+                         completed_at,failed_at,retry_at,input_sha256,output_sha256,error_json,
+                         provenance_json,visibility_json,rollback_of,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (imported_stage_run_ids[original_id], cycle_id, original["stage"], original["attempt"],
+                     original["state"], original["as_of"], original["idempotency_key"], original.get("started_at"),
+                     original.get("completed_at"), original.get("failed_at"), original.get("retry_at"),
+                     original.get("input_sha256"), original.get("output_sha256"), original.get("error_json") or "{}",
+                     original.get("provenance_json") or "{}", original.get("visibility_json") or "{}",
+                     imported_stage_run_ids.get(str(rollback_of)) if rollback_of else None,
+                     original.get("created_at") or at, original.get("updated_at") or at),
+                )
+        else:
+            # Hand-authored v3 fixtures predate the stage ledger.  Give those
+            # imports the same stable pending projection as a fresh cycle.
+            provenance = bundle.get("cycle_provenance_json") or "{}"
+            for stage in DECISION_CYCLE_STAGES:
+                connection.execute(
+                    """INSERT INTO companion_stage_run(
+                         stage_run_id,cycle_id,stage,attempt,state,as_of,idempotency_key,
+                         provenance_json,visibility_json,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (str(uuid.uuid5(uuid.NAMESPACE_URL, f"companion-stage/v1:{cycle_id}:{stage}:pending")),
+                     cycle_id, stage, 0, "pending", bundle["known_at"], f"{cycle_id}:{stage}:pending",
+                     provenance, json.dumps({"h0_raw": False, "h0_derived": False}, sort_keys=True), at, at),
+                )
+        for original in bundle.get("stage_events") or []:
+            original_id = str(original["event_id"])
+            event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"preview-stage-event|{preview_id}|{original_id}"))
+            connection.execute(
+                """INSERT INTO companion_stage_event(
+                     event_id,cycle_id,stage,stage_run_id,event_type,state,created_at,payload_json)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (event_id, cycle_id, original["stage"], imported_stage_run_ids[str(original["stage_run_id"])],
+                 original["event_type"], original["state"], original.get("created_at") or at,
+                 original.get("payload_json") or "{}"),
             )
         for original in bundle.get("judgment_snapshots") or []:
             imported_artifact_id = artifact_map.get(original.get("artifact_id"))

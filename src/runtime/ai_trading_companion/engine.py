@@ -20,6 +20,7 @@ from .store import (
     is_structured_test_provenance,
 )
 from .task_profiles import ManualAnalysisProfileResolver
+from .decision_cycle import DECISION_CYCLE_CONTRACT
 
 
 def utc_now() -> datetime:
@@ -49,6 +50,28 @@ class CompanionEngine:
         self.evidence_contract_factory = evidence_contract_factory or EvidenceContractFactory(self.task_profiles.calendar)
         self.memory = memory
         self.memory_space_id = memory_space_id
+
+    def _stage_started(
+        self, cycle_id: str, stage: str, *, as_of: str | None = None,
+        input_sha256: str | None = None, source: str,
+    ) -> dict[str, Any]:
+        return self.store.start_stage(
+            cycle_id, stage, as_of=as_of, input_sha256=input_sha256,
+            provenance={"source": source, "contract": DECISION_CYCLE_CONTRACT},
+        )
+
+    def _stage_succeeded(
+        self, cycle_id: str, stage: str, *, output_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        return self.store.complete_stage(cycle_id, stage, output_sha256=output_sha256)
+
+    def decision_cycle_contract(self, cycle_id: str) -> dict[str, Any]:
+        """Return the versioned lifecycle projection used by Runtime/Exchange."""
+        return self.store.decision_cycle_contract(cycle_id)
+
+    def rollback_stage(self, cycle_id: str, stage: str, *, reason: str) -> dict[str, Any]:
+        """Rollback an unpublished attempt; published judgments require a revision."""
+        return self.store.rollback_cycle_stage(cycle_id, stage, reason=reason)
 
     def record_submitted_messages(self, cycle_id: str, messages: list[dict[str, Any]]) -> None:
         if self.memory is None:
@@ -233,7 +256,12 @@ class CompanionEngine:
                 "messages": messages,
                 "source_artifact_id": artifact["artifact_id"],
             })
-        cycle = self.store.transition(cycle_id, "researching_m0", as_of=as_of or iso(utc_now()))
+        frozen_as_of = as_of or iso(utc_now())
+        cycle = self.store.transition(cycle_id, "researching_m0", as_of=frozen_as_of)
+        self._stage_started(
+            cycle_id, "m0", as_of=frozen_as_of,
+            input_sha256=cycle.get("evidence_contract_hash"), source="m0_research",
+        )
         self.emit(cycle, "m0.started", cycle)
         return cycle
 
@@ -256,6 +284,7 @@ class CompanionEngine:
             m0_retry_deadline=iso(deadline), m0_retry_attempt=attempt,
             m0_last_error=str(reason)[:2000],
         )
+        self.store.fail_stage(cycle_id, "m0", reason, retryable=True)
         self.emit(current, "research.retry_waiting", {
             "cycle": current, "reason": self._user_fault_message(reason, "M0"),
             "diagnostic_code": self._diagnostic_code(reason), "attempt": attempt,
@@ -266,6 +295,7 @@ class CompanionEngine:
     def research_failed(self, cycle_id: str, reason: str, *, details: dict[str, Any] | None = None) -> dict[str, Any]:
         message = self._stage_failure_message("M0", reason, details)
         cycle = self.store.transition(cycle_id, "failed")
+        self.store.fail_stage(cycle_id, "m0", reason, retryable=False, details=details)
         self._emit_failure(
             cycle, "research.failed", message, reason,
             {"diagnostic_code": self._diagnostic_code(reason)},
@@ -365,6 +395,11 @@ class CompanionEngine:
                 "h0_auto_submit_at": cycle["h0_auto_submit_at"],
                 "m1_publish_deadline": cycle["m1_publish_deadline"],
             }, connection=connection)
+        self._stage_succeeded(cycle_id, "m0", output_sha256=artifact["sha256"])
+        self._stage_started(
+            cycle_id, "h0", as_of=evidence_as_of or cycle["as_of"],
+            input_sha256=artifact["sha256"], source="h0_window",
+        )
         return cycle
 
     def command(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -662,6 +697,14 @@ class CompanionEngine:
             has_h0=1 if messages else 0,
             m1_started_at=locked_at,
         )
+        if artifact is None:
+            self.store.skip_stage(cycle["cycle_id"], "h0", reason="empty H0 submission")
+        else:
+            self._stage_succeeded(cycle["cycle_id"], "h0", output_sha256=artifact["sha256"])
+        self._stage_started(
+            cycle["cycle_id"], "m1", as_of=locked_at,
+            input_sha256=cycle.get("packet_hash"), source="blind_m1",
+        )
         self.emit(
             cycle,
             "h0.locked",
@@ -754,6 +797,10 @@ class CompanionEngine:
         if cycle["state"] not in {"researching_m1", "m1_retry_wait"}:
             raise ValueError(f"M1 judgment cannot start from: {cycle['state']}")
         cycle = self.store.transition(cycle_id, "judging_m1", m1_started_at=cycle.get("m1_started_at") or iso(utc_now()))
+        self._stage_started(
+            cycle_id, "m1", as_of=cycle["as_of"], input_sha256=cycle.get("packet_hash"),
+            source="m1_judgment",
+        )
         self.emit(cycle, "m1.judging", {"cycle": cycle})
         return cycle
 
@@ -853,6 +900,13 @@ class CompanionEngine:
                     "source_artifact_id": artifact["artifact_id"],
                     "fallback": bool(verifier.get("fallback")),
                 }, connection=connection)
+        self._stage_succeeded(cycle_id, "m1", output_sha256=artifact["sha256"])
+        if next_state == "synthesizing_m2":
+            self._stage_started(
+                cycle_id, "m2", as_of=completed, source="m2_synthesis",
+            )
+        else:
+            self.store.skip_stage(cycle_id, "m2", reason="M2 requires a submitted H0")
         try:
             self._publish_manual_analysis_completion(cycle, presented.markdown)
         except Exception:
@@ -1010,6 +1064,7 @@ class CompanionEngine:
             return self.store.get_cycle(cycle_id)
         diagnostic_code = self._verifier_diagnostic_code(details) or self._diagnostic_code(str(reason))
         cycle = self.store.transition(cycle_id, "m1_retry_wait" if retryable else "waiting_for_repair")
+        self.store.fail_stage(cycle_id, "m1", reason, retryable=retryable, details=details)
         if retryable:
             message = self._stage_failure_message("M1", str(reason), details)
             self._queue_event(cycle_id, "m1.retrying", {
@@ -1090,6 +1145,7 @@ class CompanionEngine:
                 },
                 connection=connection,
             )
+        self._stage_succeeded(cycle_id, "m2", output_sha256=artifact["sha256"])
         return cycle
 
     def m2_deferred(self, cycle_id: str, reason: str) -> dict[str, Any]:
@@ -1097,11 +1153,15 @@ class CompanionEngine:
         if cycle["state"] not in {"synthesizing_m2", "m2_deferred"}:
             return cycle
         cycle = self.store.transition(cycle_id, "m2_deferred")
+        self.store.fail_stage(cycle_id, "m2", reason, retryable=True)
         self._emit_failure(cycle, "m2.deferred", self._user_fault_message(reason, "M2"), reason)
         return cycle
 
     def background_failed(self, cycle_id: str, stage: str, reason: str) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
+        ledger_stage = {"outcome": "result", "reflection": "reflection"}.get(stage)
+        if ledger_stage:
+            self.store.fail_stage(cycle_id, ledger_stage, reason, retryable=False)
         label = {"chat_research": "公开补查", "outcome": "结果验证", "workflow_feedback": "工作流反馈处理", "cognition": "消息理解与受控动作"}.get(stage, stage)
         self._emit_failure(cycle, f"{stage}.failed", self._user_fault_message(reason, label), reason)
         return cycle
@@ -1192,6 +1252,12 @@ class CompanionEngine:
             cycle_id, kind, "model", presented.markdown, iso(utc_now()),
             self._presentation_metadata(metadata or {}, presented),
         )
+        if kind == "outcome":
+            self._stage_succeeded(cycle_id, "result", output_sha256=artifact["sha256"])
+        elif kind == "reflection":
+            self._stage_succeeded(cycle_id, "reflection", output_sha256=artifact["sha256"])
+            if self.memory is not None:
+                self._stage_succeeded(cycle_id, "memory", output_sha256=artifact["sha256"])
         self.emit(cycle, event_type, {
             "cycle": cycle, "text": presented.markdown,
             "presentation": presented.metadata()["presentation"],
@@ -1384,6 +1450,9 @@ class CompanionEngine:
         ]
         return {
             "cycle": cycle,
+            # The desktop treats this as a versioned Runtime projection.  It
+            # is data for the existing task timeline, not a second audit UI.
+            "decision_cycle": self.store.decision_cycle_contract(cycle["cycle_id"]),
             "m0": latest["m0"]["text"] if latest["m0"] else None,
             "m1": latest["m1"]["text"] if latest["m1"] else None,
             "m2": latest["m2"]["text"] if latest["m2"] else None,

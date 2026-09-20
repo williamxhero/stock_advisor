@@ -3,5 +3,6 @@
 from .engine import CompanionEngine
 from .store import CompanionStore
 from .paths import RuntimePaths
+from .cycle_contract import CompanionDecisionCycleSpec
 
-__all__ = ["CompanionEngine", "CompanionStore", "RuntimePaths"]
+__all__ = ["CompanionDecisionCycleSpec", "CompanionEngine", "CompanionStore", "RuntimePaths"]

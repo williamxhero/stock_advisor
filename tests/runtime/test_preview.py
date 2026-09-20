@@ -257,6 +257,8 @@ class PreviewTests(unittest.TestCase):
         self.assertTrue(second["already_imported"])
         first = next(result for result in results if not result["already_imported"])
         cycle_id = first["cycle"]["cycle_id"]
+        self.assertEqual("CompanionDecisionCycleSpec/v1", first["cycle"]["cycle_spec_version"])
+        self.assertEqual("cycle.created", self.store.cycle_events(cycle_id)[0]["event_type"])
         self.assertEqual("M0 exact", self.store.latest_artifact(cycle_id, "m0")["body_markdown"])
         self.assertEqual("M1 exact", self.store.latest_artifact(cycle_id, "m1")["body_markdown"])
         approval_events = [

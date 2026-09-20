@@ -24,6 +24,7 @@ from .cognition_expression import express_cognition_answer
 from .adaptive_memory import AdaptiveMemoryResearch, MemoryResearchError
 from .broker_client import BrokerError, BrokerRequest, BrokerResponse, ProviderBrokerClient, canonical_packet_hash
 from .config import load_settings, remove_legacy_provider_settings, save_research_settings
+from .cycle_contract import memory_boundary
 from .engine import CompanionEngine, iso
 from .evidence_contract import EvidenceContractFactory
 from .evidence_gate import EvidenceGate, EvidenceInsufficient
@@ -2498,12 +2499,13 @@ def _next_memory_research_action(
 
 def _formal_adaptive_research(engine: CompanionEngine, store: CompanionStore, cycle: dict[str, Any], stage: str, as_of: str, timeout: int) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
+    memory_cycle_id, memory_as_of = memory_boundary(cycle, stage, as_of)
     result = AdaptiveMemoryResearch(
         engine.memory, engine.memory_space_id,
         lambda state: _next_memory_research_action(store, cycle, state, deadline),
         discover_external=lambda action, snapshot: _discover_chat_external_evidence(engine, action, snapshot),
         max_actions=FORMAL_MEMORY_MAX_ACTIONS,
-    ).collect(cycle["cycle_id"], [{"message_id": stage, "body_text": f"Formal {stage} evidence gaps", "known_at": as_of}], deadline=deadline, stage=stage)
+    ).collect(memory_cycle_id, [{"message_id": stage, "body_text": f"Formal {stage} evidence gaps", "known_at": memory_as_of}], deadline=deadline, stage=stage)
     return {"memoryhub_snapshot": result.snapshot, "adaptive_memory": list(result.context), "adaptive_actions": list(result.actions)}
 
 

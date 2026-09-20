@@ -21,6 +21,11 @@ from .cycle_contract import (
 from .evidence_qualification import VERSION as QUALIFICATION_VERSION
 from .evidence_qualification import qualify_record
 from .evidence_spec import VERSION, from_observation, validate
+from .evidence_snapshot import (
+    build_snapshot,
+    derive_source_watermarks,
+    validate_snapshot,
+)
 from .secret_guard import assert_safe
 from .decision_cycle import (
     DECISION_CYCLE_CONTRACT,
@@ -360,6 +365,23 @@ class CompanionStore:
               PRIMARY KEY(cycle_id,evidence_id,stage));
             CREATE INDEX IF NOT EXISTS ix_evidence_cycle_use_evidence
               ON evidence_cycle_use(evidence_id,cycle_id,used_at);
+            CREATE TABLE IF NOT EXISTS evidence_snapshot (
+              snapshot_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              as_of TEXT NOT NULL, source_watermarks_json TEXT NOT NULL,
+              schema_version INTEGER NOT NULL, content_hash TEXT NOT NULL,
+              snapshot_json TEXT NOT NULL, parent_snapshot_id TEXT, decision_id TEXT,
+              created_at TEXT NOT NULL, UNIQUE(cycle_id,content_hash)
+            );
+            CREATE INDEX IF NOT EXISTS ix_evidence_snapshot_cycle
+              ON evidence_snapshot(cycle_id,created_at,snapshot_id);
+            CREATE TABLE IF NOT EXISTS evidence_snapshot_reference (
+              cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              stage TEXT NOT NULL, snapshot_id TEXT NOT NULL REFERENCES evidence_snapshot(snapshot_id),
+              role TEXT NOT NULL, created_at TEXT NOT NULL,
+              PRIMARY KEY(cycle_id,stage,snapshot_id,role)
+            );
+            CREATE INDEX IF NOT EXISTS ix_evidence_snapshot_reference_snapshot
+              ON evidence_snapshot_reference(snapshot_id,cycle_id,stage);
             CREATE TABLE IF NOT EXISTS judgment_snapshot (
               snapshot_id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL UNIQUE,
               cycle_id TEXT NOT NULL, kind TEXT NOT NULL, snapshot_json TEXT NOT NULL,
@@ -3542,7 +3564,166 @@ class CompanionStore:
                        VALUES(?,?,?,?)""",
                     (cycle["cycle_id"], evidence_id, stage, known_at),
                 )
+        # The ledger and the public snapshot are both runtime-owned.  Freeze
+        # the snapshot only after all accepted source rows have been recorded;
+        # retries therefore resolve to the same immutable version.
+        previous_snapshot = self.evidence_snapshot_for_stage(
+            str(cycle["cycle_id"]), stage,
+            role="m0_baseline" if stage == "m0_research" else "evidence",
+        )
+        snapshot = build_snapshot(
+            cycle_id=str(cycle["cycle_id"]),
+            as_of=str(evidence.get("as_of") or cycle["as_of"]),
+            source_watermarks=derive_source_watermarks(evidence, observations),
+            evidence=evidence,
+        )
+        if previous_snapshot is not None and previous_snapshot["content_hash"] != snapshot["content_hash"]:
+            snapshot = build_snapshot(
+                cycle_id=str(cycle["cycle_id"]),
+                as_of=str(evidence.get("as_of") or cycle["as_of"]),
+                source_watermarks=derive_source_watermarks(evidence, observations),
+                evidence=evidence,
+                parent_snapshot_id=previous_snapshot["snapshot_id"],
+            )
+        self.save_evidence_snapshot(
+            snapshot, stage=stage,
+            role="m0_baseline" if stage == "m0_research" else "evidence",
+        )
         return inserted
+
+    @staticmethod
+    def _snapshot_row(row: sqlite3.Row) -> dict[str, Any]:
+        snapshot = json.loads(row["snapshot_json"])
+        validate_snapshot(snapshot)
+        return snapshot
+
+    def save_evidence_snapshot(
+        self, snapshot: dict[str, Any], *, stage: str, role: str = "evidence",
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        """Persist one snapshot and a stage reference without ever overwriting it."""
+        validate_snapshot(snapshot)
+        if not str(stage or "").strip() or not str(role or "").strip():
+            raise ValueError("evidence snapshot stage and role are required")
+
+        def save(c: sqlite3.Connection) -> dict[str, Any]:
+            cycle = c.execute(
+                "SELECT cycle_id FROM companion_cycle WHERE cycle_id=?", (snapshot["cycle_id"],)
+            ).fetchone()
+            if not cycle:
+                raise ValueError("evidence snapshot cycle does not exist")
+            raw = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            c.execute(
+                """INSERT OR IGNORE INTO evidence_snapshot(
+                     snapshot_id,cycle_id,as_of,source_watermarks_json,schema_version,
+                     content_hash,snapshot_json,parent_snapshot_id,decision_id,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    snapshot["snapshot_id"], snapshot["cycle_id"], snapshot["as_of"],
+                    json.dumps(snapshot["source_watermarks"], ensure_ascii=False, sort_keys=True),
+                    snapshot["schema_version"], snapshot["content_hash"], raw,
+                    snapshot.get("parent_snapshot_id"), snapshot.get("decision_id"), now(),
+                ),
+            )
+            stored = c.execute(
+                "SELECT * FROM evidence_snapshot WHERE snapshot_id=?", (snapshot["snapshot_id"],)
+            ).fetchone()
+            if stored is None or stored["snapshot_json"] != raw:
+                raise ValueError("evidence snapshot is immutable and cannot be overwritten")
+            c.execute(
+                """INSERT OR IGNORE INTO evidence_snapshot_reference(
+                     cycle_id,stage,snapshot_id,role,created_at) VALUES(?,?,?,?,?)""",
+                (snapshot["cycle_id"], stage, snapshot["snapshot_id"], role, now()),
+            )
+            reference = c.execute(
+                """SELECT s.*,r.stage,r.role FROM evidence_snapshot s
+                   JOIN evidence_snapshot_reference r ON r.snapshot_id=s.snapshot_id
+                   WHERE s.snapshot_id=? AND r.cycle_id=? AND r.stage=? AND r.role=?""",
+                (snapshot["snapshot_id"], snapshot["cycle_id"], stage, role),
+            ).fetchone()
+            if reference is None:
+                raise ValueError("evidence snapshot reference was not persisted")
+            return self._snapshot_row(reference)
+
+        if connection is not None:
+            return save(connection)
+        with self.connection() as c:
+            return save(c)
+
+    def get_evidence_snapshot(self, snapshot_id: str) -> dict[str, Any] | None:
+        self.initialize()
+        with self.connection() as c:
+            row = c.execute(
+                "SELECT * FROM evidence_snapshot WHERE snapshot_id=?", (snapshot_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        snapshot = json.loads(row["snapshot_json"])
+        validate_snapshot(snapshot)
+        return snapshot
+
+    def reference_evidence_snapshot(
+        self, cycle_id: str, snapshot_id: str, *, stage: str, role: str = "shared_baseline",
+    ) -> dict[str, Any]:
+        """Add a stage reference to an existing immutable snapshot."""
+        snapshot = self.get_evidence_snapshot(snapshot_id)
+        if snapshot is None or snapshot["cycle_id"] != cycle_id:
+            raise ValueError("evidence snapshot does not belong to the cycle")
+        with self.connection() as c:
+            c.execute(
+                """INSERT OR IGNORE INTO evidence_snapshot_reference(
+                     cycle_id,stage,snapshot_id,role,created_at) VALUES(?,?,?,?,?)""",
+                (cycle_id, stage, snapshot_id, role, now()),
+            )
+        referenced = self.evidence_snapshot_for_stage(cycle_id, stage, role=role)
+        if referenced is None:
+            raise ValueError("evidence snapshot reference was not persisted")
+        return referenced
+
+    def evidence_snapshots(self, cycle_id: str | None = None) -> list[dict[str, Any]]:
+        self.initialize()
+        with self.connection() as c:
+            if cycle_id:
+                rows = c.execute(
+                    "SELECT * FROM evidence_snapshot WHERE cycle_id=? ORDER BY created_at,snapshot_id",
+                    (cycle_id,),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM evidence_snapshot ORDER BY created_at,snapshot_id"
+                ).fetchall()
+        result = []
+        for row in rows:
+            snapshot = json.loads(row["snapshot_json"])
+            validate_snapshot(snapshot)
+            result.append(snapshot)
+        return result
+
+    def evidence_snapshot_for_stage(
+        self, cycle_id: str, stage: str, *, role: str | None = None,
+    ) -> dict[str, Any] | None:
+        self.initialize()
+        query = """SELECT s.*,r.stage,r.role FROM evidence_snapshot s
+                   JOIN evidence_snapshot_reference r ON r.snapshot_id=s.snapshot_id
+                   WHERE r.cycle_id=? AND r.stage=?"""
+        values: list[Any] = [cycle_id, stage]
+        if role is not None:
+            query += " AND r.role=?"
+            values.append(role)
+        query += " ORDER BY r.created_at DESC,s.snapshot_id DESC LIMIT 1"
+        with self.connection() as c:
+            row = c.execute(query, values).fetchone()
+        return self._snapshot_row(row) if row else None
+
+    def shared_evidence_snapshot(self, cycle_id: str) -> dict[str, Any] | None:
+        """Return the M0 baseline referenced by M1, if both references agree."""
+        baseline = self.evidence_snapshot_for_stage(cycle_id, "m0_research", role="m0_baseline")
+        m1 = self.evidence_snapshot_for_stage(cycle_id, "m1_research")
+        if baseline is None:
+            return None
+        if m1 is not None and m1["snapshot_id"] != baseline["snapshot_id"]:
+            raise ValueError("M0 and M1 evidence references do not share one baseline")
+        return baseline
 
     def evidence_for_day(self, trading_date: str, known_at: str, *, limit: int = 120) -> list[dict[str, Any]]:
         with self.connection() as c:

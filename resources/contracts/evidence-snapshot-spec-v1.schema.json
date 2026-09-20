@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvidenceSnapshotSpec/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "snapshot_id", "cycle_id", "as_of", "source_watermarks", "schema_version", "content_hash", "evidence", "parent_snapshot_id", "decision_id"],
+  "properties": {
+    "contract": {"const": "EvidenceSnapshotSpec/v1"},
+    "snapshot_id": {"type": "string", "format": "uuid"},
+    "cycle_id": {"type": "string", "minLength": 1},
+    "as_of": {"type": "string", "minLength": 1},
+    "source_watermarks": {"type": "object", "additionalProperties": true},
+    "schema_version": {"const": 1},
+    "content_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "evidence": {"type": "object"},
+    "parent_snapshot_id": {"type": ["string", "null"]},
+    "decision_id": {"type": ["string", "null"]}
+  }
+}

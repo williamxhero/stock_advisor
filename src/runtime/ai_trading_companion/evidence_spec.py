@@ -58,6 +58,11 @@ def from_observation(item: dict[str, Any], observation: dict[str, Any]) -> dict[
     propagation = str(item.get("market_propagation") or "unknown")
     propagation = propagation if propagation in PROPAGATION else "unknown"
     impact = copy.deepcopy(item.get("propagation_impact") or {})
+    reference = copy.deepcopy(item.get("source_reference") or {})
+    if item.get("screenshot_only") is True:
+        reference["screenshot_only"] = True
+    if item.get("source_strength"):
+        reference["source_strength"] = item["source_strength"]
     if propagation == "observed":
         impact.setdefault("evidence_refs", [str(item.get("evidence_ref") or "")])
         if item.get("propagation_observed_from"):
@@ -67,8 +72,7 @@ def from_observation(item: dict[str, Any], observation: dict[str, Any]) -> dict[
     record = {
         "contract": VERSION, "kind": kind,
         "source": {"url": str(item.get("url") or ""), "title": str(item.get("title") or ""),
-                   "identity": str(item.get("source_identity") or ""),
-                   "reference": copy.deepcopy(item.get("source_reference") or {})},
+                   "identity": str(item.get("source_identity") or ""), "reference": reference},
         "occurred_at": occurred, "known_at": known, "content": body,
         "truth_status": "unknown" if kind in AI_KINDS else truth,
         "market_propagation": {"status": propagation, "impact": impact},

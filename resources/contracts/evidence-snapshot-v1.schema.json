@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EvidenceSnapshotSpec/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "snapshot_id", "cycle_id", "as_of", "source_watermarks", "schema_version", "content_hash", "evidence_refs", "version", "previous_snapshot_id"],
+  "properties": {
+    "contract": {"const": "EvidenceSnapshotSpec/v1"},
+    "snapshot_id": {"type": "string", "format": "uuid"},
+    "cycle_id": {"type": "string", "minLength": 1},
+    "as_of": {"type": "string", "format": "date-time"},
+    "source_watermarks": {"type": "object"},
+    "schema_version": {"const": "EvidenceSnapshotSpec/v1"},
+    "content_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "evidence_refs": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["evidence_id"], "properties": {"evidence_id": {"type": "string", "minLength": 1}, "content_sha256": {"type": "string"}, "known_at": {"type": ["string", "null"]}, "occurred_at": {"type": ["string", "null"]}, "qualification_id": {"type": "string"}}}},
+    "version": {"type": "integer", "minimum": 1},
+    "previous_snapshot_id": {"type": ["string", "null" ]}
+  }
+}

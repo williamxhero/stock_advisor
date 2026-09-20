@@ -16,6 +16,7 @@ from .stage_expression import verified_weekly_market_comparison
 from .trading_calendar import TradingCalendarUnavailable
 from .opportunities import is_premarket, OBSERVATION_INSTRUCTION, REVIEW_RESULT_INSTRUCTION
 from .cycle_contract import memory_boundary
+from .decision_cycle import assert_m1_blind
 
 
 PUBLIC_STAGES = {"m0_research", "m1_research", "outcome_research", "chat_research"}
@@ -750,13 +751,14 @@ class RuntimePacketBuilder:
         return " ".join(str(item.get("title", "")) for item in evidence.get("sources", [])[:8])
 
     def _assert_m1_blind(self, packet: dict[str, Any], cycle: dict[str, Any]) -> None:
-        forbidden = {
+        forbidden = [
             artifact["body_markdown"] for artifact in self.store.artifacts(cycle["cycle_id"])
             if artifact["actor"] == "human"
-        }
-        serialized = json.dumps(packet, ensure_ascii=False, sort_keys=True)
-        if any(text and text in serialized for text in forbidden):
-            raise RuntimeError("M1 packet contains current-cycle human content")
+        ]
+        try:
+            assert_m1_blind(packet, human_texts=forbidden)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     @staticmethod
     def prompt(packet: dict[str, Any]) -> str:

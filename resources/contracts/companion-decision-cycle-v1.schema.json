@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "companion-decision-cycle/v1",
+  "title": "Companion decision cycle",
+  "type": "object",
+  "required": ["contract", "contract_version", "cycle_id", "task_key", "as_of", "scheduled_for", "schedule", "state", "revision", "stages", "provenance"],
+  "properties": {
+    "contract": { "const": "companion-decision-cycle/v1" },
+    "contract_version": { "const": 1 },
+    "cycle_id": { "type": "string", "minLength": 1 },
+    "task_key": { "type": "string", "minLength": 1 },
+    "as_of": { "type": "string", "minLength": 1 },
+    "scheduled_for": { "type": "string", "minLength": 1 },
+    "schedule": {
+      "type": "object",
+      "required": ["schedule_id", "revision", "snapshot"],
+      "properties": {
+        "schedule_id": { "type": ["string", "null"] },
+        "revision": { "type": ["integer", "null"] },
+        "snapshot": { "type": ["object", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "state": { "type": "string" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "stages": {
+      "type": "array",
+      "minItems": 7,
+      "items": {
+        "type": "object",
+        "required": ["stage", "state", "attempt", "as_of", "provenance", "visibility"],
+        "properties": {
+          "stage": { "enum": ["m0", "h0", "m1", "m2", "result", "reflection", "memory"] },
+          "state": { "enum": ["pending", "running", "retry_wait", "succeeded", "failed", "skipped", "rolled_back"] },
+          "attempt": { "type": "integer", "minimum": 0 },
+          "as_of": { "type": "string" },
+          "started_at": { "type": ["string", "null"] },
+          "completed_at": { "type": ["string", "null"] },
+          "failed_at": { "type": ["string", "null"] },
+          "retry_at": { "type": ["string", "null"] },
+          "input_sha256": { "type": ["string", "null"] },
+          "output_sha256": { "type": ["string", "null"] },
+          "provenance": { "type": "object" },
+          "visibility": { "type": "object" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "provenance": { "type": "object" }
+  },
+  "additionalProperties": false
+}

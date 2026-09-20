@@ -136,6 +136,12 @@ class PreviewTests(unittest.TestCase):
             "scheduled_for": self.source["scheduled_for"], "known_at": known_at,
             "replay_mode": "original_cycle_inputs", "qualification_version": 2, "cycle_state": "complete",
             "preview_status": "passed",
+            "cycle_spec_version": 1,
+            "cycle_provenance_json": json.dumps({
+                "contract": "companion-decision-cycle-provenance/v1",
+                "source": "frozen_replay",
+                "source_cycle_id": self.source["cycle_id"],
+            }, sort_keys=True),
             "schedule_snapshot": {},
             "artifacts": [
                 artifact("evidence", json.dumps(research_output, ensure_ascii=False, sort_keys=True)),
@@ -175,6 +181,22 @@ class PreviewTests(unittest.TestCase):
                 }, sort_keys=True),
             }],
             "attempts": attempts, "stage_checkpoints": checkpoints, "judgment_snapshots": [], "evidence": {},
+            "stage_runs": [{
+                "stage_run_id": "stage-run-m1", "cycle_id": "preview-cycle", "stage": "m1",
+                "attempt": 1, "state": "succeeded", "as_of": known_at,
+                "idempotency_key": "preview-cycle:m1:attempt:1", "started_at": known_at,
+                "completed_at": known_at, "failed_at": None, "retry_at": None,
+                "input_sha256": attempts[-1]["input_sha256"], "output_sha256": "m1-output",
+                "error_json": "{}", "provenance_json": json.dumps({"source": "frozen_replay"}, sort_keys=True),
+                "visibility_json": json.dumps({
+                    "h0_raw": False, "h0_derived": False, "private_context": "pre_h0_snapshot",
+                }, sort_keys=True), "rollback_of": None, "created_at": known_at, "updated_at": known_at,
+            }],
+            "stage_events": [{
+                "event_id": "stage-event-m1", "cycle_id": "preview-cycle", "stage": "m1",
+                "stage_run_id": "stage-run-m1", "event_type": "stage.started", "state": "running",
+                "created_at": known_at, "payload_json": json.dumps({"replayed": True}, sort_keys=True),
+            }],
         }
         seal_bundle(bundle, signing_key)
         tampered = copy.deepcopy(bundle)
@@ -301,6 +323,17 @@ class PreviewTests(unittest.TestCase):
             for event in self.store.pending_events()
             if event["cycle_id"] == cycle_id
         ))
+        self.assertEqual("succeeded", self.store.stage_status(cycle_id, "m1")["state"])
+        self.assertEqual(
+            {"h0_raw": False, "h0_derived": False, "private_context": "pre_h0_snapshot"},
+            json.loads(self.store.stage_status(cycle_id, "m1")["visibility_json"]),
+        )
+        self.assertEqual(1, len(self.store.stage_events(cycle_id, "m1")))
+        self.assertEqual(
+            self.source["cycle_id"],
+            json.loads(self.store.get_cycle(cycle_id)["cycle_provenance_json"])["source_cycle_id"],
+        )
+        self.assertEqual(cycle_id, self.store.decision_cycle_contract(cycle_id)["cycle_id"])
         approval_events = [
             event for event in self.store.pending_events()
             if event["cycle_id"] == cycle_id and event["event_type"] == "cycle.preview_approved"

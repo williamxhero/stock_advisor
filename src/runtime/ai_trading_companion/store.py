@@ -19,6 +19,14 @@ from .cycle_contract import (
 )
 from .secret_guard import assert_safe
 from .evidence_spec import VERSION, from_observation, qualify, validate
+from .decision_cycle import (
+    DECISION_CYCLE_CONTRACT,
+    DECISION_CYCLE_STAGES,
+    canonical_json,
+    cycle_contract,
+    validate_stage,
+    validate_stage_state,
+)
 
 
 _USER_VISIBLE_CYCLE_SQL = """NOT (
@@ -133,6 +141,7 @@ class CompanionStore:
               as_of TEXT NOT NULL, state TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
               cycle_spec_version TEXT NOT NULL DEFAULT 'CompanionDecisionCycleSpec/v1',
               cycle_contract_json TEXT, cycle_contract_hash TEXT,
+              cycle_provenance_json TEXT NOT NULL DEFAULT '{}',
               kind TEXT NOT NULL DEFAULT 'scheduled', work_start_at TEXT,
               trigger TEXT NOT NULL DEFAULT 'scheduled', request_id TEXT,
               requested_at TEXT, request_source_json TEXT,
@@ -273,6 +282,24 @@ class CompanionStore:
               as_of TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT,
               input_sha256 TEXT, output_sha256 TEXT, error TEXT,
               UNIQUE(cycle_id, stage, attempt_number));
+            CREATE TABLE IF NOT EXISTS companion_stage_run (
+              stage_run_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              stage TEXT NOT NULL, attempt INTEGER NOT NULL, state TEXT NOT NULL,
+              as_of TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+              started_at TEXT, completed_at TEXT, failed_at TEXT, retry_at TEXT,
+              input_sha256 TEXT, output_sha256 TEXT, error_json TEXT,
+              provenance_json TEXT NOT NULL, visibility_json TEXT NOT NULL,
+              rollback_of TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+              UNIQUE(cycle_id, stage, attempt), UNIQUE(cycle_id, stage, idempotency_key));
+            CREATE TABLE IF NOT EXISTS companion_stage_event (
+              event_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              stage TEXT NOT NULL, stage_run_id TEXT NOT NULL REFERENCES companion_stage_run(stage_run_id),
+              event_type TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL,
+              payload_json TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS ix_companion_stage_run_cycle
+              ON companion_stage_run(cycle_id, stage, attempt);
+            CREATE INDEX IF NOT EXISTS ix_companion_stage_event_cycle
+              ON companion_stage_event(cycle_id, stage, created_at);
             CREATE TABLE IF NOT EXISTS stage_checkpoint (
               cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               stage TEXT NOT NULL, packet_sha256 TEXT NOT NULL, attempt_id TEXT NOT NULL REFERENCES llm_attempt(attempt_id),
@@ -437,6 +464,7 @@ class CompanionStore:
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
             for name, declaration in {
+                "cycle_provenance_json": "TEXT NOT NULL DEFAULT '{}'",
                 "m1_publish_deadline": "TEXT",
                 "h0_auto_submit_at": "TEXT",
                 "h0_locked_at": "TEXT",
@@ -987,9 +1015,290 @@ class CompanionStore:
                 c.execute("DELETE FROM schedule_worker_claim")
         return cycle_ids
 
+    # ------------------------------------------------------------------
+    # CompanionDecisionCycleSpec v1
+    # ------------------------------------------------------------------
+    def initialize_cycle_stages(
+        self, cycle_id: str, *, provenance: dict[str, Any] | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        """Create the pending high-level stages exactly once for a cycle."""
+        self.initialize()
+        cycle = self.get_cycle(cycle_id, connection=connection) if connection is not None else self.get_cycle(cycle_id)
+        base = {
+            "contract": "companion-decision-cycle-provenance/v1",
+            "source": "runtime",
+            "cycle_id": cycle_id,
+            "task_key": cycle["task_key"],
+        }
+        base.update(provenance or {})
+
+        def insert(c: sqlite3.Connection) -> None:
+            at = now()
+            for stage in DECISION_CYCLE_STAGES:
+                c.execute(
+                    """INSERT OR IGNORE INTO companion_stage_run(
+                         stage_run_id,cycle_id,stage,attempt,state,as_of,idempotency_key,
+                         provenance_json,visibility_json,created_at,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        str(uuid.uuid5(uuid.NAMESPACE_URL, f"companion-stage/v1:{cycle_id}:{stage}:pending")),
+                        cycle_id, stage, 0, "pending", cycle["as_of"], f"{cycle_id}:{stage}:pending",
+                        canonical_json(base), canonical_json({"h0_raw": False, "h0_derived": False}), at, at,
+                    ),
+                )
+
+        if connection is not None:
+            insert(connection)
+        else:
+            with self.connection() as c:
+                insert(c)
+
+    def set_cycle_provenance(self, cycle_id: str, provenance: dict[str, Any]) -> None:
+        value = {
+            "contract": "companion-decision-cycle-provenance/v1",
+            "source": "runtime",
+            **provenance,
+        }
+        with self.connection() as c:
+            c.execute(
+                "UPDATE companion_cycle SET cycle_provenance_json=?,updated_at=? WHERE cycle_id=?",
+                (canonical_json(value), now(), cycle_id),
+            )
+
+    def _stage_latest(self, cycle_id: str, stage: str, connection: sqlite3.Connection) -> sqlite3.Row | None:
+        validate_stage(stage)
+        return connection.execute(
+            "SELECT * FROM companion_stage_run WHERE cycle_id=? AND stage=? ORDER BY attempt DESC LIMIT 1",
+            (cycle_id, stage),
+        ).fetchone()
+
+    @staticmethod
+    def _stage_event(
+        connection: sqlite3.Connection, *, cycle_id: str, stage: str, stage_run_id: str,
+        event_type: str, state: str, payload: dict[str, Any] | None = None,
+    ) -> None:
+        connection.execute(
+            """INSERT INTO companion_stage_event(
+                 event_id,cycle_id,stage,stage_run_id,event_type,state,created_at,payload_json
+               ) VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                str(uuid.uuid4()), cycle_id, stage, stage_run_id, event_type, state, now(),
+                canonical_json(payload or {}),
+            ),
+        )
+
+    @staticmethod
+    def _stage_visibility(stage: str) -> dict[str, Any]:
+        if stage == "m1":
+            return {
+                "h0_raw": False,
+                "h0_derived": False,
+                "private_context": "pre_h0_snapshot",
+                "retry_input": "same_frozen_public_packet",
+            }
+        return {"h0_raw": stage == "m2", "h0_derived": stage == "m2"}
+
+    def start_stage(
+        self, cycle_id: str, stage: str, *, as_of: str | None = None,
+        input_sha256: str | None = None, idempotency_key: str | None = None,
+        provenance: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        stage = validate_stage(stage)
+        self.initialize_cycle_stages(cycle_id)
+        with self.connection() as c:
+            cycle = self.get_cycle(cycle_id, connection=c)
+            if stage == "m1" and not cycle.get("private_context_json"):
+                raise ValueError("M1 requires the pre-H0 private context snapshot")
+            latest = self._stage_latest(cycle_id, stage, c)
+            requested_key = idempotency_key or f"{cycle_id}:{stage}:{input_sha256 or cycle['as_of']}"
+            if latest is not None and latest["state"] == "running":
+                if latest["idempotency_key"] not in {
+                    requested_key, f"{requested_key}:attempt:{latest['attempt']}",
+                }:
+                    raise ValueError(f"{stage} already has a running attempt")
+                return dict(latest)
+            if latest is not None and latest["state"] in {"succeeded", "skipped"}:
+                return dict(latest)
+            attempt = int(c.execute(
+                "SELECT COALESCE(MAX(attempt),0)+1 FROM companion_stage_run WHERE cycle_id=? AND stage=?",
+                (cycle_id, stage),
+            ).fetchone()[0])
+            effective_key = f"{requested_key}:attempt:{attempt}"
+            at = now()
+            run_id = str(uuid.uuid4())
+            root = {
+                "contract": "companion-decision-cycle-provenance/v1",
+                "source": "runtime",
+                "cycle_id": cycle_id,
+                "task_key": cycle["task_key"],
+                "stage": stage,
+                "attempt": attempt,
+            }
+            root.update(provenance or {})
+            c.execute(
+                """INSERT INTO companion_stage_run(
+                     stage_run_id,cycle_id,stage,attempt,state,as_of,idempotency_key,started_at,
+                     input_sha256,provenance_json,visibility_json,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    run_id, cycle_id, stage, attempt, "running", as_of or cycle["as_of"], effective_key, at,
+                    input_sha256, canonical_json(root), canonical_json(self._stage_visibility(stage)), at, at,
+                ),
+            )
+            self._stage_event(
+                c, cycle_id=cycle_id, stage=stage, stage_run_id=run_id,
+                event_type="stage.started", state="running",
+                payload={"as_of": as_of or cycle["as_of"], "input_sha256": input_sha256, "provenance": root},
+            )
+            return dict(c.execute("SELECT * FROM companion_stage_run WHERE stage_run_id=?", (run_id,)).fetchone())
+
+    def _finish_stage(
+        self, cycle_id: str, stage: str, state: str, *, output_sha256: str | None = None,
+        error: dict[str, Any] | None = None, retry_at: str | None = None,
+        stage_run_id: str | None = None, event_type: str | None = None,
+    ) -> dict[str, Any]:
+        stage = validate_stage(stage)
+        state = validate_stage_state(state)
+        if state not in {"succeeded", "failed", "retry_wait", "skipped", "rolled_back"}:
+            raise ValueError(f"invalid terminal stage state: {state}")
+        self.initialize_cycle_stages(cycle_id)
+        with self.connection() as c:
+            row = c.execute(
+                "SELECT * FROM companion_stage_run WHERE stage_run_id=? AND cycle_id=? AND stage=?" if stage_run_id else
+                "SELECT * FROM companion_stage_run WHERE cycle_id=? AND stage=? ORDER BY attempt DESC LIMIT 1",
+                (stage_run_id, cycle_id, stage) if stage_run_id else (cycle_id, stage),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown stage execution")
+            if row["state"] == state:
+                return dict(row)
+            if row["state"] not in {"running", "retry_wait", "failed", "rolled_back", "pending"}:
+                raise ValueError(f"stage {stage} cannot transition from {row['state']} to {state}")
+            at = now()
+            fields = ["state=?", "updated_at=?"]
+            values: list[Any] = [state, at]
+            if state == "succeeded" or state == "skipped":
+                fields.append("completed_at=?"); values.append(at)
+            if state == "failed":
+                fields.append("failed_at=?"); values.append(at)
+            if state == "retry_wait":
+                fields.append("retry_at=?"); values.append(retry_at or at)
+            if output_sha256 is not None:
+                fields.append("output_sha256=?"); values.append(output_sha256)
+            if error is not None:
+                fields.append("error_json=?"); values.append(canonical_json(error))
+            values.extend([row["stage_run_id"], cycle_id])
+            c.execute(
+                f"UPDATE companion_stage_run SET {', '.join(fields)} WHERE stage_run_id=? AND cycle_id=?",
+                values,
+            )
+            self._stage_event(
+                c, cycle_id=cycle_id, stage=stage, stage_run_id=row["stage_run_id"],
+                event_type=event_type or f"stage.{state}", state=state,
+                payload={"output_sha256": output_sha256, "error": error, "retry_at": retry_at},
+            )
+            return dict(c.execute("SELECT * FROM companion_stage_run WHERE stage_run_id=?", (row["stage_run_id"],)).fetchone())
+
+    def complete_stage(self, cycle_id: str, stage: str, *, output_sha256: str | None = None, stage_run_id: str | None = None) -> dict[str, Any]:
+        stage = validate_stage(stage)
+        self.initialize_cycle_stages(cycle_id)
+        with self.connection() as c:
+            latest = self._stage_latest(cycle_id, stage, c)
+        if latest is not None and latest["state"] == "pending":
+            self.start_stage(cycle_id, stage, idempotency_key=f"{cycle_id}:{stage}:implicit-complete")
+        return self._finish_stage(cycle_id, stage, "succeeded", output_sha256=output_sha256, stage_run_id=stage_run_id)
+
+    def skip_stage(self, cycle_id: str, stage: str, *, reason: str) -> dict[str, Any]:
+        return self._finish_stage(cycle_id, stage, "skipped", error={"reason": reason}, event_type="stage.skipped")
+
+    def fail_stage(self, cycle_id: str, stage: str, reason: str, *, retryable: bool, details: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._finish_stage(
+            cycle_id, stage, "retry_wait" if retryable else "failed",
+            error={"reason": str(reason), "details": details or {}, "retryable": retryable},
+            event_type="stage.retry_waiting" if retryable else "stage.failed",
+        )
+
+    def rollback_stage(self, cycle_id: str, stage: str, *, reason: str, target_stage_run_id: str | None = None) -> dict[str, Any]:
+        stage = validate_stage(stage)
+        if stage == "m1" and self.latest_artifact(cycle_id, "m1") is not None:
+            raise ValueError("published M1 cannot be rolled back; append a judgment revision")
+        return self._finish_stage(
+            cycle_id, stage, "rolled_back", stage_run_id=target_stage_run_id,
+            error={"reason": str(reason)}, event_type="stage.rolled_back",
+        )
+
+    def stage_status(self, cycle_id: str, stage: str) -> dict[str, Any]:
+        stage = validate_stage(stage)
+        self.initialize_cycle_stages(cycle_id)
+        with self.connection() as c:
+            row = self._stage_latest(cycle_id, stage, c)
+        if row is None:
+            raise ValueError("unknown stage")
+        return dict(row)
+
+    def stage_history(self, cycle_id: str, stage: str | None = None) -> list[dict[str, Any]]:
+        self.initialize_cycle_stages(cycle_id)
+        with self.connection() as c:
+            if stage is None:
+                rows = c.execute(
+                    "SELECT * FROM companion_stage_run WHERE cycle_id=? ORDER BY stage,attempt",
+                    (cycle_id,),
+                ).fetchall()
+            else:
+                validate_stage(stage)
+                rows = c.execute(
+                    "SELECT * FROM companion_stage_run WHERE cycle_id=? AND stage=? ORDER BY attempt",
+                    (cycle_id, stage),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def stage_events(self, cycle_id: str, stage: str | None = None) -> list[dict[str, Any]]:
+        with self.connection() as c:
+            if stage is None:
+                rows = c.execute(
+                    "SELECT * FROM companion_stage_event WHERE cycle_id=? ORDER BY created_at,event_id",
+                    (cycle_id,),
+                ).fetchall()
+            else:
+                validate_stage(stage)
+                rows = c.execute(
+                    "SELECT * FROM companion_stage_event WHERE cycle_id=? AND stage=? ORDER BY created_at,event_id",
+                    (cycle_id, stage),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def decision_cycle_contract(self, cycle_id: str) -> dict[str, Any]:
+        cycle = self.get_cycle(cycle_id)
+        stages = []
+        for stage in DECISION_CYCLE_STAGES:
+            row = self.stage_status(cycle_id, stage)
+            item = {
+                "stage": stage, "state": row["state"], "attempt": row["attempt"],
+                "as_of": row["as_of"], "started_at": row.get("started_at"),
+                "completed_at": row.get("completed_at"), "failed_at": row.get("failed_at"),
+                "retry_at": row.get("retry_at"), "input_sha256": row.get("input_sha256"),
+                "output_sha256": row.get("output_sha256"),
+                "provenance": json.loads(row.get("provenance_json") or "{}"),
+                "visibility": json.loads(row.get("visibility_json") or "{}"),
+            }
+            stages.append(item)
+        return cycle_contract(cycle, stages)
+
+    def rollback_cycle_stage(self, cycle_id: str, stage: str, *, reason: str) -> dict[str, Any]:
+        """Rollback an unpublished execution attempt without deleting facts."""
+        result = self.rollback_stage(cycle_id, stage, reason=reason)
+        cycle = self.get_cycle(cycle_id)
+        self.queue_event(cycle_id, "stage.rolled_back", {
+            "cycle": cycle, "stage": stage, "stage_run_id": result["stage_run_id"],
+            "reason": reason, "contract": DECISION_CYCLE_CONTRACT,
+        })
+        return {"cycle": cycle, "stage": result}
+
     def create_cycle(self, task_key: str, scheduled_for: str, as_of: str, *, schedule_id: str | None = None, schedule_revision: int | None = None, schedule_snapshot: dict[str, Any] | None = None, kind: str = "scheduled", work_start_at: str | None = None) -> dict[str, Any]:
         self.initialize(); cycle_id = str(uuid.uuid4()); at = now()
         validate_state("queued")
+        created_cycle = False
         with self.connection() as c:
             c.execute("BEGIN IMMEDIATE")
             claimed = c.execute("SELECT cycle_id FROM companion_schedule_claim WHERE task_key=? AND scheduled_for=?", (task_key, scheduled_for)).fetchone()
@@ -1027,7 +1336,17 @@ class CompanionStore:
                         c, cycle_id, "cycle.created", to_state="queued",
                         payload=contract.to_dict(),
                     )
+                    created_cycle = True
                 c.execute("INSERT INTO companion_schedule_claim(task_key,scheduled_for,cycle_id,claimed_at) VALUES(?,?,?,?)", (task_key, scheduled_for, cycle_id, at))
+        if created_cycle:
+            self.set_cycle_provenance(cycle_id, {
+                "task_key": task_key, "schedule_id": schedule_id,
+                "schedule_revision": schedule_revision, "kind": kind,
+            })
+        frozen = self.get_cycle(cycle_id)
+        self.initialize_cycle_stages(
+            cycle_id, provenance={"schedule_revision": frozen.get("schedule_revision")},
+        )
         return self.get_cycle(cycle_id)
 
     def create_manual_analysis_cycle(
@@ -1115,7 +1434,11 @@ class CompanionStore:
                 "INSERT INTO companion_manual_analysis_claim(request_id,cycle_id,claimed_at) VALUES(?,?,?)",
                 (request_id, cycle_id, claimed_at),
             )
-            return self.get_cycle(cycle_id, connection=c), True
+        self.set_cycle_provenance(cycle_id, {
+            "task_key": task_key, "request_id": request_id, "kind": "manual",
+        })
+        self.initialize_cycle_stages(cycle_id, provenance={"request_id": request_id, "source": "manual_analysis"})
+        return self.get_cycle(cycle_id), True
 
     def refresh_manual_analysis_contract(self, cycle_id: str, as_of: str, contract: dict[str, Any]) -> dict[str, Any]:
         """Freeze a manual request at the instant its research worker actually starts."""
@@ -1314,6 +1637,11 @@ class CompanionStore:
                     "UPDATE companion_cycle SET h0_artifact_id=?, updated_at=?, revision=revision+1 WHERE cycle_id=?",
                     (copied_artifacts["h0"]["artifact_id"], now(), cycle_id),
                 )
+        self.set_cycle_provenance(cycle_id, {
+            "task_key": source["task_key"], "source_cycle_id": source_cycle_id,
+            "kind": "diagnostic_rerun",
+        })
+        self.initialize_cycle_stages(cycle_id, provenance={"source_cycle_id": source_cycle_id, "kind": "diagnostic_rerun"})
         return self.get_cycle(cycle_id)
 
     def create_preview_cycle(self, source_cycle_id: str, known_at: str) -> dict[str, Any]:
@@ -1360,6 +1688,11 @@ class CompanionStore:
                 provenance={"source": "preview_rerun", "source_cycle_id": source_cycle_id},
                 payload=contract.to_dict(),
             )
+        self.set_cycle_provenance(cycle_id, {
+            "task_key": source["task_key"], "source_cycle_id": source_cycle_id,
+            "kind": "preview_rerun",
+        })
+        self.initialize_cycle_stages(cycle_id, provenance={"source_cycle_id": source_cycle_id, "kind": "preview_rerun"})
         return self.get_cycle(cycle_id)
 
     def _append_cycle_event(

@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .secret_guard import find_secrets
+from .evidence_spec import from_observation
 
 
 class AcquisitionBoundary:
@@ -27,11 +28,12 @@ class AcquisitionBoundary:
         secret_rejected_items = 0
         for row in rows:
             url = str(row.get("url") or "")
-            if not url:
+            source_reference = row.get("source_reference") if isinstance(row.get("source_reference"), dict) else {}
+            if not url and not source_reference and str(result.get("backend") or "") != "market":
                 continue
             self._sequence += 1
             ref = f"ev_{self.attempt_id.replace('-', '')}_{self._sequence}"
-            host = urlsplit(url).netloc.lower()
+            host = urlsplit(url).netloc.lower() or str(source_reference.get("source_system") or "market")
             excerpt = str(
                 row.get("excerpt_text") or row.get("snippet") or row.get("text") or row.get("title") or ""
             )[:8000]
@@ -69,6 +71,13 @@ class AcquisitionBoundary:
                 "claims": [dict(value) for value in row.get("claims") or [] if isinstance(value, dict)],
                 "excerpt_text": excerpt, "fact_as_of": row.get("fact_as_of") or row.get("published_at"),
                 "published_at": row.get("published_at"), "acquired_at": acquired_at,
+                "known_at": acquired_at,
+                "evidence_kind": str(row.get("evidence_kind") or ""),
+                "source_reference": source_reference,
+                "propagation_impact": row.get("propagation_impact") if isinstance(row.get("propagation_impact"), dict) else {},
+                "propagation_observed_from": row.get("propagation_observed_from"),
+                "propagation_observed_to": row.get("propagation_observed_to"),
+                "derivation": row.get("derivation") if isinstance(row.get("derivation"), dict) else {},
             }
             evidence_items.append(item)
             model_rows.append({"evidence_ref": ref, "excerpt": excerpt})
@@ -83,6 +92,8 @@ class AcquisitionBoundary:
             "prompt_injection_blocked": bool(result.get("prompt_injection_blocked")),
             "prompt_injection_succeeded": bool(result.get("prompt_injection_succeeded")),
         }
+        for item in evidence_items:
+            item["evidence_spec"] = from_observation(item, observation)
         model_result = {"backend": str(result.get("backend") or name), "results": model_rows}
         if not model_rows and result.get("text"):
             model_result["text"] = str(result.get("text"))[:8000]

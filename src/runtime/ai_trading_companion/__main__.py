@@ -38,6 +38,7 @@ from .memory_commands import handle_memory_command
 from .memory_port import HttpMemoryAdapter, MemoryUnavailable
 from .memory_health import MemoryCapabilityPolicy
 from .memory_evidence import MemoryEvidenceRegistrar
+from .evidence_spec import fingerprint, validate
 from .memoryhub_migration import LegacyWorkspaceImporter
 from .migration import LegacyMigrator, LegacySources
 from .models import TASK_POLICIES
@@ -1117,8 +1118,10 @@ def _research_memory_registrar(
         for index, item in enumerate(observation.get("evidence_items") or []):
             body = str(item.get("excerpt_text") or "")
             url = str(item.get("url") or "")
-            if not body or not url:
-                raise MemoryUnavailable("external evidence requires URL and content before registration")
+            if not body:
+                raise MemoryUnavailable("external evidence requires content before registration")
+            if not url:
+                url = "runtime://evidence/" + str(item.get("evidence_ref") or index)
             body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
             receipt = registrar.register_web_snapshot(
                 memory_space_id=memory_space_id,
@@ -1131,6 +1134,7 @@ def _research_memory_registrar(
                 occurred_at=str(
                     item.get("published_at") or item.get("fact_as_of") or observation.get("acquired_at")
                 ),
+                evidence_spec=item.get("evidence_spec"),
                 object_reference={
                     "cycle_id": cycle["cycle_id"],
                     "attempt_id": observation.get("attempt_id"),
@@ -1143,6 +1147,18 @@ def _research_memory_registrar(
                 "known_at": receipt.known_at,
                 "memory_content_hash": receipt.context["content_hash"],
             })
+            spec = dict(item.get("evidence_spec") or {})
+            if spec:
+                spec["known_at"] = receipt.known_at
+                provenance = dict(spec.get("provenance") or {})
+                provenance.update({
+                    "memory_episode_id": receipt.episode_id,
+                    "memory_content_hash": receipt.context["content_hash"],
+                })
+                spec["provenance"] = provenance
+                spec["record_id"] = fingerprint({k: v for k, v in spec.items() if k != "record_id"})
+                validate(spec)
+                item["evidence_spec"] = spec
 
     return register
 

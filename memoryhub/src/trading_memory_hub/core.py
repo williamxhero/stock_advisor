@@ -19,6 +19,12 @@ ALLOWED_STAGES = {
     "chat", "chat_research", "m0_research", "m0_compose", "m1_research",
     "m1_judgment", "m2_synthesis", "reflection", "workflow_feedback",
 }
+EVIDENCE_KINDS = {
+    "market_fact", "derived_calculation", "news_disclosure", "social_propagation",
+    "source_opinion", "quant_research", "ai_reasoning", "ai_summary", "ai_conclusion",
+}
+EVIDENCE_TRUTH_STATUSES = {"verified", "unverified", "refuted", "conflicted", "unknown"}
+EVIDENCE_PROPAGATION_STATUSES = {"observed", "not_observed", "unknown"}
 
 
 class MemoryHubError(RuntimeError):
@@ -202,10 +208,18 @@ class MemoryHub:
             raise MemoryHubError("episode requires body or source_reference")
         if value.get("body"):
             assert_safe(str(value["body"]))
-
         value = dict(value)
         for name in ("occurred_at", "known_at", "submitted_at"):
             value[name] = _canonical_time(str(value[name]))
+        metadata = value.get("metadata") or {}
+        evidence_spec = metadata.get("evidence_spec") if isinstance(metadata, dict) else None
+        if evidence_spec:
+            normalized_spec = dict(evidence_spec)
+            for name in ("occurred_at", "known_at"):
+                if normalized_spec.get(name):
+                    normalized_spec[name] = _canonical_time(str(normalized_spec[name]))
+            self._validate_evidence_spec(normalized_spec, value)
+            metadata = {**metadata, "evidence_spec": normalized_spec}
         if value.get("body"):
             actual_body_hash = _content_hash(str(value["body"]))
             if value["content_hash"] == "auto":
@@ -254,7 +268,7 @@ class MemoryHub:
                     value.get("body"), _json(value.get("source_reference")),
                     value["occurred_at"], value["known_at"], value["submitted_at"],
                     value["authority"], _json(value.get("original_span")), correction,
-                    PROTOCOL_VERSION, _json(value.get("metadata") or {}),
+                    PROTOCOL_VERSION, _json(metadata),
                 ),
             )
             if hydrated is not None:
@@ -267,6 +281,52 @@ class MemoryHub:
                 (episode_id, value["submitted_at"]),
             )
             return AppendReceipt(episode_id, int(cursor.lastrowid), value["content_hash"])
+
+    @staticmethod
+    def _validate_evidence_spec(spec: Any, episode: dict[str, Any]) -> None:
+        if not isinstance(spec, dict) or spec.get("contract") != "EvidenceSpec/v1":
+            raise MemoryHubError("unsupported evidence contract")
+        required = ("record_id", "kind", "source", "occurred_at", "known_at", "content",
+                    "truth_status", "market_propagation", "provenance", "external_fact")
+        missing = [key for key in required if key not in spec]
+        if missing:
+            raise MemoryHubError("evidence spec missing fields: " + ", ".join(missing))
+        if spec["kind"] not in EVIDENCE_KINDS:
+            raise MemoryHubError("unsupported evidence kind")
+        source = spec["source"]
+        provenance = spec["provenance"]
+        propagation = spec["market_propagation"]
+        if not isinstance(source, dict) or any(
+            key not in source for key in ("url", "title", "identity", "reference")
+        ):
+            raise MemoryHubError("evidence source fields required")
+        if not isinstance(provenance, dict) or any(
+            key not in provenance
+            for key in ("origin", "attempt_id", "observation_id", "evidence_ref", "content_sha256")
+        ):
+            raise MemoryHubError("evidence provenance fields required")
+        if not isinstance(propagation, dict) or propagation.get("status") not in EVIDENCE_PROPAGATION_STATUSES:
+            raise MemoryHubError("invalid evidence propagation status")
+        if not isinstance(propagation.get("impact"), dict):
+            raise MemoryHubError("evidence propagation impact required")
+        if spec["truth_status"] not in EVIDENCE_TRUTH_STATUSES:
+            raise MemoryHubError("invalid evidence truth status")
+        if not isinstance(spec["external_fact"], bool):
+            raise MemoryHubError("evidence external_fact must be boolean")
+        if provenance["content_sha256"] != hashlib.sha256(str(spec["content"]).encode("utf-8")).hexdigest():
+            raise SourceIntegrityError("evidence content hash does not match episode")
+        if spec["content"] != episode.get("body"):
+            raise SourceIntegrityError("evidence spec content does not match episode body")
+        if spec["known_at"] != episode.get("known_at"):
+            raise SourceIntegrityError("evidence spec known_at does not match episode")
+        if spec["occurred_at"] != episode.get("occurred_at"):
+            raise SourceIntegrityError("evidence spec occurred_at does not match episode")
+        if spec.get("kind") in {"ai_reasoning", "ai_summary", "ai_conclusion"}:
+            raise MemoryHubError("AI reasoning cannot be stored as external evidence")
+        if spec.get("external_fact") and (
+            spec.get("kind") != "market_fact" or spec.get("truth_status") != "verified"
+        ):
+            raise MemoryHubError("only verified market facts may be external facts")
 
     def append_batch(self, values: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(values, list) or len(values) > 1000:

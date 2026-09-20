@@ -18,6 +18,7 @@ from .cycle_contract import (
     validate_state,
 )
 from .secret_guard import assert_safe
+from .evidence_spec import VERSION, from_observation, qualify, validate
 
 
 _USER_VISIBLE_CYCLE_SQL = """NOT (
@@ -317,7 +318,10 @@ class CompanionStore:
               evidence_id TEXT PRIMARY KEY, trading_date TEXT NOT NULL, cycle_id TEXT,
               source_url TEXT, source_title TEXT, body_text TEXT NOT NULL,
               occurred_at TEXT, known_at TEXT NOT NULL, metadata_json TEXT NOT NULL,
-              stage TEXT, content_sha256 TEXT, coverage_state TEXT NOT NULL DEFAULT 'observed');
+              stage TEXT, content_sha256 TEXT, coverage_state TEXT NOT NULL DEFAULT 'observed',
+              evidence_kind TEXT NOT NULL DEFAULT 'news_disclosure',
+              truth_status TEXT NOT NULL DEFAULT 'unknown', propagation_status TEXT NOT NULL DEFAULT 'unknown',
+              provenance_json TEXT NOT NULL DEFAULT '{}', evidence_spec_json TEXT NOT NULL DEFAULT '{}');
             CREATE TABLE IF NOT EXISTS evidence_cycle_use (
               cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               evidence_id TEXT NOT NULL REFERENCES evidence_ledger_entry(evidence_id),
@@ -511,6 +515,11 @@ class CompanionStore:
                 "stage": "TEXT",
                 "content_sha256": "TEXT",
                 "coverage_state": "TEXT NOT NULL DEFAULT 'observed'",
+                "evidence_kind": "TEXT NOT NULL DEFAULT 'news_disclosure'",
+                "truth_status": "TEXT NOT NULL DEFAULT 'unknown'",
+                "propagation_status": "TEXT NOT NULL DEFAULT 'unknown'",
+                "provenance_json": "TEXT NOT NULL DEFAULT '{}'",
+                "evidence_spec_json": "TEXT NOT NULL DEFAULT '{}'",
             }.items():
                 if name not in evidence_columns:
                     c.execute(f"ALTER TABLE evidence_ledger_entry ADD COLUMN {name} {declaration}")
@@ -3071,44 +3080,97 @@ class CompanionStore:
             raise ValueError("unknown router policy cell")
         return dict(row)
 
-    def record_evidence(self, cycle: dict[str, Any], stage: str, evidence: dict[str, Any]) -> list[str]:
+    def record_evidence(
+        self, cycle: dict[str, Any], stage: str, evidence: dict[str, Any],
+        observations: list[dict[str, Any]] | None = None,
+    ) -> list[str]:
         trading_date = cycle["scheduled_for"][:10]
         known_at = now()
         inserted: list[str] = []
         sources = evidence.get("sources") if isinstance(evidence.get("sources"), list) else []
+        if observations is None:
+            attempts = [row for row in self.attempts(cycle["cycle_id"]) if row.get("stage") == stage]
+            if attempts:
+                try:
+                    observations = json.loads(attempts[-1].get("tool_trace_json") or "[]")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    observations = []
+        observed: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        for observation in observations or []:
+            for item in observation.get("evidence_items") or []:
+                ref = str(item.get("evidence_ref") or "")
+                if ref:
+                    observed[ref] = (item, observation)
         with self.connection() as c:
             for source in sources:
                 if not isinstance(source, dict):
                     continue
-                url = str(source.get("url") or "")
-                title = str(source.get("title") or "")
-                body = str(source.get("excerpt") or title).strip()
+                ref = str(source.get("evidence_ref") or "")
+                observed_item, observation = observed.get(ref, ({}, {}))
+                bound = {**observed_item, "excerpt_text": (
+                    observed_item.get("excerpt_text")
+                    or source.get("excerpt_text")
+                    or source.get("excerpt")
+                )}
+                bound.setdefault("url", source.get("url"))
+                bound.setdefault("title", source.get("title"))
+                bound.setdefault("fact_as_of", source.get("fact_as_of") or source.get("published_or_retrieved_at"))
+                bound.setdefault("published_at", source.get("published_at"))
+                bound.setdefault("evidence_ref", ref)
+                bound.setdefault("known_at", source.get("known_at") or known_at)
+                bound.setdefault("acquired_at", known_at)
+                url = str(bound.get("url") or "")
+                title = str(bound.get("title") or "")
+                body = str(bound.get("excerpt_text") or title).strip()
                 if not body:
                     continue
                 assert_safe(body, boundary="evidence fact storage")
                 fingerprint = digest("\n".join((url, title, body)))
                 evidence_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{trading_date}|{url}|{fingerprint}"))
+                spec = bound.get("evidence_spec")
+                if not isinstance(spec, dict):
+                    spec = from_observation(bound, observation or {
+                        "attempt_id": source.get("attempt_id") or "legacy",
+                        "observation_id": source.get("tool_observation_id") or "legacy",
+                        "operation": "legacy_evidence", "backend": "legacy",
+                        "acquired_at": known_at,
+                    })
+                validate(spec)
+                qualification = qualify(spec)
                 metadata = {
                     "task_key": cycle["task_key"],
                     "factual_reliability": source.get("factual_reliability"),
-                    "market_propagation": source.get("market_propagation"),
-                    "published_at": source.get("published_at"),
+                    "market_propagation": spec["market_propagation"],
+                    "published_at": bound.get("published_at"),
                     "source_family": source.get("source_family"),
                     "upstream_id": source.get("upstream_id"),
                     "tool_observation_id": source.get("tool_observation_id"),
                     "result_item_hash": source.get("result_item_hash"),
+                    "qualification": qualification,
                 }
                 changed = c.execute(
                     """INSERT OR IGNORE INTO evidence_ledger_entry(
                          evidence_id,trading_date,cycle_id,source_url,source_title,body_text,
-                         occurred_at,known_at,metadata_json,stage,content_sha256,coverage_state)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,'observed')""",
+                         occurred_at,known_at,metadata_json,stage,content_sha256,coverage_state,
+                         evidence_kind,truth_status,propagation_status,provenance_json,evidence_spec_json)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (evidence_id, trading_date, cycle["cycle_id"], url, title, body,
-                     source.get("fact_as_of") or source.get("published_or_retrieved_at"), known_at,
-                     json.dumps(metadata, ensure_ascii=False, sort_keys=True), stage, fingerprint),
+                     spec.get("occurred_at"), spec.get("known_at") or known_at,
+                     json.dumps(metadata, ensure_ascii=False, sort_keys=True), stage, fingerprint,
+                     "observed", spec["kind"], spec["truth_status"],
+                     spec["market_propagation"]["status"],
+                     json.dumps(spec["provenance"], ensure_ascii=False, sort_keys=True),
+                     json.dumps(spec, ensure_ascii=False, sort_keys=True)),
                 ).rowcount
                 if changed:
                     inserted.append(evidence_id)
+                    self.queue_event(
+                        cycle["cycle_id"], "evidence.recorded", {
+                            "contract": VERSION, "evidence_id": evidence_id,
+                            "cycle_id": cycle["cycle_id"], "stage": stage,
+                            "record": spec, "qualification": qualification,
+                        }, connection=c,
+                    )
                 c.execute(
                     """INSERT OR IGNORE INTO evidence_cycle_use(cycle_id,evidence_id,stage,used_at)
                        VALUES(?,?,?,?)""",

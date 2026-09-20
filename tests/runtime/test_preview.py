@@ -143,6 +143,37 @@ class PreviewTests(unittest.TestCase):
                 artifact("m1_evidence", json.dumps(research_output, ensure_ascii=False, sort_keys=True)),
                 artifact("m1", "M1 exact"),
             ],
+            "evidence_ledger": [{
+                "evidence_id": "original-evidence",
+                "trading_date": "2026-08-26",
+                "cycle_id": "preview-cycle",
+                "source_url": source["url"],
+                "source_title": source["title"],
+                "body_text": source["excerpt"],
+                "occurred_at": known_at,
+                "known_at": known_at,
+                "metadata_json": "{}",
+                "stage": "m0_research",
+                "content_sha256": hashlib.sha256(source["excerpt"].encode()).hexdigest(),
+                "coverage_state": "observed",
+                "evidence_kind": "news_disclosure",
+                "truth_status": "verified",
+                "propagation_status": "unknown",
+                "provenance_json": json.dumps({"origin": "external_source"}, sort_keys=True),
+                "evidence_spec_json": json.dumps({
+                    "contract": "EvidenceSpec/v1",
+                    "record_id": "a" * 64,
+                    "kind": "news_disclosure",
+                    "source": {"url": source["url"], "title": source["title"], "identity": "example.test", "reference": {}},
+                    "occurred_at": known_at,
+                    "known_at": known_at,
+                    "content": source["excerpt"],
+                    "truth_status": "verified",
+                    "market_propagation": {"status": "unknown", "impact": {}},
+                    "provenance": {"origin": "external_source"},
+                    "external_fact": False,
+                }, sort_keys=True),
+            }],
             "attempts": attempts, "stage_checkpoints": checkpoints, "judgment_snapshots": [], "evidence": {},
         }
         seal_bundle(bundle, signing_key)
@@ -261,6 +292,15 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual("cycle.created", self.store.cycle_events(cycle_id)[0]["event_type"])
         self.assertEqual("M0 exact", self.store.latest_artifact(cycle_id, "m0")["body_markdown"])
         self.assertEqual("M1 exact", self.store.latest_artifact(cycle_id, "m1")["body_markdown"])
+        imported_evidence = self.store.evidence_for_day("2026-08-26", known_at)
+        self.assertEqual("news_disclosure", imported_evidence[0]["evidence_kind"])
+        self.assertEqual("verified", imported_evidence[0]["truth_status"])
+        self.assertEqual("EvidenceSpec/v1", json.loads(imported_evidence[0]["evidence_spec_json"])["contract"])
+        self.assertTrue(any(
+            event["event_type"] == "evidence.recorded"
+            for event in self.store.pending_events()
+            if event["cycle_id"] == cycle_id
+        ))
         approval_events = [
             event for event in self.store.pending_events()
             if event["cycle_id"] == cycle_id and event["event_type"] == "cycle.preview_approved"

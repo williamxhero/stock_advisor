@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentRoleSpec/v1 input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "version", "role", "stage", "visibility", "agent_contract_sha256", "input_refs", "provenance", "permissions"],
+  "properties": {
+    "contract": {"const": "AgentRoleSpec/v1"},
+    "version": {"const": 1},
+    "role": {"enum": ["fundamental", "market_structure", "news_event", "propagation_sentiment", "bull", "bear", "risk", "coordinator"]},
+    "stage": {"enum": ["m0_research", "m1_research", "m2", "outcome_research", "chat_research"]},
+    "visibility": {"const": "internal"},
+    "agent_contract_sha256": {"type": "string", "minLength": 1},
+    "input_refs": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string", "minLength": 1}}},
+    "provenance": {"type": "object", "required": ["as_of"], "properties": {"as_of": {"type": "string", "minLength": 1}}},
+    "permissions": {"type": "object", "required": ["write_permissions"], "properties": {"write_permissions": {"const": []}, "read_permissions": {"type": "array"}}}
+  }
+}

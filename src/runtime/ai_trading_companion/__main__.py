@@ -24,6 +24,7 @@ from .cognition_expression import express_cognition_answer
 from .adaptive_memory import AdaptiveMemoryResearch, MemoryResearchError
 from .agent_contract import attach_input as attach_agent_contract, build_output as build_agent_contract_output
 from .agent_role import attach_role_inputs, build_runtime_coordinator_output
+from .debate import failure as debate_failure, from_stage as debate_from_stage
 from .broker_client import BrokerError, BrokerRequest, BrokerResponse, ProviderBrokerClient, canonical_packet_hash
 from .config import load_settings, remove_legacy_provider_settings, save_research_settings
 from .cycle_contract import memory_boundary
@@ -1088,6 +1089,18 @@ def _call_stage(
                 "agent_role_inputs": packet.get("agent_role_inputs"),
                 "agent_role_outputs": [role_output],
             }
+            # DebateSpec is an internal, read-only qualification envelope.  It
+            # is deliberately attached after the provider/evidence verifier so
+            # debate cannot become a second fact owner or publish a result.
+            try:
+                verifier["debate"] = debate_from_stage(
+                    packet, data, verifier, attempt_id=attempt["attempt_id"],
+                )
+            except ValueError as exc:
+                verifier["debate"] = debate_failure(
+                    packet, stage=stage, status="evidence_insufficient",
+                    attempt_id=attempt["attempt_id"], reason=str(exc),
+                )
         status = "succeeded" if verifier.get("passed") else "rejected"
         output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(
@@ -1130,7 +1143,14 @@ def _call_stage(
             store.finish_attempt(
                 attempt["attempt_id"], status, error=str(exc),
                 output=getattr(exc, "output", None),
-                verifier=getattr(exc, "verifier", None),
+                verifier={
+                    **(getattr(exc, "verifier", None) or {}),
+                    **({"debate": debate_failure(
+                        packet, stage=stage,
+                        status="timed_out" if status == "timed_out" else "failed",
+                        attempt_id=attempt["attempt_id"], reason=str(exc),
+                    )} if packet.get("agent_contract") and packet.get("agent_role_inputs") else {}),
+                } or None,
                 broker_metadata=exc.metadata or {"request_id": exc.request_id, "attempts": exc.attempts} if isinstance(exc, BrokerError) else None,
                 actual_model=exc.metadata.get("actual_model") if isinstance(exc, BrokerError) else None,
                 tool_trace=getattr(exc, "tool_trace", None) or tool_trace,

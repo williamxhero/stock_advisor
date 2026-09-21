@@ -70,7 +70,7 @@ class AcquisitionBoundary:
                 "factual_status": str(row.get("factual_status") or "unknown"),
                 "market_propagation": str(row.get("market_propagation") or "unknown"),
                 "claims": [dict(value) for value in row.get("claims") or [] if isinstance(value, dict)],
-                "excerpt_text": excerpt, "fact_as_of": row.get("fact_as_of") or row.get("published_at"),
+                "excerpt_text": excerpt, "fact_as_of": row.get("fact_as_of"),
                 "published_at": row.get("published_at"), "acquired_at": acquired_at,
                 "known_at": acquired_at,
                 "evidence_kind": str(row.get("evidence_kind") or ""),
@@ -82,6 +82,9 @@ class AcquisitionBoundary:
                 "propagation_observed_to": row.get("propagation_observed_to"),
                 "derivation": row.get("derivation") if isinstance(row.get("derivation"), dict) else {},
             }
+            for clock_name in ("effective_time", "event_time", "market_time", "calculation_time", "research_as_of", "ingest_time"):
+                if row.get(clock_name) not in (None, ""):
+                    item[clock_name] = row[clock_name]
             evidence_items.append(item)
             model_rows.append({"evidence_ref": ref, "excerpt": excerpt})
         observation = {

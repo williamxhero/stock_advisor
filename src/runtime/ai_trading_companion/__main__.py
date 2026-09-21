@@ -39,6 +39,7 @@ from .memory_port import HttpMemoryAdapter, MemoryUnavailable
 from .memory_health import MemoryCapabilityPolicy
 from .memory_evidence import MemoryEvidenceRegistrar
 from .evidence_spec import fingerprint, validate
+from .temporal_integrity import resolve_temporal
 from .memoryhub_migration import LegacyWorkspaceImporter
 from .migration import LegacyMigrator, LegacySources
 from .models import TASK_POLICIES
@@ -1150,6 +1151,15 @@ def _research_memory_registrar(
             spec = dict(item.get("evidence_spec") or {})
             if spec:
                 spec["known_at"] = receipt.known_at
+                temporal = spec.get("temporal_integrity")
+                if not isinstance(temporal, dict):
+                    temporal = resolve_temporal({**spec, "known_at": receipt.known_at}, {"known_at": receipt.known_at})
+                else:
+                    temporal = dict(temporal)
+                    temporal["known_at"] = receipt.known_at
+                    temporal["known_at_source"] = "memoryhub.receipt"
+                spec["published_at"] = spec.get("published_at")
+                spec["temporal_integrity"] = temporal
                 provenance = dict(spec.get("provenance") or {})
                 provenance.update({
                     "memory_episode_id": receipt.episode_id,

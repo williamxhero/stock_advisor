@@ -21,6 +21,7 @@ from .evidence_gate import EvidenceGate
 from .evidence_qualification import VERSION as QUALIFICATION_VERSION
 from .evidence_qualification import validate_qualification
 from .evidence_spec import VERSION
+from .temporal_integrity import replay_records, validate_replay
 from .router import CognitiveRouter
 from .secret_guard import assert_safe
 from .stage_expression import normalize_stage_output
@@ -330,6 +331,19 @@ def verify_bundle(
         return
     if bundle.get("preview_status") != "passed":
         raise ValueError("failed preview cannot be approved")
+    temporal_records: list[dict[str, Any]] = []
+    for ledger_row in bundle.get("evidence_ledger") or []:
+        try:
+            evidence_spec = json.loads(str(ledger_row.get("evidence_spec_json") or "{}"))
+        except json.JSONDecodeError:
+            evidence_spec = {}
+        if isinstance(evidence_spec, dict) and evidence_spec.get("contract") == VERSION:
+            temporal_records.append(evidence_spec)
+    if temporal_records:
+        temporal_replay = replay_records(temporal_records, as_of=str(bundle.get("known_at") or ""))
+        validate_replay(temporal_replay)
+        if not temporal_replay["passed"]:
+            raise ValueError("temporal integrity rejected future evidence in frozen preview")
     required = {artifact["kind"] for artifact in artifacts}
     if not {"evidence", "m0", "m1_evidence", "m1"}.issubset(required):
         raise ValueError("preview bundle is incomplete")

@@ -7,6 +7,7 @@ from typing import Any
 
 from .evidence_qualification import qualify_record
 from .evidence_spec import VERSION, fingerprint, validate
+from .temporal_integrity import resolve_temporal
 from .memory_port import MemoryPort
 from .secret_guard import assert_safe
 
@@ -38,6 +39,15 @@ class MemoryEvidenceRegistrar:
         if spec:
             spec.setdefault("contract", VERSION)
             spec["known_at"] = known_at
+            temporal = spec.get("temporal_integrity")
+            if not isinstance(temporal, dict):
+                temporal = resolve_temporal({**spec, "known_at": known_at}, {"known_at": known_at})
+            else:
+                temporal = dict(temporal)
+                temporal["known_at"] = known_at
+                temporal["known_at_source"] = "memoryhub.receipt"
+            spec["published_at"] = spec.get("published_at")
+            spec["temporal_integrity"] = temporal
             spec["record_id"] = fingerprint({k: v for k, v in spec.items() if k != "record_id"})
             validate(spec)
         qualification = None

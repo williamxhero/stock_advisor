@@ -22,6 +22,7 @@ from .backup import BackupManager
 from .cognition import UnifiedCognition, verify_cognition_result
 from .cognition_expression import express_cognition_answer
 from .adaptive_memory import AdaptiveMemoryResearch, MemoryResearchError
+from .agent_contract import attach_input as attach_agent_contract, build_output as build_agent_contract_output
 from .broker_client import BrokerError, BrokerRequest, BrokerResponse, ProviderBrokerClient, canonical_packet_hash
 from .config import load_settings, remove_legacy_provider_settings, save_research_settings
 from .cycle_contract import memory_boundary
@@ -826,6 +827,8 @@ def _call_stage(
     timeout = controls.timeout_seconds
     search = bool(search and controls.max_operations > 0 and controls.enabled_backends)
     packet = finalize_stage_packet(packet, controls)
+    if search:
+        packet = attach_agent_contract(packet, capability=f"research:{stage}")
     router = CognitiveRouter(effort_policy=CognitiveEffortPolicy.load(store))
     preliminary = router.plan(stage, packet, timeout, search)
     cell = store.router_policy_cell(
@@ -1046,6 +1049,27 @@ def _call_stage(
             stage_audit = outcome.audit_metadata()
             usage = outcome.usage
             actual_model = outcome.actual_model
+        if search:
+            # Persist only the bounded, attributable decision artifact. The
+            # legacy evidence payload remains available for deterministic
+            # replay, while this contract never stores free-form reasoning.
+            source_refs = []
+            for row in (data.get("sources") or []) if isinstance(data, dict) else []:
+                if isinstance(row, dict) and row.get("url"):
+                    source_refs.append(str(row["url"]))
+            unknowns = list(verifier.get("missing_requirements") or verifier.get("critical_gaps") or [])
+            artifact_status = "succeeded" if verifier.get("passed") else "blocked"
+            contract_output = build_agent_contract_output(
+                packet["agent_contract"], capability=f"research:{stage}",
+                status=artifact_status,
+                propositions=list(data.get("propositions") or []) if isinstance(data, dict) else [],
+                evidence=[{"reference": ref, "kind": "source"} for ref in sorted(set(source_refs))],
+                counterevidence=list(data.get("counterevidence") or []) if isinstance(data, dict) else [],
+                risks=list(data.get("risks") or []) if isinstance(data, dict) else [],
+                unknowns=[{"description": str(item)} for item in unknowns],
+                provenance={"attempt_id": attempt["attempt_id"], "bundle_sha256": getattr(research, "bundle_sha256", None) if research else None},
+            )
+            verifier = {**verifier, "agent_contract": contract_output}
         status = "succeeded" if verifier.get("passed") else "rejected"
         output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(

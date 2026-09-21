@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DebateSpec/v1",
+  "type": "object", "additionalProperties": false,
+  "required": ["contract", "version", "stage", "visibility", "status", "arguments", "counterarguments", "conflicts", "coordination", "provenance", "permissions"],
+  "properties": {
+    "contract": {"const": "DebateSpec/v1"}, "version": {"const": 1}, "stage": {"type": "string", "minLength": 1}, "visibility": {"const": "internal"},
+    "status": {"enum": ["succeeded", "partial", "conflict_unresolved", "evidence_insufficient", "timed_out", "failed", "unknown"]},
+    "arguments": {"type": "array", "items": {"$ref": "#/$defs/argument"}},
+    "counterarguments": {"type": "array", "items": {"$ref": "#/$defs/counterargument"}},
+    "conflicts": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["claim_id", "evidence_ids", "state", "reason"], "properties": {"claim_id": {"type": "string", "minLength": 1}, "evidence_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}, "state": {"const": "unresolved"}, "reason": {"type": "string", "minLength": 1}}}},
+    "coordination": {"type": "object", "additionalProperties": false, "required": ["state", "issues"], "properties": {"state": {"enum": ["ready", "conflict_unresolved", "evidence_insufficient", "timed_out", "failed", "unknown"]}, "issues": {"type": "array", "items": {"type": "object"}}}},
+    "provenance": {"type": "object", "required": ["input_sha256"], "properties": {"input_sha256": {"type": "string", "minLength": 1}, "attempt_id": {}, "packet_sha256": {}, "source_output_sha256": {}, "verifier_passed": {"type": "boolean"}}},
+    "permissions": {"type": "object", "required": ["write_permissions"], "properties": {"write_permissions": {"const": []}, "read_permissions": {"type": "array"}}}
+  },
+  "$defs": {
+    "argument": {"type": "object", "additionalProperties": false, "required": ["argument_id", "role", "claim_id", "position", "statement", "evidence_ids"], "properties": {"argument_id": {"type": "string", "minLength": 1}, "role": {"type": "string", "minLength": 1}, "claim_id": {"type": "string", "minLength": 1}, "position": {"enum": ["support", "oppose", "unknown"]}, "statement": {"type": "string", "minLength": 1}, "evidence_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}}},
+    "counterargument": {"type": "object", "additionalProperties": false, "required": ["counterargument_id", "target_claim_id", "statement", "evidence_ids", "status"], "properties": {"counterargument_id": {"type": "string", "minLength": 1}, "target_claim_id": {"type": "string", "minLength": 1}, "statement": {"type": "string", "minLength": 1}, "evidence_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}, "status": {"enum": ["supports", "refutes", "unresolved"]}}}
+  }
+}

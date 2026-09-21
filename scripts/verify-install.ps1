@@ -17,6 +17,8 @@ foreach ($required in @(
     'resources\contracts\agent-contract-input-v1.schema.json',
     'resources\contracts\agent-role-spec-v1.schema.json',
     'resources\contracts\agent-role-input-v1.schema.json',
+    'resources\contracts\debate-spec-v1.schema.json',
+    'resources\contracts\debate-input-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
     'runtime\ai_trading_companion\evidence_snapshot.py',
@@ -24,6 +26,7 @@ foreach ($required in @(
     'runtime\ai_trading_companion\message_presentation.py',
     'runtime\ai_trading_companion\agent_contract.py',
     'runtime\ai_trading_companion\agent_role.py',
+    'runtime\ai_trading_companion\debate.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'
 )) {
@@ -66,6 +69,20 @@ try {
         $roleQualification = $roleReplayOne | ConvertFrom-Json
         if ($roleQualification.contract -ne 'AgentRoleInstallQualification/v1' -or $roleQualification.qualified -ne $true) {
             throw 'Installed AgentRole qualification did not pass.'
+        }
+        $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed Debate replay 1 failed with exit code $LASTEXITCODE." }
+        $debateReplayTwo = ((& $python -m ai_trading_companion.debate) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed Debate replay 2 failed with exit code $LASTEXITCODE." }
+        if ($debateReplayOne -ne $debateReplayTwo) { throw 'Installed Debate frozen replays were not deterministic.' }
+        $debateQualification = $debateReplayOne | ConvertFrom-Json
+        if ($debateQualification.contract -ne 'DebateInstallQualification/v1' -or $debateQualification.qualified -ne $true) {
+            throw 'Installed Debate qualification did not pass.'
+        }
+        foreach ($axis in @('delivery_speed', 'qualification_probability', 'research_quality', 'judgment_outcome', 'safety_reliability')) {
+            if ($debateQualification.evaluation_vector.PSObject.Properties.Name -notcontains $axis) {
+                throw "Installed Debate qualification is missing evaluation axis: $axis"
+            }
         }
         foreach ($axis in @('delivery_speed', 'qualification_probability', 'research_quality', 'judgment_outcome', 'safety_reliability')) {
             if ($roleQualification.evaluation_vector.PSObject.Properties.Name -notcontains $axis) {

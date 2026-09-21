@@ -3607,7 +3607,7 @@ class CompanionStore:
                 fingerprint = digest(f"{url}\n{title}\n{body}")
                 evidence_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{trading_date}|{url}|{fingerprint}"))
                 spec = bound.get("evidence_spec")
-                if not isinstance(spec, dict):
+                if not isinstance(spec, dict) or not isinstance(spec.get("temporal_integrity"), dict):
                     spec = from_observation(bound, observation or {
                         "attempt_id": source.get("attempt_id") or "legacy",
                         "observation_id": source.get("tool_observation_id") or "legacy",

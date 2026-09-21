@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .evidence_spec import AI_KINDS, PROPAGATION, TRUTH, fingerprint, validate
+from .temporal_integrity import qualify_temporal
 
 VERSION = "EvidenceQualificationSpec/v1"
 POLICY_VERSION = "EvidenceQualificationPolicy/v1"
@@ -50,12 +51,22 @@ def qualify_record(
     becoming an external fact.
     """
     validate(record)
+    temporal = qualify_temporal(
+        record["temporal_integrity"], as_of=as_of,
+        allow_post_cutoff_known_at=allow_post_cutoff_known_at,
+    )
     truth = str(record["truth_status"])
     propagation = str(record["market_propagation"]["status"])
     reasons: list[str] = []
     state = "qualified"
     permitted_use = "external_fact" if record.get("external_fact") else "source_report"
     kind = str(record["kind"])
+
+    reasons.extend(str(reason) for reason in temporal.get("reasons") or [])
+    if temporal["state"] == "rejected":
+        state, permitted_use = "rejected", "none"
+    elif temporal["state"] == "degraded":
+        state, permitted_use = "degraded", "context_only"
 
     if kind in AI_KINDS or record["provenance"].get("origin") == "ai":
         state, permitted_use = "rejected", "reasoning_only"
@@ -105,7 +116,7 @@ def qualify_record(
         cutoff = _time(as_of)
         if (not allow_post_cutoff_known_at and _time(record["known_at"]) > cutoff) or (
             record.get("occurred_at") and _time(record["occurred_at"]) > cutoff
-        ):
+        ) or (record.get("published_at") and _time(record["published_at"]) > cutoff):
             state, permitted_use = "rejected", "none"
             reasons.append("not_known_at_cutoff")
         elif record.get("expires_at") and _time(record["expires_at"]) <= cutoff:

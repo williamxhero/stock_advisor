@@ -11,6 +11,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+from .temporal_integrity import resolve_temporal, validate_temporal
+
 VERSION = "EvidenceSpec/v1"
 KINDS = frozenset({"market_fact", "derived_calculation", "news_disclosure",
                    "social_propagation", "source_opinion", "quant_research",
@@ -50,8 +52,9 @@ def source_kind(item: dict[str, Any], observation: dict[str, Any] | None = None)
 def from_observation(item: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
     """Bind untrusted source claims to runtime observation identity and clocks."""
     kind = source_kind(item, observation)
-    known = item.get("known_at") or item.get("acquired_at") or observation.get("acquired_at")
-    occurred = item.get("fact_as_of") or item.get("published_at")
+    temporal = resolve_temporal({**item, "evidence_kind": kind}, observation)
+    known = temporal["known_at"]
+    occurred = temporal["occurred_at"]
     body = str(item.get("excerpt_text") or "")
     truth = str(item.get("factual_status") or "unknown")
     truth = truth if truth in TRUTH else "unknown"
@@ -73,7 +76,8 @@ def from_observation(item: dict[str, Any], observation: dict[str, Any]) -> dict[
         "contract": VERSION, "kind": kind,
         "source": {"url": str(item.get("url") or ""), "title": str(item.get("title") or ""),
                    "identity": str(item.get("source_identity") or ""), "reference": reference},
-        "occurred_at": occurred, "known_at": known, "content": body,
+        "occurred_at": occurred, "known_at": known, "published_at": temporal["published_at"],
+        "temporal_integrity": temporal, "content": body,
         "truth_status": "unknown" if kind in AI_KINDS else truth,
         "market_propagation": {"status": propagation, "impact": impact},
         "provenance": {
@@ -103,7 +107,7 @@ def validate(record: dict[str, Any]) -> None:
         raise ValueError("unsupported evidence contract or kind")
     required = (
         "record_id", "source", "occurred_at", "known_at", "content",
-        "truth_status", "market_propagation", "provenance", "external_fact",
+        "published_at", "temporal_integrity", "truth_status", "market_propagation", "provenance", "external_fact",
     )
     missing = [key for key in required if key not in record]
     if missing:
@@ -113,6 +117,12 @@ def validate(record: dict[str, Any]) -> None:
     source = record.get("source")
     provenance = record.get("provenance")
     propagation = record.get("market_propagation")
+    temporal = record.get("temporal_integrity")
+    validate_temporal(temporal)
+    if temporal.get("occurred_at") != record.get("occurred_at") or temporal.get("known_at") != record.get("known_at"):
+        raise ValueError("evidence temporal clocks do not match record")
+    if temporal.get("published_at") != record.get("published_at"):
+        raise ValueError("evidence publication clock does not match record")
     if not isinstance(source, dict) or not isinstance(provenance, dict):
         raise ValueError("evidence source and provenance required")
     if any(key not in source for key in ("url", "title", "identity", "reference")):

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "TemporalIntegritySpec/v1",
+  "title": "Runtime TemporalIntegritySpec/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "policy_version", "kind", "as_of", "occurred_at", "known_at", "published_at", "occurred_at_source", "known_at_source", "published_at_source", "precedence", "state", "permitted_use", "reasons"],
+  "properties": {
+    "contract": {"const": "TemporalIntegritySpec/v1"},
+    "policy_version": {"const": "TemporalIntegrityPolicy/v1"},
+    "kind": {"type": "string", "minLength": 1},
+    "as_of": {"type": ["string", "null"]},
+    "occurred_at": {"type": ["string", "null"]},
+    "known_at": {"type": ["string", "null"]},
+    "published_at": {"type": ["string", "null"]},
+    "occurred_at_source": {"type": ["string", "null"]},
+    "known_at_source": {"type": ["string", "null"]},
+    "published_at_source": {"type": ["string", "null"]},
+    "precedence": {"type": "object"},
+    "state": {"enum": ["eligible", "degraded", "rejected"]},
+    "permitted_use": {"enum": ["full", "degraded", "none"]},
+    "reasons": {"type": "array", "items": {"type": "string"}}
+  }
+}

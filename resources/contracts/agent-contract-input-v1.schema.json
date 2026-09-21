@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentContractSpec/v1 input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "version", "capability", "evidence_snapshot", "mandate", "controlled_context", "memory_references", "provenance"],
+  "properties": {
+    "contract": {"const": "AgentContractSpec/v1"},
+    "version": {"const": 1},
+    "capability": {"type": "string", "minLength": 1},
+    "evidence_snapshot": {"type": "object", "required": ["as_of"], "properties": {"as_of": {"type": "string"}}},
+    "mandate": {"type": "object", "required": ["goal"], "properties": {"goal": {"type": "string", "minLength": 1}, "constraints": {"type": "array"}}},
+    "controlled_context": {"type": "object", "required": ["as_of"], "properties": {"as_of": {"type": "string"}, "cycle_id": {"type": ["string", "null"]}, "stage": {"type": ["string", "null"]}}},
+    "memory_references": {"type": "array", "items": {"type": "object", "required": ["reference"], "properties": {"reference": {"type": "string", "minLength": 1}, "kind": {"type": "string"}}}},
+    "provenance": {"type": "object"}
+  }
+}

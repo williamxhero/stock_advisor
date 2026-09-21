@@ -23,6 +23,7 @@ from .cognition import UnifiedCognition, verify_cognition_result
 from .cognition_expression import express_cognition_answer
 from .adaptive_memory import AdaptiveMemoryResearch, MemoryResearchError
 from .agent_contract import attach_input as attach_agent_contract, build_output as build_agent_contract_output
+from .agent_role import attach_role_inputs, build_runtime_coordinator_output
 from .broker_client import BrokerError, BrokerRequest, BrokerResponse, ProviderBrokerClient, canonical_packet_hash
 from .config import load_settings, remove_legacy_provider_settings, save_research_settings
 from .cycle_contract import memory_boundary
@@ -829,6 +830,7 @@ def _call_stage(
     packet = finalize_stage_packet(packet, controls)
     if search:
         packet = attach_agent_contract(packet, capability=f"research:{stage}")
+        packet = attach_role_inputs(packet, stage=stage)
     router = CognitiveRouter(effort_policy=CognitiveEffortPolicy.load(store))
     preliminary = router.plan(stage, packet, timeout, search)
     cell = store.router_policy_cell(
@@ -1069,7 +1071,23 @@ def _call_stage(
                 unknowns=[{"description": str(item)} for item in unknowns],
                 provenance={"attempt_id": attempt["attempt_id"], "bundle_sha256": getattr(research, "bundle_sha256", None) if research else None},
             )
-            verifier = {**verifier, "agent_contract": contract_output}
+            role_output = build_runtime_coordinator_output(
+                packet.get("agent_role_inputs") or [],
+                status=artifact_status,
+                evidence_refs=sorted({
+                    *source_refs,
+                    *[str(item.get("evidence_ref")) for item in (data.get("sources") or []) if isinstance(item, dict) and item.get("evidence_ref")],
+                }),
+                unknowns=[str(item) for item in unknowns],
+                attempt_id=attempt["attempt_id"],
+                bundle_sha256=getattr(research, "bundle_sha256", None) if research else None,
+            )
+            verifier = {
+                **verifier,
+                "agent_contract": contract_output,
+                "agent_role_inputs": packet.get("agent_role_inputs"),
+                "agent_role_outputs": [role_output],
+            }
         status = "succeeded" if verifier.get("passed") else "rejected"
         output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(

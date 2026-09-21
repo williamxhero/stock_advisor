@@ -15,12 +15,15 @@ foreach ($required in @(
     'resources\contracts\temporal-integrity-spec-v1.schema.json',
     'resources\contracts\agent-contract-spec-v1.schema.json',
     'resources\contracts\agent-contract-input-v1.schema.json',
+    'resources\contracts\agent-role-spec-v1.schema.json',
+    'resources\contracts\agent-role-input-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
     'runtime\ai_trading_companion\evidence_snapshot.py',
     'runtime\ai_trading_companion\temporal_integrity.py',
     'runtime\ai_trading_companion\message_presentation.py',
     'runtime\ai_trading_companion\agent_contract.py',
+    'runtime\ai_trading_companion\agent_role.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'
 )) {
@@ -45,9 +48,33 @@ try {
     # smoke isolated from the user's formal database and workspace while still
     # exercising the exact installed Runtime and resources.
     $env:AI_TRADING_COMPANION_HOME = $healthHome
-    & $python -m ai_trading_companion status | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Installed Runtime health check failed with exit code $LASTEXITCODE."
+    Push-Location $healthHome
+    try {
+        & $python -m ai_trading_companion status | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Installed Runtime health check failed with exit code $LASTEXITCODE."
+        }
+        # Run only from the installed runtime path and replay the same frozen
+        # role evidence twice.  The two receipts must be byte-identical; the
+        # qualification keeps speed, qualification probability, research
+        # quality, judgment outcome, and safety reliability as separate axes.
+        $roleReplayOne = ((& $python -m ai_trading_companion.agent_role) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed AgentRole replay 1 failed with exit code $LASTEXITCODE." }
+        $roleReplayTwo = ((& $python -m ai_trading_companion.agent_role) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed AgentRole replay 2 failed with exit code $LASTEXITCODE." }
+        if ($roleReplayOne -ne $roleReplayTwo) { throw 'Installed AgentRole frozen replays were not deterministic.' }
+        $roleQualification = $roleReplayOne | ConvertFrom-Json
+        if ($roleQualification.contract -ne 'AgentRoleInstallQualification/v1' -or $roleQualification.qualified -ne $true) {
+            throw 'Installed AgentRole qualification did not pass.'
+        }
+        foreach ($axis in @('delivery_speed', 'qualification_probability', 'research_quality', 'judgment_outcome', 'safety_reliability')) {
+            if ($roleQualification.evaluation_vector.PSObject.Properties.Name -notcontains $axis) {
+                throw "Installed AgentRole qualification is missing evaluation axis: $axis"
+            }
+        }
+    }
+    finally {
+        Pop-Location
     }
 }
 finally {

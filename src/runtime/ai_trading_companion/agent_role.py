@@ -10,6 +10,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import tempfile
+import time
+from dataclasses import dataclass
 from typing import Any
 
 from .agent_contract import CONTRACT as AGENT_CONTRACT
@@ -38,15 +42,252 @@ STAGE_ROLES: dict[str, tuple[str, ...]] = {
     "outcome_research": ("fundamental", "market_structure", "news_event", "propagation_sentiment", "risk", "coordinator"),
     "chat_research": ("fundamental", "market_structure", "news_event", "propagation_sentiment", "risk", "coordinator"),
 }
-STATUSES = frozenset({"succeeded", "partial", "blocked", "failed", "unknown"})
+STATUSES = frozenset({"pending", "running", "succeeded", "partial", "blocked", "failed", "skipped", "unknown"})
 EFFECTS = frozenset({"evidence_only", "support", "oppose", "block", "coordinate", "unknown"})
 _COORDINATOR_EFFECTS = {
+    "pending": "unknown",
+    "running": "unknown",
     "succeeded": "coordinate",
-    "partial": "coordinate",
+    "partial": "block",
     "blocked": "block",
     "failed": "block",
+    "skipped": "block",
     "unknown": "unknown",
 }
+
+COORDINATOR_CONTRACT = "CoordinatorSpec/v1"
+COORDINATOR_VERSION = 1
+COORDINATOR_TERMINAL_STATUSES = frozenset({"succeeded", "partial", "blocked", "failed", "skipped"})
+COORDINATOR_TRANSITIONS: dict[str, frozenset[str]] = {
+    "pending": frozenset({"pending", "running", "blocked", "skipped"}),
+    "running": frozenset({"running", "succeeded", "partial", "blocked", "failed", "skipped", "unknown"}),
+    "succeeded": frozenset({"succeeded", "pending"}),
+    "partial": frozenset({"partial", "pending"}),
+    "blocked": frozenset({"blocked", "pending"}),
+    "failed": frozenset({"failed", "pending"}),
+    "skipped": frozenset({"skipped", "pending"}),
+    "unknown": frozenset({"unknown", "pending", "running"}),
+}
+
+
+def validate_coordinator_transition(previous: str, current: str) -> None:
+    """Validate the externally observable CoordinatorSpec lifecycle."""
+    if previous not in STATUSES or current not in STATUSES:
+        raise ValueError("invalid CoordinatorSpec lifecycle status")
+    if current not in COORDINATOR_TRANSITIONS[previous]:
+        raise ValueError(f"invalid CoordinatorSpec transition: {previous} -> {current}")
+
+
+def validate_dependency_graph(graph: dict[str, list[str] | tuple[str, ...]]) -> dict[str, list[str]]:
+    """Return a canonical, acyclic dependency graph or fail closed."""
+    if not isinstance(graph, dict) or not graph:
+        raise ValueError("CoordinatorSpec dependency graph must be a non-empty object")
+    nodes = {str(node) for node in graph}
+    if any(not node.strip() for node in nodes):
+        raise ValueError("CoordinatorSpec dependency graph contains an empty node")
+    canonical: dict[str, list[str]] = {}
+    for node, dependencies in graph.items():
+        node = str(node)
+        if not isinstance(dependencies, (list, tuple, set)):
+            raise ValueError("CoordinatorSpec dependencies must be lists")
+        deps = sorted({str(dep) for dep in dependencies})
+        if node in deps or any(dep not in nodes for dep in deps):
+            raise ValueError("CoordinatorSpec dependency graph contains an invalid edge")
+        canonical[node] = deps
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node: str) -> None:
+        if node in visiting:
+            raise ValueError("CoordinatorSpec dependency graph contains a cycle")
+        if node in visited:
+            return
+        visiting.add(node)
+        for dependency in canonical[node]:
+            visit(dependency)
+        visiting.remove(node)
+        visited.add(node)
+
+    for node in sorted(canonical):
+        visit(node)
+    return canonical
+
+
+def coordinator_frontier(
+    graph: dict[str, list[str] | tuple[str, ...]],
+    states: dict[str, str],
+) -> dict[str, list[str]]:
+    """Compute runnable and fail-closed nodes from a declared SPEC graph."""
+    canonical = validate_dependency_graph(graph)
+    normalized = {str(node): str(state) for node, state in states.items()}
+    unknown_nodes = sorted(set(normalized) - set(canonical))
+    if unknown_nodes:
+        raise ValueError("CoordinatorSpec states contain unknown nodes: " + ", ".join(unknown_nodes))
+    frontier: list[str] = []
+    blocked: list[str] = []
+    waiting: list[str] = []
+    for node in sorted(canonical):
+        state = normalized.get(node, "pending")
+        if state != "pending":
+            continue
+        dependency_states = [normalized.get(dep, "pending") for dep in canonical[node]]
+        if any(dep_state in {"partial", "blocked", "failed", "skipped", "unknown"} for dep_state in dependency_states):
+            blocked.append(node)
+        elif all(dep_state == "succeeded" for dep_state in dependency_states):
+            frontier.append(node)
+        else:
+            waiting.append(node)
+    return {"frontier": frontier, "blocked": blocked, "waiting": waiting}
+
+
+@dataclass
+class CoordinatorLifecycle:
+    """Small runtime-owned lifecycle journal used by CoordinatorSpec."""
+
+    node_id: str
+    status: str = "pending"
+    records: list[dict[str, Any]] | None = None
+
+    def __post_init__(self) -> None:
+        if not self.node_id.strip():
+            raise ValueError("CoordinatorSpec node_id is required")
+        if self.status not in STATUSES:
+            raise ValueError("invalid CoordinatorSpec lifecycle status")
+        self.records = list(self.records or [])
+        if not self.records:
+            # Pure artifact construction must be replayable. Durable callers
+            # provide a real timestamp through transition(..., at=...).
+            self.records.append({"node_id": self.node_id, "from": None, "to": self.status, "at": 0.0})
+
+    def transition(self, status: str, *, at: float | None = None, reason: str | None = None) -> dict[str, Any]:
+        validate_coordinator_transition(self.status, status)
+        record = {"node_id": self.node_id, "from": self.status, "to": status, "at": at if at is not None else time.time()}
+        if reason:
+            record["reason"] = str(reason)
+        self.status = status
+        self.records.append(record)
+        return copy.deepcopy(record)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"node_id": self.node_id, "status": self.status, "records": copy.deepcopy(self.records)}
+
+
+@dataclass
+class CoordinatorSpec:
+    """Declared dependency graph plus observable state for one coordinator run."""
+
+    dependency_graph: dict[str, list[str] | tuple[str, ...]]
+    states: dict[str, str] | None = None
+    lifecycles: dict[str, CoordinatorLifecycle] | None = None
+
+    def __post_init__(self) -> None:
+        self.dependency_graph = validate_dependency_graph(self.dependency_graph)
+        self.states = {node: "pending" for node in self.dependency_graph} | {
+            str(node): str(status) for node, status in (self.states or {}).items()
+        }
+        if set(self.states) != set(self.dependency_graph) or any(status not in STATUSES for status in self.states.values()):
+            raise ValueError("CoordinatorSpec states must match the dependency graph")
+        self.lifecycles = dict(self.lifecycles or {})
+        for node, status in self.states.items():
+            self.lifecycles.setdefault(node, CoordinatorLifecycle(node, status=status))
+
+    def transition(self, node_id: str, status: str, *, at: float | None = None, reason: str | None = None) -> dict[str, Any]:
+        if node_id not in self.dependency_graph:
+            raise ValueError("CoordinatorSpec transition references an unknown node")
+        record = self.lifecycles[node_id].transition(status, at=at, reason=reason)
+        self.states[node_id] = status
+        return record
+
+    def frontier(self) -> dict[str, list[str]]:
+        return coordinator_frontier(self.dependency_graph, self.states)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "contract": COORDINATOR_CONTRACT,
+            "version": COORDINATOR_VERSION,
+            "dependency_graph": copy.deepcopy(self.dependency_graph),
+            "states": copy.deepcopy(self.states),
+            "frontier": self.frontier(),
+            "lifecycles": {node: lifecycle.as_dict() for node, lifecycle in self.lifecycles.items()},
+        }
+
+
+def build_coordinator_spec(
+    dependency_graph: dict[str, list[str] | tuple[str, ...]],
+    *,
+    states: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build the canonical externally observable CoordinatorSpec envelope."""
+    return CoordinatorSpec(dependency_graph, states=states).as_dict()
+
+
+class CoordinatorStateStore:
+    """Durable, atomic state for takeover/retry and duplicate execution guards."""
+
+    def __init__(self, path: str | os.PathLike[str]):
+        self.path = os.fspath(path)
+
+    def _read(self) -> dict[str, Any]:
+        try:
+            with open(self.path, encoding="utf-8") as handle:
+                value = json.load(handle)
+            return value if isinstance(value, dict) else {}
+        except FileNotFoundError:
+            return {}
+
+    def _write(self, value: dict[str, Any]) -> None:
+        directory = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix="coordinator-", suffix=".json", dir=directory, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(value, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def get(self, node_id: str) -> dict[str, Any] | None:
+        return copy.deepcopy(self._read().get(node_id))
+
+    def claim(self, node_id: str, idempotency_key: str, *, lease_seconds: float = 300, now: float | None = None) -> dict[str, Any]:
+        if not node_id.strip() or not idempotency_key.strip():
+            raise ValueError("CoordinatorSpec node_id and idempotency_key are required")
+        timestamp = time.time() if now is None else float(now)
+        state = self._read()
+        current = state.get(node_id)
+        if isinstance(current, dict) and current.get("idempotency_key") == idempotency_key:
+            if current.get("status") in COORDINATOR_TERMINAL_STATUSES:
+                return {**copy.deepcopy(current), "duplicate": True, "takeover": False}
+            if current.get("status") == "running" and float(current.get("lease_until") or 0) > timestamp:
+                return {**copy.deepcopy(current), "duplicate": True, "takeover": False}
+        previous = str(current.get("status") if isinstance(current, dict) else "pending")
+        takeover = previous == "running" and float(current.get("lease_until") or 0) <= timestamp if isinstance(current, dict) else False
+        if previous not in STATUSES:
+            previous = "pending"
+        if previous != "pending" and not takeover:
+            validate_coordinator_transition(previous, "pending")
+        lifecycle = CoordinatorLifecycle(node_id, status=previous if takeover else "pending", records=(current or {}).get("lifecycle") if isinstance(current, dict) else None)
+        if lifecycle.status != "running":
+            lifecycle.transition("running", at=timestamp, reason="takeover" if takeover else "claimed")
+        record = {"node_id": node_id, "idempotency_key": idempotency_key, "status": "running", "lease_until": timestamp + max(1, lease_seconds), "execution_count": int((current or {}).get("execution_count") or 0) + 1, "lifecycle": lifecycle.records}
+        state[node_id] = record
+        self._write(state)
+        return {**copy.deepcopy(record), "duplicate": False, "takeover": takeover}
+
+    def finish(self, node_id: str, status: str, *, idempotency_key: str, reason: str | None = None, now: float | None = None) -> dict[str, Any]:
+        current = self.get(node_id)
+        if not current or current.get("idempotency_key") != idempotency_key:
+            raise ValueError("CoordinatorSpec finish does not match the active claim")
+        lifecycle = CoordinatorLifecycle(node_id, status=str(current.get("status") or "running"), records=current.get("lifecycle"))
+        lifecycle.transition(status, at=time.time() if now is None else float(now), reason=reason)
+        state = self._read()
+        current.update({"status": status, "lease_until": None, "lifecycle": lifecycle.records})
+        state[node_id] = current
+        self._write(state)
+        return copy.deepcopy(current)
 
 _FORBIDDEN_KEYS = frozenset({
     "chain_of_thought", "cot", "thoughts", "reasoning_trace", "private_reasoning",
@@ -255,6 +496,20 @@ def validate_output(value: dict[str, Any]) -> None:
             raise ValueError("AgentRoleSpec coordinator output requires provenance.attempt_id")
     if not isinstance(value["permissions"], dict) or value["permissions"].get("write_permissions") != []:
         raise ValueError("AgentRoleSpec outputs are read-only")
+    coordinator_spec = value.get("provenance", {}).get("coordinator_spec") if isinstance(value.get("provenance"), dict) else None
+    if coordinator_spec is not None:
+        if not isinstance(coordinator_spec, dict) or coordinator_spec.get("contract") != COORDINATOR_CONTRACT:
+            raise ValueError("invalid CoordinatorSpec provenance")
+        graph = validate_dependency_graph(coordinator_spec.get("dependency_graph"))
+        states = coordinator_spec.get("states", coordinator_spec.get("dependency_states"))
+        if not isinstance(states, dict) or set(states) != set(graph):
+            raise ValueError("CoordinatorSpec states do not match dependency graph")
+        frontier = coordinator_frontier(graph, states)
+        if coordinator_spec.get("frontier", coordinator_spec.get("executable_frontier")) != frontier:
+            raise ValueError("CoordinatorSpec executable frontier is stale")
+        lifecycle = coordinator_spec.get("lifecycle")
+        if not isinstance(lifecycle, dict) or not isinstance(lifecycle.get("records"), list):
+            raise ValueError("CoordinatorSpec lifecycle records are required")
     for field in ("evidence_refs", "counterevidence_refs"):
         _refs(value[field], field)
     for field in ("propositions", "risks", "unknowns"):
@@ -423,6 +678,12 @@ def build_runtime_coordinator_output(
     unknowns: list[str],
     attempt_id: str,
     bundle_sha256: str | None,
+    dependency_graph: dict[str, list[str] | tuple[str, ...]] | None = None,
+    dependency_states: dict[str, str] | None = None,
+    node_id: str = "coordinator",
+    state_store: CoordinatorStateStore | None = None,
+    lease_seconds: float = 300,
+    now: float | None = None,
 ) -> dict[str, Any]:
     """Close one runtime research attempt with a bounded coordinator artifact.
 
@@ -443,18 +704,53 @@ def build_runtime_coordinator_output(
 
     coordinator = coordinators[0]
     validate_input(coordinator)
-    # `coordinate` means the coordinator completed its bounded qualification,
-    # not that the underlying research passed. Preserve unknown separately and
-    # reserve `block` for explicit blocked/failed outcomes.
     if status not in _COORDINATOR_EFFECTS:
         raise ValueError("invalid AgentRoleSpec coordinator status")
+    graph = dependency_graph or {node_id: []}
+    states = {str(key): str(value) for key, value in (dependency_states or {}).items()}
+    states.setdefault(node_id, status)
+    frontier = coordinator_frontier(graph, states)
+    idempotency_key = f"{attempt_id}:{node_id}:{sha256({ 'status': status, 'evidence_refs': sorted(set(evidence_refs)), 'unknowns': sorted(map(str, unknowns)) })}"
+    lifecycle = CoordinatorLifecycle(node_id, status="pending")
+    lifecycle_at = now if now is not None else 0.0
+    if status != "pending":
+        lifecycle.transition("running", at=lifecycle_at, reason="runtime coordinator started")
+        lifecycle.transition(status, at=lifecycle_at, reason="runtime coordinator result")
+    recovery: dict[str, Any] = {"persisted": False, "duplicate": False, "takeover": False}
+    if state_store is not None:
+        claim = state_store.claim(node_id, idempotency_key, lease_seconds=lease_seconds, now=now)
+        recovery = {key: claim.get(key) for key in ("persisted", "duplicate", "takeover") if key in claim}
+        recovery.update({"persisted": True, "execution_count": claim.get("execution_count")})
+        if not claim.get("duplicate"):
+            finished = state_store.finish(node_id, status, idempotency_key=idempotency_key, reason="runtime coordinator result", now=now)
+            lifecycle = CoordinatorLifecycle(node_id, status=status, records=finished.get("lifecycle"))
+        else:
+            lifecycle = CoordinatorLifecycle(node_id, status=str(claim.get("status") or status), records=claim.get("lifecycle"))
+            status = str(claim.get("status") or status)
     return build_output(
         coordinator,
         status=status,
         decision_effect=_COORDINATOR_EFFECTS[status],
         evidence_refs=evidence_refs,
         unknowns=[{"description": str(item)} for item in unknowns],
-        provenance={"attempt_id": attempt_id, "bundle_sha256": bundle_sha256},
+        provenance={
+            "attempt_id": attempt_id, "bundle_sha256": bundle_sha256,
+            "coordinator_spec": {
+                "contract": COORDINATOR_CONTRACT,
+                "version": COORDINATOR_VERSION,
+                "node_id": node_id,
+                "idempotency_key": idempotency_key,
+                "status": status,
+                "dependency_graph": validate_dependency_graph(graph),
+                "states": states,
+                "dependency_states": states,
+                "frontier": frontier,
+                "executable_frontier": frontier,
+                "lifecycle": lifecycle.as_dict(),
+                "lifecycle_records": copy.deepcopy(lifecycle.records),
+                "recovery": recovery,
+            },
+        },
     )
 
 

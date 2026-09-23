@@ -1101,6 +1101,28 @@ def _call_stage(
                     packet, stage=stage, status="evidence_insufficient",
                     attempt_id=attempt["attempt_id"], reason=str(exc),
                 )
+        elif packet.get("agent_role_inputs"):
+            # CoordinatorSpec is attached to every role-bearing stage, not
+            # only the evidence-search path. This keeps judgment, timeout,
+            # and recovery projections on one externally observable seam.
+            source_refs = [
+                str(row["url"]) for row in (data.get("sources") or [])
+                if isinstance(row, dict) and row.get("url")
+            ] if isinstance(data, dict) else []
+            role_status = "succeeded" if verifier.get("passed") else "blocked"
+            role_output = build_runtime_coordinator_output(
+                packet["agent_role_inputs"],
+                status=role_status,
+                evidence_refs=sorted(set(source_refs)),
+                unknowns=[str(item) for item in (verifier.get("missing_requirements") or verifier.get("critical_gaps") or [])],
+                attempt_id=attempt["attempt_id"],
+                bundle_sha256=None,
+            )
+            verifier = {
+                **verifier,
+                "agent_role_inputs": packet["agent_role_inputs"],
+                "agent_role_outputs": [role_output],
+            }
         status = "succeeded" if verifier.get("passed") else "rejected"
         output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(
@@ -1140,11 +1162,41 @@ def _call_stage(
                 isinstance(exc, TimeoutError)
                 or isinstance(exc, BrokerError) and exc.category == "broker_timeout"
             ) else "failed"
+            # CoordinatorSpec is an operational contract, so provider errors,
+            # timeouts, and skipped/incomplete work must remain observable in
+            # the same internal role boundary as successful research.
+            failure_verifier = {
+                **(getattr(exc, "verifier", None) or {}),
+                "passed": False,
+                "coordinator_failure": {
+                    "stage": stage,
+                    "status": "failed" if status == "failed" else "blocked",
+                    "exception_type": type(exc).__name__,
+                },
+            }
+            if packet.get("agent_role_inputs"):
+                try:
+                    failure_output = build_runtime_coordinator_output(
+                        packet["agent_role_inputs"],
+                        status="failed" if status == "failed" else "blocked",
+                        evidence_refs=[],
+                        unknowns=[str(exc)],
+                        attempt_id=attempt["attempt_id"],
+                        bundle_sha256=None,
+                    )
+                    failure_verifier.update({
+                        "agent_role_inputs": packet["agent_role_inputs"],
+                        "agent_role_outputs": [failure_output],
+                    })
+                except (TypeError, ValueError) as coordinator_exc:
+                    # A malformed role packet must not hide the original
+                    # provider failure; retain an auditable coordinator error.
+                    failure_verifier["coordinator_error"] = str(coordinator_exc)
             store.finish_attempt(
                 attempt["attempt_id"], status, error=str(exc),
                 output=getattr(exc, "output", None),
                 verifier={
-                    **(getattr(exc, "verifier", None) or {}),
+                    **failure_verifier,
                     **({"debate": debate_failure(
                         packet, stage=stage,
                         status="timed_out" if status == "timed_out" else "failed",

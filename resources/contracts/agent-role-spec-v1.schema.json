@@ -10,7 +10,7 @@
     "role": {"enum": ["fundamental", "market_structure", "news_event", "propagation_sentiment", "bull", "bear", "risk", "coordinator"]},
     "stage": {"enum": ["m0_research", "m1_research", "m2", "outcome_research", "chat_research"]},
     "visibility": {"const": "internal"},
-    "status": {"enum": ["succeeded", "partial", "blocked", "failed", "unknown"]},
+    "status": {"enum": ["pending", "running", "succeeded", "partial", "blocked", "failed", "skipped", "unknown"]},
     "decision_effect": {"enum": ["evidence_only", "support", "oppose", "block", "coordinate", "unknown"]},
     "propositions": {"type": "array", "items": {"$ref": "#/$defs/proposition"}},
     "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}},

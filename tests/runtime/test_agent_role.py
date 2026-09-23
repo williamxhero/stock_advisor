@@ -106,7 +106,7 @@ def test_runtime_coordinator_artifact_preserves_role_boundary() -> None:
     ("status", "effect"),
     [
         ("succeeded", "coordinate"),
-        ("partial", "coordinate"),
+        ("partial", "block"),
         ("blocked", "block"),
         ("failed", "block"),
         ("unknown", "unknown"),

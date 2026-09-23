@@ -204,11 +204,10 @@ def spec95_runtime_qualification(baseline: dict[str, Any] | None = None) -> tupl
     """
     verified = validate_spec95_baseline(baseline)
     if verified is None:
-        # Preserve the historical packet shape for callers that only inspect
-        # the local role roster.  Runtime authorization separately requires a
-        # validated receipt, so this compatibility projection cannot unlock a
-        # provider stage.
-        return ({node: "succeeded" for node in SPEC95_NODE_IDS}, {node: True for node in SPEC95_NODE_IDS})
+        # Absence of a receipt is an unverified prerequisite, not evidence
+        # that the six tickets completed.  Keep the packet shape deterministic
+        # while making the CoordinatorSpec gate fail closed.
+        return ({node: "blocked" for node in SPEC95_NODE_IDS}, {node: False for node in SPEC95_NODE_IDS})
     return (
         {node: str(verified["spec_issue_states"][node]).casefold() for node in SPEC95_NODE_IDS},
         {node: True for node in SPEC95_NODE_IDS},

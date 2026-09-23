@@ -260,10 +260,20 @@ def test_role_packet_emits_runtime_qualification_metadata() -> None:
     assert packet["spec_issue_states"] == issue_states
     assert packet["spec_evidence_gates"] == evidence_gates
     assert all(
-        state == "succeeded"
+        state == "blocked"
         for state in spec95_dependency_states(packet["spec_issue_states"], packet["spec_evidence_gates"]).values()
         if state != "pending"
     )
+
+
+def test_missing_spec95_receipt_cannot_authorize_downstream_work() -> None:
+    issue_states, evidence_gates = spec95_runtime_qualification()
+
+    assert set(issue_states) == set(f"SPEC-95.{index}" for index in range(1, 7))
+    assert set(evidence_gates) == set(issue_states)
+    assert all(state == "blocked" for state in issue_states.values())
+    assert all(gate is False for gate in evidence_gates.values())
+    assert spec95_dependency_states(issue_states, evidence_gates)["coordinator"] == "blocked"
 
 
 def test_runtime_packet_builder_qualifies_normal_m0_and_m1_research_packets() -> None:

@@ -100,6 +100,21 @@ def spec95_runtime_qualification() -> tuple[dict[str, str], dict[str, bool]]:
     )
 
 
+def attach_runtime_qualification(packet: dict[str, Any]) -> dict[str, Any]:
+    """Add the runtime-owned SPEC-95 gates before a packet is hashed.
+
+    This is intentionally additive only when both fields are absent.  A
+    packet carrying partial, stale, or contradictory qualification metadata
+    must remain unchanged so ``spec95_dependency_states`` can fail closed.
+    """
+    value = copy.deepcopy(packet)
+    if "spec_issue_states" not in value and "spec_evidence_gates" not in value:
+        issue_states, evidence_gates = spec95_runtime_qualification()
+        value["spec_issue_states"] = issue_states
+        value["spec_evidence_gates"] = evidence_gates
+    return value
+
+
 def spec95_dependency_states(
     issue_states: dict[str, str] | None = None,
     evidence_gates: dict[str, bool] | None = None,
@@ -740,18 +755,10 @@ def attach_role_inputs(packet: dict[str, Any], *, stage: str) -> dict[str, Any]:
     Only stable references are attached.  In particular this function does
     not copy H0 or any MemoryHub/portfolio payload into a role input.
     """
-    value = copy.deepcopy(packet)
+    value = attach_runtime_qualification(packet)
     agent_contract = value.get("agent_contract")
     if not isinstance(agent_contract, dict):
         raise TypeError("AgentRoleSpec requires an attached AgentContractSpec")
-    # A normal packet is qualified by the runtime's installed contract at the
-    # point where the role roster is attached.  Preserve caller-supplied
-    # metadata verbatim so partial, stale, or contradictory qualification
-    # remains fail-closed in spec95_dependency_states().
-    if "spec_issue_states" not in value and "spec_evidence_gates" not in value:
-        issue_states, evidence_gates = spec95_runtime_qualification()
-        value["spec_issue_states"] = issue_states
-        value["spec_evidence_gates"] = evidence_gates
     refs: dict[str, list[str]] = {
         "evidence_snapshot": [str((agent_contract.get("evidence_snapshot") or {}).get("snapshot_id") or "snapshot:pending")],
         "public_evidence": [str(value.get("evidence_bundle_sha256") or value.get("sha256") or "packet:pending")],

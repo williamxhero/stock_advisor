@@ -8,7 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .learning import WorkflowEvolution
-from .agent_role import spec95_runtime_qualification
+from .agent_role import attach_runtime_qualification
 from .memory_port import MemoryPort, MemoryUnavailable
 from .secret_guard import assert_safe
 from .evidence_contract import EvidenceContractFactory
@@ -77,9 +77,7 @@ class RuntimePacketBuilder:
         # their hash is frozen or any provider work is considered.  Replayed
         # or externally supplied packets still receive no implicit approval.
         if stage in {"m0_research", "m1_research"}:
-            issue_states, evidence_gates = spec95_runtime_qualification()
-            packet["spec_issue_states"] = issue_states
-            packet["spec_evidence_gates"] = evidence_gates
+            packet = attach_runtime_qualification(packet)
         if cycle.get("task_profile_json"):
             packet["task_profile"] = json.loads(cycle["task_profile_json"])
         memory_cards = self._memory_cards(cycle, stage, packet_as_of, evidence)

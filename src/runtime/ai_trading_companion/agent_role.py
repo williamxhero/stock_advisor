@@ -85,6 +85,21 @@ SPEC95_DEPENDENCY_GRAPH: dict[str, list[str]] = {
 }
 
 
+def spec95_runtime_qualification() -> tuple[dict[str, str], dict[str, bool]]:
+    """Return the qualification metadata owned by this runtime boundary.
+
+    The install replay is the runtime-owned evidence that the AgentRole and
+    coordinator contracts are available.  Emit that fact explicitly so the
+    coordinator gate can remain fail-closed for external/replayed packets
+    while normal runtime packets carry verified qualification metadata.
+    """
+    qualified = bool(install_qualification().get("qualified"))
+    return (
+        {node: "succeeded" if qualified else "blocked" for node in SPEC95_NODE_IDS},
+        {node: qualified for node in SPEC95_NODE_IDS},
+    )
+
+
 def spec95_dependency_states(
     issue_states: dict[str, str] | None = None,
     evidence_gates: dict[str, bool] | None = None,
@@ -729,6 +744,14 @@ def attach_role_inputs(packet: dict[str, Any], *, stage: str) -> dict[str, Any]:
     agent_contract = value.get("agent_contract")
     if not isinstance(agent_contract, dict):
         raise TypeError("AgentRoleSpec requires an attached AgentContractSpec")
+    # A normal packet is qualified by the runtime's installed contract at the
+    # point where the role roster is attached.  Preserve caller-supplied
+    # metadata verbatim so partial, stale, or contradictory qualification
+    # remains fail-closed in spec95_dependency_states().
+    if "spec_issue_states" not in value and "spec_evidence_gates" not in value:
+        issue_states, evidence_gates = spec95_runtime_qualification()
+        value["spec_issue_states"] = issue_states
+        value["spec_evidence_gates"] = evidence_gates
     refs: dict[str, list[str]] = {
         "evidence_snapshot": [str((agent_contract.get("evidence_snapshot") or {}).get("snapshot_id") or "snapshot:pending")],
         "public_evidence": [str(value.get("evidence_bundle_sha256") or value.get("sha256") or "packet:pending")],

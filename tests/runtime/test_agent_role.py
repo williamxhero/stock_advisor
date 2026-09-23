@@ -18,6 +18,7 @@ from ai_trading_companion.agent_role import (
     frozen_replay,
     install_qualification,
     role_definition,
+    spec95_runtime_qualification,
     spec95_dependency_states,
     validate_output,
 )
@@ -249,6 +250,29 @@ def test_missing_spec95_prerequisite_metadata_blocks_every_node() -> None:
 
     assert all(states[node] == "blocked" for node in SPEC95_DEPENDENCY_GRAPH if node != "coordinator")
     assert states["coordinator"] == "blocked"
+
+
+def test_role_packet_emits_runtime_qualification_metadata() -> None:
+    packet = attach_role_inputs({**PACKET, "agent_contract": _agent_input()}, stage="m1_research")
+    issue_states, evidence_gates = spec95_runtime_qualification()
+
+    assert packet["spec_issue_states"] == issue_states
+    assert packet["spec_evidence_gates"] == evidence_gates
+    assert all(
+        state == "succeeded"
+        for state in spec95_dependency_states(packet["spec_issue_states"], packet["spec_evidence_gates"]).values()
+        if state != "pending"
+    )
+
+
+def test_partial_spec95_metadata_is_not_filled_in() -> None:
+    packet = attach_role_inputs(
+        {**PACKET, "agent_contract": _agent_input(), "spec_issue_states": {}},
+        stage="m1_research",
+    )
+
+    assert "spec_evidence_gates" not in packet
+    assert spec95_dependency_states(packet["spec_issue_states"], packet.get("spec_evidence_gates"))["SPEC-95.1"] == "blocked"
 
 
 def test_durable_coordinator_claim_uses_scheduling_idempotency_key() -> None:

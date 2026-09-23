@@ -102,6 +102,79 @@ def test_runtime_coordinator_artifact_preserves_role_boundary() -> None:
     assert output["provenance"]["bundle_sha256"] == "bundle-1"
 
 
+@pytest.mark.parametrize(
+    ("status", "effect"),
+    [
+        ("succeeded", "coordinate"),
+        ("partial", "coordinate"),
+        ("blocked", "block"),
+        ("failed", "block"),
+        ("unknown", "unknown"),
+    ],
+)
+def test_runtime_coordinator_terminal_status_is_explicit_and_idempotent(status: str, effect: str) -> None:
+    packet = attach_role_inputs({**PACKET, "agent_contract": _agent_input()}, stage="m1_research")
+    role_inputs = packet["agent_role_inputs"]
+    original = copy.deepcopy(role_inputs)
+    kwargs = {
+        "status": status,
+        "evidence_refs": ["evidence-hash"],
+        "unknowns": ["source availability not verified"],
+        "attempt_id": "attempt-stable",
+        "bundle_sha256": "bundle-stable",
+    }
+
+    first = build_runtime_coordinator_output(role_inputs, **kwargs)
+    recovered = build_runtime_coordinator_output(copy.deepcopy(role_inputs), **kwargs)
+
+    assert first == recovered
+    assert first["status"] == status
+    assert first["decision_effect"] == effect
+    assert first["provenance"]["attempt_id"] == "attempt-stable"
+    assert role_inputs == original
+
+
+def test_runtime_coordinator_rejects_ambiguous_identity_and_incomplete_attempt_context() -> None:
+    packet = attach_role_inputs({**PACKET, "agent_contract": _agent_input()}, stage="m1_research")
+    role_inputs = packet["agent_role_inputs"]
+    coordinator = next(row for row in role_inputs if row["role"] == "coordinator")
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        build_runtime_coordinator_output(
+            [*role_inputs, copy.deepcopy(coordinator)], status="succeeded", evidence_refs=[],
+            unknowns=[], attempt_id="attempt-1", bundle_sha256=None,
+        )
+    with pytest.raises(ValueError, match="attempt_id"):
+        build_runtime_coordinator_output(
+            role_inputs, status="succeeded", evidence_refs=[], unknowns=[],
+            attempt_id="", bundle_sha256=None,
+        )
+    with pytest.raises(ValueError, match="bundle_sha256"):
+        build_runtime_coordinator_output(
+            role_inputs, status="succeeded", evidence_refs=[], unknowns=[],
+            attempt_id="attempt-1", bundle_sha256="",
+        )
+
+
+def test_coordinator_output_validation_rejects_contradictory_or_untraceable_state() -> None:
+    packet = attach_role_inputs({**PACKET, "agent_contract": _agent_input()}, stage="m1_research")
+    coordinator = next(row for row in packet["agent_role_inputs"] if row["role"] == "coordinator")
+    output = build_runtime_coordinator_output(
+        [coordinator], status="blocked", evidence_refs=[], unknowns=["dependency evidence missing"],
+        attempt_id="attempt-blocked", bundle_sha256=None,
+    )
+
+    contradictory = copy.deepcopy(output)
+    contradictory["decision_effect"] = "coordinate"
+    with pytest.raises(ValueError, match="status and decision_effect disagree"):
+        validate_output(contradictory)
+
+    untraceable = copy.deepcopy(output)
+    untraceable["provenance"].pop("attempt_id")
+    with pytest.raises(ValueError, match="provenance.attempt_id"):
+        validate_output(untraceable)
+
+
 def test_schema_and_install_contract_include_agent_role() -> None:
     root = Path(__file__).parents[2]
     schema = json.loads((root / "resources/contracts/agent-role-spec-v1.schema.json").read_text(encoding="utf-8"))

@@ -40,6 +40,13 @@ STAGE_ROLES: dict[str, tuple[str, ...]] = {
 }
 STATUSES = frozenset({"succeeded", "partial", "blocked", "failed", "unknown"})
 EFFECTS = frozenset({"evidence_only", "support", "oppose", "block", "coordinate", "unknown"})
+_COORDINATOR_EFFECTS = {
+    "succeeded": "coordinate",
+    "partial": "coordinate",
+    "blocked": "block",
+    "failed": "block",
+    "unknown": "unknown",
+}
 
 _FORBIDDEN_KEYS = frozenset({
     "chain_of_thought", "cot", "thoughts", "reasoning_trace", "private_reasoning",
@@ -239,6 +246,13 @@ def validate_output(value: dict[str, Any]) -> None:
     definition = ROLE_SPECS[value["role"]]
     if value["decision_effect"] not in definition["allowed_effects"]:
         raise ValueError("AgentRoleSpec decision effect is not allowed for role")
+    if value["role"] == "coordinator":
+        expected_effect = _COORDINATOR_EFFECTS[value["status"]]
+        if value["decision_effect"] != expected_effect:
+            raise ValueError("AgentRoleSpec coordinator status and decision_effect disagree")
+        attempt_id = value.get("provenance", {}).get("attempt_id") if isinstance(value.get("provenance"), dict) else None
+        if not isinstance(attempt_id, str) or not attempt_id.strip():
+            raise ValueError("AgentRoleSpec coordinator output requires provenance.attempt_id")
     if not isinstance(value["permissions"], dict) or value["permissions"].get("write_permissions") != []:
         raise ValueError("AgentRoleSpec outputs are read-only")
     for field in ("evidence_refs", "counterevidence_refs"):
@@ -417,13 +431,27 @@ def build_runtime_coordinator_output(
     role output was emitted.  This is a qualification/status artifact, not a
     replacement for the provider result and never a user-facing persona.
     """
-    coordinator = next((item for item in role_inputs if item.get("role") == "coordinator"), None)
-    if coordinator is None:
+    coordinators = [item for item in role_inputs if isinstance(item, dict) and item.get("role") == "coordinator"]
+    if not coordinators:
         raise ValueError("AgentRoleSpec coordinator input is missing")
+    if len(coordinators) != 1:
+        raise ValueError("AgentRoleSpec coordinator input is ambiguous")
+    if not isinstance(attempt_id, str) or not attempt_id.strip():
+        raise ValueError("AgentRoleSpec coordinator output requires attempt_id")
+    if bundle_sha256 is not None and (not isinstance(bundle_sha256, str) or not bundle_sha256.strip()):
+        raise ValueError("AgentRoleSpec coordinator bundle_sha256 must be non-empty when provided")
+
+    coordinator = coordinators[0]
+    validate_input(coordinator)
+    # `coordinate` means the coordinator completed its bounded qualification,
+    # not that the underlying research passed. Preserve unknown separately and
+    # reserve `block` for explicit blocked/failed outcomes.
+    if status not in _COORDINATOR_EFFECTS:
+        raise ValueError("invalid AgentRoleSpec coordinator status")
     return build_output(
         coordinator,
         status=status,
-        decision_effect="coordinate" if status == "succeeded" else "block",
+        decision_effect=_COORDINATOR_EFFECTS[status],
         evidence_refs=evidence_refs,
         unknowns=[{"description": str(item)} for item in unknowns],
         provenance={"attempt_id": attempt_id, "bundle_sha256": bundle_sha256},

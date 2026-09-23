@@ -890,27 +890,36 @@ def _call_stage(
     coordinator_idempotency_key = f"{cycle['cycle_id']}:{stage}:{packet.get('sha256') or ''}"
     coordinator_claim_already_held = False
     if packet.get("agent_role_inputs"):
-        if any(coordinator_dependency_states[node] != "succeeded" for node in SPEC95_NODE_IDS):
+        coordinator_gate_passed = all(
+            coordinator_dependency_states[node] == "succeeded" for node in SPEC95_NODE_IDS
+        )
+        # Evidence acquisition is an upstream deterministic step.  It may
+        # complete and record its evidence even when the qualification
+        # metadata is absent; its coordinator artifact remains blocked.  Any
+        # downstream model/provider work must stop before it begins.
+        evidence_only_stage = search and schema_name.startswith("companion-evidence-result-")
+        if not coordinator_gate_passed and not evidence_only_stage:
             raise EvidenceInsufficient({
                 "passed": False,
                 "coordinator_frontier_stopped": True,
                 "coordinator_states": coordinator_dependency_states,
             })
-        claim = coordinator_state_store.claim(
-            "coordinator", coordinator_idempotency_key, now=None,
-        )
-        if claim.get("duplicate"):
-            replay = _replay_coordinator_stage_result(
-                store, cycle["cycle_id"], stage, packet.get("sha256"),
+        if coordinator_gate_passed:
+            claim = coordinator_state_store.claim(
+                "coordinator", coordinator_idempotency_key, now=None,
             )
-            if replay is not None:
-                return replay
-            raise EvidenceInsufficient({
-                "passed": False,
-                "coordinator_duplicate": True,
-                "coordinator_state": claim,
-            })
-        coordinator_claim_already_held = True
+            if claim.get("duplicate"):
+                replay = _replay_coordinator_stage_result(
+                    store, cycle["cycle_id"], stage, packet.get("sha256"),
+                )
+                if replay is not None:
+                    return replay
+                raise EvidenceInsufficient({
+                    "passed": False,
+                    "coordinator_duplicate": True,
+                    "coordinator_state": claim,
+                })
+            coordinator_claim_already_held = True
     attempt = store.begin_attempt(
         cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), packet.get("sha256"),
         model=None, reasoning_effort=decision.reasoning_effort,

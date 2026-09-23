@@ -930,13 +930,18 @@ def _call_stage(
                     store, cycle["cycle_id"], stage, packet.get("sha256"),
                 )
                 if replay is not None:
-                    coordinator_state_store.finish(
-                        "coordinator",
-                        "succeeded",
-                        idempotency_key=coordinator_idempotency_key,
-                        execution_generation=claim.get("execution_generation"),
-                        reason="replayed completed coordinator stage",
-                    )
+                    # A prior provider attempt may have been persisted before
+                    # the process died while closing the durable claim. Close
+                    # only that still-running generation; a terminal claim is
+                    # already durable and must not be rewritten during replay.
+                    if claim.get("status") == "running":
+                        coordinator_state_store.finish(
+                            "coordinator",
+                            "succeeded",
+                            idempotency_key=coordinator_idempotency_key,
+                            execution_generation=claim.get("execution_generation"),
+                            reason="replayed completed coordinator stage",
+                        )
                     return replay
                 raise EvidenceInsufficient({
                     "passed": False,

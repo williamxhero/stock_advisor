@@ -110,25 +110,27 @@ def validate_spec95_baseline(value: Any) -> dict[str, Any] | None:
     """
     if not isinstance(value, dict):
         return None
+    # The issue snapshot is the authority for this receipt. Top-level
+    # convenience fields are accepted only as redundant copies below; they
+    # cannot manufacture an issue state in a packet supplied by a caller.
     issue = value.get("issue") if isinstance(value.get("issue"), dict) else None
+    if issue is None or issue.get("number") != SPEC95_ISSUE_NUMBER:
+        return None
     issue_number = value.get("issue_number")
-    if issue is not None and issue.get("number") is not None:
-        if issue_number is not None and issue_number != issue["number"]:
-            return None
-        issue_number = issue["number"]
-    if issue_number != SPEC95_ISSUE_NUMBER:
+    if issue_number is not None and issue_number != issue["number"]:
         return None
     issue_state_value = value.get("issue_state")
-    if issue is not None and issue.get("state") is not None:
-        if issue_state_value is not None and str(issue_state_value).casefold() != str(issue["state"]).casefold():
-            return None
-        issue_state_value = issue["state"]
+    if issue.get("state") is None:
+        return None
+    if issue_state_value is not None and str(issue_state_value).casefold() != str(issue["state"]).casefold():
+        return None
+    issue_state_value = issue["state"]
     issue_state = str(issue_state_value or "").casefold()
     if issue_state not in {"closed", "completed", "done", "succeeded"}:
         return None
     declared = value.get("declared_specs")
-    issue_declared = issue.get("declared_specs") if issue is not None else None
-    if declared is not None and issue_declared is not None and declared != issue_declared:
+    issue_declared = issue.get("declared_specs")
+    if issue_declared is not None and declared is not None and declared != issue_declared:
         return None
     if declared is None:
         declared = issue_declared
@@ -183,6 +185,8 @@ def validate_spec95_baseline(value: Any) -> dict[str, Any] | None:
     if isinstance(delivery, dict) and isinstance(delivery.get("nodes"), dict):
         delivery = delivery["nodes"]
     if not isinstance(dependency, dict) or not isinstance(delivery, dict):
+        return None
+    if not set(SPEC95_NODE_IDS) <= set(dependency) or not set(SPEC95_NODE_IDS) <= set(delivery):
         return None
     if not all(_spec95_gate(dependency.get(node)) for node in SPEC95_NODE_IDS):
         return None
@@ -556,6 +560,8 @@ class CoordinatorStateStore:
         reason: str | None = None,
         now: float | None = None,
     ) -> dict[str, Any]:
+        if status not in STATUSES:
+            raise ValueError("invalid CoordinatorSpec finish status")
         with self._locked():
             state = self._read()
             current = state.get(node_id)

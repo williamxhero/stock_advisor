@@ -29,6 +29,7 @@ from .agent_role import (
     attach_role_inputs,
     build_runtime_coordinator_output,
     spec95_dependency_states,
+    validate_spec95_baseline,
     CoordinatorStateStore,
 )
 from .debate import failure as debate_failure, from_stage as debate_from_stage
@@ -894,18 +895,22 @@ def _call_stage(
         coordinator_gate_passed = all(
             coordinator_dependency_states[node] == "succeeded" for node in SPEC95_NODE_IDS
         )
+        coordinator_baseline_verified = validate_spec95_baseline(
+            packet.get("spec95_baseline") or packet.get("spec95_qualification")
+        ) is not None
         # Evidence acquisition is an upstream deterministic step.  It may
         # complete and record its evidence even when the qualification
         # metadata is absent; its coordinator artifact remains blocked.  Any
         # downstream model/provider work must stop before it begins.
         evidence_only_stage = search and schema_name.startswith("companion-evidence-result-")
-        if not coordinator_gate_passed and not evidence_only_stage:
+        if (not coordinator_gate_passed or not coordinator_baseline_verified) and not evidence_only_stage:
             raise EvidenceInsufficient({
                 "passed": False,
                 "coordinator_frontier_stopped": True,
                 "coordinator_states": coordinator_dependency_states,
+                "spec95_baseline_verified": coordinator_baseline_verified,
             })
-        if coordinator_gate_passed:
+        if coordinator_gate_passed and coordinator_baseline_verified:
             claim = coordinator_state_store.claim(
                 "coordinator", coordinator_idempotency_key, now=None,
             )

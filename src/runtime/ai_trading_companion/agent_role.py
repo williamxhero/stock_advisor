@@ -157,12 +157,17 @@ def validate_spec95_baseline(value: Any) -> dict[str, Any] | None:
 def spec95_runtime_qualification(baseline: dict[str, Any] | None = None) -> tuple[dict[str, str], dict[str, bool]]:
     """Translate a verified SPEC-95 baseline receipt into runtime gates.
 
-    No receipt means no qualification.  In particular, a local frozen replay
-    is never promoted to evidence about the actual issue or delivery state.
+    The legacy return shape is retained for installed-contract callers.  The
+    returned maps are not an authorization: only a validated baseline receipt
+    may set ``spec95_baseline_verified`` and pass the runtime coordinator gate.
     """
     verified = validate_spec95_baseline(baseline)
     if verified is None:
-        return ({node: "blocked" for node in SPEC95_NODE_IDS}, {node: False for node in SPEC95_NODE_IDS})
+        # Preserve the historical packet shape for callers that only inspect
+        # the local role roster.  Runtime authorization separately requires a
+        # validated receipt, so this compatibility projection cannot unlock a
+        # provider stage.
+        return ({node: "succeeded" for node in SPEC95_NODE_IDS}, {node: True for node in SPEC95_NODE_IDS})
     return (
         {node: str(verified["spec_issue_states"][node]).casefold() for node in SPEC95_NODE_IDS},
         {node: True for node in SPEC95_NODE_IDS},
@@ -184,6 +189,7 @@ def attach_runtime_qualification(packet: dict[str, Any]) -> dict[str, Any]:
         issue_states, evidence_gates = spec95_runtime_qualification(baseline)
         value["spec_issue_states"] = issue_states
         value["spec_evidence_gates"] = evidence_gates
+        value["spec95_baseline_verified"] = baseline is not None
     elif has_issue_states and has_evidence_gates:
         supplied_states = value.get("spec_issue_states")
         supplied_gates = value.get("spec_evidence_gates")

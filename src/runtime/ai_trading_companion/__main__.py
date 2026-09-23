@@ -29,6 +29,7 @@ from .agent_role import (
     attach_role_inputs,
     build_runtime_coordinator_output,
     spec95_dependency_states,
+    spec95_runtime_qualification,
     validate_spec95_baseline,
     CoordinatorStateStore,
 )
@@ -892,12 +893,22 @@ def _call_stage(
     coordinator_claim_already_held = False
     coordinator_execution_generation: int | None = None
     if packet.get("agent_role_inputs"):
+        verified_baseline = validate_spec95_baseline(
+            packet.get("spec95_baseline") or packet.get("spec95_qualification")
+        )
         coordinator_gate_passed = all(
             coordinator_dependency_states[node] == "succeeded" for node in SPEC95_NODE_IDS
         )
-        coordinator_baseline_verified = validate_spec95_baseline(
-            packet.get("spec95_baseline") or packet.get("spec95_qualification")
-        ) is not None
+        expected_issue_states, expected_evidence_gates = spec95_runtime_qualification(verified_baseline)
+        # Do not let a caller combine a valid-looking receipt with a separate
+        # forged set of all-success packet fields.  The receipt is the source
+        # of truth for the coordinator gate; packet metadata must agree with
+        # its projection exactly.
+        coordinator_baseline_verified = (
+            verified_baseline is not None
+            and packet.get("spec_issue_states") == expected_issue_states
+            and packet.get("spec_evidence_gates") == expected_evidence_gates
+        )
         # Evidence acquisition is an upstream deterministic step.  It may
         # complete and record its evidence even when the qualification
         # metadata is absent; its coordinator artifact remains blocked.  Any

@@ -91,7 +91,11 @@ def _spec95_gate(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, dict):
-        return value.get("passed") is True or value.get("verified") is True
+        flags = [value[key] for key in ("passed", "verified") if key in value]
+        # A receipt with contradictory flags is not positive evidence.  This
+        # matters when a producer includes both its legacy ``passed`` field
+        # and the newer ``verified`` field.
+        return bool(flags) and all(flag is True for flag in flags)
     return False
 
 
@@ -106,14 +110,28 @@ def validate_spec95_baseline(value: Any) -> dict[str, Any] | None:
     """
     if not isinstance(value, dict):
         return None
-    issue = value.get("issue") if isinstance(value.get("issue"), dict) else {}
-    issue_number = value.get("issue_number", issue.get("number"))
+    issue = value.get("issue") if isinstance(value.get("issue"), dict) else None
+    issue_number = value.get("issue_number")
+    if issue is not None and issue.get("number") is not None:
+        if issue_number is not None and issue_number != issue["number"]:
+            return None
+        issue_number = issue["number"]
     if issue_number != SPEC95_ISSUE_NUMBER:
         return None
-    issue_state = str(value.get("issue_state", issue.get("state")) or "").casefold()
+    issue_state_value = value.get("issue_state")
+    if issue is not None and issue.get("state") is not None:
+        if issue_state_value is not None and str(issue_state_value).casefold() != str(issue["state"]).casefold():
+            return None
+        issue_state_value = issue["state"]
+    issue_state = str(issue_state_value or "").casefold()
     if issue_state not in {"closed", "completed", "done", "succeeded"}:
         return None
-    declared = value.get("declared_specs", issue.get("declared_specs"))
+    declared = value.get("declared_specs")
+    issue_declared = issue.get("declared_specs") if issue is not None else None
+    if declared is not None and issue_declared is not None and declared != issue_declared:
+        return None
+    if declared is None:
+        declared = issue_declared
     if not isinstance(declared, (list, tuple, set)):
         return None
     declared_ids = {
@@ -122,25 +140,44 @@ def validate_spec95_baseline(value: Any) -> dict[str, Any] | None:
     }
     if declared_ids != set(SPEC95_NODE_IDS):
         return None
-    synchronization = value.get("synchronization_state", value.get("sync_state", value.get("synchronization")))
+    synchronization_values = [
+        value[key] for key in ("synchronization_state", "sync_state", "synchronization")
+        if key in value
+    ]
+    if synchronization_values and any(item != synchronization_values[0] for item in synchronization_values[1:]):
+        return None
+    synchronization = synchronization_values[0] if synchronization_values else None
     if isinstance(synchronization, dict):
-        synchronized = synchronization.get("passed") is True or synchronization.get("verified") is True
+        synchronized = _spec95_gate(synchronization)
     else:
         synchronized = synchronization is True or str(synchronization or "").casefold() in {"synchronized", "synchronised", "in_sync", "verified"}
     if not synchronized:
         return None
-    issue_states = value.get("spec_issue_states", value.get("issue_states"))
-    if not isinstance(issue_states, dict) and all(isinstance(item, dict) for item in declared):
-        issue_states = {
+    issue_state_values = [value[key] for key in ("spec_issue_states", "issue_states") if key in value]
+    if issue_state_values and any(item != issue_state_values[0] for item in issue_state_values[1:]):
+        return None
+    issue_states = issue_state_values[0] if issue_state_values else None
+    declared_issue_states = {
             str(item.get("id") or item.get("spec") or item.get("key")): item.get("state")
             for item in declared
-        }
+            if isinstance(item, dict)
+        } if all(isinstance(item, dict) for item in declared) else None
+    if issue_states is not None and declared_issue_states is not None and issue_states != declared_issue_states:
+        return None
+    if not isinstance(issue_states, dict):
+        issue_states = declared_issue_states
     if not isinstance(issue_states, dict) or set(map(str, issue_states)) != set(SPEC95_NODE_IDS):
         return None
     if any(str(issue_states[node]).casefold() not in {"closed", "completed", "done", "succeeded"} for node in SPEC95_NODE_IDS):
         return None
-    dependency = value.get("dependency_evidence", value.get("dependency_evidence_gates"))
-    delivery = value.get("delivery_evidence", value.get("delivery_evidence_gates"))
+    dependency_values = [value[key] for key in ("dependency_evidence", "dependency_evidence_gates") if key in value]
+    delivery_values = [value[key] for key in ("delivery_evidence", "delivery_evidence_gates") if key in value]
+    if dependency_values and any(item != dependency_values[0] for item in dependency_values[1:]):
+        return None
+    if delivery_values and any(item != delivery_values[0] for item in delivery_values[1:]):
+        return None
+    dependency = dependency_values[0] if dependency_values else None
+    delivery = delivery_values[0] if delivery_values else None
     if isinstance(dependency, dict) and isinstance(dependency.get("nodes"), dict):
         dependency = dependency["nodes"]
     if isinstance(delivery, dict) and isinstance(delivery.get("nodes"), dict):
@@ -151,7 +188,11 @@ def validate_spec95_baseline(value: Any) -> dict[str, Any] | None:
         return None
     if not all(_spec95_gate(delivery.get(node)) for node in SPEC95_NODE_IDS):
         return None
-    return copy.deepcopy(value)
+    normalized = copy.deepcopy(value)
+    normalized["spec_issue_states"] = {
+        node: str(issue_states[node]).casefold() for node in SPEC95_NODE_IDS
+    }
+    return normalized
 
 
 def spec95_runtime_qualification(baseline: dict[str, Any] | None = None) -> tuple[dict[str, str], dict[str, bool]]:
@@ -194,7 +235,13 @@ def attach_runtime_qualification(packet: dict[str, Any]) -> dict[str, Any]:
         supplied_states = value.get("spec_issue_states")
         supplied_gates = value.get("spec_evidence_gates")
         expected_states, expected_gates = spec95_runtime_qualification(baseline)
-        if baseline is None or supplied_states != expected_states or supplied_gates != expected_gates:
+        matches_verified_baseline = (
+            baseline is not None
+            and supplied_states == expected_states
+            and supplied_gates == expected_gates
+        )
+        value["spec95_baseline_verified"] = matches_verified_baseline
+        if not matches_verified_baseline:
             # Complete-looking metadata without a verified receipt is not an
             # authorization.  Keep partial metadata untouched for diagnostic
             # replay, but neutralize a full forged/contradictory pair.
@@ -515,7 +562,13 @@ class CoordinatorStateStore:
             current = state.get(node_id)
             if not isinstance(current, dict) or current.get("idempotency_key") != idempotency_key:
                 raise ValueError("CoordinatorSpec finish does not match the active claim")
-            if execution_generation is not None and current.get("execution_generation") != execution_generation:
+            # The scheduling key identifies the logical work item, not the
+            # lease owner.  A stale worker can therefore have the same key
+            # after a takeover; only the generation identifies the worker
+            # which is allowed to close this claim.
+            if execution_generation is None:
+                raise ValueError("CoordinatorSpec finish requires an execution generation")
+            if current.get("execution_generation") != execution_generation:
                 raise ValueError("CoordinatorSpec finish does not own the active execution generation")
             current_status = str(current.get("status") or "running")
             if current_status in COORDINATOR_TERMINAL_STATUSES:

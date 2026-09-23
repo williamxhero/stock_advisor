@@ -23,7 +23,14 @@ from .cognition import UnifiedCognition, verify_cognition_result
 from .cognition_expression import express_cognition_answer
 from .adaptive_memory import AdaptiveMemoryResearch, MemoryResearchError
 from .agent_contract import attach_input as attach_agent_contract, build_output as build_agent_contract_output
-from .agent_role import attach_role_inputs, build_runtime_coordinator_output
+from .agent_role import (
+    SPEC95_DEPENDENCY_GRAPH,
+    SPEC95_NODE_IDS,
+    attach_role_inputs,
+    build_runtime_coordinator_output,
+    spec95_dependency_states,
+    CoordinatorStateStore,
+)
 from .debate import failure as debate_failure, from_stage as debate_from_stage
 from .broker_client import BrokerError, BrokerRequest, BrokerResponse, ProviderBrokerClient, canonical_packet_hash
 from .config import load_settings, remove_legacy_provider_settings, save_research_settings
@@ -800,6 +807,29 @@ def _publication_actual_model(
     return None
 
 
+def _replay_coordinator_stage_result(
+    store: CompanionStore, cycle_id: str, stage: str, packet_sha256: str | None,
+) -> VerifiedStageResult | None:
+    """Recover a completed stage instead of re-running a duplicate claim."""
+    for attempt in reversed(store.attempts(cycle_id)):
+        if (
+            attempt.get("stage") != stage
+            or attempt.get("status") != "succeeded"
+            or packet_sha256 is not None and attempt.get("input_sha256") != packet_sha256
+        ):
+            continue
+        try:
+            output = json.loads(attempt.get("output_json") or "null")
+            verifier = json.loads(attempt.get("verifier_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(output, dict) and isinstance(verifier, dict) and verifier.get("passed"):
+            return VerifiedStageResult(
+                output, None, str(attempt["attempt_id"]), str(packet_sha256 or ""), verifier,
+            )
+    return None
+
+
 def _call_stage(
     store: CompanionStore,
     cycle: dict[str, Any],
@@ -844,6 +874,43 @@ def _call_stage(
         cycle["cycle_id"], stage, plan.profile.cell_key, plan.mode, plan.profile.as_json(),
         plan.baseline.as_json(), plan.candidate.as_json() if plan.candidate else None, decision.as_json(),
     )
+    # Coordinator state is durable runtime state, not a verifier-local
+    # decoration.  Scope the journal to the scheduling context so a retry of
+    # the same cycle/stage/packet is idempotent without different stages
+    # contending for one coordinator record.
+    coordinator_state_key = hashlib.sha256(
+        f"{cycle['cycle_id']}|{stage}|{packet.get('sha256') or ''}".encode("utf-8")
+    ).hexdigest()
+    coordinator_state_store = CoordinatorStateStore(
+        PATHS.runtime / "coordinator-state" / f"{coordinator_state_key}.json"
+    )
+    coordinator_dependency_states = spec95_dependency_states(
+        packet.get("spec_issue_states"), packet.get("spec_evidence_gates")
+    )
+    coordinator_idempotency_key = f"{cycle['cycle_id']}:{stage}:{packet.get('sha256') or ''}"
+    coordinator_claim_already_held = False
+    if packet.get("agent_role_inputs"):
+        if any(coordinator_dependency_states[node] != "succeeded" for node in SPEC95_NODE_IDS):
+            raise EvidenceInsufficient({
+                "passed": False,
+                "coordinator_frontier_stopped": True,
+                "coordinator_states": coordinator_dependency_states,
+            })
+        claim = coordinator_state_store.claim(
+            "coordinator", coordinator_idempotency_key, now=None,
+        )
+        if claim.get("duplicate"):
+            replay = _replay_coordinator_stage_result(
+                store, cycle["cycle_id"], stage, packet.get("sha256"),
+            )
+            if replay is not None:
+                return replay
+            raise EvidenceInsufficient({
+                "passed": False,
+                "coordinator_duplicate": True,
+                "coordinator_state": claim,
+            })
+        coordinator_claim_already_held = True
     attempt = store.begin_attempt(
         cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), packet.get("sha256"),
         model=None, reasoning_effort=decision.reasoning_effort,
@@ -1082,6 +1149,11 @@ def _call_stage(
                 unknowns=[str(item) for item in unknowns],
                 attempt_id=attempt["attempt_id"],
                 bundle_sha256=getattr(research, "bundle_sha256", None) if research else None,
+                dependency_graph=SPEC95_DEPENDENCY_GRAPH,
+                dependency_states=coordinator_dependency_states,
+                state_store=coordinator_state_store,
+                idempotency_key=coordinator_idempotency_key,
+                claim_already_held=coordinator_claim_already_held,
             )
             verifier = {
                 **verifier,
@@ -1117,6 +1189,11 @@ def _call_stage(
                 unknowns=[str(item) for item in (verifier.get("missing_requirements") or verifier.get("critical_gaps") or [])],
                 attempt_id=attempt["attempt_id"],
                 bundle_sha256=None,
+                dependency_graph=SPEC95_DEPENDENCY_GRAPH,
+                dependency_states=coordinator_dependency_states,
+                state_store=coordinator_state_store,
+                idempotency_key=coordinator_idempotency_key,
+                claim_already_held=coordinator_claim_already_held,
             )
             verifier = {
                 **verifier,
@@ -1183,6 +1260,11 @@ def _call_stage(
                         unknowns=[str(exc)],
                         attempt_id=attempt["attempt_id"],
                         bundle_sha256=None,
+                        dependency_graph=SPEC95_DEPENDENCY_GRAPH,
+                        dependency_states=coordinator_dependency_states,
+                        state_store=coordinator_state_store,
+                        idempotency_key=coordinator_idempotency_key,
+                        claim_already_held=coordinator_claim_already_held,
                     )
                     failure_verifier.update({
                         "agent_role_inputs": packet["agent_role_inputs"],

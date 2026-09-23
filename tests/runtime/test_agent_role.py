@@ -9,6 +9,8 @@ from ai_trading_companion.agent_contract import attach_input
 from ai_trading_companion.agent_role import (
     CONTRACT,
     ROLE_IDS,
+    CoordinatorStateStore,
+    SPEC95_DEPENDENCY_GRAPH,
     attach_role_inputs,
     build_input,
     build_output,
@@ -16,6 +18,7 @@ from ai_trading_companion.agent_role import (
     frozen_replay,
     install_qualification,
     role_definition,
+    spec95_dependency_states,
     validate_output,
 )
 from jsonschema import Draft202012Validator
@@ -221,3 +224,43 @@ def test_coordinator_m2_can_reference_frozen_h0_but_other_roles_cannot() -> None
     assert "h0_frozen" in coordinator["input_refs"]
     with pytest.raises(ValueError, match="disallowed inputs"):
         build_input(agent, role="risk", stage="m2", input_refs={"h0_frozen": ["h0:snapshot"]}, provenance={"as_of": PACKET["as_of"]})
+
+
+def test_runtime_installs_spec95_graph_and_stops_after_a_failed_evidence_gate() -> None:
+    packet = attach_role_inputs({**PACKET, "agent_contract": _agent_input()}, stage="m1_research")
+    states = spec95_dependency_states(
+        {"SPEC-95.1": "closed", "SPEC-95.2": "closed", "SPEC-95.3": "closed"},
+        {"SPEC-95.3": False},
+    )
+    output = build_runtime_coordinator_output(
+        packet["agent_role_inputs"], status="succeeded", evidence_refs=[], unknowns=[],
+        attempt_id="attempt-graph", bundle_sha256=None,
+        dependency_graph=SPEC95_DEPENDENCY_GRAPH, dependency_states=states,
+    )
+    coordinator_spec = output["provenance"]["coordinator_spec"]
+    assert set(f"SPEC-95.{index}" for index in range(1, 7)) <= set(coordinator_spec["dependency_graph"])
+    assert output["status"] == "blocked"
+    assert output["decision_effect"] == "block"
+    assert coordinator_spec["states"]["SPEC-95.6"] == "blocked"
+
+
+def test_durable_coordinator_claim_uses_scheduling_idempotency_key() -> None:
+    packet = attach_role_inputs({**PACKET, "agent_contract": _agent_input()}, stage="m1_research")
+    state_path = Path.cwd() / "_agent_role_coordinator_state.json"
+    state_path.unlink(missing_ok=True)
+    state_path.with_suffix(state_path.suffix + ".lock").unlink(missing_ok=True)
+    store = CoordinatorStateStore(state_path)
+    kwargs = {
+        "status": "succeeded", "evidence_refs": [], "unknowns": [],
+        "bundle_sha256": None, "state_store": store,
+        "idempotency_key": "cycle-role-1:m1_research:packet-hash",
+    }
+    try:
+        first = build_runtime_coordinator_output(packet["agent_role_inputs"], attempt_id="attempt-1", **kwargs)
+        replay = build_runtime_coordinator_output(packet["agent_role_inputs"], attempt_id="attempt-2", **kwargs)
+        assert first["provenance"]["coordinator_spec"]["recovery"]["execution_count"] == 1
+        assert replay["provenance"]["coordinator_spec"]["recovery"]["duplicate"] is True
+        assert replay["provenance"]["coordinator_spec"]["recovery"]["execution_count"] == 1
+    finally:
+        state_path.unlink(missing_ok=True)
+        state_path.with_suffix(state_path.suffix + ".lock").unlink(missing_ok=True)

@@ -13,6 +13,7 @@ import json
 import os
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -69,6 +70,71 @@ COORDINATOR_TRANSITIONS: dict[str, frozenset[str]] = {
     "unknown": frozenset({"unknown", "pending", "running"}),
 }
 
+# SPEC-95 is deliberately represented as data at the runtime boundary.  The
+# graph is also useful to callers which replay a run without importing the
+# implementation details of the six tickets.
+SPEC95_NODE_IDS = tuple(f"SPEC-95.{index}" for index in range(1, 7))
+SPEC95_DEPENDENCY_GRAPH: dict[str, list[str]] = {
+    SPEC95_NODE_IDS[0]: [],
+    SPEC95_NODE_IDS[1]: [SPEC95_NODE_IDS[0]],
+    SPEC95_NODE_IDS[2]: [SPEC95_NODE_IDS[1]],
+    SPEC95_NODE_IDS[3]: [SPEC95_NODE_IDS[2]],
+    SPEC95_NODE_IDS[4]: [SPEC95_NODE_IDS[3]],
+    SPEC95_NODE_IDS[5]: [SPEC95_NODE_IDS[4]],
+    "coordinator": [SPEC95_NODE_IDS[5]],
+}
+
+
+def spec95_dependency_states(
+    issue_states: dict[str, str] | None = None,
+    evidence_gates: dict[str, bool] | None = None,
+) -> dict[str, str]:
+    """Translate issue/evidence gates into fail-closed CoordinatorSpec state.
+
+    A missing issue state is treated as installed/satisfied for the local
+    runtime.  When a caller supplies a state, only an explicitly closed or
+    completed issue can advance its node; a failed evidence gate blocks it.
+    This keeps the production runtime usable while making partial graph input
+    conservative and deterministic.
+    """
+    issue_states = {str(key): str(value).casefold() for key, value in (issue_states or {}).items()}
+    evidence_gates = {str(key): bool(value) for key, value in (evidence_gates or {}).items()}
+    states: dict[str, str] = {}
+    for node in SPEC95_NODE_IDS:
+        issue = issue_states.get(node)
+        if issue is None:
+            state = "succeeded"
+        elif issue in {"closed", "completed", "done", "succeeded"}:
+            state = "succeeded"
+        elif issue in {"blocked", "failed", "rejected", "cancelled", "canceled"}:
+            state = "blocked"
+        else:
+            state = "pending"
+        if node in evidence_gates and not evidence_gates[node]:
+            state = "blocked"
+        states[node] = state
+    # A failed prerequisite closes the downstream frontier.  Propagate only
+    # terminal failure; pending work remains waiting and can still recover.
+    for node in SPEC95_NODE_IDS[1:]:
+        dependency = SPEC95_DEPENDENCY_GRAPH[node][0]
+        if states[dependency] in {"partial", "blocked", "failed", "skipped", "unknown"}:
+            states[node] = "blocked"
+    states["coordinator"] = "pending"
+    if states[SPEC95_NODE_IDS[-1]] in {"partial", "blocked", "failed", "skipped", "unknown"}:
+        states["coordinator"] = "blocked"
+    return states
+
+
+def spec95_frontier(
+    issue_states: dict[str, str] | None = None,
+    evidence_gates: dict[str, bool] | None = None,
+) -> dict[str, list[str]]:
+    """Return the runnable/blocked SPEC-95 frontier."""
+    return coordinator_frontier(
+        SPEC95_DEPENDENCY_GRAPH,
+        spec95_dependency_states(issue_states, evidence_gates),
+    )
+
 
 def validate_coordinator_transition(previous: str, current: str) -> None:
     """Validate the externally observable CoordinatorSpec lifecycle."""
@@ -123,6 +189,8 @@ def coordinator_frontier(
     unknown_nodes = sorted(set(normalized) - set(canonical))
     if unknown_nodes:
         raise ValueError("CoordinatorSpec states contain unknown nodes: " + ", ".join(unknown_nodes))
+    if any(status not in STATUSES for status in normalized.values()):
+        raise ValueError("CoordinatorSpec states contain an invalid lifecycle status")
     frontier: list[str] = []
     blocked: list[str] = []
     waiting: list[str] = []
@@ -249,45 +317,75 @@ class CoordinatorStateStore:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
+    @contextmanager
+    def _locked(self):
+        """Serialize read/claim/write across concurrent runtime processes."""
+        lock_path = self.path + ".lock"
+        os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+        with open(lock_path, "a+b") as handle:
+            handle.seek(0)
+            if not handle.read(1):
+                handle.seek(0)
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def get(self, node_id: str) -> dict[str, Any] | None:
-        return copy.deepcopy(self._read().get(node_id))
+        with self._locked():
+            return copy.deepcopy(self._read().get(node_id))
 
     def claim(self, node_id: str, idempotency_key: str, *, lease_seconds: float = 300, now: float | None = None) -> dict[str, Any]:
         if not node_id.strip() or not idempotency_key.strip():
             raise ValueError("CoordinatorSpec node_id and idempotency_key are required")
         timestamp = time.time() if now is None else float(now)
-        state = self._read()
-        current = state.get(node_id)
-        if isinstance(current, dict) and current.get("idempotency_key") == idempotency_key:
-            if current.get("status") in COORDINATOR_TERMINAL_STATUSES:
-                return {**copy.deepcopy(current), "duplicate": True, "takeover": False}
-            if current.get("status") == "running" and float(current.get("lease_until") or 0) > timestamp:
-                return {**copy.deepcopy(current), "duplicate": True, "takeover": False}
-        previous = str(current.get("status") if isinstance(current, dict) else "pending")
-        takeover = previous == "running" and float(current.get("lease_until") or 0) <= timestamp if isinstance(current, dict) else False
-        if previous not in STATUSES:
-            previous = "pending"
-        if previous != "pending" and not takeover:
-            validate_coordinator_transition(previous, "pending")
-        lifecycle = CoordinatorLifecycle(node_id, status=previous if takeover else "pending", records=(current or {}).get("lifecycle") if isinstance(current, dict) else None)
-        if lifecycle.status != "running":
-            lifecycle.transition("running", at=timestamp, reason="takeover" if takeover else "claimed")
-        record = {"node_id": node_id, "idempotency_key": idempotency_key, "status": "running", "lease_until": timestamp + max(1, lease_seconds), "execution_count": int((current or {}).get("execution_count") or 0) + 1, "lifecycle": lifecycle.records}
-        state[node_id] = record
-        self._write(state)
-        return {**copy.deepcopy(record), "duplicate": False, "takeover": takeover}
+        with self._locked():
+            state = self._read()
+            current = state.get(node_id)
+            if isinstance(current, dict) and current.get("idempotency_key") == idempotency_key:
+                if current.get("status") in COORDINATOR_TERMINAL_STATUSES:
+                    return {**copy.deepcopy(current), "duplicate": True, "takeover": False}
+                if current.get("status") == "running" and float(current.get("lease_until") or 0) > timestamp:
+                    return {**copy.deepcopy(current), "duplicate": True, "takeover": False}
+            previous = str(current.get("status") if isinstance(current, dict) else "pending")
+            takeover = previous == "running" and float(current.get("lease_until") or 0) <= timestamp if isinstance(current, dict) else False
+            if previous not in STATUSES:
+                previous = "pending"
+            if previous != "pending" and not takeover:
+                validate_coordinator_transition(previous, "pending")
+            lifecycle = CoordinatorLifecycle(node_id, status=previous if takeover else "pending", records=(current or {}).get("lifecycle") if isinstance(current, dict) else None)
+            if lifecycle.status != "running":
+                lifecycle.transition("running", at=timestamp, reason="takeover" if takeover else "claimed")
+            record = {"node_id": node_id, "idempotency_key": idempotency_key, "status": "running", "lease_until": timestamp + max(1, lease_seconds), "execution_count": int((current or {}).get("execution_count") or 0) + 1, "lifecycle": lifecycle.records}
+            state[node_id] = record
+            self._write(state)
+            return {**copy.deepcopy(record), "duplicate": False, "takeover": takeover}
 
     def finish(self, node_id: str, status: str, *, idempotency_key: str, reason: str | None = None, now: float | None = None) -> dict[str, Any]:
-        current = self.get(node_id)
-        if not current or current.get("idempotency_key") != idempotency_key:
-            raise ValueError("CoordinatorSpec finish does not match the active claim")
-        lifecycle = CoordinatorLifecycle(node_id, status=str(current.get("status") or "running"), records=current.get("lifecycle"))
-        lifecycle.transition(status, at=time.time() if now is None else float(now), reason=reason)
-        state = self._read()
-        current.update({"status": status, "lease_until": None, "lifecycle": lifecycle.records})
-        state[node_id] = current
-        self._write(state)
-        return copy.deepcopy(current)
+        with self._locked():
+            state = self._read()
+            current = state.get(node_id)
+            if not isinstance(current, dict) or current.get("idempotency_key") != idempotency_key:
+                raise ValueError("CoordinatorSpec finish does not match the active claim")
+            lifecycle = CoordinatorLifecycle(node_id, status=str(current.get("status") or "running"), records=current.get("lifecycle"))
+            lifecycle.transition(status, at=time.time() if now is None else float(now), reason=reason)
+            current.update({"status": status, "lease_until": None, "lifecycle": lifecycle.records})
+            state[node_id] = current
+            self._write(state)
+            return copy.deepcopy(current)
 
 _FORBIDDEN_KEYS = frozenset({
     "chain_of_thought", "cot", "thoughts", "reasoning_trace", "private_reasoning",
@@ -684,6 +782,8 @@ def build_runtime_coordinator_output(
     state_store: CoordinatorStateStore | None = None,
     lease_seconds: float = 300,
     now: float | None = None,
+    idempotency_key: str | None = None,
+    claim_already_held: bool = False,
 ) -> dict[str, Any]:
     """Close one runtime research attempt with a bounded coordinator artifact.
 
@@ -707,10 +807,25 @@ def build_runtime_coordinator_output(
     if status not in _COORDINATOR_EFFECTS:
         raise ValueError("invalid AgentRoleSpec coordinator status")
     graph = dependency_graph or {node_id: []}
-    states = {str(key): str(value) for key, value in (dependency_states or {}).items()}
+    canonical_graph = validate_dependency_graph(graph)
+    states = {node: "pending" for node in canonical_graph}
+    states.update({str(key): str(value) for key, value in (dependency_states or {}).items()})
     states.setdefault(node_id, status)
+    if node_id not in canonical_graph:
+        raise ValueError("CoordinatorSpec node_id is missing from dependency graph")
+    if any(value not in STATUSES for value in states.values()):
+        raise ValueError("CoordinatorSpec states contain an invalid lifecycle status")
+    dependencies = canonical_graph[node_id]
+    if status == "succeeded" and any(states.get(dependency) != "succeeded" for dependency in dependencies):
+        # A coordinator must never report successful work while a declared
+        # prerequisite is pending or failed.  This is the runtime stop gate
+        # for downstream SPEC nodes.
+        status = "blocked"
+    states[node_id] = status
     frontier = coordinator_frontier(graph, states)
-    idempotency_key = f"{attempt_id}:{node_id}:{sha256({ 'status': status, 'evidence_refs': sorted(set(evidence_refs)), 'unknowns': sorted(map(str, unknowns)) })}"
+    durable_idempotency_key = idempotency_key or (
+        f"{attempt_id}:{node_id}:{sha256({ 'status': status, 'evidence_refs': sorted(set(evidence_refs)), 'unknowns': sorted(map(str, unknowns)) })}"
+    )
     lifecycle = CoordinatorLifecycle(node_id, status="pending")
     lifecycle_at = now if now is not None else 0.0
     if status != "pending":
@@ -718,11 +833,17 @@ def build_runtime_coordinator_output(
         lifecycle.transition(status, at=lifecycle_at, reason="runtime coordinator result")
     recovery: dict[str, Any] = {"persisted": False, "duplicate": False, "takeover": False}
     if state_store is not None:
-        claim = state_store.claim(node_id, idempotency_key, lease_seconds=lease_seconds, now=now)
+        if claim_already_held:
+            claim = state_store.get(node_id)
+            if not claim or claim.get("idempotency_key") != durable_idempotency_key or claim.get("status") != "running":
+                raise ValueError("CoordinatorSpec runtime claim is no longer active")
+            claim = {**claim, "duplicate": False, "takeover": False}
+        else:
+            claim = state_store.claim(node_id, durable_idempotency_key, lease_seconds=lease_seconds, now=now)
         recovery = {key: claim.get(key) for key in ("persisted", "duplicate", "takeover") if key in claim}
         recovery.update({"persisted": True, "execution_count": claim.get("execution_count")})
         if not claim.get("duplicate"):
-            finished = state_store.finish(node_id, status, idempotency_key=idempotency_key, reason="runtime coordinator result", now=now)
+            finished = state_store.finish(node_id, status, idempotency_key=durable_idempotency_key, reason="runtime coordinator result", now=now)
             lifecycle = CoordinatorLifecycle(node_id, status=status, records=finished.get("lifecycle"))
         else:
             lifecycle = CoordinatorLifecycle(node_id, status=str(claim.get("status") or status), records=claim.get("lifecycle"))
@@ -739,9 +860,9 @@ def build_runtime_coordinator_output(
                 "contract": COORDINATOR_CONTRACT,
                 "version": COORDINATOR_VERSION,
                 "node_id": node_id,
-                "idempotency_key": idempotency_key,
+                "idempotency_key": durable_idempotency_key,
                 "status": status,
-                "dependency_graph": validate_dependency_graph(graph),
+                "dependency_graph": canonical_graph,
                 "states": states,
                 "dependency_states": states,
                 "frontier": frontier,

@@ -18,6 +18,8 @@ from ai_trading_companion.agent_role import (
     frozen_replay,
     install_qualification,
     role_definition,
+    attach_runtime_qualification,
+    validate_spec95_baseline,
     spec95_runtime_qualification,
     spec95_dependency_states,
     validate_output,
@@ -274,6 +276,84 @@ def test_missing_spec95_receipt_cannot_authorize_downstream_work() -> None:
     assert all(state == "blocked" for state in issue_states.values())
     assert all(gate is False for gate in evidence_gates.values())
     assert spec95_dependency_states(issue_states, evidence_gates)["coordinator"] == "blocked"
+
+
+def _qualified_spec95_baseline() -> dict:
+    nodes = [f"SPEC-95.{index}" for index in range(1, 7)]
+    return {
+        "issue": {"number": 95, "state": "closed", "declared_specs": nodes},
+        "declared_specs": nodes,
+        "synchronization_state": "synchronized",
+        "spec_issue_states": {node: "closed" for node in nodes},
+        "dependency_evidence": {node: {"passed": True} for node in nodes},
+        "delivery_evidence": {node: {"verified": True} for node in nodes},
+    }
+
+
+def test_spec95_baseline_requires_real_issue_and_all_evidence_gates() -> None:
+    baseline = _qualified_spec95_baseline()
+    assert validate_spec95_baseline(baseline) is not None
+
+    mutations = [
+        lambda value: value.pop("issue"),
+        lambda value: value["issue"].update(number=94),
+        lambda value: value["issue"].update(state="open"),
+        lambda value: value["issue"].pop("declared_specs"),
+        lambda value: value.update(declared_specs=["SPEC-95.1"]),
+        lambda value: value.update(synchronization_state="out_of_sync"),
+        lambda value: value.pop("dependency_evidence"),
+        lambda value: value["delivery_evidence"]["SPEC-95.6"].update(verified=False),
+        lambda value: value["spec_issue_states"].update({"SPEC-95.5": "open"}),
+    ]
+    for mutate in mutations:
+        invalid = copy.deepcopy(baseline)
+        mutate(invalid)
+        assert validate_spec95_baseline(invalid) is None
+        states, gates = spec95_runtime_qualification(invalid)
+        assert all(state == "blocked" for state in states.values())
+        assert all(gate is False for gate in gates.values())
+
+
+def test_unverified_or_contradictory_baseline_cannot_fill_packet_gates() -> None:
+    forged = {
+        **PACKET,
+        "spec_issue_states": {f"SPEC-95.{index}": "closed" for index in range(1, 7)},
+        "spec_evidence_gates": {f"SPEC-95.{index}": True for index in range(1, 7)},
+    }
+    qualified = attach_runtime_qualification(forged)
+    assert qualified["spec95_baseline_verified"] is False
+    assert set(qualified["spec_issue_states"].values()) == {"blocked"}
+    assert set(qualified["spec_evidence_gates"].values()) == {False}
+
+    conflicting = _qualified_spec95_baseline()
+    conflicting["delivery_evidence"]["SPEC-95.3"] = False
+    assert validate_spec95_baseline(conflicting) is None
+
+
+def test_stale_coordinator_generation_cannot_finish_after_takeover() -> None:
+    state_path = Path.cwd() / "_agent_role_generation_state.json"
+    state_path.unlink(missing_ok=True)
+    state_path.with_suffix(state_path.suffix + ".lock").unlink(missing_ok=True)
+    state_store = CoordinatorStateStore(state_path)
+    try:
+        first = state_store.claim("coordinator", "same-work", lease_seconds=5, now=10)
+        second = state_store.claim("coordinator", "same-work", lease_seconds=5, now=16)
+        assert second["takeover"] is True
+        assert second["execution_generation"] == first["execution_generation"] + 1
+
+        with pytest.raises(ValueError, match="execution generation"):
+            state_store.finish(
+                "coordinator", "succeeded", idempotency_key="same-work",
+                execution_generation=first["execution_generation"], now=17,
+            )
+        result = state_store.finish(
+            "coordinator", "succeeded", idempotency_key="same-work",
+            execution_generation=second["execution_generation"], now=17,
+        )
+        assert result["status"] == "succeeded"
+    finally:
+        state_path.unlink(missing_ok=True)
+        state_path.with_suffix(state_path.suffix + ".lock").unlink(missing_ok=True)
 
 
 def test_runtime_packet_builder_qualifies_normal_m0_and_m1_research_packets() -> None:

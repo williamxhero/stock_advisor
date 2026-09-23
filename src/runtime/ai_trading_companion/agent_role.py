@@ -130,10 +130,13 @@ def validate_spec95_baseline(value: Any) -> dict[str, Any] | None:
         return None
     declared = value.get("declared_specs")
     issue_declared = issue.get("declared_specs")
-    if issue_declared is not None and declared is not None and declared != issue_declared:
+    # The declaration must come from the issue snapshot itself.  A
+    # caller-supplied top-level copy cannot establish what issue #95 declared.
+    if not isinstance(issue_declared, (list, tuple, set)):
         return None
-    if declared is None:
-        declared = issue_declared
+    if declared is not None and declared != issue_declared:
+        return None
+    declared = issue_declared
     if not isinstance(declared, (list, tuple, set)):
         return None
     declared_ids = {

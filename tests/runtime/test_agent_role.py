@@ -244,6 +244,13 @@ def test_runtime_installs_spec95_graph_and_stops_after_a_failed_evidence_gate() 
     assert coordinator_spec["states"]["SPEC-95.6"] == "blocked"
 
 
+def test_missing_spec95_prerequisite_metadata_blocks_every_node() -> None:
+    states = spec95_dependency_states()
+
+    assert all(states[node] == "blocked" for node in SPEC95_DEPENDENCY_GRAPH if node != "coordinator")
+    assert states["coordinator"] == "blocked"
+
+
 def test_durable_coordinator_claim_uses_scheduling_idempotency_key() -> None:
     packet = attach_role_inputs({**PACKET, "agent_contract": _agent_input()}, stage="m1_research")
     state_path = Path.cwd() / "_agent_role_coordinator_state.json"

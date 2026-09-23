@@ -1165,16 +1165,16 @@ def _call_stage(
             # CoordinatorSpec is an operational contract, so provider errors,
             # timeouts, and skipped/incomplete work must remain observable in
             # the same internal role boundary as successful research.
-            failure_verifier = {
-                **(getattr(exc, "verifier", None) or {}),
-                "passed": False,
-                "coordinator_failure": {
-                    "stage": stage,
-                    "status": "failed" if status == "failed" else "blocked",
-                    "exception_type": type(exc).__name__,
-                },
-            }
+            failure_verifier = dict(getattr(exc, "verifier", None) or {})
             if packet.get("agent_role_inputs"):
+                failure_verifier.update({
+                    "passed": False,
+                    "coordinator_failure": {
+                        "stage": stage,
+                        "status": "failed" if status == "failed" else "blocked",
+                        "exception_type": type(exc).__name__,
+                    },
+                })
                 try:
                     failure_output = build_runtime_coordinator_output(
                         packet["agent_role_inputs"],

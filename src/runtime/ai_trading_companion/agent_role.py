@@ -91,26 +91,27 @@ def spec95_dependency_states(
 ) -> dict[str, str]:
     """Translate issue/evidence gates into fail-closed CoordinatorSpec state.
 
-    A missing issue state is treated as installed/satisfied for the local
-    runtime.  When a caller supplies a state, only an explicitly closed or
-    completed issue can advance its node; a failed evidence gate blocks it.
-    This keeps the production runtime usable while making partial graph input
-    conservative and deterministic.
+    Every SPEC-95 node must have an explicitly verified issue state and
+    evidence gate.  Missing or failed prerequisites are blocked rather than
+    being inferred as complete; this prevents an ordinary packet that omits
+    the qualification metadata from authorizing downstream work.
     """
     issue_states = {str(key): str(value).casefold() for key, value in (issue_states or {}).items()}
-    evidence_gates = {str(key): bool(value) for key, value in (evidence_gates or {}).items()}
+    evidence_gates = {str(key): value for key, value in (evidence_gates or {}).items()}
     states: dict[str, str] = {}
     for node in SPEC95_NODE_IDS:
         issue = issue_states.get(node)
         if issue is None:
-            state = "succeeded"
+            state = "blocked"
         elif issue in {"closed", "completed", "done", "succeeded"}:
             state = "succeeded"
         elif issue in {"blocked", "failed", "rejected", "cancelled", "canceled"}:
             state = "blocked"
         else:
             state = "pending"
-        if node in evidence_gates and not evidence_gates[node]:
+        # Evidence must be explicitly true.  Missing, false, or malformed
+        # gate values are all unverified and therefore fail closed.
+        if evidence_gates.get(node) is not True:
             state = "blocked"
         states[node] = state
     # A failed prerequisite closes the downstream frontier.  Propagate only

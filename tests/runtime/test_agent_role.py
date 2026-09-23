@@ -22,6 +22,7 @@ from ai_trading_companion.agent_role import (
     spec95_dependency_states,
     validate_output,
 )
+from ai_trading_companion.packet_builder import RuntimePacketBuilder
 from jsonschema import Draft202012Validator
 
 PACKET = {
@@ -263,6 +264,36 @@ def test_role_packet_emits_runtime_qualification_metadata() -> None:
         for state in spec95_dependency_states(packet["spec_issue_states"], packet["spec_evidence_gates"]).values()
         if state != "pending"
     )
+
+
+def test_runtime_packet_builder_qualifies_normal_m0_and_m1_research_packets() -> None:
+    class PacketBuilder(RuntimePacketBuilder):
+        def _calendar_context(self, _scheduled_for: str) -> dict:
+            return {"authority": "test"}
+
+        def _memory_cards(self, *_args, **_kwargs) -> list[dict]:
+            return []
+
+        def _public_scope(self, *_args, **_kwargs) -> dict:
+            return {"mode": "test"}
+
+        def _evidence_snapshot_descriptor(self, *_args, **_kwargs) -> dict:
+            return {"snapshot_id": "test-snapshot"}
+
+    cycle = {
+        "cycle_id": "cycle-packet-qualification",
+        "task_key": "daily.opportunity.0900",
+        "scheduled_for": "2026-09-21T09:00:00+08:00",
+        "as_of": "2026-09-21T01:00:00Z",
+        "evidence_contract_json": json.dumps({"requirements": []}),
+    }
+    expected_issue_states, expected_evidence_gates = spec95_runtime_qualification()
+    builder = PacketBuilder(Path.cwd(), object())
+
+    for stage in ("m0_research", "m1_research"):
+        packet = builder.build(cycle, stage, evidence={"sources": []})
+        assert packet["spec_issue_states"] == expected_issue_states
+        assert packet["spec_evidence_gates"] == expected_evidence_gates
 
 
 def test_partial_spec95_metadata_is_not_filled_in() -> None:

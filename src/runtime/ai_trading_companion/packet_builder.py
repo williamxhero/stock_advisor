@@ -8,6 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .learning import WorkflowEvolution
+from .agent_role import spec95_runtime_qualification
 from .memory_port import MemoryPort, MemoryUnavailable
 from .secret_guard import assert_safe
 from .evidence_contract import EvidenceContractFactory
@@ -71,6 +72,14 @@ class RuntimePacketBuilder:
             "scheduled_for": cycle["scheduled_for"],
             "calendar_context": self._calendar_context(cycle["scheduled_for"]),
         }
+        # Qualification is owned by the runtime packet producer, so normal
+        # M0/M1 evidence packets carry the coordinator prerequisites before
+        # their hash is frozen or any provider work is considered.  Replayed
+        # or externally supplied packets still receive no implicit approval.
+        if stage in {"m0_research", "m1_research"}:
+            issue_states, evidence_gates = spec95_runtime_qualification()
+            packet["spec_issue_states"] = issue_states
+            packet["spec_evidence_gates"] = evidence_gates
         if cycle.get("task_profile_json"):
             packet["task_profile"] = json.loads(cycle["task_profile_json"])
         memory_cards = self._memory_cards(cycle, stage, packet_as_of, evidence)

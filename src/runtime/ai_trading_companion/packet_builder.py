@@ -72,6 +72,13 @@ class RuntimePacketBuilder:
             "scheduled_for": cycle["scheduled_for"],
             "calendar_context": self._calendar_context(cycle["scheduled_for"]),
         }
+        baseline = (
+            cycle.get("spec95_baseline")
+            or (evidence or {}).get("spec95_baseline")
+            or (context or {}).get("spec95_baseline")
+        )
+        if baseline is not None:
+            packet["spec95_baseline"] = baseline
         # Qualification is owned by the runtime packet producer, so normal
         # M0/M1 evidence packets carry the coordinator prerequisites before
         # their hash is frozen or any provider work is considered.  Replayed

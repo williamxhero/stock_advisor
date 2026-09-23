@@ -74,6 +74,7 @@ COORDINATOR_TRANSITIONS: dict[str, frozenset[str]] = {
 # graph is also useful to callers which replay a run without importing the
 # implementation details of the six tickets.
 SPEC95_NODE_IDS = tuple(f"SPEC-95.{index}" for index in range(1, 7))
+SPEC95_ISSUE_NUMBER = 95
 SPEC95_DEPENDENCY_GRAPH: dict[str, list[str]] = {
     SPEC95_NODE_IDS[0]: [],
     SPEC95_NODE_IDS[1]: [SPEC95_NODE_IDS[0]],
@@ -85,18 +86,86 @@ SPEC95_DEPENDENCY_GRAPH: dict[str, list[str]] = {
 }
 
 
-def spec95_runtime_qualification() -> tuple[dict[str, str], dict[str, bool]]:
-    """Return the qualification metadata owned by this runtime boundary.
+def _spec95_gate(value: Any) -> bool:
+    """Read a qualification gate without treating a truthy object as proof."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, dict):
+        return value.get("passed") is True or value.get("verified") is True
+    return False
 
-    The install replay is the runtime-owned evidence that the AgentRole and
-    coordinator contracts are available.  Emit that fact explicitly so the
-    coordinator gate can remain fail-closed for external/replayed packets
-    while normal runtime packets carry verified qualification metadata.
+
+def validate_spec95_baseline(value: Any) -> dict[str, Any] | None:
+    """Validate the externally supplied SPEC-95 baseline receipt.
+
+    ``install_qualification`` only proves that a local frozen replay works.
+    It cannot prove the state of issue #95 or any delivery/synchronization
+    evidence, so it is deliberately not consulted here.  Baseline metadata is
+    accepted only when it names the real issue, declares all six nodes, and
+    contains explicit positive evidence for every required gate.
     """
-    qualified = bool(install_qualification().get("qualified"))
+    if not isinstance(value, dict):
+        return None
+    issue = value.get("issue") if isinstance(value.get("issue"), dict) else {}
+    issue_number = value.get("issue_number", issue.get("number"))
+    if issue_number != SPEC95_ISSUE_NUMBER:
+        return None
+    issue_state = str(value.get("issue_state", issue.get("state")) or "").casefold()
+    if issue_state not in {"closed", "completed", "done", "succeeded"}:
+        return None
+    declared = value.get("declared_specs", issue.get("declared_specs"))
+    if not isinstance(declared, (list, tuple, set)):
+        return None
+    declared_ids = {
+        str(item.get("id") or item.get("spec") or item.get("key")) if isinstance(item, dict) else str(item)
+        for item in declared
+    }
+    if declared_ids != set(SPEC95_NODE_IDS):
+        return None
+    synchronization = value.get("synchronization_state", value.get("sync_state", value.get("synchronization")))
+    if isinstance(synchronization, dict):
+        synchronized = synchronization.get("passed") is True or synchronization.get("verified") is True
+    else:
+        synchronized = synchronization is True or str(synchronization or "").casefold() in {"synchronized", "synchronised", "in_sync", "verified"}
+    if not synchronized:
+        return None
+    issue_states = value.get("spec_issue_states", value.get("issue_states"))
+    if not isinstance(issue_states, dict) and all(isinstance(item, dict) for item in declared):
+        issue_states = {
+            str(item.get("id") or item.get("spec") or item.get("key")): item.get("state")
+            for item in declared
+        }
+    if not isinstance(issue_states, dict) or set(map(str, issue_states)) != set(SPEC95_NODE_IDS):
+        return None
+    if any(str(issue_states[node]).casefold() not in {"closed", "completed", "done", "succeeded"} for node in SPEC95_NODE_IDS):
+        return None
+    dependency = value.get("dependency_evidence", value.get("dependency_evidence_gates"))
+    delivery = value.get("delivery_evidence", value.get("delivery_evidence_gates"))
+    if isinstance(dependency, dict) and isinstance(dependency.get("nodes"), dict):
+        dependency = dependency["nodes"]
+    if isinstance(delivery, dict) and isinstance(delivery.get("nodes"), dict):
+        delivery = delivery["nodes"]
+    if not isinstance(dependency, dict) or not isinstance(delivery, dict):
+        return None
+    if not all(_spec95_gate(dependency.get(node)) for node in SPEC95_NODE_IDS):
+        return None
+    if not all(_spec95_gate(delivery.get(node)) for node in SPEC95_NODE_IDS):
+        return None
+    return copy.deepcopy(value)
+
+
+def spec95_runtime_qualification(baseline: dict[str, Any] | None = None) -> tuple[dict[str, str], dict[str, bool]]:
+    """Translate a verified SPEC-95 baseline receipt into runtime gates.
+
+    No receipt means no qualification.  In particular, a local frozen replay
+    is never promoted to evidence about the actual issue or delivery state.
+    """
+    verified = validate_spec95_baseline(baseline)
+    if verified is None:
+        return ({node: "blocked" for node in SPEC95_NODE_IDS}, {node: False for node in SPEC95_NODE_IDS})
     return (
-        {node: "succeeded" if qualified else "blocked" for node in SPEC95_NODE_IDS},
-        {node: qualified for node in SPEC95_NODE_IDS},
+        {node: str(verified["spec_issue_states"][node]).casefold() for node in SPEC95_NODE_IDS},
+        {node: True for node in SPEC95_NODE_IDS},
     )
 
 
@@ -108,10 +177,29 @@ def attach_runtime_qualification(packet: dict[str, Any]) -> dict[str, Any]:
     must remain unchanged so ``spec95_dependency_states`` can fail closed.
     """
     value = copy.deepcopy(packet)
-    if "spec_issue_states" not in value and "spec_evidence_gates" not in value:
-        issue_states, evidence_gates = spec95_runtime_qualification()
+    baseline = validate_spec95_baseline(value.get("spec95_baseline") or value.get("spec95_qualification"))
+    has_issue_states = "spec_issue_states" in value
+    has_evidence_gates = "spec_evidence_gates" in value
+    if not has_issue_states and not has_evidence_gates:
+        issue_states, evidence_gates = spec95_runtime_qualification(baseline)
         value["spec_issue_states"] = issue_states
         value["spec_evidence_gates"] = evidence_gates
+    elif has_issue_states and has_evidence_gates:
+        supplied_states = value.get("spec_issue_states")
+        supplied_gates = value.get("spec_evidence_gates")
+        expected_states, expected_gates = spec95_runtime_qualification(baseline)
+        if baseline is None or supplied_states != expected_states or supplied_gates != expected_gates:
+            # Complete-looking metadata without a verified receipt is not an
+            # authorization.  Keep partial metadata untouched for diagnostic
+            # replay, but neutralize a full forged/contradictory pair.
+            if (
+                isinstance(supplied_states, dict)
+                and set(map(str, supplied_states)) == set(SPEC95_NODE_IDS)
+                and isinstance(supplied_gates, dict)
+                and set(map(str, supplied_gates)) == set(SPEC95_NODE_IDS)
+            ):
+                value["spec_issue_states"] = {node: "blocked" for node in SPEC95_NODE_IDS}
+                value["spec_evidence_gates"] = {node: False for node in SPEC95_NODE_IDS}
     return value
 
 
@@ -400,19 +488,40 @@ class CoordinatorStateStore:
             lifecycle = CoordinatorLifecycle(node_id, status=previous if takeover else "pending", records=(current or {}).get("lifecycle") if isinstance(current, dict) else None)
             if lifecycle.status != "running":
                 lifecycle.transition("running", at=timestamp, reason="takeover" if takeover else "claimed")
-            record = {"node_id": node_id, "idempotency_key": idempotency_key, "status": "running", "lease_until": timestamp + max(1, lease_seconds), "execution_count": int((current or {}).get("execution_count") or 0) + 1, "lifecycle": lifecycle.records}
+            execution_generation = int((current or {}).get("execution_generation") or 0) + 1
+            record = {"node_id": node_id, "idempotency_key": idempotency_key, "status": "running", "lease_until": timestamp + max(1, lease_seconds), "execution_count": int((current or {}).get("execution_count") or 0) + 1, "execution_generation": execution_generation, "lifecycle": lifecycle.records}
             state[node_id] = record
             self._write(state)
             return {**copy.deepcopy(record), "duplicate": False, "takeover": takeover}
 
-    def finish(self, node_id: str, status: str, *, idempotency_key: str, reason: str | None = None, now: float | None = None) -> dict[str, Any]:
+    def finish(
+        self,
+        node_id: str,
+        status: str,
+        *,
+        idempotency_key: str,
+        execution_generation: int | None = None,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
         with self._locked():
             state = self._read()
             current = state.get(node_id)
             if not isinstance(current, dict) or current.get("idempotency_key") != idempotency_key:
                 raise ValueError("CoordinatorSpec finish does not match the active claim")
-            lifecycle = CoordinatorLifecycle(node_id, status=str(current.get("status") or "running"), records=current.get("lifecycle"))
-            lifecycle.transition(status, at=time.time() if now is None else float(now), reason=reason)
+            if execution_generation is not None and current.get("execution_generation") != execution_generation:
+                raise ValueError("CoordinatorSpec finish does not own the active execution generation")
+            current_status = str(current.get("status") or "running")
+            if current_status in COORDINATOR_TERMINAL_STATUSES:
+                if current_status != status:
+                    raise ValueError("CoordinatorSpec finish cannot change a completed claim")
+                return copy.deepcopy(current)
+            lease_until = current.get("lease_until")
+            timestamp = time.time() if now is None else float(now)
+            if lease_until is not None and float(lease_until) <= timestamp:
+                raise ValueError("CoordinatorSpec finish does not own the active lease")
+            lifecycle = CoordinatorLifecycle(node_id, status=current_status, records=current.get("lifecycle"))
+            lifecycle.transition(status, at=timestamp, reason=reason)
             current.update({"status": status, "lease_until": None, "lifecycle": lifecycle.records})
             state[node_id] = current
             self._write(state)
@@ -815,6 +924,7 @@ def build_runtime_coordinator_output(
     now: float | None = None,
     idempotency_key: str | None = None,
     claim_already_held: bool = False,
+    execution_generation: int | None = None,
 ) -> dict[str, Any]:
     """Close one runtime research attempt with a bounded coordinator artifact.
 
@@ -868,13 +978,26 @@ def build_runtime_coordinator_output(
             claim = state_store.get(node_id)
             if not claim or claim.get("idempotency_key") != durable_idempotency_key or claim.get("status") != "running":
                 raise ValueError("CoordinatorSpec runtime claim is no longer active")
+            if execution_generation is None or claim.get("execution_generation") != execution_generation:
+                raise ValueError("CoordinatorSpec runtime claim generation is no longer active")
             claim = {**claim, "duplicate": False, "takeover": False}
         else:
             claim = state_store.claim(node_id, durable_idempotency_key, lease_seconds=lease_seconds, now=now)
         recovery = {key: claim.get(key) for key in ("persisted", "duplicate", "takeover") if key in claim}
-        recovery.update({"persisted": True, "execution_count": claim.get("execution_count")})
+        recovery.update({
+            "persisted": True,
+            "execution_count": claim.get("execution_count"),
+            "execution_generation": claim.get("execution_generation"),
+        })
         if not claim.get("duplicate"):
-            finished = state_store.finish(node_id, status, idempotency_key=durable_idempotency_key, reason="runtime coordinator result", now=now)
+            finished = state_store.finish(
+                node_id,
+                status,
+                idempotency_key=durable_idempotency_key,
+                execution_generation=claim.get("execution_generation"),
+                reason="runtime coordinator result",
+                now=now,
+            )
             lifecycle = CoordinatorLifecycle(node_id, status=status, records=finished.get("lifecycle"))
         else:
             lifecycle = CoordinatorLifecycle(node_id, status=str(claim.get("status") or status), records=claim.get("lifecycle"))

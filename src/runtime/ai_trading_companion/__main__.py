@@ -889,6 +889,7 @@ def _call_stage(
     )
     coordinator_idempotency_key = f"{cycle['cycle_id']}:{stage}:{packet.get('sha256') or ''}"
     coordinator_claim_already_held = False
+    coordinator_execution_generation: int | None = None
     if packet.get("agent_role_inputs"):
         coordinator_gate_passed = all(
             coordinator_dependency_states[node] == "succeeded" for node in SPEC95_NODE_IDS
@@ -913,6 +914,13 @@ def _call_stage(
                     store, cycle["cycle_id"], stage, packet.get("sha256"),
                 )
                 if replay is not None:
+                    coordinator_state_store.finish(
+                        "coordinator",
+                        "succeeded",
+                        idempotency_key=coordinator_idempotency_key,
+                        execution_generation=claim.get("execution_generation"),
+                        reason="replayed completed coordinator stage",
+                    )
                     return replay
                 raise EvidenceInsufficient({
                     "passed": False,
@@ -920,6 +928,7 @@ def _call_stage(
                     "coordinator_state": claim,
                 })
             coordinator_claim_already_held = True
+            coordinator_execution_generation = claim.get("execution_generation")
     attempt = store.begin_attempt(
         cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), packet.get("sha256"),
         model=None, reasoning_effort=decision.reasoning_effort,
@@ -1163,6 +1172,7 @@ def _call_stage(
                 state_store=coordinator_state_store,
                 idempotency_key=coordinator_idempotency_key,
                 claim_already_held=coordinator_claim_already_held,
+                execution_generation=coordinator_execution_generation,
             )
             verifier = {
                 **verifier,
@@ -1203,6 +1213,7 @@ def _call_stage(
                 state_store=coordinator_state_store,
                 idempotency_key=coordinator_idempotency_key,
                 claim_already_held=coordinator_claim_already_held,
+                execution_generation=coordinator_execution_generation,
             )
             verifier = {
                 **verifier,
@@ -1274,6 +1285,7 @@ def _call_stage(
                         state_store=coordinator_state_store,
                         idempotency_key=coordinator_idempotency_key,
                         claim_already_held=coordinator_claim_already_held,
+                        execution_generation=coordinator_execution_generation,
                     )
                     failure_verifier.update({
                         "agent_role_inputs": packet["agent_role_inputs"],

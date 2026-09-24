@@ -11,6 +11,7 @@ from ai_trading_companion.agent_role import (
     ROLE_IDS,
     CoordinatorStateStore,
     SPEC95_DEPENDENCY_GRAPH,
+    SPEC95_NODE_IDS,
     attach_role_inputs,
     build_input,
     build_output,
@@ -185,6 +186,7 @@ def test_coordinator_output_validation_rejects_contradictory_or_untraceable_stat
 def test_schema_and_install_contract_include_agent_role() -> None:
     root = Path(__file__).parents[2]
     schema = json.loads((root / "resources/contracts/agent-role-spec-v1.schema.json").read_text(encoding="utf-8"))
+    coordinator_schema = json.loads((root / "resources/contracts/coordinator-spec-v1.schema.json").read_text(encoding="utf-8"))
     input_schema = json.loads((root / "resources/contracts/agent-role-input-v1.schema.json").read_text(encoding="utf-8"))
     packet = attach_role_inputs({**PACKET, "agent_contract": _agent_input()}, stage="m1_research")
     assert not list(Draft202012Validator(input_schema).iter_errors(packet["agent_role_inputs"][0]))
@@ -193,9 +195,17 @@ def test_schema_and_install_contract_include_agent_role() -> None:
         unknowns=[], attempt_id="attempt-1", bundle_sha256="bundle-1",
     )
     assert not list(Draft202012Validator(schema).iter_errors(output))
+    coordinator_spec = output["provenance"]["coordinator_spec"]
+    assert not list(Draft202012Validator(coordinator_schema).iter_errors(coordinator_spec))
+    assert set(coordinator_spec["lifecycles"]) == set(coordinator_spec["dependency_graph"])
+    invalid_output = copy.deepcopy(output)
+    invalid_output["provenance"]["coordinator_spec"]["lifecycles"].pop("coordinator")
+    with pytest.raises(ValueError, match="lifecycles must cover every dependency node"):
+        validate_output(invalid_output)
     script = (root / "scripts/verify-install.ps1").read_text(encoding="utf-8")
     assert "resources\\contracts\\agent-role-spec-v1.schema.json" in script
     assert "resources\\contracts\\agent-role-input-v1.schema.json" in script
+    assert "resources\\contracts\\coordinator-spec-v1.schema.json" in script
     assert "runtime\\ai_trading_companion\\agent_role.py" in script
 
 
@@ -276,6 +286,21 @@ def test_missing_spec95_receipt_cannot_authorize_downstream_work() -> None:
     assert all(state == "blocked" for state in issue_states.values())
     assert all(gate is False for gate in evidence_gates.values())
     assert spec95_dependency_states(issue_states, evidence_gates)["coordinator"] == "blocked"
+
+
+def test_coordinator_state_store_persists_every_spec95_lifecycle(tmp_path: Path) -> None:
+    state_store = CoordinatorStateStore(tmp_path / "coordinator.json")
+    states = {
+        node: "blocked" for node in SPEC95_NODE_IDS
+    }
+    states["coordinator"] = "blocked"
+
+    lifecycles = state_store.snapshot_graph(SPEC95_DEPENDENCY_GRAPH, states, now=10)
+
+    assert set(lifecycles) == set(SPEC95_DEPENDENCY_GRAPH)
+    persisted = json.loads((tmp_path / "coordinator.json").read_text(encoding="utf-8"))
+    assert set(persisted) == set(SPEC95_NODE_IDS) | {"coordinator"}
+    assert all(persisted[node]["status"] == "blocked" for node in SPEC95_NODE_IDS)
 
 
 def _qualified_spec95_baseline() -> dict:
@@ -421,9 +446,9 @@ def test_durable_coordinator_claim_uses_scheduling_idempotency_key() -> None:
     try:
         first = build_runtime_coordinator_output(packet["agent_role_inputs"], attempt_id="attempt-1", **kwargs)
         replay = build_runtime_coordinator_output(packet["agent_role_inputs"], attempt_id="attempt-2", **kwargs)
-        assert first["provenance"]["coordinator_spec"]["recovery"]["execution_count"] == 1
-        assert replay["provenance"]["coordinator_spec"]["recovery"]["duplicate"] is True
-        assert replay["provenance"]["coordinator_spec"]["recovery"]["execution_count"] == 1
+        assert first["provenance"]["coordinator_recovery"]["execution_count"] == 1
+        assert replay["provenance"]["coordinator_recovery"]["duplicate"] is True
+        assert replay["provenance"]["coordinator_recovery"]["execution_count"] == 1
     finally:
         state_path.unlink(missing_ok=True)
         state_path.with_suffix(state_path.suffix + ".lock").unlink(missing_ok=True)

@@ -17,6 +17,7 @@ foreach ($required in @(
     'resources\contracts\agent-contract-input-v1.schema.json',
     'resources\contracts\agent-role-spec-v1.schema.json',
     'resources\contracts\agent-role-input-v1.schema.json',
+    'resources\contracts\coordinator-spec-v1.schema.json',
     'resources\contracts\debate-spec-v1.schema.json',
     'resources\contracts\debate-input-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',

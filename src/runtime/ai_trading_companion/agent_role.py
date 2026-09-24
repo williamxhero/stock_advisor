@@ -15,6 +15,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .agent_contract import CONTRACT as AGENT_CONTRACT
@@ -75,6 +76,8 @@ COORDINATOR_TRANSITIONS: dict[str, frozenset[str]] = {
 # implementation details of the six tickets.
 SPEC95_NODE_IDS = tuple(f"SPEC-95.{index}" for index in range(1, 7))
 SPEC95_ISSUE_NUMBER = 95
+SPEC95_BASELINE_CONTRACT = "Spec95Baseline/v1"
+SPEC95_BASELINE_FILENAME = "spec95-baseline.json"
 SPEC95_DEPENDENCY_GRAPH: dict[str, list[str]] = {
     SPEC95_NODE_IDS[0]: [],
     SPEC95_NODE_IDS[1]: [SPEC95_NODE_IDS[0]],
@@ -201,6 +204,71 @@ def validate_spec95_baseline(value: Any) -> dict[str, Any] | None:
     return normalized
 
 
+def load_authoritative_spec95_baseline(runtime_root: str | os.PathLike[str] | None = None) -> dict[str, Any] | None:
+    """Read the runtime-owned SPEC-95 receipt, never packet metadata.
+
+    The receipt is outside the stage packet and is written by a local runtime
+    acquisition/import step. A missing, malformed, or tampered receipt returns
+    ``None`` so the coordinator remains fail-closed.
+    """
+    if runtime_root is None:
+        configured_root = os.environ.get("AI_TRADING_COMPANION_RUNTIME_ROOT")
+        if configured_root:
+            runtime_root = configured_root
+        else:
+            home = os.environ.get("AI_TRADING_COMPANION_HOME")
+            runtime_root = Path(home) / "runtime" if home else Path("D:/APP/AITradingCompanion/runtime")
+    path = Path(runtime_root) / "coordinator-state" / SPEC95_BASELINE_FILENAME
+    try:
+        with path.open(encoding="utf-8") as handle:
+            envelope = json.load(handle)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("contract") != SPEC95_BASELINE_CONTRACT
+        or envelope.get("version") != 1
+    ):
+        return None
+    baseline = envelope.get("baseline")
+    verified = validate_spec95_baseline(baseline)
+    if verified is None:
+        return None
+    expected_digest = envelope.get("baseline_sha256")
+    if not isinstance(expected_digest, str) or expected_digest != sha256(verified):
+        return None
+    return verified
+
+
+class Spec95BaselineStore:
+    """Persist and load the runtime-owned SPEC-95 qualification receipt."""
+
+    def __init__(self, runtime_root: str | os.PathLike[str]):
+        self.path = Path(runtime_root) / "coordinator-state" / SPEC95_BASELINE_FILENAME
+
+    def load(self) -> dict[str, Any] | None:
+        return load_authoritative_spec95_baseline(self.path.parent.parent)
+
+    def persist(self, baseline: dict[str, Any]) -> dict[str, Any]:
+        verified = validate_spec95_baseline(baseline)
+        if verified is None:
+            raise ValueError("invalid SPEC-95 baseline receipt")
+        envelope = {
+            "contract": SPEC95_BASELINE_CONTRACT,
+            "version": 1,
+            "baseline": verified,
+            "baseline_sha256": sha256(verified),
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(envelope, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, self.path)
+        return copy.deepcopy(verified)
+
+
 def spec95_runtime_qualification(baseline: dict[str, Any] | None = None) -> tuple[dict[str, str], dict[str, bool]]:
     """Translate a verified SPEC-95 baseline receipt into runtime gates.
 
@@ -228,10 +296,9 @@ def attach_runtime_qualification(packet: dict[str, Any]) -> dict[str, Any]:
     must remain unchanged so ``spec95_dependency_states`` can fail closed.
     """
     value = copy.deepcopy(packet)
-    # Packets, evidence, and context are caller-controlled inputs. There is no
-    # authoritative local SPEC-95 baseline source yet, so their receipts must
-    # never elevate runtime-owned gates.
-    baseline = None
+    # Packets, evidence, and context are caller-controlled inputs. Only the
+    # runtime-owned receipt can elevate runtime-owned gates.
+    baseline = load_authoritative_spec95_baseline()
     has_issue_states = "spec_issue_states" in value
     has_evidence_gates = "spec_evidence_gates" in value
     if not has_issue_states and not has_evidence_gates:
@@ -528,6 +595,65 @@ class CoordinatorStateStore:
         with self._locked():
             return copy.deepcopy(self._read().get(node_id))
 
+    def snapshot_graph(
+        self,
+        graph: dict[str, list[str] | tuple[str, ...]],
+        states: dict[str, str],
+        *,
+        now: float | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Persist every declared node's qualification lifecycle atomically."""
+        canonical = validate_dependency_graph(graph)
+        if set(states) != set(canonical) or any(value not in STATUSES for value in states.values()):
+            raise ValueError("CoordinatorSpec graph snapshot states must match the dependency graph")
+        timestamp = time.time() if now is None else float(now)
+
+        def lifecycle_for(node: str, desired: str, current: dict[str, Any] | None) -> CoordinatorLifecycle:
+            if isinstance(current, dict) and isinstance(current.get("lifecycle"), list):
+                lifecycle = CoordinatorLifecycle(
+                    node,
+                    status=str(current.get("status") or "pending"),
+                    records=current["lifecycle"],
+                )
+            else:
+                lifecycle = CoordinatorLifecycle(node, status="pending")
+            if lifecycle.status == desired:
+                return lifecycle
+            if lifecycle.status != "pending":
+                lifecycle.transition("pending", at=timestamp, reason="qualification snapshot refreshed")
+            if desired == "pending":
+                return lifecycle
+            if desired in {"succeeded", "partial", "failed"}:
+                lifecycle.transition("running", at=timestamp, reason="qualification snapshot")
+            lifecycle.transition(desired, at=timestamp, reason="qualification snapshot")
+            return lifecycle
+
+        with self._locked():
+            state = self._read()
+            result: dict[str, dict[str, Any]] = {}
+            for node in canonical:
+                current = state.get(node) if isinstance(state.get(node), dict) else None
+                if node == "coordinator" and current is not None:
+                    lifecycle = CoordinatorLifecycle(
+                        node,
+                        status=str(current.get("status") or "pending"),
+                        records=current.get("lifecycle"),
+                    )
+                else:
+                    lifecycle = lifecycle_for(node, states[node], current)
+                    state[node] = {
+                        "node_id": node,
+                        "idempotency_key": f"qualification:{node}",
+                        "status": states[node],
+                        "lease_until": None,
+                        "execution_count": int((current or {}).get("execution_count") or 0),
+                        "execution_generation": int((current or {}).get("execution_generation") or 0),
+                        "lifecycle": lifecycle.records,
+                    }
+                result[node] = lifecycle.as_dict()
+            self._write(state)
+            return result
+
     def claim(self, node_id: str, idempotency_key: str, *, lease_seconds: float = 300, now: float | None = None) -> dict[str, Any]:
         if not node_id.strip() or not idempotency_key.strip():
             raise ValueError("CoordinatorSpec node_id and idempotency_key are required")
@@ -814,9 +940,15 @@ def validate_output(value: dict[str, Any]) -> None:
         frontier = coordinator_frontier(graph, states)
         if coordinator_spec.get("frontier", coordinator_spec.get("executable_frontier")) != frontier:
             raise ValueError("CoordinatorSpec executable frontier is stale")
-        lifecycle = coordinator_spec.get("lifecycle")
-        if not isinstance(lifecycle, dict) or not isinstance(lifecycle.get("records"), list):
-            raise ValueError("CoordinatorSpec lifecycle records are required")
+        lifecycles = coordinator_spec.get("lifecycles")
+        if not isinstance(lifecycles, dict) or set(lifecycles) != set(graph):
+            raise ValueError("CoordinatorSpec lifecycles must cover every dependency node")
+        for node, lifecycle in lifecycles.items():
+            if (not isinstance(lifecycle, dict)
+                    or lifecycle.get("node_id") != node
+                    or lifecycle.get("status") != states[node]
+                    or not isinstance(lifecycle.get("records"), list)):
+                raise ValueError(f"CoordinatorSpec lifecycle is invalid for {node}")
     for field in ("evidence_refs", "counterevidence_refs"):
         _refs(value[field], field)
     for field in ("propositions", "risks", "unknowns"):
@@ -1042,7 +1174,12 @@ def build_runtime_coordinator_output(
         lifecycle.transition("running", at=lifecycle_at, reason="runtime coordinator started")
         lifecycle.transition(status, at=lifecycle_at, reason="runtime coordinator result")
     recovery: dict[str, Any] = {"persisted": False, "duplicate": False, "takeover": False}
+    lifecycles = {
+        node: CoordinatorLifecycle(node, status=states[node]).as_dict()
+        for node in canonical_graph
+    }
     if state_store is not None:
+        lifecycles = state_store.snapshot_graph(canonical_graph, states, now=now)
         if claim_already_held:
             claim = state_store.get(node_id)
             if not claim or claim.get("idempotency_key") != durable_idempotency_key or claim.get("status") != "running":
@@ -1071,6 +1208,7 @@ def build_runtime_coordinator_output(
         else:
             lifecycle = CoordinatorLifecycle(node_id, status=str(claim.get("status") or status), records=claim.get("lifecycle"))
             status = str(claim.get("status") or status)
+        lifecycles[node_id] = lifecycle.as_dict()
     return build_output(
         coordinator,
         status=status,
@@ -1082,18 +1220,12 @@ def build_runtime_coordinator_output(
             "coordinator_spec": {
                 "contract": COORDINATOR_CONTRACT,
                 "version": COORDINATOR_VERSION,
-                "node_id": node_id,
-                "idempotency_key": durable_idempotency_key,
-                "status": status,
                 "dependency_graph": canonical_graph,
                 "states": states,
-                "dependency_states": states,
                 "frontier": frontier,
-                "executable_frontier": frontier,
-                "lifecycle": lifecycle.as_dict(),
-                "lifecycle_records": copy.deepcopy(lifecycle.records),
-                "recovery": recovery,
+                "lifecycles": lifecycles,
             },
+            "coordinator_recovery": recovery,
         },
     )
 

@@ -28,6 +28,7 @@ from .agent_role import (
     SPEC95_NODE_IDS,
     attach_role_inputs,
     build_runtime_coordinator_output,
+    load_authoritative_spec95_baseline,
     spec95_dependency_states,
     spec95_runtime_qualification,
     CoordinatorStateStore,
@@ -891,10 +892,13 @@ def _call_stage(
     coordinator_idempotency_key = f"{cycle['cycle_id']}:{stage}:{packet.get('sha256') or ''}"
     coordinator_claim_already_held = False
     coordinator_execution_generation: int | None = None
-    if packet.get("agent_role_inputs"):
-        # A packet receipt is not an authority. Until the formal local runtime
-        # has an authoritative baseline source, downstream work stays blocked.
-        verified_baseline = None
+    coordinator_gate_required = bool(packet.get("agent_role_inputs")) or stage in {
+        "m0_compose", "m1_judgment", "m2", "outcome_research", "chat_research",
+    }
+    if coordinator_gate_required:
+        # A packet receipt is not an authority. Qualification comes only from
+        # the runtime-owned, digest-checked local receipt.
+        verified_baseline = load_authoritative_spec95_baseline(PATHS.runtime)
         coordinator_gate_passed = all(
             coordinator_dependency_states[node] == "succeeded" for node in SPEC95_NODE_IDS
         )
@@ -919,6 +923,7 @@ def _call_stage(
                 "coordinator_frontier_stopped": True,
                 "coordinator_states": coordinator_dependency_states,
                 "spec95_baseline_verified": coordinator_baseline_verified,
+                "stage": stage,
             })
         if coordinator_gate_passed and coordinator_baseline_verified:
             claim = coordinator_state_store.claim(

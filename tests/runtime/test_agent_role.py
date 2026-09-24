@@ -323,6 +323,20 @@ def _qualified_spec95_baseline() -> dict:
     }
 
 
+def test_snapshot_graph_preserves_active_running_claim(tmp_path: Path) -> None:
+    state_store = CoordinatorStateStore(tmp_path / "coordinator.json")
+    claimed = state_store.claim("coordinator", "active-work", lease_seconds=60, now=10)
+
+    state_store.snapshot_graph(
+        {"coordinator": []}, {"coordinator": "pending"}, now=11,
+    )
+
+    current = state_store.get("coordinator")
+    assert current["status"] == "running"
+    assert current["execution_generation"] == claimed["execution_generation"]
+    assert current["lease_until"] == claimed["lease_until"]
+
+
 def test_spec95_baseline_requires_real_issue_and_all_evidence_gates() -> None:
     baseline = _qualified_spec95_baseline()
     assert validate_spec95_baseline(baseline) is not None
@@ -509,3 +523,8 @@ def test_authoritative_baseline_qualifies_downstream_packet_without_projection(t
             )
     broker.invoke.assert_called_once()
     assert store.attempts(cycle["cycle_id"])[0]["status"] == "timed_out"
+    state_files = [path for path in (tmp_path / "coordinator-state").glob("*.json") if path.name != "spec95-baseline.json"]
+    assert len(state_files) == 1
+    state = json.loads(state_files[0].read_text(encoding="utf-8"))
+    assert state["coordinator"]["status"] == "blocked"
+    assert state["coordinator"]["lease_until"] is None

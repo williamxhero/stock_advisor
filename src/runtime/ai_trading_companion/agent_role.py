@@ -601,6 +601,7 @@ class CoordinatorStateStore:
         states: dict[str, str],
         *,
         now: float | None = None,
+        preserve_running: bool = True,
     ) -> dict[str, dict[str, Any]]:
         """Persist every declared node's qualification lifecycle atomically."""
         canonical = validate_dependency_graph(graph)
@@ -619,6 +620,11 @@ class CoordinatorStateStore:
                 lifecycle = CoordinatorLifecycle(node, status="pending")
             if lifecycle.status == desired:
                 return lifecycle
+            if lifecycle.status == "running":
+                if desired == "pending":
+                    return lifecycle
+                lifecycle.transition(desired, at=timestamp, reason="qualification snapshot refreshed")
+                return lifecycle
             if lifecycle.status != "pending":
                 lifecycle.transition("pending", at=timestamp, reason="qualification snapshot refreshed")
             if desired == "pending":
@@ -633,11 +639,16 @@ class CoordinatorStateStore:
             result: dict[str, dict[str, Any]] = {}
             for node in canonical:
                 current = state.get(node) if isinstance(state.get(node), dict) else None
-                lifecycle = lifecycle_for(node, states[node], current)
+                running_claim = preserve_running and isinstance(current, dict) and current.get("status") == "running"
+                lifecycle = (
+                    CoordinatorLifecycle(node, status="running", records=current.get("lifecycle"))
+                    if running_claim else lifecycle_for(node, states[node], current)
+                )
+                persisted_status = "running" if running_claim else states[node]
                 state[node] = {
                     "node_id": node,
                     "idempotency_key": str((current or {}).get("idempotency_key") or f"qualification:{node}"),
-                    "status": states[node],
+                    "status": persisted_status,
                     "lease_until": (current or {}).get("lease_until"),
                     "execution_count": int((current or {}).get("execution_count") or 0),
                     "execution_generation": int((current or {}).get("execution_generation") or 0),
@@ -1172,16 +1183,27 @@ def build_runtime_coordinator_output(
         for node in canonical_graph
     }
     if state_store is not None:
-        lifecycles = state_store.snapshot_graph(canonical_graph, states, now=now)
         if claim_already_held:
+            lifecycles = {}
+            for node in canonical_graph:
+                record = state_store.get(node)
+                if record is None:
+                    raise ValueError("CoordinatorSpec runtime graph state is missing a claimed node")
+                lifecycles[node] = CoordinatorLifecycle(
+                    node,
+                    status=str(record.get("status") or states[node]),
+                    records=record.get("lifecycle"),
+                ).as_dict()
             claim = state_store.get(node_id)
+        else:
+            lifecycles = state_store.snapshot_graph(canonical_graph, states, now=now)
+            claim = state_store.claim(node_id, durable_idempotency_key, lease_seconds=lease_seconds, now=now)
+        if claim_already_held:
             if not claim or claim.get("idempotency_key") != durable_idempotency_key or claim.get("status") != "running":
                 raise ValueError("CoordinatorSpec runtime claim is no longer active")
             if execution_generation is None or claim.get("execution_generation") != execution_generation:
                 raise ValueError("CoordinatorSpec runtime claim generation is no longer active")
             claim = {**claim, "duplicate": False, "takeover": False}
-        else:
-            claim = state_store.claim(node_id, durable_idempotency_key, lease_seconds=lease_seconds, now=now)
         recovery = {key: claim.get(key) for key in ("persisted", "duplicate", "takeover") if key in claim}
         recovery.update({
             "persisted": True,

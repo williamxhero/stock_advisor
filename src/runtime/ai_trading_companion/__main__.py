@@ -29,6 +29,7 @@ from .agent_role import (
     attach_role_inputs,
     build_runtime_coordinator_output,
     load_authoritative_spec95_baseline,
+    sha256 as coordinator_sha256,
     spec95_dependency_states,
     spec95_runtime_qualification,
     CoordinatorStateStore,
@@ -890,6 +891,7 @@ def _call_stage(
     coordinator_idempotency_key = f"{cycle['cycle_id']}:{stage}:{packet.get('sha256') or ''}"
     coordinator_claim_already_held = False
     coordinator_execution_generation: int | None = None
+    coordinator_claim_finished = True
     coordinator_gate_required = (
         coordinator_gate is True
         or bool(packet.get("agent_role_inputs"))
@@ -899,6 +901,7 @@ def _call_stage(
     coordinator_dependency_states = spec95_dependency_states(
         packet.get("spec_issue_states"), packet.get("spec_evidence_gates")
     )
+    coordinator_baseline_digest: str | None = None
     coordinator_gate_error: EvidenceInsufficient | None = None
     if coordinator_gate_required:
         # A packet receipt is not an authority. Qualification comes only from
@@ -906,6 +909,9 @@ def _call_stage(
         # may omit the projection; in that case derive it from the same
         # authoritative receipt rather than treating omission as a mismatch.
         verified_baseline = load_authoritative_spec95_baseline(PATHS.runtime)
+        coordinator_baseline_digest = (
+            coordinator_sha256(verified_baseline) if verified_baseline is not None else None
+        )
         expected_issue_states, expected_evidence_gates = spec95_runtime_qualification(verified_baseline)
         has_projection = "spec_issue_states" in packet or "spec_evidence_gates" in packet
         if verified_baseline is not None and not has_projection:
@@ -942,6 +948,11 @@ def _call_stage(
                 "stage": stage,
             })
         if coordinator_gate_error is None and coordinator_gate_passed and coordinator_baseline_verified:
+            qualification_states = dict(coordinator_dependency_states)
+            qualification_states["coordinator"] = "pending"
+            coordinator_state_store.snapshot_graph(
+                SPEC95_DEPENDENCY_GRAPH, qualification_states,
+            )
             claim = coordinator_state_store.claim(
                 "coordinator", coordinator_idempotency_key, now=None,
             )
@@ -971,7 +982,22 @@ def _call_stage(
                     "coordinator_state": claim,
                 })
             coordinator_claim_already_held = True
+            coordinator_claim_finished = False
             coordinator_execution_generation = claim.get("execution_generation")
+
+    def finish_coordinator_claim(status: str) -> None:
+        nonlocal coordinator_claim_finished
+        if coordinator_claim_finished:
+            return
+        coordinator_state_store.finish(
+            "coordinator",
+            status,
+            idempotency_key=coordinator_idempotency_key,
+            execution_generation=coordinator_execution_generation,
+            reason="runtime stage completed",
+        )
+        coordinator_claim_finished = True
+
     attempt = store.begin_attempt(
         cycle["cycle_id"], stage, iso(datetime.now(timezone.utc)), packet.get("sha256"),
         model=None, reasoning_effort=decision.reasoning_effort,
@@ -1055,10 +1081,21 @@ def _call_stage(
             saved_research = store.research_checkpoint(
                 cycle["cycle_id"], stage, str(packet.get("sha256") or request_hash),
             )
+            if coordinator_gate_required:
+                checkpoint = saved_research.get("checkpoint") if saved_research else None
+                if (
+                    coordinator_baseline_digest is None
+                    or not isinstance(checkpoint, dict)
+                    or checkpoint.get("spec95_baseline_sha256") != coordinator_baseline_digest
+                ):
+                    saved_research = None
             def persist_research_checkpoint(value: dict[str, Any]) -> None:
+                checkpoint = dict(value)
+                if coordinator_gate_required:
+                    checkpoint["spec95_baseline_sha256"] = coordinator_baseline_digest
                 store.save_research_checkpoint(
                     cycle["cycle_id"], stage, str(packet.get("sha256") or request_hash),
-                    attempt["attempt_id"], value,
+                    attempt["attempt_id"], checkpoint,
                 )
             research = LocalResearchChain(
                 # A repair is bounded so an incomplete web discovery cannot
@@ -1228,6 +1265,7 @@ def _call_stage(
                 "agent_role_inputs": packet.get("agent_role_inputs"),
                 "agent_role_outputs": [role_output],
             }
+            coordinator_claim_finished = True
             # DebateSpec is an internal, read-only qualification envelope.  It
             # is deliberately attached after the provider/evidence verifier so
             # debate cannot become a second fact owner or publish a result.
@@ -1268,6 +1306,7 @@ def _call_stage(
                 "agent_role_inputs": packet["agent_role_inputs"],
                 "agent_role_outputs": [role_output],
             }
+            coordinator_claim_finished = True
         status = "succeeded" if verifier.get("passed") else "rejected"
         output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(
@@ -1280,6 +1319,7 @@ def _call_stage(
             tool_trace=[*tool_trace, stage_audit], actual_model=actual_model,
         )
         attempt_finished = True
+        finish_coordinator_claim("succeeded" if verifier.get("passed") else "blocked")
         if not verifier.get("passed"):
             raise EvidenceInsufficient(verifier)
         if runtime_strategy_shadow_cell is None:
@@ -1358,6 +1398,7 @@ def _call_stage(
                 actual_model=exc.metadata.get("actual_model") if isinstance(exc, BrokerError) else None,
                 tool_trace=getattr(exc, "tool_trace", None) or tool_trace,
             )
+            finish_coordinator_claim("blocked" if status == "timed_out" else "failed")
         if (
             isinstance(exc, BrokerError) and exc.category == "broker_effort_unsupported"
             and plan.mode == "promoted"

@@ -330,6 +330,17 @@ def test_unverified_or_contradictory_baseline_cannot_fill_packet_gates() -> None
     assert validate_spec95_baseline(conflicting) is None
 
 
+def test_structurally_valid_caller_baseline_does_not_authorize_runtime_gates() -> None:
+    packet = attach_runtime_qualification({
+        **PACKET,
+        "spec95_baseline": _qualified_spec95_baseline(),
+    })
+
+    assert packet["spec95_baseline_verified"] is False
+    assert set(packet["spec_issue_states"].values()) == {"blocked"}
+    assert set(packet["spec_evidence_gates"].values()) == {False}
+
+
 def test_stale_coordinator_generation_cannot_finish_after_takeover() -> None:
     state_path = Path.cwd() / "_agent_role_generation_state.json"
     state_path.unlink(missing_ok=True)

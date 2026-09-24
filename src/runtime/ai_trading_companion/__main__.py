@@ -30,7 +30,6 @@ from .agent_role import (
     build_runtime_coordinator_output,
     spec95_dependency_states,
     spec95_runtime_qualification,
-    validate_spec95_baseline,
     CoordinatorStateStore,
 )
 from .debate import failure as debate_failure, from_stage as debate_from_stage
@@ -893,9 +892,9 @@ def _call_stage(
     coordinator_claim_already_held = False
     coordinator_execution_generation: int | None = None
     if packet.get("agent_role_inputs"):
-        verified_baseline = validate_spec95_baseline(
-            packet.get("spec95_baseline") or packet.get("spec95_qualification")
-        )
+        # A packet receipt is not an authority. Until the formal local runtime
+        # has an authoritative baseline source, downstream work stays blocked.
+        verified_baseline = None
         coordinator_gate_passed = all(
             coordinator_dependency_states[node] == "succeeded" for node in SPEC95_NODE_IDS
         )
@@ -925,15 +924,16 @@ def _call_stage(
             claim = coordinator_state_store.claim(
                 "coordinator", coordinator_idempotency_key, now=None,
             )
-            if claim.get("duplicate"):
+            if claim.get("duplicate") or claim.get("takeover"):
                 replay = _replay_coordinator_stage_result(
                     store, cycle["cycle_id"], stage, packet.get("sha256"),
                 )
                 if replay is not None:
                     # A prior provider attempt may have been persisted before
                     # the process died while closing the durable claim. Close
-                    # only that still-running generation; a terminal claim is
-                    # already durable and must not be rewritten during replay.
+                    # the current generation after either a duplicate read or
+                    # a lease takeover; otherwise an expired claim could be
+                    # taken over and the completed provider work repeated.
                     if claim.get("status") == "running":
                         coordinator_state_store.finish(
                             "coordinator",

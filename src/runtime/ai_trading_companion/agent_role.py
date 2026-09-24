@@ -100,13 +100,12 @@ def _spec95_gate(value: Any) -> bool:
 
 
 def validate_spec95_baseline(value: Any) -> dict[str, Any] | None:
-    """Validate the externally supplied SPEC-95 baseline receipt.
+    """Validate the shape and consistency of a SPEC-95 baseline receipt.
 
     ``install_qualification`` only proves that a local frozen replay works.
     It cannot prove the state of issue #95 or any delivery/synchronization
-    evidence, so it is deliberately not consulted here.  Baseline metadata is
-    accepted only when it names the real issue, declares all six nodes, and
-    contains explicit positive evidence for every required gate.
+    evidence. This helper checks receipt contents only; its output is not
+    authority to authorize downstream work.
     """
     if not isinstance(value, dict):
         return None
@@ -229,7 +228,10 @@ def attach_runtime_qualification(packet: dict[str, Any]) -> dict[str, Any]:
     must remain unchanged so ``spec95_dependency_states`` can fail closed.
     """
     value = copy.deepcopy(packet)
-    baseline = validate_spec95_baseline(value.get("spec95_baseline") or value.get("spec95_qualification"))
+    # Packets, evidence, and context are caller-controlled inputs. There is no
+    # authoritative local SPEC-95 baseline source yet, so their receipts must
+    # never elevate runtime-owned gates.
+    baseline = None
     has_issue_states = "spec_issue_states" in value
     has_evidence_gates = "spec_evidence_gates" in value
     if not has_issue_states and not has_evidence_gates:

@@ -620,6 +620,8 @@ class CoordinatorStateStore:
                 lifecycle = CoordinatorLifecycle(node, status="pending")
             if lifecycle.status == desired:
                 return lifecycle
+            if lifecycle.status in COORDINATOR_TERMINAL_STATUSES and desired == "pending":
+                return lifecycle
             if lifecycle.status == "running":
                 if desired == "pending":
                     return lifecycle
@@ -640,11 +642,22 @@ class CoordinatorStateStore:
             for node in canonical:
                 current = state.get(node) if isinstance(state.get(node), dict) else None
                 running_claim = preserve_running and isinstance(current, dict) and current.get("status") == "running"
+                terminal_claim = (
+                    isinstance(current, dict)
+                    and current.get("status") in COORDINATOR_TERMINAL_STATUSES
+                    and states[node] == "pending"
+                )
                 lifecycle = (
                     CoordinatorLifecycle(node, status="running", records=current.get("lifecycle"))
-                    if running_claim else lifecycle_for(node, states[node], current)
+                    if running_claim else (
+                        CoordinatorLifecycle(
+                            node, status=str(current.get("status")), records=current.get("lifecycle"),
+                        ) if terminal_claim else lifecycle_for(node, states[node], current)
+                    )
                 )
-                persisted_status = "running" if running_claim else states[node]
+                persisted_status = (
+                    str(current.get("status")) if running_claim or terminal_claim else states[node]
+                )
                 state[node] = {
                     "node_id": node,
                     "idempotency_key": str((current or {}).get("idempotency_key") or f"qualification:{node}"),

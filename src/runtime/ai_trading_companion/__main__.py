@@ -296,6 +296,12 @@ def resolve_stage_controls(
     return runtime_strategy.controls(stage, timeout_seconds=timeout, search=search, task_key=task_key)
 
 
+_COORDINATOR_GATED_STAGES = frozenset({
+    "m0_research", "m0_compose", "m1_research", "m1_judgment", "m2",
+    "outcome_research", "chat_research",
+})
+
+
 def finalize_stage_packet(packet: dict[str, Any], controls: RuntimeStrategyControls) -> dict[str, Any]:
     """Bind runtime controls before deriving the sole hash for a stage invocation.
 
@@ -319,6 +325,11 @@ def finalize_stage_packet(packet: dict[str, Any], controls: RuntimeStrategyContr
         "revisions": list(controls.revisions),
     }
     final_packet["allowed_research_backends"] = list(controls.enabled_backends)
+    if final_packet.get("stage") in _COORDINATOR_GATED_STAGES:
+        baseline = load_authoritative_spec95_baseline(PATHS.runtime)
+        final_packet["spec95_baseline_sha256"] = (
+            coordinator_sha256(baseline) if baseline is not None else None
+        )
     final_packet["sha256"] = canonical_packet_hash(final_packet)
     return final_packet
 

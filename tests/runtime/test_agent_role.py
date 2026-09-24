@@ -29,7 +29,8 @@ from ai_trading_companion.agent_role import (
     validate_output,
 )
 from ai_trading_companion.packet_builder import RuntimePacketBuilder
-from ai_trading_companion.__main__ import _call_stage
+from ai_trading_companion.__main__ import _call_stage, finalize_stage_packet
+from ai_trading_companion.runtime_strategy_policy import RuntimeStrategyControls
 from ai_trading_companion.broker_client import BrokerError
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.evidence_gate import EvidenceInsufficient
@@ -335,6 +336,39 @@ def test_snapshot_graph_preserves_active_running_claim(tmp_path: Path) -> None:
     assert current["status"] == "running"
     assert current["execution_generation"] == claimed["execution_generation"]
     assert current["lease_until"] == claimed["lease_until"]
+
+
+def test_terminal_coordinator_claim_survives_pending_snapshot_and_replays(tmp_path: Path) -> None:
+    state_store = CoordinatorStateStore(tmp_path / "coordinator.json")
+    first = state_store.claim("coordinator", "same-work", lease_seconds=60, now=10)
+    state_store.finish(
+        "coordinator", "succeeded", idempotency_key="same-work",
+        execution_generation=first["execution_generation"], now=11,
+    )
+
+    state_store.snapshot_graph(
+        {"coordinator": []}, {"coordinator": "pending"}, now=12,
+    )
+    replay = state_store.claim("coordinator", "same-work", lease_seconds=60, now=13)
+
+    assert replay["duplicate"] is True
+    assert replay["execution_count"] == 1
+    assert state_store.get("coordinator")["status"] == "succeeded"
+
+
+def test_coordinator_gated_packet_hash_tracks_current_baseline() -> None:
+    controls = RuntimeStrategyControls(60, 0, (), ())
+    packet = {"stage": "m0_compose", "cycle_id": "cycle", "as_of": "2026-09-21T00:00:00Z"}
+    with patch(
+        "ai_trading_companion.__main__.load_authoritative_spec95_baseline",
+        side_effect=[{"baseline": "old"}, None],
+    ):
+        first = finalize_stage_packet(packet, controls)
+        second = finalize_stage_packet(packet, controls)
+
+    assert first["spec95_baseline_sha256"]
+    assert second["spec95_baseline_sha256"] is None
+    assert first["sha256"] != second["sha256"]
 
 
 def test_spec95_baseline_requires_real_issue_and_all_evidence_gates() -> None:

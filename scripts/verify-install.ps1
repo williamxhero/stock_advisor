@@ -40,6 +40,16 @@ if ([string]$buildInfo.source_revision -notmatch '^[0-9a-f]{40}$') { throw 'Inst
 if ($ExpectedRevision -and $buildInfo.source_revision -ne $ExpectedRevision) {
     throw "Installed revision $($buildInfo.source_revision) does not match expected revision $ExpectedRevision."
 }
+$coordinatorSchemaPath = Join-Path $InstallRoot 'resources\contracts\coordinator-spec-v1.schema.json'
+$coordinatorSchema = Get-Content -LiteralPath $coordinatorSchemaPath -Raw | ConvertFrom-Json
+if ($coordinatorSchema.title -ne 'CoordinatorSpec/v1' -or $coordinatorSchema.'$schema' -ne 'https://json-schema.org/draft/2020-12/schema') {
+    throw 'Installed CoordinatorSpec schema has an unexpected contract or schema dialect.'
+}
+foreach ($required in @('contract', 'version', 'dependency_graph', 'states', 'frontier', 'lifecycles')) {
+    if ($coordinatorSchema.required -notcontains $required) {
+        throw "Installed CoordinatorSpec schema is missing required field: $required."
+    }
+}
 $env:AI_TRADING_COMPANION_INSTALL_ROOT = $InstallRoot
 $env:PYTHONPATH = "$InstallRoot\runtime"
 $runtimePython = Join-Path $CompanionHome 'runtime\python\Scripts\python.exe'

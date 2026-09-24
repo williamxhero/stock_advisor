@@ -845,6 +845,7 @@ def _call_stage(
     runtime_strategy_shadow_cell: str | None = None,
     frozen_controls: RuntimeStrategyControls | None = None,
     evidence_registrar: Callable[[dict[str, Any]], None] | None = None,
+    coordinator_gate: bool | None = None,
 ) -> VerifiedStageResult:
     from .opportunities import is_premarket
     settings = load_settings(PATHS.home)
@@ -877,7 +878,7 @@ def _call_stage(
         plan.baseline.as_json(), plan.candidate.as_json() if plan.candidate else None, decision.as_json(),
     )
     # Coordinator state is durable runtime state, not a verifier-local
-    # decoration.  Scope the journal to the scheduling context so a retry of
+    # decoration. Scope the journal to the scheduling context so a retry of
     # the same cycle/stage/packet is idempotent without different stages
     # contending for one coordinator record.
     coordinator_state_key = hashlib.sha256(
@@ -886,46 +887,61 @@ def _call_stage(
     coordinator_state_store = CoordinatorStateStore(
         PATHS.runtime / "coordinator-state" / f"{coordinator_state_key}.json"
     )
-    coordinator_dependency_states = spec95_dependency_states(
-        packet.get("spec_issue_states"), packet.get("spec_evidence_gates")
-    )
     coordinator_idempotency_key = f"{cycle['cycle_id']}:{stage}:{packet.get('sha256') or ''}"
     coordinator_claim_already_held = False
     coordinator_execution_generation: int | None = None
-    coordinator_gate_required = bool(packet.get("agent_role_inputs")) or stage in {
-        "m0_compose", "m1_judgment", "m2", "outcome_research", "chat_research",
-    }
+    coordinator_gate_required = (
+        coordinator_gate is True
+        or bool(packet.get("agent_role_inputs"))
+        or "spec_issue_states" in packet
+        or "spec_evidence_gates" in packet
+    )
+    coordinator_dependency_states = spec95_dependency_states(
+        packet.get("spec_issue_states"), packet.get("spec_evidence_gates")
+    )
+    coordinator_gate_error: EvidenceInsufficient | None = None
     if coordinator_gate_required:
         # A packet receipt is not an authority. Qualification comes only from
-        # the runtime-owned, digest-checked local receipt.
+        # the runtime-owned, digest-checked local receipt. Downstream packets
+        # may omit the projection; in that case derive it from the same
+        # authoritative receipt rather than treating omission as a mismatch.
         verified_baseline = load_authoritative_spec95_baseline(PATHS.runtime)
+        expected_issue_states, expected_evidence_gates = spec95_runtime_qualification(verified_baseline)
+        has_projection = "spec_issue_states" in packet or "spec_evidence_gates" in packet
+        if verified_baseline is not None and not has_projection:
+            coordinator_dependency_states = spec95_dependency_states(
+                expected_issue_states, expected_evidence_gates,
+            )
         coordinator_gate_passed = all(
             coordinator_dependency_states[node] == "succeeded" for node in SPEC95_NODE_IDS
         )
-        expected_issue_states, expected_evidence_gates = spec95_runtime_qualification(verified_baseline)
-        # Do not let a caller combine a valid-looking receipt with a separate
-        # forged set of all-success packet fields.  The receipt is the source
-        # of truth for the coordinator gate; packet metadata must agree with
-        # its projection exactly.
-        coordinator_baseline_verified = (
-            verified_baseline is not None
-            and packet.get("spec_issue_states") == expected_issue_states
-            and packet.get("spec_evidence_gates") == expected_evidence_gates
+        projection_matches = (
+            not has_projection
+            or (
+                packet.get("spec_issue_states") == expected_issue_states
+                and packet.get("spec_evidence_gates") == expected_evidence_gates
+            )
         )
-        # Evidence acquisition is an upstream deterministic step.  It may
+        coordinator_baseline_verified = verified_baseline is not None and projection_matches
+        # Evidence acquisition is an upstream deterministic step. It may
         # complete and record its evidence even when the qualification
-        # metadata is absent; its coordinator artifact remains blocked.  Any
+        # metadata is absent; its coordinator artifact remains blocked. Any
         # downstream model/provider work must stop before it begins.
         evidence_only_stage = search and schema_name.startswith("companion-evidence-result-")
         if (not coordinator_gate_passed or not coordinator_baseline_verified) and not evidence_only_stage:
-            raise EvidenceInsufficient({
+            lifecycles = coordinator_state_store.snapshot_graph(
+                SPEC95_DEPENDENCY_GRAPH, coordinator_dependency_states,
+            )
+            coordinator_gate_error = EvidenceInsufficient({
                 "passed": False,
+                "problems": ["coordinator_qualification_missing_or_inconsistent"],
                 "coordinator_frontier_stopped": True,
                 "coordinator_states": coordinator_dependency_states,
+                "coordinator_lifecycles": lifecycles,
                 "spec95_baseline_verified": coordinator_baseline_verified,
                 "stage": stage,
             })
-        if coordinator_gate_passed and coordinator_baseline_verified:
+        if coordinator_gate_error is None and coordinator_gate_passed and coordinator_baseline_verified:
             claim = coordinator_state_store.claim(
                 "coordinator", coordinator_idempotency_key, now=None,
             )
@@ -950,6 +966,7 @@ def _call_stage(
                     return replay
                 raise EvidenceInsufficient({
                     "passed": False,
+                    "problems": ["coordinator_duplicate_without_replay"],
                     "coordinator_duplicate": True,
                     "coordinator_state": claim,
                 })
@@ -970,6 +987,11 @@ def _call_stage(
     tool_trace: list[dict[str, Any]] = []
     planner: BrokerResearchPlanner | None = None
     try:
+        if coordinator_gate_error is not None:
+            # The attempt is created before rejecting the downstream stage so
+            # the blocked frontier is auditable and recoverable like any other
+            # stage failure. No provider call is made after this point.
+            raise coordinator_gate_error
         broker = broker_client(settings)
         deadline = time.monotonic() + max(1, min(timeout, decision.timeout_seconds))
         evidence_verifier: dict[str, Any] | None = None
@@ -1510,6 +1532,7 @@ def run_runtime_strategy_shadow(store: CompanionStore, job: dict[str, Any], exec
             store, cycle, job["stage"], packet, job["schema_name"],
             search=search, timeout=requested_timeout,
             runtime_strategy_shadow_cell=job["cell_key"],
+            coordinator_gate=job["stage"] in {"m0_compose", "m1_judgment", "m2", "outcome_research", "chat_research"},
         )
         attempts = {row["attempt_id"]: row for row in store.attempts(cycle["cycle_id"])}
         from .governance import _attempt_dimensions
@@ -1786,6 +1809,7 @@ def run_research(
                 compose_stage = _call_stage(
                     store, cycle, "m0_compose", local_packet, "companion-m0-result-v3.schema.json",
                     search=False, timeout=compose_timeout, frozen_controls=compose_controls,
+                    coordinator_gate=True,
                 )
                 m0_output, compose_attempt_id = compose_stage.output, compose_stage.attempt_id
                 store.save_stage_checkpoint(cycle["cycle_id"], "m0_compose", local_packet["sha256"], compose_attempt_id, m0_output)
@@ -1995,6 +2019,7 @@ def run_m1(
                 judgment_stage = _call_stage(
                     store, cycle, "m1_judgment", local_packet, "companion-m1-result-v5.schema.json",
                     search=False, timeout=judgment_timeout, frozen_controls=judgment_controls,
+                    coordinator_gate=True,
                 )
                 judgment, judgment_attempt_id = judgment_stage.output, judgment_stage.attempt_id
                 store.save_stage_checkpoint(cycle_id, "m1_judgment", local_packet["sha256"], judgment_attempt_id, judgment)
@@ -2148,6 +2173,7 @@ def run_m2(engine: CompanionEngine, store: CompanionStore, cycle_id: str, execut
         stage_result = _call_stage(
             store, cycle, "m2", packet, "companion-m2-result-v4.schema.json",
             search=False, timeout=timeout, frozen_controls=controls,
+            coordinator_gate=True,
         )
         store.save_stage_checkpoint(cycle_id, "m2", packet["sha256"], stage_result.attempt_id, stage_result.output)
         output, attempt_id = stage_result.output, stage_result.attempt_id
@@ -2283,7 +2309,7 @@ def run_outcome(
         )
         outcome_result = _call_stage(
             store, cycle, "outcome_research", packet, "companion-outcome-result-v1.schema.json",
-            search=True, timeout=300,
+            search=True, timeout=300, coordinator_gate=True,
         )
         result, outcome_stage = _stage_output(outcome_result)
     if not result.get("checkpoint_ready"):
@@ -2398,7 +2424,7 @@ def run_chat_research(
         )
         evidence, _ = _call_stage(
             store, cycle, "chat_research", research_packet, "companion-evidence-result-v3.schema.json",
-            search=True, timeout=300,
+            search=True, timeout=300, coordinator_gate=True,
         )
         store.record_evidence(cycle, "chat_research", evidence)
         if reply_to_batch_ids and not store.has_pending_message_batches(reply_to_batch_ids):

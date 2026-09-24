@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 from ai_trading_companion.agent_contract import attach_input
@@ -10,6 +12,7 @@ from ai_trading_companion.agent_role import (
     CONTRACT,
     ROLE_IDS,
     CoordinatorStateStore,
+    Spec95BaselineStore,
     SPEC95_DEPENDENCY_GRAPH,
     SPEC95_NODE_IDS,
     attach_role_inputs,
@@ -26,6 +29,11 @@ from ai_trading_companion.agent_role import (
     validate_output,
 )
 from ai_trading_companion.packet_builder import RuntimePacketBuilder
+from ai_trading_companion.__main__ import _call_stage
+from ai_trading_companion.broker_client import BrokerError
+from ai_trading_companion.engine import CompanionEngine
+from ai_trading_companion.evidence_gate import EvidenceInsufficient
+from ai_trading_companion.store import CompanionStore
 from jsonschema import Draft202012Validator
 
 PACKET = {
@@ -452,3 +460,52 @@ def test_durable_coordinator_claim_uses_scheduling_idempotency_key() -> None:
     finally:
         state_path.unlink(missing_ok=True)
         state_path.with_suffix(state_path.suffix + ".lock").unlink(missing_ok=True)
+
+
+def test_formal_coordinator_gate_persists_blocked_attempt_without_provider(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    cycle = CompanionEngine(store).start_cycle(
+        "daily.review.1520", "2026-09-21T15:20:00+08:00", "2026-09-21T07:20:00Z",
+    )
+    packet = {"task_key": cycle["task_key"], "stage": "m0_compose", "as_of": cycle["as_of"]}
+    broker = Mock()
+    paths = SimpleNamespace(home=tmp_path, runtime=tmp_path, tools=tmp_path)
+    settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
+    with patch("ai_trading_companion.__main__.PATHS", paths), patch(
+        "ai_trading_companion.__main__.load_settings", return_value=settings,
+    ), patch("ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker):
+        with pytest.raises(EvidenceInsufficient, match="coordinator_qualification_missing_or_inconsistent"):
+            _call_stage(
+                store, cycle, "m0_compose", packet, "companion-m0-result-v3.schema.json",
+                search=False, timeout=60, coordinator_gate=True,
+            )
+    broker.invoke.assert_not_called()
+    attempts = store.attempts(cycle["cycle_id"])
+    assert len(attempts) == 1 and attempts[0]["status"] == "failed"
+    verifier = json.loads(attempts[0]["verifier_json"])
+    assert verifier["coordinator_frontier_stopped"]
+    assert set(verifier["coordinator_lifecycles"]) == set(SPEC95_DEPENDENCY_GRAPH)
+    assert set((tmp_path / "coordinator-state").glob("*.json"))
+
+
+def test_authoritative_baseline_qualifies_downstream_packet_without_projection(tmp_path: Path) -> None:
+    Spec95BaselineStore(tmp_path).persist(_qualified_spec95_baseline())
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    cycle = CompanionEngine(store).start_cycle(
+        "daily.review.1520", "2026-09-21T15:20:00+08:00", "2026-09-21T07:20:00Z",
+    )
+    packet = {"task_key": cycle["task_key"], "stage": "m0_compose", "as_of": cycle["as_of"]}
+    broker = Mock()
+    broker.invoke.side_effect = BrokerError("provider reached", category="broker_timeout")
+    paths = SimpleNamespace(home=tmp_path, runtime=tmp_path, tools=tmp_path)
+    settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
+    with patch("ai_trading_companion.__main__.PATHS", paths), patch(
+        "ai_trading_companion.__main__.load_settings", return_value=settings,
+    ), patch("ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker):
+        with pytest.raises(BrokerError, match="provider reached"):
+            _call_stage(
+                store, cycle, "m0_compose", packet, "companion-m0-result-v3.schema.json",
+                search=False, timeout=60, coordinator_gate=True,
+            )
+    broker.invoke.assert_called_once()
+    assert store.attempts(cycle["cycle_id"])[0]["status"] == "timed_out"

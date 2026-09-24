@@ -633,23 +633,16 @@ class CoordinatorStateStore:
             result: dict[str, dict[str, Any]] = {}
             for node in canonical:
                 current = state.get(node) if isinstance(state.get(node), dict) else None
-                if node == "coordinator" and current is not None:
-                    lifecycle = CoordinatorLifecycle(
-                        node,
-                        status=str(current.get("status") or "pending"),
-                        records=current.get("lifecycle"),
-                    )
-                else:
-                    lifecycle = lifecycle_for(node, states[node], current)
-                    state[node] = {
-                        "node_id": node,
-                        "idempotency_key": f"qualification:{node}",
-                        "status": states[node],
-                        "lease_until": None,
-                        "execution_count": int((current or {}).get("execution_count") or 0),
-                        "execution_generation": int((current or {}).get("execution_generation") or 0),
-                        "lifecycle": lifecycle.records,
-                    }
+                lifecycle = lifecycle_for(node, states[node], current)
+                state[node] = {
+                    "node_id": node,
+                    "idempotency_key": str((current or {}).get("idempotency_key") or f"qualification:{node}"),
+                    "status": states[node],
+                    "lease_until": (current or {}).get("lease_until"),
+                    "execution_count": int((current or {}).get("execution_count") or 0),
+                    "execution_generation": int((current or {}).get("execution_generation") or 0),
+                    "lifecycle": lifecycle.records,
+                }
                 result[node] = lifecycle.as_dict()
             self._write(state)
             return result

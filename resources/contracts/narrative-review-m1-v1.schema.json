@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "M1CoordinationReview/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["core_hash", "draft_hash", "coordination_hash", "grounded", "faithful", "scores", "problems", "suggestions"],
+  "properties": {
+    "core_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "draft_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "coordination_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "grounded": {"type": "boolean"},
+    "faithful": {"type": "boolean"},
+    "scores": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["specificity", "causality", "counterargument", "portfolio", "naturalness", "broadcast_risk"],
+      "properties": {
+        "specificity": {"type": "integer", "minimum": 0, "maximum": 3},
+        "causality": {"type": "integer", "minimum": 0, "maximum": 3},
+        "counterargument": {"type": "integer", "minimum": 0, "maximum": 3},
+        "portfolio": {"type": "integer", "minimum": 0, "maximum": 3},
+        "naturalness": {"type": "integer", "minimum": 0, "maximum": 3},
+        "broadcast_risk": {"type": "integer", "minimum": 0, "maximum": 3}
+      }
+    },
+    "problems": {"type": "array", "minItems": 0, "maxItems": 12, "items": {"type": "string", "minLength": 1, "maxLength": 500}},
+    "suggestions": {"type": "array", "minItems": 0, "maxItems": 3, "items": {"type": "string", "minLength": 1, "maxLength": 500}}
+  }
+}

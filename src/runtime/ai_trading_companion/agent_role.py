@@ -1082,7 +1082,7 @@ def attach_role_inputs(packet: dict[str, Any], *, stage: str) -> dict[str, Any]:
     Only stable references are attached.  In particular this function does
     not copy H0 or any MemoryHub/portfolio payload into a role input.
     """
-    value = attach_runtime_qualification(packet)
+    value = copy.deepcopy(packet)
     agent_contract = value.get("agent_contract")
     if not isinstance(agent_contract, dict):
         raise TypeError("AgentRoleSpec requires an attached AgentContractSpec")

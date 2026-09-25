@@ -47,8 +47,10 @@ def assert_m1_blind(packet: dict[str, Any], *, human_texts: Iterable[str] = ()) 
     """
     forbidden_keys = {
         "h0", "h0_text", "h0_raw", "h0_artifact", "h0_artifact_id",
-        "h0_derived", "h0_signal", "derived_h0_signal", "cognition_result",
-        "h0_action_result", "h0_action_receipt",
+        "h0_propositions", "h0_actions", "h0_signal", "h0_action",
+        "h0_action_result", "h0_action_receipt", "h0_derived", "derived_h0_signal",
+        "human_judgment", "human_claim", "human_action", "user_h0", "user_h0_text",
+        "cognition_result", "cognition_receipt", "cognition_signal",
     }
 
     def walk(value: Any, path: tuple[str, ...] = ()) -> None:

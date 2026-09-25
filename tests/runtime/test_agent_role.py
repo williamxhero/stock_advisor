@@ -215,7 +215,10 @@ def test_schema_and_install_contract_include_agent_role() -> None:
     assert "resources\\contracts\\agent-role-spec-v1.schema.json" in script
     assert "resources\\contracts\\agent-role-input-v1.schema.json" in script
     assert "resources\\contracts\\coordinator-spec-v1.schema.json" in script
+    assert "resources\\contracts\\companion-m1-result-v5.schema.json" in script
+    assert "resources\\contracts\\narrative-review-m1-v1.schema.json" in script
     assert "runtime\\ai_trading_companion\\agent_role.py" in script
+    assert "runtime\\ai_trading_companion\\judgment_publication.py" in script
 
 
 def test_frozen_replay_is_deterministic_and_keeps_evaluation_axes_separate() -> None:
@@ -274,17 +277,11 @@ def test_missing_spec95_prerequisite_metadata_blocks_every_node() -> None:
     assert states["coordinator"] == "blocked"
 
 
-def test_role_packet_emits_runtime_qualification_metadata() -> None:
+def test_role_packet_does_not_infer_delivery_issue_qualification() -> None:
     packet = attach_role_inputs({**PACKET, "agent_contract": _agent_input()}, stage="m1_research")
-    issue_states, evidence_gates = spec95_runtime_qualification()
-
-    assert packet["spec_issue_states"] == issue_states
-    assert packet["spec_evidence_gates"] == evidence_gates
-    assert all(
-        state == "blocked"
-        for state in spec95_dependency_states(packet["spec_issue_states"], packet["spec_evidence_gates"]).values()
-        if state != "pending"
-    )
+    assert "spec_issue_states" not in packet
+    assert "spec_evidence_gates" not in packet
+    assert [row["role"] for row in packet["agent_role_inputs"]][-1] == "coordinator"
 
 
 def test_missing_spec95_receipt_cannot_authorize_downstream_work() -> None:
@@ -358,7 +355,10 @@ def test_terminal_coordinator_claim_survives_pending_snapshot_and_replays(tmp_pa
 
 def test_coordinator_gated_packet_hash_tracks_current_baseline() -> None:
     controls = RuntimeStrategyControls(60, 0, (), ())
-    packet = {"stage": "m0_compose", "cycle_id": "cycle", "as_of": "2026-09-21T00:00:00Z"}
+    packet = {
+        "stage": "m0_compose", "cycle_id": "cycle", "as_of": "2026-09-21T00:00:00Z",
+        "spec_issue_states": {},
+    }
     with patch(
         "ai_trading_companion.__main__.load_authoritative_spec95_baseline",
         side_effect=[{"baseline": "old"}, None],
@@ -448,7 +448,7 @@ def test_stale_coordinator_generation_cannot_finish_after_takeover() -> None:
         state_path.with_suffix(state_path.suffix + ".lock").unlink(missing_ok=True)
 
 
-def test_runtime_packet_builder_qualifies_normal_m0_and_m1_research_packets() -> None:
+def test_runtime_packet_builder_does_not_embed_delivery_issue_status() -> None:
     class PacketBuilder(RuntimePacketBuilder):
         def _calendar_context(self, _scheduled_for: str) -> dict:
             return {"authority": "test"}
@@ -468,14 +468,15 @@ def test_runtime_packet_builder_qualifies_normal_m0_and_m1_research_packets() ->
         "scheduled_for": "2026-09-21T09:00:00+08:00",
         "as_of": "2026-09-21T01:00:00Z",
         "evidence_contract_json": json.dumps({"requirements": []}),
+        "spec95_baseline": _qualified_spec95_baseline(),
     }
-    expected_issue_states, expected_evidence_gates = spec95_runtime_qualification()
     builder = PacketBuilder(Path.cwd(), object())
 
     for stage in ("m0_research", "m1_research"):
         packet = builder.build(cycle, stage, evidence={"sources": []})
-        assert packet["spec_issue_states"] == expected_issue_states
-        assert packet["spec_evidence_gates"] == expected_evidence_gates
+        assert "spec95_baseline" not in packet
+        assert "spec_issue_states" not in packet
+        assert "spec_evidence_gates" not in packet
 
 
 def test_partial_spec95_metadata_is_not_filled_in() -> None:
@@ -534,6 +535,27 @@ def test_formal_coordinator_gate_persists_blocked_attempt_without_provider(tmp_p
     assert verifier["coordinator_frontier_stopped"]
     assert set(verifier["coordinator_lifecycles"]) == set(SPEC95_DEPENDENCY_GRAPH)
     assert set((tmp_path / "coordinator-state").glob("*.json"))
+
+
+def test_business_stage_does_not_require_delivery_issue_baseline(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    cycle = CompanionEngine(store).start_cycle(
+        "daily.review.1520", "2026-09-21T15:20:00+08:00", "2026-09-21T07:20:00Z",
+    )
+    packet = {"task_key": cycle["task_key"], "stage": "m0_compose", "as_of": cycle["as_of"]}
+    broker = Mock()
+    broker.invoke.side_effect = BrokerError("provider reached", category="broker_timeout")
+    paths = SimpleNamespace(home=tmp_path, runtime=tmp_path, tools=tmp_path)
+    settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
+    with patch("ai_trading_companion.__main__.PATHS", paths), patch(
+        "ai_trading_companion.__main__.load_settings", return_value=settings,
+    ), patch("ai_trading_companion.__main__.ProviderBrokerClient", return_value=broker):
+        with pytest.raises(BrokerError, match="provider reached"):
+            _call_stage(
+                store, cycle, "m0_compose", packet, "companion-m0-result-v3.schema.json",
+                search=False, timeout=60,
+            )
+    broker.invoke.assert_called_once()
 
 
 def test_authoritative_baseline_qualifies_downstream_packet_without_projection(tmp_path: Path) -> None:

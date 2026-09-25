@@ -18,6 +18,8 @@ foreach ($required in @(
     'resources\contracts\agent-role-spec-v1.schema.json',
     'resources\contracts\agent-role-input-v1.schema.json',
     'resources\contracts\coordinator-spec-v1.schema.json',
+    'resources\contracts\companion-m1-result-v5.schema.json',
+    'resources\contracts\narrative-review-m1-v1.schema.json',
     'resources\contracts\debate-spec-v1.schema.json',
     'resources\contracts\debate-input-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
@@ -27,6 +29,7 @@ foreach ($required in @(
     'runtime\ai_trading_companion\message_presentation.py',
     'runtime\ai_trading_companion\agent_contract.py',
     'runtime\ai_trading_companion\agent_role.py',
+    'runtime\ai_trading_companion\judgment_publication.py',
     'runtime\ai_trading_companion\debate.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'
@@ -49,6 +52,22 @@ foreach ($required in @('contract', 'version', 'dependency_graph', 'states', 'fr
     if ($coordinatorSchema.required -notcontains $required) {
         throw "Installed CoordinatorSpec schema is missing required field: $required."
     }
+}
+$m1Schema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\companion-m1-result-v5.schema.json') -Raw | ConvertFrom-Json
+$m1Publication = $m1Schema.properties.publication
+foreach ($required in @('coordination', 'coordination_hash')) {
+    if ($m1Publication.required -notcontains $required) {
+        throw "Installed M1 schema is missing required coordination field: $required."
+    }
+}
+foreach ($required in @('version', 'core_hash', 'source_hash', 'reasons', 'counterargument', 'source_quality', 'conflicts', 'risk_stance', 'critical_unknowns')) {
+    if ($m1Publication.properties.coordination.required -notcontains $required) {
+        throw "Installed M1 coordination schema is missing required field: $required."
+    }
+}
+$m1ReviewSchema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\narrative-review-m1-v1.schema.json') -Raw | ConvertFrom-Json
+if ($m1ReviewSchema.required -notcontains 'coordination_hash') {
+    throw 'Installed M1 review schema does not bind the coordination hash.'
 }
 $env:AI_TRADING_COMPANION_INSTALL_ROOT = $InstallRoot
 $env:PYTHONPATH = "$InstallRoot\runtime"

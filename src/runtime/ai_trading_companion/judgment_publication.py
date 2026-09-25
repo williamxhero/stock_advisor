@@ -143,13 +143,99 @@ def core_problems(core: dict, packet: dict) -> list[str]:
     return list(dict.fromkeys(problems))
 
 
-def model_sources(packet: dict) -> dict[str, dict]:
+M1_COORDINATION_VERSION = 1
+
+
+def m1_coordination(core: dict, packet: dict) -> dict:
+    """Project the M1 argument and its frozen provenance without scoring it."""
+    evidence = packet.get("evidence") or {}
+    sources = evidence_sources(packet)
+    reasons = [{key: row[key] for key in ("fact", "mechanism", "implication", "evidence_refs")}
+               for row in core["reasons"]]
+    counter = {key: core["counterargument"][key]
+               for key in ("claim", "why_not_base", "evidence_refs")}
+    positions = [{key: row[key] for key in ("symbol", "action", "reason", "evidence_refs")}
+                 for row in core["position_focus"]]
+    plan = [{key: row[key] for key in ("symbol", "status", "decision_reason", "counterargument",
+                                     "risk_cluster", "evidence_refs")}
+            for row in (core.get("opportunity_plan") or {}).get("candidates") or []]
+    conditions = copy.deepcopy(core["transition_conditions"])
+    followups = [{key: row[key] for key in ("symbol", "status", "reason", "evidence_refs")}
+                 for row in core.get("opportunity_followup") or []]
+    reviews = [{key: row[key] for key in ("symbol", "reason", "evidence_quality",
+                                        "process_assessment", "evidence_refs")}
+               for row in core.get("opportunity_review") or []]
+    conflicts = [{key: row.get(key) for key in ("claim", "competing_evidence_refs", "materiality", "resolution")}
+                 for row in evidence.get("conflicts") or []]
+    cited = set(ref for row in [*reasons, counter, *positions, *plan, *followups, *reviews]
+                for ref in row["evidence_refs"])
+    cited.update(ref for row in conditions if row.get("kind") == "event"
+                 for ref in row.get("evidence_refs") or [])
+    cited.update(ref for row in conflicts for ref in row["competing_evidence_refs"] or [])
+    source_quality = []
+    for ref in sorted(cited):
+        source = sources.get(ref, {})
+        qualification = source.get("evidence_qualification") or {}
+        spec = source.get("evidence_spec") or {}
+        source_quality.append({"evidence_ref": ref, "source_tier": source.get("source_tier"),
+                               "source_strength": source.get("source_strength"),
+                               "factual_status": source.get("factual_status"),
+                               "truth_status": spec.get("truth_status"),
+                               "market_propagation": source.get("market_propagation"),
+                               "fact_as_of": source.get("fact_as_of"),
+                               "known_at": source.get("known_at"),
+                               "published_at": source.get("published_at"),
+                               "qualification_state": qualification.get("state")})
+    return {
+        "version": M1_COORDINATION_VERSION,
+        "core_hash": canonical_packet_hash(core),
+        "source_hash": canonical_packet_hash({"sources": sources, "conflicts": evidence.get("conflicts") or [],
+                                              "critical_gaps": evidence.get("critical_gaps") or []}),
+        "reasons": reasons, "counterargument": counter, "source_quality": source_quality,
+        "conflicts": conflicts,
+        "risk_stance": {"direction": core["direction"], "confidence": core["confidence"],
+                        "current_action": core["current_action"], "action_reason": core["action_reason"],
+                        "portfolio_stance": core["portfolio_stance"], "position_focus": positions,
+                        "candidates": plan, "opportunity_followup": followups,
+                        "opportunity_review": reviews, "transition_conditions": conditions,
+                        "considered_evidence_refs": sorted(cited)},
+        "critical_unknowns": {"decision": core["critical_unknowns"],
+                              "evidence": evidence.get("critical_gaps") or []},
+    }
+
+
+def m1_coordination_problems(core: dict, packet: dict, coordination: dict | None) -> list[str]:
+    if not isinstance(coordination, dict):
+        return ["m1_coordination_missing"]
+    expected = m1_coordination(core, packet)
+    problems = []
+    if coordination != expected:
+        problems.append("m1_coordination_mismatch")
+    sources = evidence_sources(packet)
+    if any(row["evidence_ref"] not in sources for row in expected["source_quality"]):
+        problems.append("m1_coordination_unknown_evidence_reference")
+    unresolved = [row for row in expected["conflicts"]
+                  if row["materiality"] == "high" and row["resolution"] not in
+                  {"primary_precedence", "scope_difference", "resolved"}]
+    gaps = (expected["critical_unknowns"]["decision"] or expected["critical_unknowns"]["evidence"]
+            or unresolved)
+    stance = expected["risk_stance"]
+    adding_risk = (stance["current_action"] == "allow_add_risk"
+                   or any(row["action"] == "allow_add_risk" for row in stance["position_focus"])
+                   or any(row["status"] == "selected" for row in stance["candidates"]))
+    if gaps and (adding_risk or (stance["confidence"] == "high" and stance["direction"] != "neutral")):
+        problems.append("m1_coordination_unresolved_risk")
+    return problems
+
+
+def model_sources(packet: dict, *, required_refs: set[str] | None = None) -> dict[str, dict]:
     """Bound the model projection while the immutable evidence ledger remains lossless."""
     sources = evidence_sources(packet)
     if not sources:
         return {}
     relevant_refs = _premarket_decision_source_refs(packet)
     if relevant_refs:
+        relevant_refs.update(required_refs or set())
         relevant_sources = {ref: row for ref, row in sources.items() if ref in relevant_refs}
         if relevant_sources:
             sources = relevant_sources
@@ -162,7 +248,7 @@ def model_sources(packet: dict) -> dict[str, dict]:
             str(row.get("fact_as_of") or ""),
             str(row.get("source_identity") or ""),
         )
-        if identity in seen_content:
+        if identity in seen_content and ref not in (required_refs or set()):
             continue
         seen_content.add(identity)
         unique_sources[ref] = row
@@ -170,10 +256,24 @@ def model_sources(packet: dict) -> dict[str, dict]:
     excerpt_limit = min(200, max(120, 4_000 // len(sources)))
     useful_fields = (
         "evidence_ref", "title", "excerpt", "fact_as_of", "source_identity",
+        "source_tier", "source_strength", "factual_status", "market_propagation",
+        "published_at", "known_at",
     )
     projected: dict[str, dict] = {}
     for ref, row in sources.items():
         item = {key: value for key in useful_fields if (value := row.get(key)) not in (None, "", [], {})}
+        qualification = row.get("evidence_qualification")
+        if isinstance(qualification, dict):
+            item["evidence_qualification"] = {
+                key: qualification[key] for key in ("qualification_id", "state", "permitted_use", "as_of")
+                if key in qualification
+            }
+        spec = row.get("evidence_spec")
+        if isinstance(spec, dict):
+            item["evidence_spec"] = {
+                key: spec[key] for key in ("record_id", "truth_status", "occurred_at", "known_at")
+                if key in spec
+            }
         item["evidence_ref"] = ref
         item["excerpt"] = _bounded_model_text(row.get("excerpt"), excerpt_limit)
         projected[ref] = item
@@ -433,9 +533,10 @@ def _render_opportunity_core(core: dict) -> str:
     return "\n\n".join(paragraphs)
 
 
-def review_passed(review: dict, core_hash: str, draft_hash: str) -> bool:
+def review_passed(review: dict, core_hash: str, draft_hash: str, coordination_hash: str | None = None) -> bool:
     scores = review.get("scores") or {}
     return (review.get("core_hash") == core_hash and review.get("draft_hash") == draft_hash
+            and (coordination_hash is None or review.get("coordination_hash") == coordination_hash)
             and review.get("grounded") is True and review.get("faithful") is True
             and not review.get("problems")
             and all(type(scores.get(key)) is int and scores[key] >= 2 for key in
@@ -450,20 +551,38 @@ def publication_problems(output: dict, packet: dict) -> list[str]:
         (RuntimePaths.discover().contracts / (name + ".schema.json")).read_text(encoding="utf-8")
     ))
     if not _validate_schema(output, schema)["passed"]:
-        return ["publication_invalid_schema"]
+        problems = ["publication_invalid_schema"]
+        audit_value = output.get("publication")
+        if output.get("result_version") == 5 and (
+            not isinstance(audit_value, dict) or not isinstance(audit_value.get("coordination"), dict)
+        ):
+            problems.append("m1_coordination_missing")
+        return problems
     digest = canonical_packet_hash(core)
     audit = output.get("publication") or {}
     problems = core_problems(core, packet)
     if audit.get("core_hash") != digest:
         problems.append("publication_core_hash_mismatch")
+    coordination_hash = None
+    if output.get("result_version") == 5:
+        coordination = audit.get("coordination")
+        problems.extend(m1_coordination_problems(core, packet, coordination))
+        if isinstance(coordination, dict):
+            coordination_hash = canonical_packet_hash(coordination)
+            if audit.get("coordination_hash") != coordination_hash:
+                problems.append("publication_coordination_hash_mismatch")
+        else:
+            problems.append("publication_coordination_hash_mismatch")
     baseline = render_core(core) if core else ""
-    if not review_passed(audit.get("core_review") or {}, digest, canonical_packet_hash({"text": baseline})):
+    if not review_passed(audit.get("core_review") or {}, digest, canonical_packet_hash({"text": baseline}),
+                         coordination_hash if output.get("result_version") == 5 else None):
         problems.append("publication_core_not_reviewed")
     text = str(output.get("narrative") or "")
     if audit.get("fallback"):
         if text != baseline:
             problems.append("publication_fallback_changed_core")
-    elif not review_passed(audit.get("narrative_review") or {}, digest, canonical_packet_hash({"text": text})):
+    elif not review_passed(audit.get("narrative_review") or {}, digest, canonical_packet_hash({"text": text}),
+                           coordination_hash if output.get("result_version") == 5 else None):
         problems.append("publication_narrative_not_reviewed")
     return problems
 
@@ -504,6 +623,11 @@ REVIEW_INSTRUCTION = """独立审查交易判断和正文，返回 narrative-rev
 有证据基础的合理机制推断不要求被来源直接证明因果；若整体语义已经明确“更可能、倾向、假设”等不确定性，不因某个连接词要求再加一层套话。
 problems 只记录必须阻止发布的事实失真、逻辑不成立、风险或忠实性缺陷，以及低于合格分的质量缺陷；纯润色建议写 suggestions，不得混入 problems。
 若 grounded/faithful 均为真、各质量项达到2且 broadcast_risk 不超过1，不应再因可选润色拒绝。不要为了填 problems 而降低原本合格的评分。"""
+
+M1_REVIEW_INSTRUCTION = """M1 coordination 是内审记录，复制 coordination_hash；逐项核对命题和事实引用的原始证据、来源质量与时效、证据一致性和未决冲突，
+评估最强反证能否动摇基准判断、风险与账户动作、关键未知是否限制置信度。不依据角色权威、多数票、文本长度或自信语气裁决。
+证据不足可以是中性或低置信度判断；关键缺口未闭合时不能通过高置信度方向判断或新增风险。
+历史回放的 known_at 是采集或 MemoryHub 回执时钟，可以晚于冻结事实时点；未来信息判断以 fact_as_of 与 published_at 为准。"""
 
 
 CORE_EVENT_INSTRUCTION = (
@@ -548,8 +672,9 @@ class JudgmentPublicationPipeline:
             check = _validate_schema(result, schema)
             if not check["passed"]:
                 raise BrokerError("publication schema invalid", verifier=check)
-            if schema_name == "narrative-review-v1":
-                check = {"passed": review_passed(result, packet["core_hash"], packet["draft_hash"]),
+            if schema_name in {"narrative-review-v1", "narrative-review-m1-v1"}:
+                check = {"passed": review_passed(result, packet["core_hash"], packet["draft_hash"],
+                                                  packet.get("coordination_hash")),
                          "schema": check, "problems": result["problems"], "scores": result["scores"]}
             self.store.finish_attempt(attempt["attempt_id"], "succeeded" if check["passed"] else "rejected", output=result,
                                       verifier=check, usage=response.usage,
@@ -586,7 +711,7 @@ class JudgmentPublicationPipeline:
         periodic = str(base.get("task_key") or "").startswith("periodic.")
         context["memories"] = model_memories(base.get("memories", []), include_published_ai=periodic)
         # Reuse only a reviewed core under exactly the same input and policy version.
-        checkpoint_packet = {"packet": base, "pipeline_version": 1, "intellect": self.intellect,
+        checkpoint_packet = {"packet": base, "pipeline_version": 2 if prefix == "m1" else 1, "intellect": self.intellect,
                              "effort": self.effort, "is_shadow": self.is_shadow,
                              "policy_hash": canonical_packet_hash({"core": CORE_INSTRUCTION,
                                                                     "repair": CORE_REPAIR_INSTRUCTION,
@@ -595,7 +720,10 @@ class JudgmentPublicationPipeline:
                                                                     "opportunity_instruction": PLAN_INSTRUCTION,
                                                                     "followup_instruction": FOLLOWUP_INSTRUCTION,
                                                                     "review_result_instruction": REVIEW_RESULT_INSTRUCTION,
-                                                                    "context_projection_version": 3})}
+                                                                    "context_projection_version": 3,
+                                                                    **({"coordination_version": M1_COORDINATION_VERSION,
+                                                                        "coordination_review": M1_REVIEW_INSTRUCTION}
+                                                                       if prefix == "m1" else {})})}
         checkpoint_key = canonical_packet_hash(checkpoint_packet)
         saved = self.store.stage_checkpoint(cycle["cycle_id"], prefix + "_core", checkpoint_key)
         feedback: list[str] = list(_feedback or [])
@@ -634,13 +762,23 @@ class JudgmentPublicationPipeline:
                     if core_hash in revoked:
                         feedback = list(dict.fromkeys([*feedback, *revoked[core_hash]]))
                         continue
+                    coordination = m1_coordination(core, base) if prefix == "m1" else None
+                    if prefix == "m1":
+                        problems = m1_coordination_problems(core, base, coordination)
+                        if problems:
+                            feedback = list(dict.fromkeys([*feedback, *problems]))
+                            continue
+                    coordination_hash = canonical_packet_hash(coordination) if coordination is not None else None
                     text = render_core(core)
-                    review, review_id = self._review(prefix, cycle, core, text, base, deadline)
-                    if not review_passed(review, core_hash, canonical_packet_hash({"text": text})):
+                    review, review_id = self._review(prefix, cycle, core, text, base, deadline,
+                                                     coordination=coordination)
+                    if not review_passed(review, core_hash, canonical_packet_hash({"text": text}), coordination_hash):
                         feedback = list(dict.fromkeys([*feedback, *(review.get("problems") or ["core quality rubric below threshold"])]))
                         continue
                     audit = {"core_hash": core_hash, "core_attempt_id": core_id,
                              "core_review_attempt_id": review_id, "core_review": review}
+                    if coordination is not None:
+                        audit.update(coordination=coordination, coordination_hash=coordination_hash)
                     sealed = {"core": core, "audit": audit}
                     seal_attempt = self.store.begin_attempt(
                         cycle["cycle_id"], prefix + "_core", datetime.now(timezone.utc).isoformat(),
@@ -661,10 +799,32 @@ class JudgmentPublicationPipeline:
                 raise JudgmentUnavailable("no qualified decision core: " + "; ".join(feedback), last_error)
         frozen_hash = canonical_packet_hash(core)
         baseline = render_core(core)
+        coordination = audit.get("coordination") if prefix == "m1" else None
+        coordination_hash = canonical_packet_hash(coordination) if isinstance(coordination, dict) else None
         if audit.get("core_hash") != frozen_hash or core_problems(core, base) or not review_passed(
             audit.get("core_review") or {}, frozen_hash, canonical_packet_hash({"text": baseline}),
-        ):
+            coordination_hash,
+        ) or (prefix == "m1" and (
+            m1_coordination_problems(core, base, coordination)
+            or audit.get("coordination_hash") != coordination_hash
+        )):
             raise JudgmentUnavailable("saved core failed integrity/qualification checks")
+        if prefix == "m1":
+            try:
+                receipt = self.store.verified_attempt(audit["core_review_attempt_id"], cycle["cycle_id"],
+                                                      "m1_review", None)
+                receipt_packet = json.loads(receipt["input_packet_json"])
+                recorded_hash = receipt_packet.pop("sha256")
+                if (recorded_hash != receipt["input_sha256"]
+                        or canonical_packet_hash(receipt_packet) != recorded_hash
+                        or receipt_packet.get("coordination") != coordination
+                        or receipt_packet.get("coordination_hash") != coordination_hash
+                        or receipt_packet.get("core_hash") != frozen_hash
+                        or receipt_packet.get("draft_hash") != canonical_packet_hash({"text": baseline})
+                        or json.loads(receipt["output_json"]) != audit["core_review"]):
+                    raise ValueError("core review receipt does not match the frozen decision")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise JudgmentUnavailable("saved core review receipt failed integrity/qualification checks") from exc
         narrative = baseline
         audit = {**audit, "fallback": True}
         feedback = []
@@ -682,8 +842,9 @@ class JudgmentPublicationPipeline:
                     feedback = ["expression core hash mismatch"]
                     continue
                 candidate = "\n\n".join(draft["paragraphs"])
-                review, review_id = self._review(prefix, cycle, core, candidate, base, deadline)
-                if not review_passed(review, frozen_hash, canonical_packet_hash({"text": candidate})):
+                review, review_id = self._review(prefix, cycle, core, candidate, base, deadline,
+                                                 coordination=coordination)
+                if not review_passed(review, frozen_hash, canonical_packet_hash({"text": candidate}), coordination_hash):
                     feedback = list(dict.fromkeys([*feedback, *(review.get("problems") or ["narrative rubric below threshold"])]))
                     if review.get("faithful") is True and review.get("grounded") is False:
                         # The prose faithfully exposed a defect in the core. Never recover it.
@@ -702,18 +863,25 @@ class JudgmentPublicationPipeline:
         return {"result_version": 5 if prefix == "m1" else 4, "decision_core": core,
                 "narrative": narrative, "publication": audit}
 
-    def _review(self, prefix: str, cycle: dict, core: dict, text: str, packet: dict, deadline: float) -> tuple[dict, str]:
+    def _review(self, prefix: str, cycle: dict, core: dict, text: str, packet: dict, deadline: float,
+                *, coordination: dict | None = None) -> tuple[dict, str]:
+        required_refs = ({row["evidence_ref"] for row in coordination["source_quality"]}
+                         if coordination is not None else None)
         return self._call(prefix + "_review", cycle, {
             "instruction": REVIEW_INSTRUCTION + ("\n" + PLAN_INSTRUCTION if is_premarket(packet) or core.get("opportunity_plan") else "")
             + ("\n" + FOLLOWUP_INSTRUCTION if packet.get("prior_opportunity_plans") else "")
-            + ("\n" + REVIEW_RESULT_INSTRUCTION if packet.get("task_key") == "daily.review.1520" else ""),
+            + ("\n" + REVIEW_RESULT_INSTRUCTION if packet.get("task_key") == "daily.review.1520" else "")
+            + ("\n" + M1_REVIEW_INSTRUCTION if prefix == "m1" else ""),
             "core": core, "text": text,
             "core_hash": canonical_packet_hash(core), "draft_hash": canonical_packet_hash({"text": text}),
-            "evidence": model_sources(packet), "business_context": model_business_context(packet),
+            **({"coordination": coordination, "coordination_hash": canonical_packet_hash(coordination)}
+               if coordination is not None else {}),
+            "evidence": model_sources(packet, required_refs=required_refs),
+            "business_context": model_business_context(packet),
             "protocol": packet.get("protocol"), "as_of": packet.get("as_of"),
             "risk_doctrine": packet.get("risk_doctrine"),
             "prior_opportunity_plans": packet.get("prior_opportunity_plans") or [],
             "prior_opportunity_followups": packet.get("prior_opportunity_followups") or [],
             "prior_judgments": [a for a in packet.get("artifacts", [])
                                 if prefix == "m2" and a.get("kind") in {"m0", "h0", "m1"}],
-        }, "narrative-review-v1", deadline)
+        }, "narrative-review-m1-v1" if prefix == "m1" else "narrative-review-v1", deadline)

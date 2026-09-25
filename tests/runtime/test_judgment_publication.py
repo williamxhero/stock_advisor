@@ -6,13 +6,16 @@ import time
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from ai_trading_companion.broker_client import BrokerResponse, _validate_schema, canonical_packet_hash
 from ai_trading_companion.judgment_publication import (
-    JudgmentPublicationPipeline, JudgmentUnavailable, core_problems, model_business_context,
-    model_evidence, render_core,
+    JudgmentPublicationPipeline, JudgmentUnavailable, core_problems, m1_coordination,
+    m1_coordination_problems, model_business_context, model_evidence, model_sources,
+    publication_problems, render_core,
 )
 from ai_trading_companion.router import CognitiveRouter
+from ai_trading_companion.packet_builder import RuntimePacketBuilder
 from ai_trading_companion.stage_expression import normalize_stage_output
 from ai_trading_companion.store import CompanionStore
 
@@ -70,6 +73,8 @@ class Broker:
                       "grounded": not core_rejected, "faithful": not (self.reject_draft and expressed),
                       "scores": dict(specificity=2, causality=2, counterargument=2, portfolio=2, naturalness=2, broadcast_risk=0),
                       "problems": ["unsupported assertion"] if reject else [], "suggestions": []}
+            if "coordination_hash" in request.packet:
+                result["coordination_hash"] = request.packet["coordination_hash"]
         return BrokerResponse("", result, "test", "test", "expert", "expert", "test-id")
 
 
@@ -95,6 +100,49 @@ def test_published_output_preserves_real_decision_and_account_focus(tmp_path, fa
     assert normalized.snapshot["confidence"] == "medium"
     assert all(request.h0_forbidden for request in broker.calls)
     assert {a["stage"] for a in store.attempts(cycle["cycle_id"])} >= {"m1_reasoning", "m1_expression", "m1_review"}
+
+
+def test_m1_preserves_late_receipt_without_admitting_future_facts():
+    frozen = RuntimePacketBuilder._validated_m1_evidence({
+        "sources": [{
+            "evidence_ref": "historical", "fact_as_of": "2026-09-06T10:21:31Z",
+            "known_at": "2026-09-06T10:22:00Z",
+        }],
+    }, "2026-09-06T10:21:31Z")
+    assert frozen["sources"][0]["known_at"] == "2026-09-06T10:22:00Z"
+    with pytest.raises(ValueError, match="future evidence"):
+        RuntimePacketBuilder._validated_m1_evidence({
+            "sources": [{"evidence_ref": "future", "fact_as_of": "2026-09-06T10:22:00Z"}],
+        }, "2026-09-06T10:21:31Z")
+
+
+def test_m1_review_receives_frozen_source_quality_and_timeliness(tmp_path):
+    frozen = packet()
+    frozen["evidence"] = RuntimePacketBuilder._validated_m1_evidence({
+        "as_of": "2026-09-06T10:21:31Z",
+        "sources": [{
+            "evidence_ref": "ev_market", "excerpt": "成交放大15.50%但下跌家数占优；力星弱于指数；局部反弹",
+            "fact_as_of": "2026-09-06T10:00:00Z", "known_at": "2026-09-06T10:10:00Z",
+            "source_tier": "primary_market", "source_strength": "strong",
+            "factual_status": "verified", "market_propagation": {"status": "observed"},
+            "evidence_qualification": {"qualification_id": "q1", "state": "qualified", "permitted_use": "external_fact"},
+            "evidence_spec": {"record_id": "r1", "truth_status": "verified"},
+        }],
+    }, "2026-09-06T10:21:31Z")
+    broker = Broker(fail_expression=True)
+    pipeline, _, cycle = runtime(tmp_path, broker)
+    output = pipeline.produce("m1_judgment", cycle, frozen, time.monotonic() + 60)
+    review_packet = next(request.packet for request in broker.calls if request.stage == "m1_review")
+    source = review_packet["evidence"]["ev_market"]
+    assert source["source_tier"] == "primary_market"
+    assert source["known_at"] == "2026-09-06T10:10:00Z"
+    assert source["evidence_qualification"]["state"] == "qualified"
+    assert source["evidence_spec"]["truth_status"] == "verified"
+    quality = output["publication"]["coordination"]["source_quality"][0]
+    assert quality["source_tier"] == "primary_market"
+    assert quality["qualification_state"] == "qualified"
+    assert quality["fact_as_of"] == "2026-09-06T10:00:00Z"
+    assert quality["known_at"] == "2026-09-06T10:10:00Z"
 
 
 def test_rejected_drafts_reuse_reviewed_core_and_restart_checkpoint(tmp_path):
@@ -316,6 +364,229 @@ def test_m2_uses_frozen_evidence_and_shared_pipeline(tmp_path):
     assert CognitiveRouter().verify("m2", packet(), output)["passed"]
     assert normalize_stage_output("m2", output).snapshot["position_focus"]
     assert not any(r.h0_forbidden for r in broker.calls)
+    assert "coordination" not in output["publication"]
+    assert all("coordination_hash" not in r.packet for r in broker.calls if r.stage == "m2_review")
+
+
+def test_m1_schemas_require_bounded_coordination_and_review_hash(tmp_path):
+    pipeline, _, cycle = runtime(tmp_path, Broker(fail_expression=True))
+    output = pipeline.produce("m1_judgment", cycle, packet(), time.monotonic() + 60)
+    result_schema = json.loads((SCHEMAS / "companion-m1-result-v5.schema.json").read_text(encoding="utf-8"))
+    result_validator = Draft202012Validator(result_schema)
+    assert not list(result_validator.iter_errors(output))
+    missing = copy.deepcopy(output)
+    del missing["publication"]["coordination"]
+    assert list(result_validator.iter_errors(missing))
+    unbounded = copy.deepcopy(output)
+    unbounded["publication"]["coordination"] = {"version": 1}
+    assert list(result_validator.iter_errors(unbounded))
+
+    m1_review = output["publication"]["core_review"]
+    review_schema = json.loads((SCHEMAS / "narrative-review-m1-v1.schema.json").read_text(encoding="utf-8"))
+    review_validator = Draft202012Validator(review_schema)
+    assert not list(review_validator.iter_errors(m1_review))
+    missing_hash = copy.deepcopy(m1_review)
+    del missing_hash["coordination_hash"]
+    assert list(review_validator.iter_errors(missing_hash))
+    shared_schema = json.loads((SCHEMAS / "narrative-review-v1.schema.json").read_text(encoding="utf-8"))
+    assert "coordination_hash" not in shared_schema["required"]
+
+
+def test_m1_coordination_traces_arguments_conflicts_and_risk_without_voting(tmp_path):
+    frozen = packet()
+    frozen["evidence"]["sources"][0].update(source_tier="secondary", factual_status="verified",
+                                              fact_as_of="2026-09-06T10:00:00Z")
+    frozen["evidence"]["sources"].append({"evidence_ref": "ev_counter", "excerpt": "局部股票反弹",
+                                           "source_tier": "primary_document"})
+    frozen["evidence"]["conflicts"] = [{"claim": "行情是否扩散", "competing_evidence_refs": ["ev_market", "ev_counter"],
+                                        "materiality": "high", "resolution": "unresolved_equal_tier"}]
+    frozen["role_votes"] = ["bullish"] * 10
+    decision = core()
+    decision["counterargument"]["evidence_refs"] = ["ev_counter"]
+
+    class CoordinatingBroker(Broker):
+        def invoke(self, request):
+            response = super().invoke(request)
+            if request.stage == "m1_reasoning":
+                response.result.update(copy.deepcopy(decision))
+            return response
+
+    broker = CoordinatingBroker(fail_expression=True)
+    pipeline, store, cycle = runtime(tmp_path, broker)
+    output = pipeline.produce("m1_judgment", cycle, frozen, time.monotonic() + 60)
+    coordination = output["publication"]["coordination"]
+    assert coordination["version"] == 1
+    assert coordination["core_hash"] == canonical_packet_hash(decision)
+    assert coordination["reasons"][0]["evidence_refs"] == ["ev_market"]
+    assert coordination["counterargument"]["evidence_refs"] == ["ev_counter"]
+    assert coordination["risk_stance"]["position_focus"][0]["action"] == "reduce_risk"
+    assert coordination["conflicts"][0]["competing_evidence_refs"] == ["ev_market", "ev_counter"]
+    assert {row["evidence_ref"] for row in coordination["source_quality"]} == {"ev_market", "ev_counter"}
+    assert next(row for row in coordination["source_quality"] if row["evidence_ref"] == "ev_market")["factual_status"] == "verified"
+    directional = copy.deepcopy(decision)
+    directional.update(direction="bullish", confidence="high")
+    assert "m1_coordination_unresolved_risk" in m1_coordination_problems(
+        directional, frozen, m1_coordination(directional, frozen))
+    without_votes = copy.deepcopy(frozen)
+    without_votes.pop("role_votes")
+    assert m1_coordination(decision, frozen) == m1_coordination(decision, without_votes)
+    assert "votes" not in json.dumps(coordination)
+    review = next(r for r in broker.calls if r.stage == "m1_review")
+    assert review.packet["coordination"] == coordination
+    assert review.packet["coordination_hash"] == output["publication"]["coordination_hash"]
+    assert "不依据角色权威、多数票" in review.packet["instruction"]
+    assert store.stage_checkpoint(cycle["cycle_id"], "m1_core", next(
+        a["input_sha256"] for a in store.attempts(cycle["cycle_id"]) if a["stage"] == "m1_core"
+    ))["output"]["audit"]["coordination"] == coordination
+    assert not publication_problems(output, frozen)
+
+
+def test_m1_missing_or_forged_evidence_refs_block_review_and_publication(tmp_path):
+    frozen = packet()
+    frozen["evidence"]["conflicts"] = [{"claim": "冲突", "competing_evidence_refs": ["ev_market", "forged"],
+                                        "materiality": "high"}]
+    broker = Broker()
+    pipeline, _, cycle = runtime(tmp_path, broker)
+    with pytest.raises(JudgmentUnavailable, match="m1_coordination_unknown_evidence_reference"):
+        pipeline.produce("m1_judgment", cycle, frozen, time.monotonic() + 60)
+    assert not any(request.stage == "m1_review" for request in broker.calls)
+
+    clean = packet()
+    clean_dir = tmp_path / "clean"
+    clean_dir.mkdir()
+    pipeline, _, cycle = runtime(clean_dir, Broker(fail_expression=True))
+    output = pipeline.produce("m1_judgment", cycle, clean, time.monotonic() + 60)
+    altered = copy.deepcopy(output)
+    altered["publication"]["coordination"]["reasons"][0]["evidence_refs"] = ["forged"]
+    altered["publication"]["coordination_hash"] = canonical_packet_hash(altered["publication"]["coordination"])
+    assert "m1_coordination_mismatch" in publication_problems(altered, clean)
+    changed_source = copy.deepcopy(clean)
+    changed_source["evidence"]["sources"][0]["excerpt"] = "new source body"
+    assert "m1_coordination_mismatch" in publication_problems(output, changed_source)
+
+
+def test_m1_event_condition_reference_is_checked_against_frozen_sources(tmp_path):
+    decision = core()
+    decision["transition_conditions"][0] = {"outcome": "upgrade", "kind": "event",
+                                             "event": "订单确认", "evidence_refs": ["forged"]}
+    assert "m1_coordination_unknown_evidence_reference" in m1_coordination_problems(
+        decision, packet(), m1_coordination(decision, packet()))
+
+
+@pytest.mark.parametrize("direction,confidence,action,accepted", [
+    ("neutral", "medium", "observe", True),
+    ("bullish", "low", "observe", True),
+    ("bullish", "high", "observe", False),
+    ("neutral", "low", "allow_add_risk", False),
+])
+def test_m1_critical_unknown_limits_directional_confidence_and_risk(tmp_path, direction, confidence, action, accepted):
+    frozen = packet()
+    frozen["evidence"]["critical_gaps"] = ["订单兑现未核实"]
+    decision = core()
+    decision.update(direction=direction, confidence=confidence, current_action=action,
+                    critical_unknowns=["订单兑现若被否定需调整情景"])
+
+    class GapBroker(Broker):
+        def invoke(self, request):
+            response = super().invoke(request)
+            if request.stage == "m1_reasoning":
+                response.result.update(copy.deepcopy(decision))
+            return response
+
+    broker = GapBroker(fail_expression=True)
+    pipeline, _, cycle = runtime(tmp_path, broker)
+    if accepted:
+        output = pipeline.produce("m1_judgment", cycle, frozen, time.monotonic() + 60)
+        assert output["publication"]["coordination"]["critical_unknowns"]["evidence"] == ["订单兑现未核实"]
+        assert not publication_problems(output, frozen)
+    else:
+        with pytest.raises(JudgmentUnavailable, match="m1_coordination_unresolved_risk"):
+            pipeline.produce("m1_judgment", cycle, frozen, time.monotonic() + 60)
+        assert not any(request.stage == "m1_review" for request in broker.calls)
+
+
+def test_m1_saved_core_and_tampered_receipt_cannot_bypass_coordination(tmp_path):
+    pipeline, store, cycle = runtime(tmp_path, Broker(fail_expression=True))
+    output = pipeline.produce("m1_judgment", cycle, packet(), time.monotonic() + 60)
+    altered = copy.deepcopy(output)
+    altered["publication"]["core_review"]["coordination_hash"] = "forged"
+    assert "publication_core_not_reviewed" in publication_problems(altered, packet())
+    altered = copy.deepcopy(output)
+    del altered["publication"]["coordination"]
+    assert "m1_coordination_missing" in publication_problems(altered, packet())
+
+    with store.connection() as connection:
+        row = connection.execute("SELECT output_json FROM stage_checkpoint WHERE cycle_id=? AND stage=?",
+                                 (cycle["cycle_id"], "m1_core")).fetchone()
+        sealed = json.loads(row["output_json"])
+        sealed["audit"]["core_review"]["coordination_hash"] = "forged"
+        connection.execute("UPDATE stage_checkpoint SET output_json=? WHERE cycle_id=? AND stage=?",
+                           (json.dumps(sealed), cycle["cycle_id"], "m1_core"))
+    restarted = JudgmentPublicationPipeline(Broker(), store, SCHEMAS, intellect="expert", effort="medium")
+    with pytest.raises(JudgmentUnavailable, match="integrity/qualification"):
+        restarted.produce("m1_judgment", cycle, packet(), time.monotonic() + 60)
+
+
+def test_m1_saved_checkpoint_rejects_qualified_looking_forged_review(tmp_path):
+    pipeline, store, cycle = runtime(tmp_path, Broker(fail_expression=True))
+    pipeline.produce("m1_judgment", cycle, packet(), time.monotonic() + 60)
+    with store.connection() as connection:
+        row = connection.execute("SELECT output_json FROM stage_checkpoint WHERE cycle_id=? AND stage=?",
+                                 (cycle["cycle_id"], "m1_core")).fetchone()
+        sealed = json.loads(row["output_json"])
+        sealed["audit"]["core_review"]["scores"]["specificity"] = 3
+        connection.execute("UPDATE stage_checkpoint SET output_json=? WHERE cycle_id=? AND stage=?",
+                           (json.dumps(sealed), cycle["cycle_id"], "m1_core"))
+    restarted = JudgmentPublicationPipeline(Broker(), store, SCHEMAS, intellect="expert", effort="medium")
+    with pytest.raises(JudgmentUnavailable, match="core review receipt failed"):
+        restarted.produce("m1_judgment", cycle, packet(), time.monotonic() + 60)
+
+
+def test_m1_review_keeps_cited_event_sources_outside_premarket_projection(tmp_path):
+    frozen = packet()
+    frozen.update(task_key="daily.opportunity.0900", task_profile={})
+    frozen["evidence"]["sources"].append({"evidence_ref": "ev_event", "excerpt": "重大事件已获确认"})
+    frozen["evidence"]["coverage"] = [
+        {"requirement_key": "current_market_state", "status": "covered", "evidence_refs": ["ev_market"]},
+    ]
+    decision = core()
+    decision["reasons"][0]["evidence_refs"].append("ev_event")
+    assert set(model_sources(frozen)) == {"ev_market"}
+    coordination = m1_coordination(decision, frozen)
+    assert "ev_event" in coordination["risk_stance"]["considered_evidence_refs"]
+    broker = Broker()
+    pipeline, _, cycle = runtime(tmp_path, broker)
+    pipeline._review("m1", cycle, decision, render_core(decision), frozen, time.monotonic() + 60,
+                     coordination=coordination)
+    review = broker.calls[-1]
+    assert "ev_event" in review.packet["evidence"]
+    assert "重大事件" in review.packet["evidence"]["ev_event"]["excerpt"]
+
+
+def test_m1_legacy_checkpoint_policy_cannot_be_reused(tmp_path):
+    pipeline, store, cycle = runtime(tmp_path, Broker(fail_expression=True))
+    output = pipeline.produce("m1_judgment", cycle, packet(), time.monotonic() + 60)
+    seal = next(a for a in store.attempts(cycle["cycle_id"]) if a["stage"] == "m1_core")
+    checkpoint_packet = json.loads(seal["input_packet_json"])
+    checkpoint_packet.pop("sha256")
+    assert checkpoint_packet["pipeline_version"] == 2
+    checkpoint_packet["pipeline_version"] = 1
+    legacy_hash = canonical_packet_hash(checkpoint_packet)
+    legacy_cycle = store.create_cycle("manual.non_trading_outlook", "2026-09-06T10:22:31Z", "2026-09-06T10:22:31Z")
+    legacy_output = {"core": output["decision_core"], "audit": copy.deepcopy(output["publication"])}
+    legacy_output["audit"].pop("coordination")
+    legacy_output["audit"].pop("coordination_hash")
+    attempt = store.begin_attempt(legacy_cycle["cycle_id"], "m1_core", "2026-09-06T10:22:31Z", legacy_hash,
+                                  input_packet={**checkpoint_packet, "sha256": legacy_hash})
+    store.finish_attempt(attempt["attempt_id"], "succeeded", output=legacy_output,
+                         verifier={"passed": True})
+    store.save_stage_checkpoint(legacy_cycle["cycle_id"], "m1_core", legacy_hash, attempt["attempt_id"], legacy_output)
+
+    broker = Broker(fail_expression=True)
+    restarted = JudgmentPublicationPipeline(broker, store, SCHEMAS, intellect="expert", effort="medium")
+    recovered = restarted.produce("m1_judgment", legacy_cycle, packet(), time.monotonic() + 60)
+    assert any(request.stage == "m1_reasoning" for request in broker.calls)
+    assert recovered["publication"]["coordination"]["version"] == 1
 
 
 def test_expired_expression_deadline_recovers_without_new_broker_call(tmp_path):

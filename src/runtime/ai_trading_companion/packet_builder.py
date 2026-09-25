@@ -8,7 +8,6 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .learning import WorkflowEvolution
-from .agent_role import attach_runtime_qualification
 from .memory_port import MemoryPort, MemoryUnavailable
 from .secret_guard import assert_safe
 from .evidence_contract import EvidenceContractFactory
@@ -72,19 +71,6 @@ class RuntimePacketBuilder:
             "scheduled_for": cycle["scheduled_for"],
             "calendar_context": self._calendar_context(cycle["scheduled_for"]),
         }
-        baseline = (
-            cycle.get("spec95_baseline")
-            or (evidence or {}).get("spec95_baseline")
-            or (context or {}).get("spec95_baseline")
-        )
-        if baseline is not None:
-            packet["spec95_baseline"] = baseline
-        # Qualification is owned by the runtime packet producer, so normal
-        # M0/M1 evidence packets carry the coordinator prerequisites before
-        # their hash is frozen or any provider work is considered.  Replayed
-        # or externally supplied packets still receive no implicit approval.
-        if stage in {"m0_research", "m1_research"}:
-            packet = attach_runtime_qualification(packet)
         if cycle.get("task_profile_json"):
             packet["task_profile"] = json.loads(cycle["task_profile_json"])
         memory_cards = self._memory_cards(cycle, stage, packet_as_of, evidence)
@@ -721,11 +707,29 @@ class RuntimePacketBuilder:
         cls._reject_future_evidence(evidence, packet_as_of)
         sources = public.get("sources")
         if isinstance(sources, list):
-            source_allowed = {"evidence_ref", "excerpt", "analysis"}
-            public["sources"] = [
-                {key: value for key, value in source.items() if key in source_allowed}
-                for source in sources if isinstance(source, dict)
-            ]
+            source_allowed = {
+                "evidence_ref", "title", "excerpt", "analysis", "source_identity",
+                "source_tier", "source_strength", "factual_status", "fact_as_of",
+                "published_at", "known_at", "market_propagation",
+            }
+            public["sources"] = []
+            for source in sources:
+                if not isinstance(source, dict):
+                    continue
+                projected = {key: value for key, value in source.items() if key in source_allowed}
+                qualification = source.get("evidence_qualification")
+                if isinstance(qualification, dict):
+                    projected["evidence_qualification"] = {
+                        key: qualification[key] for key in ("qualification_id", "state", "permitted_use", "as_of")
+                        if key in qualification
+                    }
+                spec = source.get("evidence_spec")
+                if isinstance(spec, dict):
+                    projected["evidence_spec"] = {
+                        key: spec[key] for key in ("record_id", "truth_status", "occurred_at", "known_at")
+                        if key in spec
+                    }
+                public["sources"].append(projected)
         return public
 
     @staticmethod

@@ -296,12 +296,6 @@ def resolve_stage_controls(
     return runtime_strategy.controls(stage, timeout_seconds=timeout, search=search, task_key=task_key)
 
 
-_COORDINATOR_GATED_STAGES = frozenset({
-    "m0_research", "m0_compose", "m1_research", "m1_judgment", "m2",
-    "outcome_research", "chat_research",
-})
-
-
 def finalize_stage_packet(packet: dict[str, Any], controls: RuntimeStrategyControls) -> dict[str, Any]:
     """Bind runtime controls before deriving the sole hash for a stage invocation.
 
@@ -325,7 +319,7 @@ def finalize_stage_packet(packet: dict[str, Any], controls: RuntimeStrategyContr
         "revisions": list(controls.revisions),
     }
     final_packet["allowed_research_backends"] = list(controls.enabled_backends)
-    if final_packet.get("stage") in _COORDINATOR_GATED_STAGES:
+    if "spec_issue_states" in final_packet or "spec_evidence_gates" in final_packet:
         baseline = load_authoritative_spec95_baseline(PATHS.runtime)
         final_packet["spec95_baseline_sha256"] = (
             coordinator_sha256(baseline) if baseline is not None else None
@@ -905,12 +899,13 @@ def _call_stage(
     coordinator_claim_finished = True
     coordinator_gate_required = (
         coordinator_gate is True
-        or bool(packet.get("agent_role_inputs"))
         or "spec_issue_states" in packet
         or "spec_evidence_gates" in packet
     )
-    coordinator_dependency_states = spec95_dependency_states(
-        packet.get("spec_issue_states"), packet.get("spec_evidence_gates")
+    coordinator_graph = SPEC95_DEPENDENCY_GRAPH if coordinator_gate_required else {"coordinator": []}
+    coordinator_dependency_states = (
+        spec95_dependency_states(packet.get("spec_issue_states"), packet.get("spec_evidence_gates"))
+        if coordinator_gate_required else {"coordinator": "pending"}
     )
     coordinator_baseline_digest: str | None = None
     coordinator_gate_error: EvidenceInsufficient | None = None
@@ -1263,7 +1258,7 @@ def _call_stage(
                 unknowns=[str(item) for item in unknowns],
                 attempt_id=attempt["attempt_id"],
                 bundle_sha256=getattr(research, "bundle_sha256", None) if research else None,
-                dependency_graph=SPEC95_DEPENDENCY_GRAPH,
+                dependency_graph=coordinator_graph,
                 dependency_states=coordinator_dependency_states,
                 state_store=coordinator_state_store,
                 idempotency_key=coordinator_idempotency_key,
@@ -1305,7 +1300,7 @@ def _call_stage(
                 unknowns=[str(item) for item in (verifier.get("missing_requirements") or verifier.get("critical_gaps") or [])],
                 attempt_id=attempt["attempt_id"],
                 bundle_sha256=None,
-                dependency_graph=SPEC95_DEPENDENCY_GRAPH,
+                dependency_graph=coordinator_graph,
                 dependency_states=coordinator_dependency_states,
                 state_store=coordinator_state_store,
                 idempotency_key=coordinator_idempotency_key,
@@ -1379,7 +1374,7 @@ def _call_stage(
                         unknowns=[str(exc)],
                         attempt_id=attempt["attempt_id"],
                         bundle_sha256=None,
-                        dependency_graph=SPEC95_DEPENDENCY_GRAPH,
+                        dependency_graph=coordinator_graph,
                         dependency_states=coordinator_dependency_states,
                         state_store=coordinator_state_store,
                         idempotency_key=coordinator_idempotency_key,
@@ -1584,7 +1579,6 @@ def run_runtime_strategy_shadow(store: CompanionStore, job: dict[str, Any], exec
             store, cycle, job["stage"], packet, job["schema_name"],
             search=search, timeout=requested_timeout,
             runtime_strategy_shadow_cell=job["cell_key"],
-            coordinator_gate=job["stage"] in {"m0_compose", "m1_judgment", "m2", "outcome_research", "chat_research"},
         )
         attempts = {row["attempt_id"]: row for row in store.attempts(cycle["cycle_id"])}
         from .governance import _attempt_dimensions
@@ -1861,7 +1855,6 @@ def run_research(
                 compose_stage = _call_stage(
                     store, cycle, "m0_compose", local_packet, "companion-m0-result-v3.schema.json",
                     search=False, timeout=compose_timeout, frozen_controls=compose_controls,
-                    coordinator_gate=True,
                 )
                 m0_output, compose_attempt_id = compose_stage.output, compose_stage.attempt_id
                 store.save_stage_checkpoint(cycle["cycle_id"], "m0_compose", local_packet["sha256"], compose_attempt_id, m0_output)
@@ -2071,7 +2064,6 @@ def run_m1(
                 judgment_stage = _call_stage(
                     store, cycle, "m1_judgment", local_packet, "companion-m1-result-v5.schema.json",
                     search=False, timeout=judgment_timeout, frozen_controls=judgment_controls,
-                    coordinator_gate=True,
                 )
                 judgment, judgment_attempt_id = judgment_stage.output, judgment_stage.attempt_id
                 store.save_stage_checkpoint(cycle_id, "m1_judgment", local_packet["sha256"], judgment_attempt_id, judgment)
@@ -2225,7 +2217,6 @@ def run_m2(engine: CompanionEngine, store: CompanionStore, cycle_id: str, execut
         stage_result = _call_stage(
             store, cycle, "m2", packet, "companion-m2-result-v4.schema.json",
             search=False, timeout=timeout, frozen_controls=controls,
-            coordinator_gate=True,
         )
         store.save_stage_checkpoint(cycle_id, "m2", packet["sha256"], stage_result.attempt_id, stage_result.output)
         output, attempt_id = stage_result.output, stage_result.attempt_id
@@ -2361,7 +2352,7 @@ def run_outcome(
         )
         outcome_result = _call_stage(
             store, cycle, "outcome_research", packet, "companion-outcome-result-v1.schema.json",
-            search=True, timeout=300, coordinator_gate=True,
+            search=True, timeout=300,
         )
         result, outcome_stage = _stage_output(outcome_result)
     if not result.get("checkpoint_ready"):
@@ -2476,7 +2467,7 @@ def run_chat_research(
         )
         evidence, _ = _call_stage(
             store, cycle, "chat_research", research_packet, "companion-evidence-result-v3.schema.json",
-            search=True, timeout=300, coordinator_gate=True,
+            search=True, timeout=300,
         )
         store.record_evidence(cycle, "chat_research", evidence)
         if reply_to_batch_ids and not store.has_pending_message_batches(reply_to_batch_ids):

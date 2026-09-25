@@ -352,7 +352,12 @@ def _parse_structured_json(text: str) -> Any:
 
 
 def _contains_h0(value: Any) -> bool:
-    forbidden = {"h0", "human_messages", "chat_human", "human_message", "h0_propositions", "h0_actions"}
+    forbidden = {
+        "h0", "h0_propositions", "h0_actions", "h0_raw", "h0_text",
+        "h0_derived", "derived_h0_signal", "h0_action_result", "h0_action_receipt",
+        "human_messages", "chat_human", "human_message", "user_h0", "user_h0_text",
+        "human_judgment", "human_claim", "human_action", "cognition_result", "cognition_signal",
+    }
     if isinstance(value, dict):
         return any(str(key).lower() in forbidden or _contains_h0(item) for key, item in value.items())
     if isinstance(value, list):

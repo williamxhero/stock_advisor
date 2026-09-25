@@ -7,6 +7,9 @@ from tempfile import TemporaryDirectory
 import pytest
 
 from ai_trading_companion.decision_cycle import assert_m1_blind
+from ai_trading_companion.__main__ import _m1_should_retry
+from ai_trading_companion.broker_client import BrokerError
+from ai_trading_companion.judgment_publication import JudgmentUnavailable
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.store import CompanionStore
 
@@ -62,8 +65,19 @@ def test_m0_retry_and_m1_rollback_are_append_audited_without_h0_visibility() -> 
         assert_m1_blind({"business_context": {"private_context_before_h0": {"positions": []}}}, human_texts=["H0原文"])
         with pytest.raises(ValueError, match="H0 or H0-derived"):
             assert_m1_blind({"cognition_result": {"signal": "derived"}})
+        with pytest.raises(ValueError, match="H0 or H0-derived"):
+            assert_m1_blind({"validation_context": {"h0_propositions": ["用户方向判断"]}})
+        with pytest.raises(ValueError, match="H0 or H0-derived"):
+            assert_m1_blind({"validation_context": {"h0_actions": ["用户动作结果"]}})
         with pytest.raises(ValueError, match="current-cycle human"):
             assert_m1_blind({"note": "H0原文"}, human_texts=["H0原文"])
+
+
+def test_judgment_unavailable_retries_only_transient_broker_causes() -> None:
+    transient = JudgmentUnavailable("temporary", BrokerError("timeout", category="broker_timeout"))
+    permanent = JudgmentUnavailable("invalid core")
+    assert _m1_should_retry(transient, attempt_number=1, remaining_seconds=60) is True
+    assert _m1_should_retry(permanent, attempt_number=1, remaining_seconds=60) is False
 
 
 def test_published_judgment_cannot_be_rolled_back_and_revisions_append() -> None:

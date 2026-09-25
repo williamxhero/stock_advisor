@@ -115,6 +115,10 @@ def _m1_should_retry(exc: Exception, *, attempt_number: int, remaining_seconds: 
         return False
     if isinstance(exc, EvidenceInsufficient):
         return _is_expression_rejection(exc)
+    if isinstance(exc, JudgmentUnavailable):
+        return exc.category in {
+            "broker_timeout", "broker_network", "broker_unavailable", "broker_rate_limited",
+        }
     if isinstance(exc, TimeoutError):
         return True
     if not isinstance(exc, BrokerError):
@@ -868,6 +872,9 @@ def _call_stage(
     timeout = controls.timeout_seconds
     search = bool(search and controls.max_operations > 0 and controls.enabled_backends)
     packet = finalize_stage_packet(packet, controls)
+    if stage in {"m1_research", "m1_judgment"}:
+        from .decision_cycle import assert_m1_blind
+        assert_m1_blind(packet)
     if search:
         packet = attach_agent_contract(packet, capability=f"research:{stage}")
         packet = attach_role_inputs(packet, stage=stage)
@@ -2106,7 +2113,7 @@ def run_m1(
                 details = {**details, **safe_boundary_details}
             else:
                 details = safe_boundary_details
-            if isinstance(exc, JudgmentUnavailable):
+            if isinstance(exc, JudgmentUnavailable) and not retryable:
                 engine.m1_failed(cycle_id, str(exc), retryable=False,
                                  details={"problems": ["decision_core_unavailable"], **safe_boundary_details})
                 raise

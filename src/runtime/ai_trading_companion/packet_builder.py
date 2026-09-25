@@ -183,6 +183,8 @@ class RuntimePacketBuilder:
         ).hexdigest()
         if stage == "m1_judgment":
             self._assert_m1_blind(packet, cycle)
+        elif stage == "m1_research":
+            self._assert_m1_blind(packet, cycle)
         # Defense in depth: packets can be given to a cloud-capable runner only
         # after every selected memory and all local inputs have passed the guard.
         assert_safe(json.dumps(packet, ensure_ascii=False), boundary="LLM packet")

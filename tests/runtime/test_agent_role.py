@@ -470,7 +470,12 @@ def test_runtime_packet_builder_does_not_embed_delivery_issue_status() -> None:
         "evidence_contract_json": json.dumps({"requirements": []}),
         "spec95_baseline": _qualified_spec95_baseline(),
     }
-    builder = PacketBuilder(Path.cwd(), object())
+    class TestStore:
+        @staticmethod
+        def artifacts(_cycle_id):
+            return []
+
+    builder = PacketBuilder(Path.cwd(), TestStore())
 
     for stage in ("m0_research", "m1_research"):
         packet = builder.build(cycle, stage, evidence={"sources": []})

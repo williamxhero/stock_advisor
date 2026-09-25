@@ -260,7 +260,8 @@ def _verified_market_snapshot_summary(packet: dict[str, Any] | None) -> dict[str
     return {
         "result_version": 3,
         "semantic": {
-            "summary": {"text": f"{stage_label}，三大指数：{index_text}。", "evidence_refs": evidence_refs},
+            "summary": {"text": f"{stage_label}，三大指数：{index_text}。", "kind": "market_fact", "evidence_refs": evidence_refs},
+            "facts": [], "derived_metrics": [], "source_opinions": [], "propagation": [], "conflicts": [],
             "observations": observations,
             "connections": [],
             "attention": [],
@@ -563,6 +564,20 @@ def _verified_announcement_narrative(name: str, announcement: dict[str, Any]) ->
     return ""
 
 
+def _fallback_evidence_refs(packet: dict[str, Any] | None) -> list[str]:
+    value = packet or {}
+    refs = [
+        str(item.get("evidence_ref")) for item in value.get("verified_fact_digest") or []
+        if isinstance(item, dict) and item.get("evidence_ref")
+    ]
+    evidence = value.get("evidence") if isinstance(value.get("evidence"), dict) else {}
+    refs.extend(
+        str(item.get("evidence_ref")) for item in evidence.get("sources") or []
+        if isinstance(item, dict) and item.get("evidence_ref")
+    )
+    return list(dict.fromkeys(refs))
+
+
 def safe_stage_output(
     stage: str, *, horizon: str = "当前", packet: dict[str, Any] | None = None,
     candidate_output: dict[str, Any] | None = None,
@@ -575,14 +590,16 @@ def safe_stage_output(
         verified = _verified_market_snapshot_summary(packet)
         if verified is not None:
             return verified
+        refs = _fallback_evidence_refs(packet)
         return {
             "result_version": 3,
             "semantic": {
-                "summary": {"text": "眼下公开信息还在核对，先只保留客观观察。", "evidence_refs": []},
-                "observations": [{"text": "现有证据不足以确认盘面强弱是否已经扩散。", "evidence_refs": []}],
+                "summary": {"text": "眼下公开信息还在核对，先只保留客观观察。", "kind": "unknown", "evidence_refs": refs},
+                "facts": [], "derived_metrics": [], "source_opinions": [], "propagation": [], "conflicts": [],
+                "observations": [{"text": "现有证据不足以确认盘面强弱是否已经扩散。", "kind": "unknown", "evidence_refs": refs}],
                 "connections": [],
                 "attention": [],
-                "unknowns": [{"text": "后续成交和市场广度能否形成一致。", "evidence_refs": []}],
+                "unknowns": [{"text": "后续成交和市场广度能否形成一致。", "kind": "unknown", "evidence_refs": refs}],
             },
         }
     if stage in {"m1_judgment", "m2"}:
@@ -657,6 +674,17 @@ def express_stage_semantics(stage: str, semantic: dict[str, Any]) -> str:
         return _v4_judgment_expression(semantic)
     paragraphs = [summary]
     if stage == "m0":
+        typed_sections = (
+            ("facts", "我看到的事实是"),
+            ("derived_metrics", "确定性计算显示"),
+            ("source_opinions", "来源观点提到"),
+            ("propagation", "传播层面可观察到"),
+            ("conflicts", "不同来源存在分歧"),
+        )
+        for key, lead in typed_sections:
+            values = _m0_item_values(semantic.get(key), 3)
+            if values:
+                paragraphs.append(lead + "：" + "；".join(_sentence_piece(value) for value in values) + "。")
         observations = _m0_item_values(semantic.get("observations"), 3)
         connections = _m0_item_values(semantic.get("connections"), 2)
         attention = _m0_item_values(semantic.get("attention"), 1)

@@ -179,15 +179,23 @@ class CognitiveRouter:
             problems.extend(observation_problems(packet, output))
             calendar = packet.get("calendar_context") if isinstance(packet.get("calendar_context"), dict) else {}
             body = "".join(normalized.text.split()).lower()
-            if any(marker in body for marker in (
+            semantic = output.get("semantic") if isinstance(output.get("semantic"), dict) else {}
+            typed_text = " ".join(
+                str(item.get("text") or "")
+                for key in ("facts", "derived_metrics", "source_opinions", "propagation", "conflicts")
+                for item in semantic.get(key) or [] if isinstance(item, dict)
+            )
+            body_for_guards = body + "".join(typed_text.split()).lower()
+            if any(marker in body_for_guards for marker in (
+                "看涨", "看跌", "应买", "应卖", "建议持有", "建议清仓", "今日加仓", "可以逢低布局", "逢低布局",
                 "建议买入", "建议卖出", "建议加仓", "建议减仓", "不新增仓", "不加仓", "不减仓", "不清仓",
                 "买入股数", "卖出股数", "持有观察", "今日动作",
                 "看多", "看空", "偏多", "偏空", "做多", "做空", "bullish", "bearish",
-                "机会排序", "机会优先级", "预计上涨", "预计下跌", "将上涨", "将下跌",
+                "反弹空间", "上涨空间", "下跌空间", "机会排序", "机会优先级", "预计上涨", "预计下跌", "将上涨", "将下跌",
                 "会上涨", "会下跌", "目标价", "上行空间", "下行空间", "方向预测",
             )):
                 problems.append("m0_contains_direction_or_action")
-            if calendar.get("is_xshg_trading_day") is True and any(marker in body for marker in (
+            if calendar.get("is_xshg_trading_day") is True and any(marker in body_for_guards for marker in (
                 "非a股交易日", "非交易日", "状态:skipped", "状态：skipped",
             )):
                 problems.append("m0_calendar_context_conflict")
@@ -198,7 +206,7 @@ class CognitiveRouter:
                 wrong_labels = {f"星期{suffix}" for suffix in "一二三四五六日"} | {f"周{suffix}" for suffix in "一二三四五六日"}
                 if any(f"{expected_date}为{label}" in body for label in wrong_labels - expected_labels):
                     problems.append("m0_calendar_weekday_conflict")
-            if any(marker in body for marker in (
+            if any(marker in body_for_guards for marker in (
                 "本阶段", "m0客观观察", "冻结工具", "确定性投影", "冻结证据",
                 "已检查且无变化", "完整覆盖", "protocol", "requirement",
             )):
@@ -207,7 +215,7 @@ class CognitiveRouter:
                 _numeric_comparison_key(value) for value in _verified_numeric_tokens(packet)
             }
             unknown_numbers = sorted({
-                value for value in _numeric_tokens(body)
+                value for value in _numeric_tokens(body_for_guards)
                 if _numeric_comparison_key(value) not in verified_numbers
             })
             problems.extend(f"m0_contains_unverified_numeric_claim:{value}" for value in unknown_numbers)
@@ -828,22 +836,40 @@ def _m0_item_text(value: Any) -> str:
 def _m0_semantic_problems(packet: dict[str, Any], output: dict[str, Any], text: str) -> list[str]:
     """Validate the public M0 shape and its binding to the frozen evidence."""
     semantic = output.get("semantic") if isinstance(output.get("semantic"), dict) else {}
-    if output.get("result_version") != 3:
-        return []
     problems: list[str] = []
+    if output.get("result_version") != 3:
+        return problems
+    typed_kinds = {
+        "facts": "market_fact", "derived_metrics": "derived_calculation",
+        "source_opinions": "source_opinion", "propagation": "market_propagation",
+        "conflicts": "conflict", "unknowns": "unknown",
+    }
     problems.extend(_m0_news_delta_pagination_problems(packet))
-    expected = {"summary", "observations", "connections", "attention", "unknowns"}
+    expected = {"summary", *typed_kinds, "observations", "connections", "attention", "unknowns"}
     extra = sorted(set(semantic) - expected)
     problems.extend(f"m0_schema_forbids_field:{key}" for key in extra)
-    limits = {"observations": 3, "connections": 2, "attention": 1, "unknowns": 1}
+    limits = {"facts": 4, "derived_metrics": 3, "source_opinions": 2, "propagation": 2, "conflicts": 2,
+              "observations": 3, "connections": 2, "attention": 1, "unknowns": 1}
     refs = _m0_frozen_evidence_refs(packet)
-    for key in expected:
-        values = [semantic.get(key)] if key == "summary" else semantic.get(key)
-        if key != "summary" and not isinstance(values, list):
-            problems.append(f"m0_{key}_must_be_array")
+    evidence = packet.get("evidence") if isinstance(packet.get("evidence"), dict) else {}
+    source_kinds: dict[str, str] = {}
+    for source in evidence.get("sources") or []:
+        if not isinstance(source, dict) or not source.get("evidence_ref"):
             continue
+        spec = source.get("evidence_spec")
+        source_kinds[str(source["evidence_ref"])] = str(
+            (spec.get("kind") if isinstance(spec, dict) else None) or source.get("evidence_kind") or ""
+        )
+    for row in packet.get("verified_fact_digest") or []:
+        if isinstance(row, dict) and row.get("evidence_ref"):
+            source_kinds.setdefault(str(row["evidence_ref"]), "market_fact")
+    for key in expected:
+        values = [semantic.get(key)] if key == "summary" else semantic.get(key, [])
         if key == "summary" and not isinstance(semantic.get(key), dict):
             problems.append("m0_summary_item_invalid")
+            continue
+        if key != "summary" and not isinstance(values, list):
+            problems.append(f"m0_{key}_must_be_array")
             continue
         if key != "summary" and len(values) > limits[key]:
             problems.append(f"m0_{key}_limit_exceeded")
@@ -851,14 +877,43 @@ def _m0_semantic_problems(packet: dict[str, Any], output: dict[str, Any], text: 
             if not isinstance(item, dict) or not _m0_item_text(item):
                 problems.append(f"m0_{key}_item_invalid")
                 continue
+            if key in {"facts", "derived_metrics", "source_opinions", "propagation", "conflicts"} and item.get("kind") != typed_kinds[key]:
+                problems.append(f"m0_{key}_kind_invalid")
+            elif item.get("kind") is not None and item["kind"] not in {
+                "market_fact", "derived_calculation", "source_opinion", "market_propagation", "conflict", "unknown",
+            }:
+                problems.append(f"m0_{key}_kind_invalid")
             item_refs = item.get("evidence_refs")
-            if not isinstance(item_refs, list):
-                problems.append(f"m0_{key}_evidence_refs_invalid")
+            if not isinstance(item_refs, list) or (
+                not item_refs and (refs and key != "unknowns" or key in {"facts", "derived_metrics", "source_opinions", "propagation", "conflicts"})
+            ):
+                problems.append(f"m0_{key}_evidence_refs_required")
                 continue
             problems.extend(
                 f"m0_evidence_ref_not_in_frozen_packet:{ref}"
                 for ref in item_refs if str(ref) not in refs
             )
+            required_source_kind = {
+                "facts": "market_fact", "derived_metrics": "derived_calculation",
+                "source_opinions": "source_opinion",
+            }.get(key)
+            if required_source_kind and any(
+                source_kinds.get(str(ref)) not in {"", required_source_kind} for ref in item_refs
+            ):
+                problems.append(f"m0_{key}_source_kind_mismatch")
+            if key == "propagation":
+                sources_by_ref = {
+                    str(source["evidence_ref"]): source for source in evidence.get("sources") or []
+                    if isinstance(source, dict) and source.get("evidence_ref")
+                }
+                for ref in item_refs:
+                    source = sources_by_ref.get(str(ref), {})
+                    spec = source.get("evidence_spec")
+                    propagation = spec.get("market_propagation") if isinstance(spec, dict) else source.get("market_propagation")
+                    observed = propagation.get("status") == "observed" if isinstance(propagation, dict) else propagation == "observed"
+                    if source_kinds.get(str(ref)) not in {"", "social_propagation"} and not observed:
+                        problems.append("m0_propagation_source_kind_mismatch")
+                        break
     problems.extend(_m0_predecessor_problems(packet, semantic))
     event_problems = _m0_event_semantic_problems(packet, text)
     problems.extend(event_problems)

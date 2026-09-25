@@ -74,6 +74,8 @@ class AcquisitionBoundary:
                 "published_at": row.get("published_at"), "acquired_at": acquired_at,
                 "known_at": acquired_at,
                 "evidence_kind": str(row.get("evidence_kind") or ""),
+                "generated_by": row.get("generated_by"),
+                "origin": row.get("origin"),
                 "source_reference": source_reference,
                 "screenshot_only": bool(row.get("screenshot_only")),
                 "source_strength": str(row.get("source_strength") or ""),

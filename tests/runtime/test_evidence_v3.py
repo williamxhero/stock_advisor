@@ -37,6 +37,7 @@ class EvidenceV3Tests(TestCase):
             "result_version": 3,
             "semantic": {
                 "summary": {"text": "市场概括", "evidence_refs": ["delta-1"]},
+                "facts": [], "derived_metrics": [], "source_opinions": [], "propagation": [], "conflicts": [],
                 "observations": [{"text": "新增事件", "evidence_refs": ["delta-1"]}],
                 "connections": [{"text": "事件与盘面存在联系", "evidence_refs": ["delta-1"]}],
                 "attention": [{"text": "留意后续核验", "evidence_refs": ["delta-1"]}],
@@ -997,6 +998,45 @@ class EvidenceV3Tests(TestCase):
 
         self.assertIn("m0_exposes_internal_process", internal_verdict["problems"])
         self.assertIn("m0_contains_unverified_numeric_claim:99", invented_verdict["problems"])
+
+    def test_m0_directional_euphemism_and_empty_refs_are_rejected(self):
+        packet = {
+            "stage": "m0_compose",
+            "verified_fact_digest": [{"evidence_ref": "ev-1", "excerpt": json.dumps({"indices": [{"name": "上证指数", "price": 3959.46}]})}],
+        }
+        output = {"result_version": 3, "semantic": {
+            "summary": {"text": "预计上涨，建议买入", "evidence_refs": []},
+            "facts": [], "derived_metrics": [], "source_opinions": [], "propagation": [], "conflicts": [],
+            "observations": [], "connections": [], "attention": [], "unknowns": [],
+        }}
+        verdict = CognitiveRouter().verify("m0_compose", packet, output)
+        self.assertIn("m0_summary_evidence_refs_required", verdict["problems"])
+        self.assertIn("m0_contains_direction_or_action", verdict["problems"])
+
+    def test_m0_typed_fact_cannot_hide_direction_or_action(self):
+        packet = {
+            "stage": "m0_compose",
+            "evidence": {"sources": [{"evidence_ref": "ev-1", "excerpt": "公开行情观察"}]},
+        }
+        output = {"result_version": 3, "semantic": {
+            "summary": {"text": "公开行情观察", "evidence_refs": ["ev-1"]},
+            "facts": [{"text": "市场看涨，应买入", "kind": "market_fact", "evidence_refs": ["ev-1"]}],
+            "derived_metrics": [], "source_opinions": [], "propagation": [], "conflicts": [],
+            "observations": [], "connections": [], "attention": [], "unknowns": [],
+        }}
+        problems = CognitiveRouter().verify("m0_compose", packet, output)["problems"]
+        self.assertIn("m0_contains_direction_or_action", problems)
+
+    def test_m0_typed_fact_with_undeclared_source_kind_is_not_rejected(self):
+        packet = {"stage": "m0_compose", "evidence": {"sources": [{"evidence_ref": "ev-1", "excerpt": "公开行情观察"}]}}
+        output = {"result_version": 3, "semantic": {
+            "summary": {"text": "公开行情观察", "evidence_refs": ["ev-1"]},
+            "facts": [{"text": "指数收平", "kind": "market_fact", "evidence_refs": ["ev-1"]}],
+            "derived_metrics": [], "source_opinions": [], "propagation": [], "conflicts": [],
+            "observations": [], "connections": [], "attention": [], "unknowns": [],
+        }}
+        problems = CognitiveRouter().verify("m0_compose", packet, output)["problems"]
+        self.assertNotIn("m0_facts_source_kind_mismatch", problems)
 
     def test_m0_expression_verifier_accepts_truthful_display_rounding_only(self):
         packet = {"stage": "m0_compose", "verified_fact_digest": [{"excerpt": json.dumps({

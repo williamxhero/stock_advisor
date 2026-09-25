@@ -54,6 +54,21 @@ def test_ai_reasoning_can_be_retained_but_cannot_be_external_fact() -> None:
         validate(forged)
 
 
+@pytest.mark.parametrize("provenance", [{"generated_by": "ai"}, {"origin": "ai"}])
+def test_acquisition_cannot_promote_ai_origin_to_market_fact(provenance: dict) -> None:
+    boundary = AcquisitionBoundary("ai-origin")
+    observation, _ = boundary.observe("market_snapshot", {}, {"results": [{
+        "url": "https://example.test/generated", "excerpt_text": "模型生成的行情描述",
+        "fact_as_of": "2026-09-20T01:00:00Z", "factual_status": "verified",
+        "evidence_kind": "market_fact", **provenance,
+    }]}, True)
+    record = observation["evidence_items"][0]["evidence_spec"]
+    assert record["kind"] == "ai_reasoning"
+    assert record["external_fact"] is False
+    assert record["provenance"]["origin"] == "ai"
+    assert qualify(record)["state"] == "rejected"
+
+
 def test_memoryhub_receipt_preserves_the_versioned_record() -> None:
     memory = InMemoryMemoryAdapter()
     record = _record()

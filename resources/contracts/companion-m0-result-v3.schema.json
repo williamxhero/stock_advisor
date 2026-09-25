@@ -8,9 +8,14 @@
     "semantic": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["summary", "observations", "connections", "attention", "unknowns"],
+      "required": ["summary", "facts", "derived_metrics", "source_opinions", "propagation", "conflicts", "observations", "connections", "attention", "unknowns"],
       "properties": {
         "summary": {"$ref": "#/$defs/summary_item"},
+        "facts": {"type": "array", "maxItems": 4, "items": {"$ref": "#/$defs/typed_item"}},
+        "derived_metrics": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/typed_item"}},
+        "source_opinions": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/typed_item"}},
+        "propagation": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/typed_item"}},
+        "conflicts": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/typed_item"}},
         "observations": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/observation_item"}},
         "connections": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/observation_item"}},
         "attention": {"type": "array", "maxItems": 1, "items": {"$ref": "#/$defs/observation_item"}},
@@ -19,12 +24,23 @@
     }
   },
   "$defs": {
+    "typed_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text", "evidence_refs", "kind"],
+      "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 240},
+        "kind": {"enum": ["market_fact", "derived_calculation", "source_opinion", "market_propagation", "conflict", "unknown"]},
+        "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+      }
+    },
     "summary_item": {
       "type": "object",
       "additionalProperties": false,
       "required": ["text", "evidence_refs"],
       "properties": {
         "text": {"type": "string", "minLength": 1, "maxLength": 240},
+        "kind": {"enum": ["market_fact", "derived_calculation", "source_opinion", "market_propagation", "conflict", "unknown"]},
         "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}}
       }
     },
@@ -34,6 +50,7 @@
       "required": ["text", "evidence_refs"],
       "properties": {
         "text": {"type": "string", "minLength": 1, "maxLength": 180},
+        "kind": {"enum": ["market_fact", "derived_calculation", "source_opinion", "market_propagation", "conflict", "unknown"]},
         "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}}
       }
     }

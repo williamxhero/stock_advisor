@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CoordinatorSpec/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "version", "dependency_graph", "states", "frontier", "lifecycles"],
+  "properties": {
+    "contract": {"const": "CoordinatorSpec/v1"},
+    "version": {"const": 1},
+    "dependency_graph": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string", "minLength": 1}}},
+    "states": {"type": "object", "additionalProperties": {"enum": ["pending", "running", "succeeded", "partial", "blocked", "failed", "skipped", "unknown"]}},
+    "frontier": {
+      "type": "object",
+      "required": ["frontier", "blocked", "waiting"],
+      "properties": {
+        "frontier": {"type": "array", "items": {"type": "string"}},
+        "blocked": {"type": "array", "items": {"type": "string"}},
+        "waiting": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "lifecycles": {"type": "object", "additionalProperties": {"$ref": "#/$defs/lifecycle"}}
+  },
+  "$defs": {
+    "lifecycle": {
+      "type": "object",
+      "required": ["node_id", "status", "records"],
+      "properties": {
+        "node_id": {"type": "string", "minLength": 1},
+        "status": {"enum": ["pending", "running", "succeeded", "partial", "blocked", "failed", "skipped", "unknown"]},
+        "records": {"type": "array", "items": {"type": "object"}}
+      }
+    }
+  }
+}

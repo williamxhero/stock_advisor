@@ -734,6 +734,12 @@ def test_model_contracts_declare_native_types_and_do_not_duplicate_evidence(tmp_
     for name in ("decision-core-v1", "narrative-draft-v1", "narrative-review-v1"):
         check(json.loads((SCHEMAS / (name + ".schema.json")).read_text(encoding="utf-8")))
     original = packet()
+    evidence_spec = {
+        "contract": "EvidenceSpec/v1", "record_id": "record-model-projection",
+        "source": {"identity": "example.test", "reference": {"version": "v1"}},
+        "provenance": {"origin": "external", "content_sha256": "frozen-content"},
+    }
+    original["evidence"]["sources"][0]["evidence_spec"] = evidence_spec
     original["evidence"]["sources"][0]["excerpt_text"] = original["evidence"]["sources"][0]["excerpt"]
     original["artifacts"] = [{"kind": "m1_evidence", "body": json.dumps(original["evidence"])}]
     original["memories"] = [{"authority": "published_ai_message", "summary": "obsolete broadcast"},
@@ -746,6 +752,7 @@ def test_model_contracts_declare_native_types_and_do_not_duplicate_evidence(tmp_
     assert "excerpt_text" not in context["evidence"]["sources"][0]
     assert context["memories"] == [original["memories"][1]]
     assert context["evidence"]["sources"][0]["excerpt"] == original["evidence"]["sources"][0]["excerpt"]
+    assert context["evidence"]["sources"][0]["evidence_spec"] == evidence_spec
 
 
 def test_model_context_is_bounded_without_losing_evidence_identity_or_relevant_memory(tmp_path):

@@ -168,3 +168,25 @@ def test_rollback_preserves_private_context_and_rejects_terminal_recovery() -> N
     terminal = store.transition(cycle["cycle_id"], "complete")
     with pytest.raises(ValueError, match="terminal cycle"):
         store.recover_cycle(terminal["cycle_id"], "m1")
+
+
+def test_runtime_owns_stage_provenance_identity() -> None:
+    store, engine, _ = make_engine()
+    cycle = engine.start_cycle(
+        "daily.execution.0945", "2026-09-21T09:45:00+08:00", "2026-09-21T01:45:00Z"
+    )
+    store.initialize_cycle_stages(cycle["cycle_id"], provenance={
+        "contract": "caller-controlled", "source": "llm", "cycle_id": "other",
+    })
+    stage = store.start_stage(cycle["cycle_id"], "m0", provenance={
+        "contract": "caller-controlled", "source": "llm", "cycle_id": "other",
+    })
+    assert json.loads(stage["provenance_json"]) == {
+        "contract": "companion-decision-cycle-provenance/v1",
+        "source": "runtime", "cycle_id": cycle["cycle_id"],
+        "task_key": cycle["task_key"], "stage": "m0", "attempt": 1,
+    }
+    store.set_cycle_provenance(cycle["cycle_id"], {"source": "llm", "revision": 2})
+    assert json.loads(store.get_cycle(cycle["cycle_id"])["cycle_provenance_json"])["source"] == "runtime"
+    with pytest.raises(ValueError, match="does not match"):
+        store.set_cycle_provenance(cycle["cycle_id"], {"cycle_id": "other"})

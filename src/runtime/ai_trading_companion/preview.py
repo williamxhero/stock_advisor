@@ -257,7 +257,10 @@ def build_bundle(
         "replay_mode": "original_cycle_inputs",
         "qualification_version": 2,
         "cycle_state": cycle["state"],
-        "cycle_spec_version": cycle.get("cycle_spec_version", 1),
+        # Preserve the immutable SPEC identity even for legacy rows created
+        # before the column was added. A numeric fallback would make a replay
+        # bundle unverifiable and detach it from the cycle contract.
+        "cycle_spec_version": cycle.get("cycle_spec_version") or SPEC_VERSION,
         "cycle_provenance_json": cycle.get("cycle_provenance_json") or "{}",
         "private_context_json": cycle.get("private_context_json"),
         "private_context_sha256": cycle.get("private_context_sha256"),

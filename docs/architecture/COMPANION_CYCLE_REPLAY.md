@@ -8,9 +8,9 @@ Evaluation dimensions are independent: recorded attempt durations; qualification
 
 ## Ticket 02 verification, 2026-10-02
 
-- `scripts/test.ps1 -ProjectRegression`: 158 passed. Includes cycle identity, retry/recovery, immutable revisions, frozen replay, missing/conflicting evidence, temporal integrity, publication and internal role permissions.
+- `scripts/test.ps1 -ProjectRegression`: 159 passed. Includes cycle identity, retry/recovery, immutable revisions, frozen replay, missing/conflicting evidence, temporal integrity, publication and internal role permissions.
 - Full `scripts/test.ps1`: MemoryHub 28 passed; Runtime 780 passed, 5 skipped, 1 failed. The existing active-research evaluation fixture schedules October 1 before the current candidate registration and is rejected by the future-task gate. The test script stops before desktop tests on that failure.
-- Public schema, Exchange, CLI, plugin and installation contracts are unchanged in this ticket; conditional clean-install/source-unavailable/build-info qualification is not triggered.
+- The public decision-cycle schema now requires the immutable `cycle_spec_version` and `cycle_provenance` projection fields. The release contract was therefore verified with a clean publish and install check: `scripts/publish.ps1 -Runtime win-x64 -NoRestore` followed by `scripts/verify-install.ps1`, including source-unavailable module resolution, build-info revision binding, and two deterministic AgentRole and Debate replays.
 - Separate `dotnet test AITradingCompanion.sln --nologo`: 102 passed after NuGet restore.
 - Frozen replay correctness is verified; live delivery speed, probability, research effectiveness and investment outcomes are not established by these deterministic regressions.
 

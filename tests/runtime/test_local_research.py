@@ -2069,6 +2069,46 @@ class LocalResearchTests(unittest.TestCase):
         self.assertTrue(research.qualified, (research.verifier["problems"], research.observations))
         self.assertEqual(3, runner.resolve_with_fallback.call_count)
 
+    def test_exact_close_ledger_fallback_preserves_upstream_evidence_identity(self) -> None:
+        close = "2026-09-03T07:00:00Z"
+        contract = {
+            "version": 4, "as_of": "2026-09-03T07:20:00Z", "requirements": [{
+                "key": "indices_close", "blocking": True, "allowed_coverage": ["covered"],
+                "finality": "official_close", "window": {"mode": "exact", "start": close, "end": close},
+            }],
+        }
+        ledger = []
+        for index, symbol in enumerate(("000001", "399001", "399006"), start=1):
+            record_id = f"upstream-{index}"
+            ledger.append({
+                "title": symbol, "url": f"https://example.test/{symbol}",
+                "known_at": "2026-09-03T07:10:00Z", "coverage_state": "observed",
+                "evidence_spec": {
+                    "contract": "EvidenceSpec/v1", "record_id": record_id,
+                    "truth_status": "verified", "occurred_at": close,
+                    "known_at": "2026-09-03T07:10:00Z", "published_at": close,
+                    "provenance": {"source": "ledger", "record_id": record_id},
+                    "market_propagation": {"status": "observed"},
+                },
+                "text": json.dumps({"finality": "official_close", "indices": [{
+                    "symbol": symbol, "name": symbol, "exchange": "SSE", "source": "ledger",
+                    "price": 10.0 + index, "previous_close": 10.0, "change": float(index),
+                    "change_percent": float(index) * 10, "quote_at": close,
+                    "trading_date": "2026-09-03", "status": "closed",
+                }]}, ensure_ascii=False),
+            })
+        runner = mock.Mock()
+        runner.resolve_with_fallback.return_value = EvidenceResolution.failed(
+            "cn_market_index_batch", "tool_process_failed",
+        )
+        backend = ToolCatalogMarketBackend(runner, contract=contract, deadline=lambda: 10.0, daily_ledger=ledger)
+        result = backend("market_snapshot", {"_requirement_key": "indices_close"})
+        self.assertEqual(["upstream-1", "upstream-2", "upstream-3"], [
+            item["source_reference"]["record_id"] for item in result["results"]
+        ])
+        self.assertTrue(all(item["factual_status"] == "verified" for item in result["results"]))
+        self.assertTrue(all(item["market_propagation"] == "observed" for item in result["results"]))
+
     def test_exact_close_ledger_fallback_rejects_any_contract_downgrade(self) -> None:
         close = "2026-09-03T07:00:00Z"
         contract = {

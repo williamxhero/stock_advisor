@@ -562,7 +562,7 @@ class ToolCatalogMarketBackend:
         }
         results = []
         emitted: set[tuple[str, str]] = set()
-        for _, url, title, source_rows in candidates:
+        for entry, url, title, source_rows in candidates:
             source_rows = [
                 row for row in source_rows
                 if json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) in selected_signatures
@@ -577,6 +577,7 @@ class ToolCatalogMarketBackend:
             results.append({
                 "url": url, "title": title, "excerpt_text": excerpt,
                 "fact_as_of": request.required_at, "raw_artifact_ref": None,
+                **self._ledger_evidence_metadata(entry),
             })
         if not results:
             return None
@@ -622,19 +623,19 @@ class ToolCatalogMarketBackend:
                 continue
             signature = json.dumps(core, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             variants[signature] = core
-            candidates.append((url, str(entry.get("title") or "daily evidence ledger"), core))
+            candidates.append((url, str(entry.get("title") or "daily evidence ledger"), core, entry))
         if len(variants) != 1:
             return None
         core = next(iter(variants.values()))
         data = {
             **core, "source": "daily_evidence_ledger",
-            "source_urls": list(dict.fromkeys(url for url, _, _ in candidates)),
+            "source_urls": list(dict.fromkeys(url for url, _, _, _ in candidates)),
         }
         if validate_capability_data(request, request.required_at, data) is not None:
             return None
         results = []
         emitted: set[tuple[str, str]] = set()
-        for url, title, payload in candidates:
+        for url, title, payload, entry in candidates:
             excerpt = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             identity = (url, excerpt)
             if identity in emitted:
@@ -643,11 +644,42 @@ class ToolCatalogMarketBackend:
             results.append({
                 "url": url, "title": title, "excerpt_text": excerpt,
                 "fact_as_of": request.required_at, "raw_artifact_ref": None,
+                **self._ledger_evidence_metadata(entry),
             })
         return {
             "url": results[0]["url"], "text": results[0]["excerpt_text"],
             "source": "daily_evidence_ledger", "raw_artifact_ref": None, "results": results,
         }
+
+    @staticmethod
+    def _ledger_evidence_metadata(entry: dict[str, Any]) -> dict[str, Any]:
+        """Carry the immutable ledger identity through a deterministic fallback.
+
+        A ledger fallback is a re-read of an already sealed Runtime record.  It
+        must not manufacture an unrelated evidence identity merely because the
+        live provider was unavailable.  The acquisition boundary will still
+        seal the new observation, while this source reference preserves the
+        upstream record and provenance for audit and replay.
+        """
+        spec = entry.get("evidence_spec") if isinstance(entry, dict) else None
+        if not isinstance(spec, dict) or not spec.get("record_id"):
+            return {}
+        reference = {
+            "authority": "immutable_source_reference",
+            "contract": str(spec.get("contract") or ""),
+            "record_id": str(spec["record_id"]),
+            "provenance": copy.deepcopy(spec.get("provenance") or {}),
+        }
+        metadata: dict[str, Any] = {"source_reference": reference}
+        if spec.get("truth_status"):
+            metadata["factual_status"] = spec["truth_status"]
+        propagation = spec.get("market_propagation")
+        if isinstance(propagation, dict) and propagation.get("status"):
+            metadata["market_propagation"] = propagation["status"]
+        for key in ("occurred_at", "known_at", "published_at"):
+            if spec.get(key):
+                metadata[key] = spec[key]
+        return metadata
 
     def _cached_breadth(self, required_at: str, window_start: str, finality: str) -> dict[str, Any] | None:
         """Use only a runtime prefetch whose fact time is inside this contract."""

@@ -3,10 +3,12 @@
   "$id": "companion-decision-cycle/v1",
   "title": "Companion decision cycle",
   "type": "object",
-  "required": ["contract", "contract_version", "cycle_id", "task_key", "as_of", "scheduled_for", "schedule", "state", "revision", "stages", "provenance"],
+  "required": ["contract", "contract_version", "cycle_spec_version", "cycle_id", "task_key", "as_of", "scheduled_for", "schedule", "state", "revision", "stages", "provenance", "cycle_provenance"],
   "properties": {
     "contract": { "const": "companion-decision-cycle/v1" },
     "contract_version": { "const": 1 },
+    "cycle_spec_version": { "const": "CompanionDecisionCycleSpec/v1" },
+    "cycle_contract_hash": { "type": ["string", "null"] },
     "cycle_id": { "type": "string", "minLength": 1 },
     "task_key": { "type": "string", "minLength": 1 },
     "as_of": { "type": "string", "minLength": 1 },
@@ -46,7 +48,8 @@
         "additionalProperties": false
       }
     },
-    "provenance": { "type": "object" }
+    "provenance": { "type": "object" },
+    "cycle_provenance": { "type": "object" }
   },
   "additionalProperties": false
 }

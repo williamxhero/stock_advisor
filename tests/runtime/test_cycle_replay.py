@@ -15,7 +15,7 @@ def test_recovery_fallback_replays_actual_packet_and_preserves_legacy_discrepanc
     cycle = CompanionEngine(store).start_cycle('daily.execution.0945', '2026-09-21T09:45:00+08:00', '2026-09-21T01:45:00Z')
     packet = {'verification_repair': {'frozen_decision': {'direction': 'bullish'}}}
     packet['sha256'] = canonical_packet_hash(packet)
-    _, attempt_id = _save_safe_stage_fallback(store, cycle, 'm1_judgment', packet, horizon='当前')
+    _, attempt_id = _save_safe_stage_fallback(store, cycle, 'm1_judgment', packet, horizon='褰撳墠')
     frozen = freeze_cycle(store, cycle['cycle_id'])
     attempt = frozen['source']['attempts'][0]
     actual_packet = json.loads(attempt['input_packet_json'])
@@ -116,8 +116,10 @@ def test_replay_ignores_human_artifacts_sealed_after_m1_boundary(tmp_path):
     attempt = store.begin_attempt(cycle['cycle_id'], 'm1_judgment', cycle['as_of'],
                                   input_sha256=canonical_packet_hash(packet), input_packet=packet)
     store.finish_attempt(attempt['attempt_id'], 'succeeded', verifier={'passed': True}, output={'direction': 'wait'})
-    frozen = freeze_cycle(store, cycle['cycle_id'])
+    # Persist the later human artifact before freezing the cycle snapshot. Replay must
+    # still exclude it using the M1 attempt start boundary.
     store.append_artifact(cycle['cycle_id'], 'later_note', 'human', 'Human directional claim', cycle['as_of'])
+    frozen = freeze_cycle(store, cycle['cycle_id'])
     assert replay_cycle(frozen)['qualification']['attempts'][0]['qualified'] is True
 
 

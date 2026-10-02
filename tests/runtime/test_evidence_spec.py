@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import uuid
 from pathlib import Path
 
 import pytest
@@ -270,3 +271,61 @@ def test_runtime_ledger_retries_are_idempotent_and_retain_versioned_provenance(t
     assert json.loads(rows[0]["qualification_spec_json"])["input_record_refs"][0]["record_id"] == spec["record_id"]
     assert len(first) == 1
     assert second == []
+
+
+def test_runtime_ledger_preserves_distinct_observed_versions_with_identical_content(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    cycle = store.ensure_daily_conversation("2026-09-20")
+    boundary = AcquisitionBoundary("versioned-attempt")
+    observations = []
+    for occurred_at in ("2026-09-20T01:00:00Z", "2026-09-20T02:00:00Z"):
+        observation, _ = boundary.observe("web_read", {}, {"results": [{
+            "url": "https://example.test/fact", "title": "Fact", "excerpt_text": "unchanged content",
+            "fact_as_of": occurred_at, "factual_status": "verified",
+        }]}, True)
+        observations.append(observation)
+    evidence = {"as_of": "2099-01-01T00:00:00Z", "sources": [
+        {"evidence_ref": observation["evidence_items"][0]["evidence_ref"]}
+        for observation in observations
+    ]}
+
+    assert len(store.record_evidence(cycle, "m0_research", evidence, observations)) == 2
+    assert store.record_evidence(cycle, "m0_research", evidence, observations) == []
+    rows = store.evidence_for_day("2026-09-20", "2099-01-01T00:00:00Z")
+    assert {row["occurred_at"] for row in rows} == {
+        "2026-09-20T01:00:00Z", "2026-09-20T02:00:00Z",
+    }
+    assert {json.loads(row["evidence_spec_json"])["record_id"] for row in rows} == {
+        observation["evidence_items"][0]["evidence_spec"]["record_id"] for observation in observations
+    }
+
+
+def test_runtime_ledger_upgrade_reuses_existing_acquisition_identity(tmp_path: Path) -> None:
+    path = tmp_path / "companion.sqlite3"
+    store = CompanionStore(path)
+    cycle = store.ensure_daily_conversation("2026-09-20")
+    observation, _ = AcquisitionBoundary("old-attempt").observe("web_read", {}, {"results": [{
+        "url": "https://example.test/fact", "title": "Fact", "excerpt_text": "original fact",
+        "fact_as_of": "2026-09-20T01:00:00Z",
+    }]}, True)
+    evidence = {"as_of": "2099-01-01T00:00:00Z", "sources": [{
+        "evidence_ref": observation["evidence_items"][0]["evidence_ref"],
+    }]}
+    store.record_evidence(cycle, "m0_research", evidence, [observation])
+    row = store.evidence_for_day("2026-09-20", "2099-01-01T00:00:00Z")[0]
+    old_id = str(uuid.uuid5(uuid.NAMESPACE_URL,
+        f"2026-09-20|{row['source_url']}|{row['content_sha256']}"))
+    # Reconstruct the pre-upgrade persisted identity and uniqueness index.
+    with store.connection() as connection:
+        connection.execute("DELETE FROM evidence_cycle_use")
+        connection.execute("UPDATE evidence_ledger_entry SET evidence_id=?", (old_id,))
+        connection.execute("CREATE UNIQUE INDEX ux_evidence_content ON evidence_ledger_entry(trading_date,source_url,content_sha256)")
+    event_count = len(store.pending_events())
+
+    upgraded = CompanionStore(path)
+    upgraded.initialize()
+    assert upgraded.record_evidence(cycle, "m0_research", evidence, [observation]) == []
+    assert [entry["evidence_id"] for entry in upgraded.evidence_for_day(
+        "2026-09-20", "2099-01-01T00:00:00Z"
+    )] == [old_id]
+    assert len(upgraded.pending_events()) == event_count

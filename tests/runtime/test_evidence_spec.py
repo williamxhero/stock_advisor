@@ -152,8 +152,16 @@ def test_install_qualification_is_deterministic_and_keeps_evaluation_axes_separa
     assert smoke["available"] is False and smoke["qualified"] is False
     assert smoke["verifier_passed"] is False and smoke["evidence_items"] == []
     assert smoke["backend_calls"] == [{"operation": "web_read", "url": "https://example.test/unavailable"}]
+    assert all(smoke["measurements"].values())
     assert first["evaluation_vector"]["judgment_outcome"]["status"] == "not_measured"
     assert first["evaluation_vector"]["safety_reliability"]["measurements"]["unavailable_source_safe"] is True
+    for axis, value in first["evaluation_vector"].items():
+        assert isinstance(value, dict)
+        assert value["status"] in {"pass", "fail", "not_measured"}
+        assert isinstance(value["measurements"], dict)
+        assert isinstance(value["measurements"]["measured"], bool)
+        if value["status"] != "pass":
+            assert value["reason"]
 
 
 def test_replay_uses_production_weak_source_policy_and_binds_cutoff() -> None:
@@ -167,6 +175,51 @@ def test_replay_uses_production_weak_source_policy_and_binds_cutoff() -> None:
     assert replay["qualification_inputs"]["qualification_policy_version"] == POLICY_VERSION
     assert replay["input_sha256"] == fingerprint(replay["qualification_inputs"])
     assert replay["input_sha256"] != frozen_replay(record, as_of="2099-01-02T00:00:00Z")["input_sha256"]
+
+
+def test_replay_receipt_persists_every_production_qualification_input() -> None:
+    record = _record("news_disclosure")
+    replay = frozen_replay(
+        record,
+        as_of="2026-09-20T08:00:00Z",
+        source_refs=("source-b", "source-a", "source-a"),
+        source_conflict_refs=("conflict-2", "conflict-1"),
+        memory_receipt={"episode_id": "episode-1", "content_hash": "hash-1"},
+        allow_post_cutoff_known_at=True,
+    )
+
+    inputs = replay["qualification_inputs"]
+    assert inputs["as_of"] == "2026-09-20T08:00:00Z"
+    assert inputs["qualification_policy_version"] == POLICY_VERSION
+    assert inputs["source_refs"] == ["source-a", "source-b"]
+    assert inputs["source_conflict_refs"] == ["conflict-1", "conflict-2"]
+    assert inputs["memory_receipt"] == {"episode_id": "episode-1", "content_hash": "hash-1"}
+    assert inputs["allow_post_cutoff_known_at"] is True
+    assert replay["input_sha256"] == fingerprint(inputs)
+    assert replay["qualification"]["input_record_refs"][0]["source_refs"] == ["source-a", "source-b"]
+    assert replay["qualification"]["qualification_policy_version"] == POLICY_VERSION
+    assert replay["qualification"]["as_of"] == "2026-09-20T08:00:00Z"
+    assert replay["qualification"]["source_conflict_refs"] == ["conflict-1", "conflict-2"]
+    assert replay["qualification"]["input_record_refs"][0]["memory_receipt"] == inputs["memory_receipt"]
+
+
+def test_frozen_replay_preserves_production_permission_boundaries() -> None:
+    ai_record = _record("ai_reasoning")
+    screenshot_record = _record("market_fact")
+    screenshot_record["source"]["reference"]["screenshot_only"] = True
+    screenshot_record["record_id"] = fingerprint({
+        key: value for key, value in screenshot_record.items() if key != "record_id"
+    })
+
+    ai_replay = frozen_replay(ai_record, as_of="2099-01-01T00:00:00Z")
+    screenshot_replay = frozen_replay(screenshot_record, as_of="2099-01-01T00:00:00Z")
+
+    assert ai_replay["qualification"]["state"] == "rejected"
+    assert ai_replay["qualification"]["permitted_use"] == "reasoning_only"
+    assert "ai_is_not_external_evidence" in ai_replay["qualification"]["reasons"]
+    assert screenshot_replay["qualification"]["state"] == "degraded"
+    assert screenshot_replay["qualification"]["permitted_use"] == "context_only"
+    assert "weak_source_screenshot_only" in screenshot_replay["qualification"]["reasons"]
 
 
 def test_replay_rejects_tampered_input_without_rewriting_original() -> None:

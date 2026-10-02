@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -201,19 +202,48 @@ def qualify(record: dict[str, Any], *, as_of: str | None = None) -> dict[str, An
             "propagation_status": record["market_propagation"]["status"]}
 
 
+def _normalized_refs(values: Iterable[str] | None) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = (values,)
+    return sorted({str(value) for value in values if str(value)})
+
+
 def frozen_replay(record: dict[str, Any], *, as_of: str | None = None,
-                  original_artifact: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Rebuild qualification from an immutable input without rewriting history."""
+                  original_artifact: dict[str, Any] | None = None,
+                  source_refs: Iterable[str] = (),
+                  source_conflict_refs: Iterable[str] = (),
+                  memory_receipt: dict[str, Any] | None = None,
+                  allow_post_cutoff_known_at: bool = False) -> dict[str, Any]:
+    """Rebuild production qualification from an immutable input without rewriting history."""
     frozen = copy.deepcopy(record)
     validate(frozen)
     from .evidence_qualification import POLICY_VERSION, qualify_record
 
-    inputs = {"evidence": frozen, "as_of": as_of, "qualification_policy_version": POLICY_VERSION}
-    result = qualify_record(frozen, as_of=as_of)
+    normalized_source_refs = _normalized_refs(source_refs)
+    normalized_conflict_refs = _normalized_refs(source_conflict_refs)
+    qualification_inputs = {
+        "evidence": frozen,
+        "as_of": as_of,
+        "qualification_policy_version": POLICY_VERSION,
+        "source_refs": normalized_source_refs,
+        "source_conflict_refs": normalized_conflict_refs,
+        "memory_receipt": copy.deepcopy(memory_receipt),
+        "allow_post_cutoff_known_at": bool(allow_post_cutoff_known_at),
+    }
+    result = qualify_record(
+        frozen,
+        as_of=as_of,
+        source_refs=normalized_source_refs,
+        source_conflict_refs=normalized_conflict_refs,
+        memory_receipt=memory_receipt,
+        allow_post_cutoff_known_at=allow_post_cutoff_known_at,
+    )
     return {
         "contract": "EvidenceSpecReplay/v1",
-        "input_sha256": fingerprint(inputs),
-        "qualification_inputs": inputs,
+        "input_sha256": fingerprint(qualification_inputs),
+        "qualification_inputs": qualification_inputs,
         "evidence_contract": frozen["contract"],
         "evidence": frozen,
         "qualification": result,
@@ -222,7 +252,7 @@ def frozen_replay(record: dict[str, Any], *, as_of: str | None = None,
 
 
 def install_qualification() -> dict[str, Any]:
-    """Return the deterministic install smoke result for EvidenceSpec."""
+    """Return deterministic install checks without claiming unavailable dimensions."""
     observation = {
         "attempt_id": "install-evidence-attempt",
         "observation_id": "obs_install_evidence",
@@ -239,14 +269,15 @@ def install_qualification() -> dict[str, Any]:
         "factual_status": "verified",
         "evidence_ref": "install-evidence-1",
     }, observation)
+    cutoff = "2026-09-20T03:00:00Z"
     replay = frozen_replay(
         record,
-        as_of="2026-09-20T03:00:00Z",
+        as_of=cutoff,
         original_artifact={"judgment": "qualified", "artifact_id": "install-evidence-artifact"},
     )
+
     from .local_research import LocalResearchChain, ReadOnlyResearchExecutor
 
-    cutoff = "2026-09-20T03:00:00Z"
     contract = {"version": 3, "as_of": cutoff, "requirements": [{
         "key": "install_source", "blocking": True, "allowed_coverage": ["covered"],
         "window": {"mode": "exact", "start": cutoff, "end": cutoff},
@@ -254,7 +285,8 @@ def install_qualification() -> dict[str, Any]:
     operation = {"requirement_key": "install_source", "backend": "gateway",
                  "operation": "web_read", "arguments": {"url": "https://example.test/unavailable"},
                  "fallback_backends": []}
-    calls = []
+    expected_call = [{"operation": "web_read", "url": "https://example.test/unavailable"}]
+    calls: list[dict[str, Any]] = []
 
     def unavailable_backend(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         calls.append({"operation": name, "url": arguments.get("url")})
@@ -265,35 +297,96 @@ def install_qualification() -> dict[str, Any]:
         ReadOnlyResearchExecutor({"gateway": unavailable_backend}), max_repairs=0,
     ).run({"stage": "m0_research", "as_of": cutoff}, contract,
           attempt_id="install-evidence-unavailable-attempt")
-    items = [item for obs in failed.observations for item in obs.get("evidence_items") or []]
+    failure_observations = [
+        observation for observation in failed.observations
+        if observation.get("status") == "failed"
+    ]
+    failure_observation = failure_observations[0] if len(failure_observations) == 1 else {}
+    items = [item for observation in failed.observations for item in observation.get("evidence_items") or []]
+    successful_items = [
+        item for observation in failed.observations if observation.get("status") == "succeeded"
+        for item in observation.get("evidence_items") or []
+    ]
+    verifier_passed = failed.verifier.get("passed") is True
+    unavailable_measurements = {
+        "expected_backend_call": calls == expected_call,
+        "single_failed_acquisition": (
+            failure_observation.get("operation") == "web_read"
+            and failure_observation.get("backend") == "gateway"
+            and failure_observation.get("status") == "failed"
+        ),
+        "no_fabricated_evidence": not items and not successful_items,
+        "no_qualified_fallback": failed.qualified is False and not verifier_passed,
+    }
     unavailable = {
         "contract": "EvidenceSpecSourceAvailability/v1",
         "attempt_id": "install-evidence-unavailable-attempt",
-        "observation_id": failed.observations[0]["observation_id"] if failed.observations else None,
-        "status": failed.observations[0]["status"] if failed.observations else "not_executed",
-        "available": bool(items),
+        "observation_id": failure_observation.get("observation_id"),
+        "status": failure_observation.get("status", "not_executed"),
+        "available": bool(successful_items),
         "qualified": failed.qualified,
         "reason": "source_unavailable",
         "evidence_items": items,
         "backend_calls": calls,
-        "verifier_passed": failed.verifier.get("passed") is True,
+        "verifier_passed": verifier_passed,
+        "measurements": unavailable_measurements,
     }
-    replay_equal = replay == frozen_replay(record, as_of=cutoff, original_artifact=replay["original_artifact"])
-    failure_safe = bool(calls) and unavailable["status"] == "failed" and not items and not failed.qualified
+    failure_safe = all(unavailable_measurements.values())
+    replay_equal = replay == frozen_replay(
+        record, as_of=cutoff, original_artifact=replay["original_artifact"],
+    )
+    evaluation_vector = {
+        "delivery_speed": {
+            "status": "not_measured",
+            "reason": "install_smoke_has_no_live_latency_baseline",
+            "reason_code": "no_live_latency_baseline",
+            "measurements": {"measured": False, "sample_count": 0, "baseline_available": False},
+        },
+        "qualification_probability": {
+            "status": "not_measured",
+            "reason": "two_fixed_fixtures_are_not_a_population",
+            "reason_code": "fixture_not_population",
+            "measurements": {
+                "measured": False, "sample_count": 2, "baseline_available": False,
+                "qualified_fixtures": int(replay["qualification"]["state"] == "qualified"),
+                "rejected_fixtures": int(failed.qualified is False),
+            },
+        },
+        "research_quality": {
+            "status": "not_measured",
+            "reason": "install_smoke_has_no_research_quality_baseline",
+            "reason_code": "no_research_quality_baseline",
+            "measurements": {
+                "measured": False, "sample_count": 1,
+                "evidence_record_qualified": replay["qualification"]["state"] == "qualified",
+                "baseline_available": False,
+            },
+        },
+        "judgment_outcome": {
+            "status": "not_measured",
+            "reason": "install_smoke_has_no_trade_outcome",
+            "reason_code": "no_observed_outcome",
+            "measurements": {
+                "measured": False, "declared_artifact": replay["original_artifact"] is not None,
+                "outcome_observed": False, "baseline_available": False,
+            },
+        },
+        "safety_reliability": {
+            "status": "pass" if replay_equal and failure_safe else "fail",
+            "scope": "deterministic_install_fixtures",
+            "measurements": {
+                "measured": True,
+                "replay_equal": replay_equal,
+                "unavailable_source_safe": failure_safe,
+            },
+        },
+    }
     return {
         "contract": "EvidenceSpecInstallQualification/v1",
         "qualified": replay["qualification"]["state"] == "qualified" and replay_equal and failure_safe,
         "replay": replay,
         "source_unavailable_smoke": unavailable,
-        "evaluation_vector": {
-            "delivery_speed": {"status": "not_measured", "reason": "install_smoke_has_no_live_latency_baseline"},
-            "qualification_probability": {"status": "not_measured", "reason": "two_fixed_fixtures_are_not_a_population"},
-            "research_quality": {"status": "not_measured", "reason": "install_smoke_has_no_research_quality_baseline"},
-            "judgment_outcome": {"status": "not_measured", "reason": "install_smoke_has_no_trade_outcome"},
-            "safety_reliability": {"status": "pass" if replay_equal and failure_safe else "fail",
-                                   "scope": "deterministic_install_fixtures",
-                                   "measurements": {"replay_equal": replay_equal, "unavailable_source_safe": failure_safe}},
-        },
+        "evaluation_vector": evaluation_vector,
     }
 
 

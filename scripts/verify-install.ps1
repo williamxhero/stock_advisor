@@ -117,6 +117,14 @@ try {
             if ($evidenceQualification.evaluation_vector.$axis.status -notin @('pass', 'fail', 'not_measured')) {
                 throw "Installed EvidenceSpec evaluation axis lacks an explicit measurement status: $axis"
             }
+            $measurements = $evidenceQualification.evaluation_vector.$axis.measurements
+            if ($null -eq $measurements -or $measurements.measured -isnot [bool]) {
+                throw "Installed EvidenceSpec evaluation axis lacks structured measurements: $axis"
+            }
+            if ($evidenceQualification.evaluation_vector.$axis.status -ne 'pass' -and
+                [string]::IsNullOrWhiteSpace([string]$evidenceQualification.evaluation_vector.$axis.reason)) {
+                throw "Installed EvidenceSpec non-passing evaluation axis lacks a reason: $axis"
+            }
         }
         if ($evidenceQualification.evaluation_vector.safety_reliability.status -ne 'pass' -or
             $evidenceQualification.evaluation_vector.safety_reliability.measurements.replay_equal -ne $true -or
@@ -133,6 +141,11 @@ try {
             $unavailableSmoke.reason -ne 'source_unavailable' -or
             @($unavailableSmoke.evidence_items).Count -ne 0) {
             throw 'Installed EvidenceSpec source-unavailable smoke did not preserve an unqualified unavailable result.'
+        }
+        foreach ($measurement in @('expected_backend_call', 'single_failed_acquisition', 'no_fabricated_evidence', 'no_qualified_fallback')) {
+            if ($unavailableSmoke.measurements.$measurement -ne $true) {
+                throw "Installed EvidenceSpec source-unavailable measurement failed: $measurement"
+            }
         }
         $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")
         if ($LASTEXITCODE -ne 0) { throw "Installed Debate replay 1 failed with exit code $LASTEXITCODE." }

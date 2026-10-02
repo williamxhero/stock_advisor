@@ -87,6 +87,16 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw "Installed Runtime health check failed with exit code $LASTEXITCODE."
         }
+        # Source-unavailable smoke: resolve the imported module and prove that
+        # this run is served by the release runtime, rather than the checkout
+        # that happened to launch the verifier.
+        $modulePath = ((& $python -c "import ai_trading_companion, pathlib; print(pathlib.Path(ai_trading_companion.__file__).resolve())") -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0) { throw "Installed Runtime module resolution failed with exit code $LASTEXITCODE." }
+        $resolvedInstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+        $resolvedModulePath = [IO.Path]::GetFullPath($modulePath)
+        if (-not $resolvedModulePath.StartsWith($resolvedInstallRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Source-unavailable smoke resolved runtime outside the release directory: $resolvedModulePath"
+        }
         # Run only from the installed runtime path and replay the same frozen
         # role evidence twice.  The two receipts must be byte-identical; the
         # qualification keeps speed, qualification probability, research

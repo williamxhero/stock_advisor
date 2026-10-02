@@ -22,6 +22,8 @@ if ($ProjectRegression) {
         "$root\tests\runtime\test_judgment_publication.py",
         "$root\tests\runtime\test_decision_cycle.py",
         "$root\tests\runtime\test_agent_role.py",
+        "$root\tests\runtime\test_agent_contract.py",
+        "$root\tests\runtime\test_companion_exchange.py",
         "$root\tests\runtime\test_debate.py",
         "$root\tests\runtime\test_preview.py"
     )

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from ai_trading_companion.acquisition import AcquisitionBoundary
-from ai_trading_companion.evidence_spec import qualify, validate
+from ai_trading_companion.evidence_spec import frozen_replay, install_qualification, qualify, validate
 from ai_trading_companion.memory_evidence import MemoryEvidenceRegistrar
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.store import CompanionStore
@@ -121,6 +121,41 @@ def test_frozen_replay_rebuilds_the_same_qualification_without_mutating_history(
     ).hexdigest()
     assert qualify(expired, as_of="2099-01-01T00:00:00Z")["state"] == "expired"
     assert record["market_propagation"]["status"] == "observed"
+
+
+def test_frozen_replay_keeps_input_version_qualification_and_original_artifact() -> None:
+    record = _record(propagation="observed")
+    artifact = {"judgment": "条件成立", "published_at": "2026-09-20T03:00:00Z"}
+    first = frozen_replay(record, as_of="2099-01-01T00:00:00Z", original_artifact=artifact)
+    second = frozen_replay(copy.deepcopy(record), as_of="2099-01-01T00:00:00Z", original_artifact=artifact)
+    assert first == second
+    assert first["evidence_contract"] == "EvidenceSpec/v1"
+    assert first["qualification"]["state"] == "usable"
+    assert first["original_artifact"] == artifact
+    assert record["record_id"] == first["evidence"]["record_id"]
+
+
+def test_install_qualification_is_deterministic_and_keeps_evaluation_axes_separate() -> None:
+    first = install_qualification()
+    second = install_qualification()
+    assert first == second
+    assert first["qualified"] is True
+    assert first["replay"]["evidence_contract"] == "EvidenceSpec/v1"
+    assert first["replay"]["original_artifact"]["artifact_id"] == "install-evidence-artifact"
+    assert set(first["evaluation_vector"]) == {
+        "delivery_speed", "qualification_probability", "research_quality",
+        "judgment_outcome", "safety_reliability",
+    }
+
+
+def test_replay_rejects_tampered_input_without_rewriting_original() -> None:
+    record = _record()
+    original_id = record["record_id"]
+    tampered = copy.deepcopy(record)
+    tampered["content"] = "被篡改"
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        frozen_replay(tampered)
+    assert record["record_id"] == original_id
 
 
 def test_runtime_ledger_keeps_record_fields_and_emits_exchange_contract(tmp_path: Path) -> None:

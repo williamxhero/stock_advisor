@@ -12,6 +12,7 @@ foreach ($required in @(
     'resources\contracts\companion-client-event-v1.schema.json',
     'resources\contracts\companion-decision-cycle-v1.schema.json',
     'resources\contracts\evidence-snapshot-spec-v1.schema.json',
+    'resources\contracts\evidence-spec-v1.schema.json',
     'resources\contracts\temporal-integrity-spec-v1.schema.json',
     'resources\contracts\agent-contract-spec-v1.schema.json',
     'resources\contracts\agent-contract-input-v1.schema.json',
@@ -99,6 +100,20 @@ try {
         $roleQualification = $roleReplayOne | ConvertFrom-Json
         if ($roleQualification.contract -ne 'AgentRoleInstallQualification/v1' -or $roleQualification.qualified -ne $true) {
             throw 'Installed AgentRole qualification did not pass.'
+        }
+        $evidenceReplayOne = ((& $python -m ai_trading_companion.evidence_spec) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed EvidenceSpec replay 1 failed with exit code $LASTEXITCODE." }
+        $evidenceReplayTwo = ((& $python -m ai_trading_companion.evidence_spec) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed EvidenceSpec replay 2 failed with exit code $LASTEXITCODE." }
+        if ($evidenceReplayOne -ne $evidenceReplayTwo) { throw 'Installed EvidenceSpec frozen replays were not deterministic.' }
+        $evidenceQualification = $evidenceReplayOne | ConvertFrom-Json
+        if ($evidenceQualification.contract -ne 'EvidenceSpecInstallQualification/v1' -or $evidenceQualification.qualified -ne $true) {
+            throw 'Installed EvidenceSpec qualification did not pass.'
+        }
+        foreach ($axis in @('delivery_speed', 'qualification_probability', 'research_quality', 'judgment_outcome', 'safety_reliability')) {
+            if ($evidenceQualification.evaluation_vector.PSObject.Properties.Name -notcontains $axis) {
+                throw "Installed EvidenceSpec qualification is missing evaluation axis: $axis"
+            }
         }
         $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")
         if ($LASTEXITCODE -ne 0) { throw "Installed Debate replay 1 failed with exit code $LASTEXITCODE." }

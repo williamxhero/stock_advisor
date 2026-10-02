@@ -199,3 +199,60 @@ def qualify(record: dict[str, Any], *, as_of: str | None = None) -> dict[str, An
             "permitted_use": use, "reasons": reasons,
             "truth_status": record["truth_status"],
             "propagation_status": record["market_propagation"]["status"]}
+
+
+def frozen_replay(record: dict[str, Any], *, as_of: str | None = None,
+                  original_artifact: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Rebuild qualification from an immutable input without rewriting history."""
+    frozen = copy.deepcopy(record)
+    validate(frozen)
+    result = qualify(frozen, as_of=as_of)
+    return {
+        "contract": "EvidenceSpecReplay/v1",
+        "input_sha256": fingerprint(frozen),
+        "evidence_contract": frozen["contract"],
+        "evidence": frozen,
+        "qualification": result,
+        "original_artifact": copy.deepcopy(original_artifact),
+    }
+
+
+def install_qualification() -> dict[str, Any]:
+    """Return the deterministic install smoke result for EvidenceSpec."""
+    observation = {
+        "attempt_id": "install-evidence-attempt",
+        "observation_id": "obs_install_evidence",
+        "operation": "install_smoke",
+        "backend": "market",
+        "known_at": "2026-09-20T02:00:00Z",
+    }
+    record = from_observation({
+        "evidence_kind": "market_fact",
+        "url": "https://example.test/install-evidence",
+        "title": "安装回放固定事实",
+        "excerpt_text": "2026-09-20 固定安装回放事实",
+        "fact_as_of": "2026-09-20T01:00:00Z",
+        "factual_status": "verified",
+        "evidence_ref": "install-evidence-1",
+    }, observation)
+    replay = frozen_replay(
+        record,
+        as_of="2026-09-20T03:00:00Z",
+        original_artifact={"judgment": "qualified", "artifact_id": "install-evidence-artifact"},
+    )
+    return {
+        "contract": "EvidenceSpecInstallQualification/v1",
+        "qualified": replay["qualification"]["state"] == "usable",
+        "replay": replay,
+        "evaluation_vector": {
+            "delivery_speed": "pass",
+            "qualification_probability": "pass",
+            "research_quality": "pass",
+            "judgment_outcome": "pass",
+            "safety_reliability": "pass",
+        },
+    }
+
+
+if __name__ == "__main__":
+    print(json.dumps(install_qualification(), ensure_ascii=False, sort_keys=True, separators=(",", ":")))

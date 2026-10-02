@@ -1,11 +1,15 @@
 [CmdletBinding()]
 param(
     [switch]$Release,
+    [switch]$ProjectRegression,
     [ValidateSet('all', 'EvidenceSpec')]
     [string]$Select = 'all'
 )
 
 $ErrorActionPreference = 'Stop'
+if ($ProjectRegression -and $Select -ne 'all') {
+    throw 'ProjectRegression requires the complete regression suite; Select must be all.'
+}
 $root = Split-Path -Parent $PSScriptRoot
 $env:PYTHONPATH = "$root\memoryhub\src;$root\src\runtime" + $(if ($env:PYTHONPATH) { ";$env:PYTHONPATH" } else { "" })
 

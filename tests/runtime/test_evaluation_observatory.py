@@ -731,9 +731,10 @@ class ExperimentAssessmentTests(unittest.TestCase):
                 "research_quality": .95, "value": .8, "cost": .9, "stability": .98,
                 "safety_faults": 0,
             }
+            live_base_date = datetime.now().date() + timedelta(days=2)
 
             def record_live_pair(index: int, regime: str, *, mismatch: bool = False) -> None:
-                day = f"2026-10-{index + 1:02d}"
+                day = (live_base_date + timedelta(days=index)).isoformat()
                 at = f"{day}T09:45:00Z"
                 packet = {
                     "task_key": "daily.execution.0945", "as_of": at,

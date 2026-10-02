@@ -84,3 +84,5 @@ def test_installed_contract_schema_and_runtime_are_required() -> None:
     assert "resources\\contracts\\agent-contract-spec-v1.schema.json" in script
     assert "resources\\contracts\\agent-contract-input-v1.schema.json" in script
     assert "runtime\\ai_trading_companion\\agent_contract.py" in script
+    assert "Source-unavailable smoke" in script
+    assert "modulePath" in script

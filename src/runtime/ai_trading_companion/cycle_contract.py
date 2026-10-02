@@ -93,15 +93,24 @@ def _require_time(value: str, field: str) -> str:
 
 def validate_m1_blind_packet(value: Any, *, path: str = "packet") -> None:
     """Reject H0 raw text and H0-derived signals at the durable LLM boundary."""
-    if isinstance(value, dict):
-        for key, child in value.items():
-            normalized = str(key).strip().lower()
-            if normalized in _M1_FORBIDDEN_KEYS:
-                raise ValueError(f"M1 packet exposes H0 or a derived H0 signal at {path}.{key}")
-            validate_m1_blind_packet(child, path=f"{path}.{key}")
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            validate_m1_blind_packet(child, path=f"{path}[{index}]")
+    from .decision_cycle import assert_m1_blind
+
+    try:
+        assert_m1_blind(value)
+    except ValueError as exc:
+        raise ValueError(f"M1 packet exposes H0 or a derived H0 signal at {path}") from exc
+    def walk(item: Any, location: str) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                normalized = str(key).strip().lower()
+                if normalized in _M1_FORBIDDEN_KEYS:
+                    raise ValueError(f"M1 packet exposes H0 or a derived H0 signal at {location}.{key}")
+                walk(child, f"{location}.{key}")
+        elif isinstance(item, list):
+            for index, child in enumerate(item):
+                walk(child, f"{location}[{index}]")
+
+    walk(value, path)
 
 
 @dataclass(frozen=True)

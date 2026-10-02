@@ -1,9 +1,36 @@
 [CmdletBinding()]
-param([switch]$Release)
+param(
+    [switch]$Release,
+    [switch]$ProjectRegression
+)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $env:PYTHONPATH = "$root\memoryhub\src;$root\src\runtime" + $(if ($env:PYTHONPATH) { ";$env:PYTHONPATH" } else { "" })
+
+if ($ProjectRegression) {
+    # The project-regression gate is the smallest deterministic suite that
+    # exercises the decision-cycle contract, frozen replay, recovery and the
+    # two installed qualification paths.  Keep it independent of the full
+    # MemoryHub and desktop suites so it can be used by ticket automation.
+    $regressionTests = @(
+        "$root\tests\runtime\test_cycle_contract.py",
+        "$root\tests\runtime\test_cycle_replay.py",
+        "$root\tests\runtime\test_evidence_qualification.py",
+        "$root\tests\runtime\test_evidence_snapshot.py",
+        "$root\tests\runtime\test_temporal_integrity.py",
+        "$root\tests\runtime\test_judgment_publication.py",
+        "$root\tests\runtime\test_decision_cycle.py",
+        "$root\tests\runtime\test_agent_role.py",
+        "$root\tests\runtime\test_agent_contract.py",
+        "$root\tests\runtime\test_companion_exchange.py",
+        "$root\tests\runtime\test_debate.py",
+        "$root\tests\runtime\test_preview.py"
+    )
+    py -m pytest $regressionTests -q
+    if ($LASTEXITCODE -ne 0) { throw "Project regression tests failed with exit code $LASTEXITCODE." }
+    exit 0
+}
 
 py -m pytest "$root\memoryhub\tests" -q
 if ($LASTEXITCODE -ne 0) { throw "MemoryHub tests failed with exit code $LASTEXITCODE." }

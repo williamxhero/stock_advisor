@@ -3616,6 +3616,14 @@ class CompanionStore:
                         "acquired_at": known_at,
                     })
                 validate(spec)
+                # The ledger is the runtime ownership boundary for EvidenceSpec.
+                # Never let a source excerpt cross that boundary with a record
+                # whose provenance points at a different acquisition reference.
+                # This keeps retries and stage projections traceable to the
+                # exact versioned input that was consumed.
+                spec_ref = str((spec.get("provenance") or {}).get("evidence_ref") or "")
+                if ref and spec_ref and spec_ref != ref:
+                    raise ValueError("evidence provenance reference does not match source reference")
                 # Acquired versions include clocks and provenance, even when
                 # the publisher's text is unchanged. Legacy inputs retain
                 # their content-based retry identity.

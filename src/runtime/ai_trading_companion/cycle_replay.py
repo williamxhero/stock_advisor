@@ -63,8 +63,17 @@ def replay_cycle(frozen: dict[str, Any]) -> dict[str, Any]:
             validate_m1_blind_packet(packet)
             human_texts = [a.get('body_markdown', '') for a in source['artifacts'] if a.get('actor') == 'human']
             assert_m1_blind(packet, human_texts=human_texts)
+        input_integrity = 'missing' if packet is None else 'verified'
         if packet is not None and attempt.get('input_sha256') and _hash({k: v for k, v in packet.items() if k != 'sha256'}) != attempt['input_sha256']:
-            raise ValueError('cycle replay input integrity mismatch')
+            # Old deterministic fallbacks retained the provider retry hash after
+            # removing verification_repair. Report this frozen discrepancy; do
+            # not repair history or confer current qualification on that input.
+            if (attempt.get('runner_fingerprint') == 'runtime-safe-fallback/v1'
+                    and attempt.get('routing_reason') == 'verified-stage-safe-fallback'
+                    and verifier.get('fallback') is True):
+                input_integrity = 'historical_fallback_hash_mismatch'
+            else:
+                raise ValueError('cycle replay input integrity mismatch')
         output = json.loads(attempt.get('output_json') or 'null')
         conclusion_qualified = None
         if attempt['stage'] == 'm1_judgment' and isinstance(output, dict):
@@ -74,7 +83,8 @@ def replay_cycle(frozen: dict[str, Any]) -> dict[str, Any]:
                 conclusion_qualified = False
         attempts.append({
             'attempt_id': attempt['attempt_id'], 'status': attempt['status'],
-            'qualified': attempt['status'] == 'succeeded' and verifier.get('passed') is True and packet is not None and output is not None and conclusion_qualified is not False,
+            'qualified': attempt['status'] == 'succeeded' and verifier.get('passed') is True and input_integrity == 'verified' and output is not None and conclusion_qualified is not False,
+            'input_integrity': input_integrity,
             'conclusion_qualified': conclusion_qualified,
             'historically_qualified': attempt['status'] == 'succeeded' and verifier.get('passed') is True,
             'input_reconstructable': packet is not None,

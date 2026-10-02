@@ -6,6 +6,36 @@ import pytest
 from ai_trading_companion.cycle_replay import freeze_cycle, replay_cycle
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.store import CompanionStore
+from ai_trading_companion.__main__ import _save_safe_stage_fallback
+from ai_trading_companion.broker_client import canonical_packet_hash
+
+
+def test_recovery_fallback_replays_actual_packet_and_preserves_legacy_discrepancy(tmp_path):
+    store = CompanionStore(tmp_path / 'cycle.sqlite3')
+    cycle = CompanionEngine(store).start_cycle('daily.execution.0945', '2026-09-21T09:45:00+08:00', '2026-09-21T01:45:00Z')
+    packet = {'verification_repair': {'frozen_decision': {'direction': 'bullish'}}}
+    packet['sha256'] = canonical_packet_hash(packet)
+    _, attempt_id = _save_safe_stage_fallback(store, cycle, 'm1_judgment', packet, horizon='当前')
+    frozen = freeze_cycle(store, cycle['cycle_id'])
+    attempt = frozen['source']['attempts'][0]
+    actual_packet = json.loads(attempt['input_packet_json'])
+    expected_hash = canonical_packet_hash({k: v for k, v in actual_packet.items() if k != 'sha256'})
+    assert attempt['input_sha256'] == actual_packet['sha256'] == expected_hash
+    assert replay_cycle(frozen)['qualification']['attempts'][0]['input_integrity'] == 'verified'
+    # Emulate the persisted pre-fix fallback, without migrating or rewriting it.
+    with store.connection() as connection:
+        actual_packet['sha256'] = packet['sha256']
+        connection.execute('UPDATE llm_attempt SET input_sha256=?, input_packet_json=? WHERE attempt_id=?',
+                           (packet['sha256'], json.dumps(actual_packet), attempt_id))
+    legacy = freeze_cycle(store, cycle['cycle_id'])
+    original = copy.deepcopy(legacy)
+    result = replay_cycle(legacy)
+    assert legacy == original
+    receipt = result['qualification']['attempts'][0]
+    assert receipt['input_integrity'] == 'historical_fallback_hash_mismatch'
+    assert receipt['historically_qualified'] is True
+    assert receipt['qualified'] is False
+    assert result['source']['attempts'][0]['input_sha256'] == packet['sha256']
 
 
 def test_frozen_cycle_reconstructs_actual_inputs_and_qualification_without_rewriting(tmp_path):

@@ -82,6 +82,8 @@ def test_prepared_cycle_keeps_the_revision_that_created_it(tmp_path):
     cycle = store.get_cycle(result[0]["cycle_id"])
     assert cycle["schedule_revision"] == 1
     assert "盘前" in cycle["schedule_snapshot_json"]
+    assert result[0]["decision_cycle"]["cycle_spec_version"] == "CompanionDecisionCycleSpec/v1"
+    assert result[0]["decision_cycle"]["cycle_provenance"]["schedule_revision"] == 1
 
 
 def test_late_unstarted_schedule_is_marked_missed(tmp_path):

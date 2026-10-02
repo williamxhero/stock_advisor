@@ -80,9 +80,18 @@ def cycle_contract(cycle: dict[str, Any], stages: list[dict[str, Any]]) -> dict[
         schedule_snapshot = json.loads(str(cycle.get("schedule_snapshot_json") or "null"))
     except json.JSONDecodeError:
         schedule_snapshot = None
+    try:
+        frozen_contract = json.loads(str(cycle.get("cycle_contract_json") or "{}"))
+    except json.JSONDecodeError:
+        frozen_contract = {}
     return {
         "contract": DECISION_CYCLE_CONTRACT,
         "contract_version": DECISION_CYCLE_VERSION,
+        # Keep the SPEC identity alongside the lifecycle projection.  The
+        # former is the immutable creation input; this contract is the
+        # evolving runtime output consumed by Exchange and read-only clients.
+        "cycle_spec_version": str(cycle.get("cycle_spec_version") or frozen_contract.get("contract") or ""),
+        "cycle_contract_hash": cycle.get("cycle_contract_hash"),
         "cycle_id": str(cycle["cycle_id"]),
         "task_key": str(cycle["task_key"]),
         "as_of": str(cycle["as_of"]),
@@ -96,4 +105,5 @@ def cycle_contract(cycle: dict[str, Any], stages: list[dict[str, Any]]) -> dict[
         "revision": int(cycle.get("revision") or 0),
         "stages": stages,
         "provenance": provenance,
+        "cycle_provenance": frozen_contract,
     }

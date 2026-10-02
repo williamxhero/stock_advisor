@@ -37,6 +37,17 @@ def test_cycle_contract_freezes_identity_schedule_and_state_events() -> None:
     assert contract["cycle_id"] == cycle["cycle_id"]
     assert contract["schedule_revision"] == 7
     assert cycle["cycle_contract_hash"]
+    projection = engine.decision_cycle_contract(cycle["cycle_id"])
+    assert projection["cycle_spec_version"] == SPEC_VERSION
+    assert projection["cycle_contract_hash"] == cycle["cycle_contract_hash"]
+    assert projection["cycle_provenance"] == contract
+
+    repeated = engine.start_cycle(
+        cycle["task_key"], cycle["scheduled_for"], "2026-09-21T02:00:00Z",
+        schedule_id="changed", schedule_revision=8,
+    )
+    assert repeated["cycle_id"] == cycle["cycle_id"]
+    assert engine.decision_cycle_contract(repeated["cycle_id"])["cycle_provenance"] == contract
 
     started = store.transition(cycle["cycle_id"], "researching_m0")
     events = store.cycle_events(cycle["cycle_id"])

@@ -282,6 +282,9 @@ class RuntimePacketBuilder:
                     "title": item["source_title"], "url": item["source_url"],
                     "known_at": item["known_at"], "coverage_state": item["coverage_state"],
                     "text": item["body_text"],
+                    "evidence_spec": json.loads(item.get("evidence_spec_json") or "{}"),
+                    "provenance": json.loads(item.get("provenance_json") or "{}"),
+                    "market_propagation": json.loads(item.get("evidence_spec_json") or "{}").get("market_propagation"),
                 }
                 for item in ledger
             ],

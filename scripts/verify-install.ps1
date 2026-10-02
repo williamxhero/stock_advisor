@@ -13,6 +13,7 @@ foreach ($required in @(
     'resources\contracts\companion-decision-cycle-v1.schema.json',
     'resources\contracts\evidence-snapshot-spec-v1.schema.json',
     'resources\contracts\evidence-spec-v1.schema.json',
+    'resources\contracts\evidence-qualification-spec-v1.schema.json',
     'resources\contracts\temporal-integrity-spec-v1.schema.json',
     'resources\contracts\agent-contract-spec-v1.schema.json',
     'resources\contracts\agent-contract-input-v1.schema.json',

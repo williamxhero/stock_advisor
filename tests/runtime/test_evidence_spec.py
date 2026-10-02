@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 from ai_trading_companion.acquisition import AcquisitionBoundary
-from ai_trading_companion.evidence_spec import frozen_replay, install_qualification, qualify, validate
+from ai_trading_companion.evidence_spec import fingerprint, frozen_replay, install_qualification, qualify, validate
+from ai_trading_companion.evidence_qualification import POLICY_VERSION, qualify_record
 from ai_trading_companion.memory_evidence import MemoryEvidenceRegistrar
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.store import CompanionStore
@@ -130,7 +131,7 @@ def test_frozen_replay_keeps_input_version_qualification_and_original_artifact()
     second = frozen_replay(copy.deepcopy(record), as_of="2099-01-01T00:00:00Z", original_artifact=artifact)
     assert first == second
     assert first["evidence_contract"] == "EvidenceSpec/v1"
-    assert first["qualification"]["state"] == "usable"
+    assert first["qualification"]["state"] == "qualified"
     assert first["original_artifact"] == artifact
     assert record["record_id"] == first["evidence"]["record_id"]
 
@@ -146,16 +147,26 @@ def test_install_qualification_is_deterministic_and_keeps_evaluation_axes_separa
         "delivery_speed", "qualification_probability", "research_quality",
         "judgment_outcome", "safety_reliability",
     }
-    assert first["source_unavailable_smoke"] == {
-        "contract": "EvidenceSpecSourceAvailability/v1",
-        "attempt_id": "install-evidence-unavailable-attempt",
-        "observation_id": "obs_install_evidence_unavailable",
-        "status": "failed",
-        "available": False,
-        "qualified": False,
-        "reason": "source_unavailable",
-        "evidence_items": [],
-    }
+    smoke = first["source_unavailable_smoke"]
+    assert smoke["status"] == "failed"
+    assert smoke["available"] is False and smoke["qualified"] is False
+    assert smoke["verifier_passed"] is False and smoke["evidence_items"] == []
+    assert smoke["backend_calls"] == [{"operation": "web_read", "url": "https://example.test/unavailable"}]
+    assert first["evaluation_vector"]["judgment_outcome"]["status"] == "not_measured"
+    assert first["evaluation_vector"]["safety_reliability"]["measurements"]["unavailable_source_safe"] is True
+
+
+def test_replay_uses_production_weak_source_policy_and_binds_cutoff() -> None:
+    record = _record("market_fact")
+    record["source"]["reference"]["screenshot_only"] = True
+    record["record_id"] = fingerprint({k: v for k, v in record.items() if k != "record_id"})
+    replay = frozen_replay(record, as_of="2099-01-01T00:00:00Z")
+    assert replay["qualification"] == qualify_record(record, as_of="2099-01-01T00:00:00Z")
+    assert replay["qualification"]["state"] == "degraded"
+    assert replay["qualification"]["permitted_use"] == "context_only"
+    assert replay["qualification_inputs"]["qualification_policy_version"] == POLICY_VERSION
+    assert replay["input_sha256"] == fingerprint(replay["qualification_inputs"])
+    assert replay["input_sha256"] != frozen_replay(record, as_of="2099-01-02T00:00:00Z")["input_sha256"]
 
 
 def test_replay_rejects_tampered_input_without_rewriting_original() -> None:

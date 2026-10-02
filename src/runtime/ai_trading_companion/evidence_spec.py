@@ -206,10 +206,14 @@ def frozen_replay(record: dict[str, Any], *, as_of: str | None = None,
     """Rebuild qualification from an immutable input without rewriting history."""
     frozen = copy.deepcopy(record)
     validate(frozen)
-    result = qualify(frozen, as_of=as_of)
+    from .evidence_qualification import POLICY_VERSION, qualify_record
+
+    inputs = {"evidence": frozen, "as_of": as_of, "qualification_policy_version": POLICY_VERSION}
+    result = qualify_record(frozen, as_of=as_of)
     return {
         "contract": "EvidenceSpecReplay/v1",
-        "input_sha256": fingerprint(frozen),
+        "input_sha256": fingerprint(inputs),
+        "qualification_inputs": inputs,
         "evidence_contract": frozen["contract"],
         "evidence": frozen,
         "qualification": result,
@@ -240,27 +244,55 @@ def install_qualification() -> dict[str, Any]:
         as_of="2026-09-20T03:00:00Z",
         original_artifact={"judgment": "qualified", "artifact_id": "install-evidence-artifact"},
     )
+    from .local_research import LocalResearchChain, ReadOnlyResearchExecutor
+
+    cutoff = "2026-09-20T03:00:00Z"
+    contract = {"version": 3, "as_of": cutoff, "requirements": [{
+        "key": "install_source", "blocking": True, "allowed_coverage": ["covered"],
+        "window": {"mode": "exact", "start": cutoff, "end": cutoff},
+    }]}
+    operation = {"requirement_key": "install_source", "backend": "gateway",
+                 "operation": "web_read", "arguments": {"url": "https://example.test/unavailable"},
+                 "fallback_backends": []}
+    calls = []
+
+    def unavailable_backend(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        calls.append({"operation": name, "url": arguments.get("url")})
+        raise OSError("source_unavailable")
+
+    failed = LocalResearchChain(
+        lambda *_: {"version": 1, "operations": [operation]},
+        ReadOnlyResearchExecutor({"gateway": unavailable_backend}), max_repairs=0,
+    ).run({"stage": "m0_research", "as_of": cutoff}, contract,
+          attempt_id="install-evidence-unavailable-attempt")
+    items = [item for obs in failed.observations for item in obs.get("evidence_items") or []]
     unavailable = {
         "contract": "EvidenceSpecSourceAvailability/v1",
         "attempt_id": "install-evidence-unavailable-attempt",
-        "observation_id": "obs_install_evidence_unavailable",
-        "status": "failed",
-        "available": False,
-        "qualified": False,
+        "observation_id": failed.observations[0]["observation_id"] if failed.observations else None,
+        "status": failed.observations[0]["status"] if failed.observations else "not_executed",
+        "available": bool(items),
+        "qualified": failed.qualified,
         "reason": "source_unavailable",
-        "evidence_items": [],
+        "evidence_items": items,
+        "backend_calls": calls,
+        "verifier_passed": failed.verifier.get("passed") is True,
     }
+    replay_equal = replay == frozen_replay(record, as_of=cutoff, original_artifact=replay["original_artifact"])
+    failure_safe = bool(calls) and unavailable["status"] == "failed" and not items and not failed.qualified
     return {
         "contract": "EvidenceSpecInstallQualification/v1",
-        "qualified": replay["qualification"]["state"] == "usable",
+        "qualified": replay["qualification"]["state"] == "qualified" and replay_equal and failure_safe,
         "replay": replay,
         "source_unavailable_smoke": unavailable,
         "evaluation_vector": {
-            "delivery_speed": "pass",
-            "qualification_probability": "pass",
-            "research_quality": "pass",
-            "judgment_outcome": "pass",
-            "safety_reliability": "pass",
+            "delivery_speed": {"status": "not_measured", "reason": "install_smoke_has_no_live_latency_baseline"},
+            "qualification_probability": {"status": "not_measured", "reason": "two_fixed_fixtures_are_not_a_population"},
+            "research_quality": {"status": "not_measured", "reason": "install_smoke_has_no_research_quality_baseline"},
+            "judgment_outcome": {"status": "not_measured", "reason": "install_smoke_has_no_trade_outcome"},
+            "safety_reliability": {"status": "pass" if replay_equal and failure_safe else "fail",
+                                   "scope": "deterministic_install_fixtures",
+                                   "measurements": {"replay_equal": replay_equal, "unavailable_source_safe": failure_safe}},
         },
     }
 

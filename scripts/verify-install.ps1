@@ -114,12 +114,22 @@ try {
             if ($evidenceQualification.evaluation_vector.PSObject.Properties.Name -notcontains $axis) {
                 throw "Installed EvidenceSpec qualification is missing evaluation axis: $axis"
             }
+            if ($evidenceQualification.evaluation_vector.$axis.status -notin @('pass', 'fail', 'not_measured')) {
+                throw "Installed EvidenceSpec evaluation axis lacks an explicit measurement status: $axis"
+            }
+        }
+        if ($evidenceQualification.evaluation_vector.safety_reliability.status -ne 'pass' -or
+            $evidenceQualification.evaluation_vector.safety_reliability.measurements.replay_equal -ne $true -or
+            $evidenceQualification.evaluation_vector.safety_reliability.measurements.unavailable_source_safe -ne $true) {
+            throw 'Installed EvidenceSpec measured safety checks failed.'
         }
         $unavailableSmoke = $evidenceQualification.source_unavailable_smoke
         if ($unavailableSmoke.contract -ne 'EvidenceSpecSourceAvailability/v1' -or
             $unavailableSmoke.status -ne 'failed' -or
             $unavailableSmoke.available -ne $false -or
             $unavailableSmoke.qualified -ne $false -or
+            $unavailableSmoke.verifier_passed -ne $false -or
+            @($unavailableSmoke.backend_calls).Count -lt 1 -or
             $unavailableSmoke.reason -ne 'source_unavailable' -or
             @($unavailableSmoke.evidence_items).Count -ne 0) {
             throw 'Installed EvidenceSpec source-unavailable smoke did not preserve an unqualified unavailable result.'

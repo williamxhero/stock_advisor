@@ -727,8 +727,16 @@ class RuntimePacketBuilder:
                     }
                 spec = source.get("evidence_spec")
                 if isinstance(spec, dict):
+                    # EvidenceSpec is the versioned runtime identity of the
+                    # source.  M1 may consume its public, read-only metadata,
+                    # including the contract version and provenance chain;
+                    # keeping these fields prevents a source from becoming an
+                    # untraceable excerpt when it crosses the stage boundary.
                     projected["evidence_spec"] = {
-                        key: spec[key] for key in ("record_id", "truth_status", "occurred_at", "known_at")
+                        key: spec[key] for key in (
+                            "contract", "record_id", "truth_status", "occurred_at", "known_at",
+                            "published_at", "source", "provenance",
+                        )
                         if key in spec
                     }
                 public["sources"].append(projected)

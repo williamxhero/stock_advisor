@@ -139,3 +139,25 @@ def test_runtime_ledger_keeps_record_fields_and_emits_exchange_contract(tmp_path
     assert json.loads(row["provenance_json"])["origin"] == "external_source"
     events = store.pending_events()
     assert any(event["event_type"] == "evidence.recorded" for event in events)
+
+
+def test_runtime_ledger_retries_are_idempotent_and_retain_versioned_provenance(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    cycle = store.ensure_daily_conversation("2026-09-20")
+    evidence = {"as_of": "2026-09-20T01:00:00Z", "sources": [{
+        "evidence_ref": "fact-1", "url": "https://example.test/fact", "title": "事实",
+        "fact_as_of": "2026-09-20T01:00:00Z", "excerpt": "2026-09-20 可核验事实",
+    }]}
+
+    first = store.record_evidence(cycle, "m0_research", evidence)
+    second = store.record_evidence(cycle, "m0_research", evidence)
+
+    rows = store.evidence_for_day("2026-09-20", "9999-01-01T00:00:00Z")
+    assert len(rows) == 1
+    spec = json.loads(rows[0]["evidence_spec_json"])
+    assert spec["contract"] == "EvidenceSpec/v1"
+    assert spec["record_id"]
+    assert spec["provenance"]["evidence_ref"] == "fact-1"
+    assert json.loads(rows[0]["qualification_spec_json"])["input_record_refs"][0]["record_id"] == spec["record_id"]
+    assert len(first) == 1
+    assert second == []

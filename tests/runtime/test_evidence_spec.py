@@ -290,6 +290,25 @@ def test_runtime_ledger_rejects_provenance_reference_drift(tmp_path: Path) -> No
         store.record_evidence(cycle, "m0_research", evidence, [observation])
 
 
+def test_runtime_ledger_rejects_missing_provenance_reference_for_bound_source(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    cycle = store.ensure_daily_conversation("2026-09-20")
+    observation, _ = AcquisitionBoundary("missing-provenance-ref").observe(
+        "web_read", {}, {"results": [{
+            "url": "https://example.test/fact", "title": "Fact",
+            "excerpt_text": "stable fact", "fact_as_of": "2026-09-20T01:00:00Z",
+        }]}, True,
+    )
+    item = observation["evidence_items"][0]
+    item["evidence_spec"]["provenance"]["evidence_ref"] = ""
+    item["evidence_spec"]["record_id"] = fingerprint({
+        key: value for key, value in item["evidence_spec"].items() if key != "record_id"
+    })
+    evidence = {"sources": [{"evidence_ref": item["evidence_ref"]}]}
+    with pytest.raises(ValueError, match="provenance reference"):
+        store.record_evidence(cycle, "m0_research", evidence, [observation])
+
+
 def test_runtime_ledger_preserves_distinct_observed_versions_with_identical_content(tmp_path: Path) -> None:
     store = CompanionStore(tmp_path / "companion.sqlite3")
     cycle = store.ensure_daily_conversation("2026-09-20")

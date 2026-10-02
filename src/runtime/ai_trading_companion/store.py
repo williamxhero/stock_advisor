@@ -3622,7 +3622,12 @@ class CompanionStore:
                 # This keeps retries and stage projections traceable to the
                 # exact versioned input that was consumed.
                 spec_ref = str((spec.get("provenance") or {}).get("evidence_ref") or "")
-                if ref and spec_ref and spec_ref != ref:
+                # Once an acquisition reference exists, the supplied spec must
+                # carry that exact reference.  An empty spec reference is not a
+                # legacy case here: it would make the persisted fact
+                # untraceable to the consumed acquisition.  Legacy records are
+                # only accepted when the source itself has no reference.
+                if ref and spec_ref != ref:
                     raise ValueError("evidence provenance reference does not match source reference")
                 # Acquired versions include clocks and provenance, even when
                 # the publisher's text is unchanged. Legacy inputs retain

@@ -51,7 +51,8 @@ def test_frozen_cycle_reconstructs_actual_inputs_and_qualification_without_rewri
         'coverage': [], 'critical_gaps': [], 'conflicts': [], 'high_impact_events': [],
     }, as_of=cycle['as_of'], source_watermarks={'market': 'revision-7'})
     attempt = store.begin_attempt(cycle['cycle_id'], 'm1_judgment', cycle['as_of'],
-                                  input_packet=packet, model='frozen-model', runner_fingerprint='prompt-v7')
+                                  input_sha256=canonical_packet_hash(packet), input_packet=packet,
+                                  model='frozen-model', runner_fingerprint='prompt-v7')
     store.finish_attempt(attempt['attempt_id'], 'succeeded', output={'direction': 'wait'},
                          verifier={'passed': True})
     artifact = store.append_artifact(cycle['cycle_id'], 'm1', 'model', 'Original judgment', cycle['as_of'])
@@ -96,6 +97,28 @@ def test_missing_historical_inputs_remain_missing_and_unqualified(tmp_path):
     assert result['qualification']['attempts'][0]['historically_qualified'] is True
     assert result['qualification']['attempts'][0]['qualified'] is False
     assert result['evaluation_vector']['safety_reliability']['inputs_complete'] is False
+
+
+def test_missing_persisted_hash_is_unqualified_even_when_packet_exists(tmp_path):
+    store = CompanionStore(tmp_path / 'cycle.sqlite3')
+    cycle = CompanionEngine(store).start_cycle('daily.execution.0945', '2026-09-21T09:45:00+08:00', '2026-09-21T01:45:00Z')
+    attempt = store.begin_attempt(cycle['cycle_id'], 'm1_judgment', cycle['as_of'], input_packet={})
+    store.finish_attempt(attempt['attempt_id'], 'succeeded', verifier={'passed': True}, output={'direction': 'wait'})
+    receipt = replay_cycle(freeze_cycle(store, cycle['cycle_id']))['qualification']['attempts'][0]
+    assert receipt['input_integrity'] == 'missing'
+    assert receipt['qualified'] is False
+
+
+def test_replay_ignores_human_artifacts_sealed_after_m1_boundary(tmp_path):
+    store = CompanionStore(tmp_path / 'cycle.sqlite3')
+    cycle = CompanionEngine(store).start_cycle('daily.execution.0945', '2026-09-21T09:45:00+08:00', '2026-09-21T01:45:00Z')
+    packet = {'frozen_public_evidence': [], 'business_context': {}}
+    attempt = store.begin_attempt(cycle['cycle_id'], 'm1_judgment', cycle['as_of'],
+                                  input_sha256=canonical_packet_hash(packet), input_packet=packet)
+    store.finish_attempt(attempt['attempt_id'], 'succeeded', verifier={'passed': True}, output={'direction': 'wait'})
+    frozen = freeze_cycle(store, cycle['cycle_id'])
+    store.append_artifact(cycle['cycle_id'], 'later_note', 'human', 'Human directional claim', cycle['as_of'])
+    assert replay_cycle(frozen)['qualification']['attempts'][0]['qualified'] is True
 
 
 @pytest.mark.parametrize('problem', ['h0_text', 'hash_conflict', 'unqualified'])

@@ -61,10 +61,20 @@ def replay_cycle(frozen: dict[str, Any]) -> dict[str, Any]:
         verifier = json.loads(attempt.get('verifier_json') or '{}')
         if str(attempt['stage']).startswith('m1') and packet is not None:
             validate_m1_blind_packet(packet)
-            human_texts = [a.get('body_markdown', '') for a in source['artifacts'] if a.get('actor') == 'human']
+            # Replay the exact frozen boundary.  Human material sealed after
+            # this attempt started was unavailable to the original M1 input
+            # and must not change the historical leakage result.
+            boundary = attempt.get('started_at') or attempt.get('as_of')
+            human_texts = [
+                a.get('body_markdown', '')
+                for a in source['artifacts']
+                if a.get('actor') == 'human'
+                and (not boundary or (a.get('sealed_at') or '') <= boundary)
+            ]
             assert_m1_blind(packet, human_texts=human_texts)
-        input_integrity = 'missing' if packet is None else 'verified'
-        if packet is not None and attempt.get('input_sha256') and _hash({k: v for k, v in packet.items() if k != 'sha256'}) != attempt['input_sha256']:
+        persisted_hash = str(attempt.get('input_sha256') or '').strip()
+        input_integrity = 'missing' if packet is None or not persisted_hash else 'verified'
+        if packet is not None and persisted_hash and _hash({k: v for k, v in packet.items() if k != 'sha256'}) != persisted_hash:
             # Old deterministic fallbacks retained the provider retry hash after
             # removing verification_repair. Report this frozen discrepancy; do
             # not repair history or confer current qualification on that input.

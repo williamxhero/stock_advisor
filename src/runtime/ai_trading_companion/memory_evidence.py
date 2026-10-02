@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .evidence_qualification import qualify_record
-from .evidence_spec import VERSION, fingerprint, validate
+from .evidence_spec import fingerprint, validate
 from .temporal_integrity import resolve_temporal
 from .memory_port import MemoryPort
 from .secret_guard import assert_safe
@@ -37,7 +37,10 @@ class MemoryEvidenceRegistrar:
         content_hash = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
         spec = dict(evidence_spec or {})
         if spec:
-            spec.setdefault("contract", VERSION)
+            # Check the acquisition identity before deriving a receipt version.
+            validate(spec)
+            if spec["content"] != body or (spec["source"]["url"] and spec["source"]["url"] != url):
+                raise ValueError("snapshot does not match evidence content or source")
             spec["known_at"] = known_at
             temporal = spec.get("temporal_integrity")
             if not isinstance(temporal, dict):

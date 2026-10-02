@@ -90,6 +90,43 @@ def test_memoryhub_receipt_preserves_the_versioned_record() -> None:
     assert registered.context["memory_episode_id"] == episode["episode_id"]
 
 
+def test_memoryhub_rejects_modified_evidence_before_recording() -> None:
+    memory = InMemoryMemoryAdapter()
+    record = _record()
+    record["truth_status"] = "refuted"
+    registrar = MemoryEvidenceRegistrar(memory, clock=lambda: "2026-09-20T02:00:00Z")
+
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        registrar.register_web_snapshot(
+            memory_space_id="replay", source_event_id="tampered-event",
+            url=record["source"]["url"], title=record["source"]["title"],
+            body=record["content"], occurred_at=record["occurred_at"], evidence_spec=record,
+        )
+
+    assert memory.export_space("replay")["episodes"] == []
+
+
+@pytest.mark.parametrize("field,value", [
+    ("body", "different material"),
+    ("url", "https://example.test/different"),
+])
+def test_memoryhub_rejects_snapshot_that_does_not_match_evidence(field: str, value: str) -> None:
+    memory = InMemoryMemoryAdapter()
+    record = _record()
+    arguments = {
+        "memory_space_id": "replay", "source_event_id": "mismatched-event",
+        "url": record["source"]["url"], "title": record["source"]["title"],
+        "body": record["content"], "occurred_at": record["occurred_at"], "evidence_spec": record,
+    }
+    arguments[field] = value
+    registrar = MemoryEvidenceRegistrar(memory, clock=lambda: "2026-09-20T02:00:00Z")
+
+    with pytest.raises(ValueError, match="snapshot does not match evidence"):
+        registrar.register_web_snapshot(**arguments)
+
+    assert memory.export_space("replay")["episodes"] == []
+
+
 def test_legacy_memoryhub_snapshot_without_evidence_spec_remains_accepted(tmp_path: Path) -> None:
     memory = MemoryHub(tmp_path / "memory.sqlite3")
     receipt = memory.append({

@@ -72,6 +72,20 @@ def assert_m1_blind(packet: dict[str, Any], *, human_texts: Iterable[str] = ()) 
 
 def cycle_contract(cycle: dict[str, Any], stages: list[dict[str, Any]]) -> dict[str, Any]:
     """Build the stable, serializable input/output contract projection."""
+    # The projection is the runtime's public read boundary.  Validate the
+    # immutable SPEC identity and current lifecycle state here as well as at
+    # write time so migrated or externally supplied rows cannot silently leak
+    # an unversioned/unknown contract to Exchange or read-only clients.
+    from .cycle_contract import SPEC_VERSION, validate_state
+
+    raw_spec_version = cycle.get("cycle_spec_version")
+    # Preview/import rows from the v1 migration used numeric ``1``.  Treat
+    # that explicit legacy spelling as the same version; reject every other
+    # unknown value at this public boundary.
+    spec_version = SPEC_VERSION if raw_spec_version in (1, "1") else str(raw_spec_version or "")
+    if spec_version != SPEC_VERSION:
+        raise ValueError(f"unsupported cycle_spec_version: {spec_version}")
+    validate_state(str(cycle.get("state") or ""))
     try:
         provenance = json.loads(str(cycle.get("cycle_provenance_json") or "{}"))
     except json.JSONDecodeError:
@@ -90,7 +104,7 @@ def cycle_contract(cycle: dict[str, Any], stages: list[dict[str, Any]]) -> dict[
         # Keep the SPEC identity alongside the lifecycle projection.  The
         # former is the immutable creation input; this contract is the
         # evolving runtime output consumed by Exchange and read-only clients.
-        "cycle_spec_version": str(cycle.get("cycle_spec_version") or frozen_contract.get("contract") or ""),
+        "cycle_spec_version": spec_version,
         "cycle_contract_hash": cycle.get("cycle_contract_hash"),
         "cycle_id": str(cycle["cycle_id"]),
         "task_key": str(cycle["task_key"]),

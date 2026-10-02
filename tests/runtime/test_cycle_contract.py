@@ -190,3 +190,25 @@ def test_runtime_owns_stage_provenance_identity() -> None:
     assert json.loads(store.get_cycle(cycle["cycle_id"])["cycle_provenance_json"])["source"] == "runtime"
     with pytest.raises(ValueError, match="does not match"):
         store.set_cycle_provenance(cycle["cycle_id"], {"cycle_id": "other"})
+
+
+def test_read_projection_rejects_unversioned_or_unknown_runtime_rows() -> None:
+    store, engine, _ = make_engine()
+    cycle = engine.start_cycle(
+        "daily.execution.0945", "2026-09-21T09:45:00+08:00", "2026-09-21T01:45:00Z"
+    )
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE companion_cycle SET cycle_spec_version=? WHERE cycle_id=?",
+            ("legacy/v0", cycle["cycle_id"]),
+        )
+    with pytest.raises(ValueError, match="unsupported cycle_spec_version"):
+        store.decision_cycle_contract(cycle["cycle_id"])
+
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE companion_cycle SET cycle_spec_version=?, state=? WHERE cycle_id=?",
+            (SPEC_VERSION, "invented_state", cycle["cycle_id"]),
+        )
+    with pytest.raises(ValueError, match="unsupported cycle state"):
+        store.decision_cycle_contract(cycle["cycle_id"])

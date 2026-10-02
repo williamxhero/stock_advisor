@@ -240,10 +240,21 @@ def install_qualification() -> dict[str, Any]:
         as_of="2026-09-20T03:00:00Z",
         original_artifact={"judgment": "qualified", "artifact_id": "install-evidence-artifact"},
     )
+    unavailable = {
+        "contract": "EvidenceSpecSourceAvailability/v1",
+        "attempt_id": "install-evidence-unavailable-attempt",
+        "observation_id": "obs_install_evidence_unavailable",
+        "status": "failed",
+        "available": False,
+        "qualified": False,
+        "reason": "source_unavailable",
+        "evidence_items": [],
+    }
     return {
         "contract": "EvidenceSpecInstallQualification/v1",
         "qualified": replay["qualification"]["state"] == "usable",
         "replay": replay,
+        "source_unavailable_smoke": unavailable,
         "evaluation_vector": {
             "delivery_speed": "pass",
             "qualification_probability": "pass",

@@ -146,6 +146,16 @@ def test_install_qualification_is_deterministic_and_keeps_evaluation_axes_separa
         "delivery_speed", "qualification_probability", "research_quality",
         "judgment_outcome", "safety_reliability",
     }
+    assert first["source_unavailable_smoke"] == {
+        "contract": "EvidenceSpecSourceAvailability/v1",
+        "attempt_id": "install-evidence-unavailable-attempt",
+        "observation_id": "obs_install_evidence_unavailable",
+        "status": "failed",
+        "available": False,
+        "qualified": False,
+        "reason": "source_unavailable",
+        "evidence_items": [],
+    }
 
 
 def test_replay_rejects_tampered_input_without_rewriting_original() -> None:

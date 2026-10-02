@@ -115,6 +115,15 @@ try {
                 throw "Installed EvidenceSpec qualification is missing evaluation axis: $axis"
             }
         }
+        $unavailableSmoke = $evidenceQualification.source_unavailable_smoke
+        if ($unavailableSmoke.contract -ne 'EvidenceSpecSourceAvailability/v1' -or
+            $unavailableSmoke.status -ne 'failed' -or
+            $unavailableSmoke.available -ne $false -or
+            $unavailableSmoke.qualified -ne $false -or
+            $unavailableSmoke.reason -ne 'source_unavailable' -or
+            @($unavailableSmoke.evidence_items).Count -ne 0) {
+            throw 'Installed EvidenceSpec source-unavailable smoke did not preserve an unqualified unavailable result.'
+        }
         $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")
         if ($LASTEXITCODE -ne 0) { throw "Installed Debate replay 1 failed with exit code $LASTEXITCODE." }
         $debateReplayTwo = ((& $python -m ai_trading_companion.debate) -join "`n")

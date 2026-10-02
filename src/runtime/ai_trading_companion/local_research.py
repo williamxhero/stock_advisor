@@ -669,16 +669,23 @@ class ToolCatalogMarketBackend:
             "contract": str(spec.get("contract") or ""),
             "record_id": str(spec["record_id"]),
             "provenance": copy.deepcopy(spec.get("provenance") or {}),
+            "temporal_integrity": copy.deepcopy(spec.get("temporal_integrity") or {}),
         }
         metadata: dict[str, Any] = {"source_reference": reference}
+        if spec.get("kind"):
+            metadata["evidence_kind"] = spec["kind"]
+        if (spec.get("provenance") or {}).get("origin") == "ai":
+            metadata["origin"] = "ai"
         if spec.get("truth_status"):
             metadata["factual_status"] = spec["truth_status"]
         propagation = spec.get("market_propagation")
         if isinstance(propagation, dict) and propagation.get("status"):
             metadata["market_propagation"] = propagation["status"]
-        for key in ("occurred_at", "known_at", "published_at"):
-            if spec.get(key):
-                metadata[key] = spec[key]
+            metadata["propagation_impact"] = copy.deepcopy(propagation.get("impact") or {})
+        if spec.get("occurred_at"):
+            metadata["fact_as_of"] = spec["occurred_at"]
+        if spec.get("published_at"):
+            metadata["published_at"] = spec["published_at"]
         return metadata
 
     def _cached_breadth(self, required_at: str, window_start: str, finality: str) -> dict[str, Any] | None:

@@ -8,8 +8,8 @@ Evaluation dimensions are independent: recorded attempt durations; qualification
 
 ## Ticket 02 verification, 2026-10-02
 
-- `scripts/test.ps1 -ProjectRegression`: 159 passed. Includes cycle identity, retry/recovery, immutable revisions, frozen replay, missing/conflicting evidence, temporal integrity, publication and internal role permissions.
-- Full `scripts/test.ps1`: MemoryHub 28 passed; Runtime 780 passed, 5 skipped, 1 failed. The existing active-research evaluation fixture schedules October 1 before the current candidate registration and is rejected by the future-task gate. The test script stops before desktop tests on that failure.
+- `scripts/test.ps1 -ProjectRegression`: 160 passed. Includes cycle identity, retry/recovery, immutable revisions, frozen replay, missing/conflicting evidence, temporal integrity, publication and internal role permissions.
+- The earlier full regression found a date-dependent active-research fixture: its October 1 task became historical relative to candidate registration. The fixture now freezes registration at September 30; the production future-task gate is unchanged.
 - The public decision-cycle schema now requires the immutable `cycle_spec_version` and `cycle_provenance` projection fields. The release contract was therefore verified with a clean publish and install check: `scripts/publish.ps1 -Runtime win-x64 -NoRestore` followed by `scripts/verify-install.ps1`, including source-unavailable module resolution, build-info revision binding, and two deterministic AgentRole and Debate replays.
 - Separate `dotnet test AITradingCompanion.sln --nologo`: 102 passed after NuGet restore.
 - Frozen replay correctness is verified; live delivery speed, probability, research effectiveness and investment outcomes are not established by these deterministic regressions.
@@ -20,3 +20,8 @@ outcome, and safety/reliability. Offline replay records unavailable dimensions
 as `not_estimated` or `not_observed`; it never folds them into an aggregate
 score or upgrades a historically accepted attempt whose inputs cannot be
 reconstructed.
+
+`verify-install.ps1` also creates an isolated cycle using the installed Runtime,
+freezes its actual packet, model/runner versions and original artifact, and
+replays it twice. It rejects differing replay results, changed frozen receipts,
+changed persisted history, missing qualification or missing evaluation axes.

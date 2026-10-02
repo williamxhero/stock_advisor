@@ -16,7 +16,7 @@ if ($Select -eq 'all') {
     if ($LASTEXITCODE -ne 0) { throw "Runtime tests failed with exit code $LASTEXITCODE." }
 }
 else {
-    py -m pytest "$root\tests\runtime\test_evidence_spec.py" "$root\tests\runtime\test_evidence_qualification.py" -q
+    py -m pytest "$root\tests\runtime\test_evidence_spec.py" "$root\tests\runtime\test_evidence_qualification.py" "$root\tests\runtime\test_evidence_snapshot.py" -q
     if ($LASTEXITCODE -ne 0) { throw "EvidenceSpec regression tests failed with exit code $LASTEXITCODE." }
 }
 dotnet test "$root\AITradingCompanion.sln" $(if ($Release) { '--configuration'; 'Release' }) --nologo

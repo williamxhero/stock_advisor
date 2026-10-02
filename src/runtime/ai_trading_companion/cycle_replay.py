@@ -83,6 +83,8 @@ def replay_cycle(frozen: dict[str, Any]) -> dict[str, Any]:
             assert_m1_blind(packet, human_texts=human_texts)
         persisted_hash = str(attempt.get('input_sha256') or '').strip()
         input_integrity = 'missing' if packet is None or not persisted_hash else 'verified'
+        if isinstance(packet, dict) and 'sha256' in packet and persisted_hash and packet['sha256'] != persisted_hash:
+            raise ValueError('cycle replay input integrity mismatch')
         if packet is not None and persisted_hash and _hash({k: v for k, v in packet.items() if k != 'sha256'}) != persisted_hash:
             # Old deterministic fallbacks retained the provider retry hash after
             # removing verification_repair. Report this frozen discrepancy; do
@@ -115,6 +117,7 @@ def replay_cycle(frozen: dict[str, Any]) -> dict[str, Any]:
                 or json.loads(checkpoint['output_json']) != json.loads(attempt.get('output_json') or 'null')
                 or _hash(json.loads(checkpoint['output_json'])) != checkpoint['output_sha256']):
             raise ValueError('cycle replay checkpoint integrity mismatch')
+    m1_attempts = [a for a in source['attempts'] if str(a['stage']).startswith('m1')]
     return {
         'contract': CONTRACT, 'source_sha256': frozen['source_sha256'],
         'source': source, 'qualification': {'attempts': attempts},
@@ -125,7 +128,7 @@ def replay_cycle(frozen: dict[str, Any]) -> dict[str, Any]:
             'judgment_outcome': {'state': 'not_observed'},
             'safety_reliability': {
                 'read_only': True,
-                'm1_h0_blind': all(a.get('input_packet_json') is not None for a in source['attempts'] if str(a['stage']).startswith('m1')),
+                'm1_h0_blind': bool(m1_attempts) and all(json.loads(a.get('input_packet_json') or 'null') is not None for a in m1_attempts),
                 'inputs_complete': bool(attempts) and all(a['input_reconstructable'] for a in attempts),
             },
         },

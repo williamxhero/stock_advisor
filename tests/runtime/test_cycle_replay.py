@@ -11,6 +11,28 @@ from ai_trading_companion.__main__ import _save_safe_stage_fallback
 from ai_trading_companion.broker_client import canonical_packet_hash
 
 
+def test_replay_does_not_claim_m1_safety_without_a_reconstructable_m1(tmp_path):
+    store = CompanionStore(tmp_path / 'cycle.sqlite3')
+    cycle = CompanionEngine(store).start_cycle('daily.execution.0945', '2026-09-21T09:45:00+08:00', '2026-09-21T01:45:00Z')
+    result = replay_cycle(freeze_cycle(store, cycle['cycle_id']))
+    assert result['evaluation_vector']['safety_reliability']['m1_h0_blind'] is False
+
+
+def test_replay_rejects_conflicting_embedded_packet_hash_without_rewriting(tmp_path):
+    store = CompanionStore(tmp_path / 'cycle.sqlite3')
+    cycle = CompanionEngine(store).start_cycle('daily.execution.0945', '2026-09-21T09:45:00+08:00', '2026-09-21T01:45:00Z')
+    packet = {'frozen_public_evidence': [], 'sha256': 'conflicting-hash'}
+    attempt = store.begin_attempt(cycle['cycle_id'], 'm1_judgment', cycle['as_of'],
+                                  input_packet=packet, input_sha256=canonical_packet_hash({'frozen_public_evidence': []}))
+    store.finish_attempt(attempt['attempt_id'], 'succeeded', output={'direction': 'wait'}, verifier={'passed': True})
+    frozen = freeze_cycle(store, cycle['cycle_id'])
+    original = copy.deepcopy(frozen)
+    with pytest.raises(ValueError, match='input integrity'):
+        replay_cycle(frozen)
+    assert frozen == original
+    assert freeze_cycle(store, cycle['cycle_id']) == original
+
+
 def test_replay_checks_human_boundary_by_instant_across_timezones(tmp_path):
     store = CompanionStore(tmp_path / 'cycle.sqlite3')
     cycle = CompanionEngine(store).start_cycle('daily.execution.0945', '2026-09-21T09:45:00+08:00', '2026-09-21T01:45:00Z')

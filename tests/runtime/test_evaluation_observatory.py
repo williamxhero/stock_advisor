@@ -1107,7 +1107,8 @@ class ExperimentAssessmentTests(unittest.TestCase):
             self.assertEqual("succeeded", stored["state"])
             self.assertEqual("shadow-attempt", stored["candidate_attempt_id"])
 
-    def test_market_understanding_candidate_is_idempotent_and_formal_scope_only(self) -> None:
+    @patch("ai_trading_companion.store.now", return_value="2026-09-30T00:00:00+00:00")
+    def test_market_understanding_candidate_is_idempotent_and_formal_scope_only(self, _clock) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = CompanionStore(Path(directory) / "companion.sqlite3")
             store.initialize()

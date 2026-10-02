@@ -24,6 +24,7 @@ foreach ($required in @(
     'resources\contracts\debate-input-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
+    'runtime\ai_trading_companion\cycle_replay.py',
     'runtime\ai_trading_companion\evidence_snapshot.py',
     'runtime\ai_trading_companion\temporal_integrity.py',
     'runtime\ai_trading_companion\message_presentation.py',
@@ -98,6 +99,40 @@ try {
             throw "Source-unavailable smoke resolved runtime outside the release directory: $resolvedModulePath"
         }
         # Run only from the installed runtime path and replay the same frozen
+        # cycle twice, preserving the original receipt and published artifact.
+        $cycleSmoke = @'
+import copy
+import json
+from pathlib import Path
+from ai_trading_companion.broker_client import canonical_packet_hash
+from ai_trading_companion.cycle_replay import freeze_cycle, replay_cycle
+from ai_trading_companion.engine import CompanionEngine
+from ai_trading_companion.store import CompanionStore
+store = CompanionStore(Path('cycle-replay.sqlite3'))
+cycle = CompanionEngine(store).start_cycle('daily.execution.0945', '2026-09-21T09:45:00+08:00', '2026-09-21T01:45:00Z')
+packet = {'frozen_public_evidence': [], 'business_context': {'positions': []}}
+attempt = store.begin_attempt(cycle['cycle_id'], 'm1_judgment', cycle['as_of'], input_packet=packet, input_sha256=canonical_packet_hash(packet), model='install-fixture', runner_fingerprint='install-fixture/v1')
+store.finish_attempt(attempt['attempt_id'], 'succeeded', output={'direction': 'wait'}, verifier={'passed': True})
+store.append_artifact(cycle['cycle_id'], 'm1', 'model', 'Original judgment', cycle['as_of'])
+frozen = freeze_cycle(store, cycle['cycle_id'])
+original = copy.deepcopy(frozen)
+first = replay_cycle(frozen)
+second = replay_cycle(copy.deepcopy(frozen))
+if first != second or frozen != original or freeze_cycle(store, cycle['cycle_id']) != original:
+    raise RuntimeError('Cycle replay changed frozen history or was not deterministic')
+if first['qualification']['attempts'][0]['qualified'] is not True:
+    raise RuntimeError('Installed cycle replay did not reconstruct qualification')
+print(json.dumps(first['evaluation_vector'], sort_keys=True))
+'@
+        $cycleQualification = ((& $python -c $cycleSmoke) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed cycle replay failed with exit code $LASTEXITCODE." }
+        $cycleVector = $cycleQualification | ConvertFrom-Json
+        foreach ($axis in @('delivery_speed', 'qualification_probability', 'research_quality', 'judgment_outcome', 'safety_reliability')) {
+            if ($cycleVector.PSObject.Properties.Name -notcontains $axis) {
+                throw "Installed cycle replay is missing evaluation axis: $axis"
+            }
+        }
+        # Replay the frozen
         # role evidence twice.  The two receipts must be byte-identical; the
         # qualification keeps speed, qualification probability, research
         # quality, judgment outcome, and safety reliability as separate axes.

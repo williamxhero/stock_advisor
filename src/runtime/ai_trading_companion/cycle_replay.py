@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from datetime import datetime
 from typing import Any
 
 from .cycle_contract import SPEC_VERSION, validate_m1_blind_packet
@@ -18,6 +19,13 @@ CONTRACT = 'CompanionDecisionCycleReplay/v1'
 
 def _hash(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode('utf-8')).hexdigest()
+
+
+def _instant(value: str) -> datetime:
+    instant = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if instant.tzinfo is None:
+        raise ValueError('cycle replay boundary must be timezone-aware')
+    return instant
 
 
 def freeze_cycle(store: CompanionStore, cycle_id: str) -> dict[str, Any]:
@@ -69,7 +77,8 @@ def replay_cycle(frozen: dict[str, Any]) -> dict[str, Any]:
                 a.get('body_markdown', '')
                 for a in source['artifacts']
                 if a.get('actor') == 'human'
-                and (not boundary or (a.get('sealed_at') or '') <= boundary)
+                and (not boundary or not a.get('sealed_at')
+                     or _instant(a['sealed_at']) <= _instant(boundary))
             ]
             assert_m1_blind(packet, human_texts=human_texts)
         persisted_hash = str(attempt.get('input_sha256') or '').strip()

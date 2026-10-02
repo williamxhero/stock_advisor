@@ -1,5 +1,6 @@
 import copy
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -8,6 +9,25 @@ from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.store import CompanionStore
 from ai_trading_companion.__main__ import _save_safe_stage_fallback
 from ai_trading_companion.broker_client import canonical_packet_hash
+
+
+def test_replay_checks_human_boundary_by_instant_across_timezones(tmp_path):
+    store = CompanionStore(tmp_path / 'cycle.sqlite3')
+    cycle = CompanionEngine(store).start_cycle('daily.execution.0945', '2026-09-21T09:45:00+08:00', '2026-09-21T01:45:00Z')
+    packet = {'note': 'Human directional claim'}
+    attempt = store.begin_attempt(cycle['cycle_id'], 'm1_judgment', cycle['as_of'],
+                                  input_packet=packet, input_sha256=canonical_packet_hash(packet))
+    earlier = datetime.fromisoformat(attempt['started_at'].replace('Z', '+00:00')) - timedelta(seconds=1)
+    artifact = store.append_artifact(cycle['cycle_id'], 'h0', 'human', 'Human directional claim', cycle['as_of'])
+    with store.connection() as connection:
+        connection.execute('UPDATE narrative_artifact SET sealed_at=? WHERE artifact_id=?',
+                           (earlier.astimezone(timezone(timedelta(hours=8))).isoformat(), artifact['artifact_id']))
+    store.finish_attempt(attempt['attempt_id'], 'succeeded', verifier={'passed': True}, output={'direction': 'wait'})
+    frozen = freeze_cycle(store, cycle['cycle_id'])
+    original = copy.deepcopy(frozen)
+    with pytest.raises(ValueError, match='human content'):
+        replay_cycle(frozen)
+    assert frozen == original
 
 
 def test_recovery_fallback_replays_actual_packet_and_preserves_legacy_discrepancy(tmp_path):

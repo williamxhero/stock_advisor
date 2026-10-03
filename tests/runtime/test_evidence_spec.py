@@ -127,6 +127,28 @@ def test_memoryhub_rejects_snapshot_that_does_not_match_evidence(field: str, val
     assert memory.export_space("replay")["episodes"] == []
 
 
+@pytest.mark.parametrize("field,value", [
+    ("title", "different title"),
+    ("occurred_at", "2026-09-19T00:00:00Z"),
+])
+def test_memoryhub_rejects_acquisition_identity_mismatch(field: str, value: str) -> None:
+    memory = InMemoryMemoryAdapter()
+    record = _record()
+    arguments = {
+        "memory_space_id": "replay", "source_event_id": "mismatched-identity",
+        "url": record["source"]["url"], "title": record["source"]["title"],
+        "body": record["content"], "occurred_at": record["occurred_at"],
+        "evidence_spec": record,
+    }
+    arguments[field] = value
+    registrar = MemoryEvidenceRegistrar(memory, clock=lambda: "2026-09-20T02:00:00Z")
+
+    with pytest.raises(ValueError, match="snapshot does not match evidence"):
+        registrar.register_web_snapshot(**arguments)
+
+    assert memory.export_space("replay")["episodes"] == []
+
+
 def test_legacy_memoryhub_snapshot_without_evidence_spec_remains_accepted(tmp_path: Path) -> None:
     memory = MemoryHub(tmp_path / "memory.sqlite3")
     receipt = memory.append({

@@ -39,7 +39,12 @@ class MemoryEvidenceRegistrar:
         if spec:
             # Check the acquisition identity before deriving a receipt version.
             validate(spec)
-            if spec["content"] != body or (spec["source"]["url"] and spec["source"]["url"] != url):
+            if (
+                spec["content"] != body
+                or (spec["source"]["url"] and spec["source"]["url"] != url)
+                or spec["source"]["title"] != title
+                or spec["occurred_at"] != occurred_at
+            ):
                 raise ValueError("snapshot does not match evidence content or source")
             spec["known_at"] = known_at
             temporal = spec.get("temporal_integrity")

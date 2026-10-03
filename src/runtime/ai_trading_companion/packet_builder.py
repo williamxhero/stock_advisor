@@ -71,6 +71,16 @@ class RuntimePacketBuilder:
             "scheduled_for": cycle["scheduled_for"],
             "calendar_context": self._calendar_context(cycle["scheduled_for"]),
         }
+        frozen_cycle = json.loads(cycle["cycle_contract_json"])
+        # Reference the immutable creation input without exposing workflow or
+        # diagnostic metadata to the independent M1 path.
+        packet["cycle_reference"] = {
+            "contract": frozen_cycle["contract"],
+            "sha256": cycle["cycle_contract_hash"],
+            "input": {key: frozen_cycle[key] for key in (
+                "cycle_id", "task_key", "as_of", "scheduled_for", "schedule_id", "schedule_revision",
+            )},
+        }
         if cycle.get("task_profile_json"):
             packet["task_profile"] = json.loads(cycle["task_profile_json"])
         memory_cards = self._memory_cards(cycle, stage, packet_as_of, evidence)

@@ -209,6 +209,8 @@ def _save_safe_stage_fallback(
     # it must be judged on that evidence rather than rejected for differing
     # wording or a conservative qualification state.
     fallback_packet.pop("verification_repair", None)
+    fallback_packet.pop("sha256", None)
+    fallback_packet["sha256"] = canonical_packet_hash(fallback_packet)
     candidate_output = rejected_output if (
         stage == "m0_compose" and _reviewed_salvageable_m0_candidate(rejected_output, rejected_verifier)
     ) else None

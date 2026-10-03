@@ -383,6 +383,21 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual("expert", bundle["attempts"][0]["broker_fulfilled_intellect"])
         self.assertEqual(1, bundle["evidence_coverage"][0]["source_count"])
 
+    def test_bundle_normalizes_numeric_legacy_cycle_spec_version(self):
+        known_at = "2026-08-26T08:30:00Z"
+        preview = self.store.create_preview_cycle(self.source["cycle_id"], known_at)
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE companion_cycle SET cycle_spec_version=? WHERE cycle_id=?",
+                (1, preview["cycle_id"]),
+            )
+
+        bundle = build_bundle(
+            self.store, preview["cycle_id"], self.source["cycle_id"], "legacy-version", known_at,
+        )
+
+        self.assertEqual("CompanionDecisionCycleSpec/v1", bundle["cycle_spec_version"])
+
 
 if __name__ == "__main__":
     unittest.main()

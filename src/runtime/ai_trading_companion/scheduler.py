@@ -122,16 +122,16 @@ def run_registry_schedule(
                 schedule_revision=int(row["current_revision"]), schedule_snapshot=config,
             )
             if local_at < target:
-                results.append(_result(row["task_key"], scheduled_for, "prepared", cycle))
+                results.append(_result(row["task_key"], scheduled_for, "prepared", cycle, engine=engine))
                 continue
         if local_at < target:
             continue
         late = local_at > target + CATCH_UP_WINDOW
         if late and cycle["state"] == "queued":
             cycle = engine.mark_missed(cycle["cycle_id"], "启动已超过 15 分钟补偿窗口")
-            results.append(_result(row["task_key"], scheduled_for, "missed", cycle))
+            results.append(_result(row["task_key"], scheduled_for, "missed", cycle, engine=engine))
         elif cycle["state"] == "queued":
-            results.append(_result(row["task_key"], scheduled_for, "queued", cycle))
+            results.append(_result(row["task_key"], scheduled_for, "queued", cycle, engine=engine))
     return results
 
 
@@ -158,7 +158,7 @@ def run_daily_schedule(
         if local_at < scheduled - item.lead_time:
             if item.task_key == "daily.opportunity.0900" and store.find_cycle(item.task_key, scheduled_for) is None:
                 cycle = engine.start_cycle(item.task_key, scheduled_for, iso(at))
-                results.append(_result(item.task_key, scheduled_for, "prepared", cycle))
+                results.append(_result(item.task_key, scheduled_for, "prepared", cycle, engine=engine))
             continue
         cycle = store.find_cycle(item.task_key, scheduled_for)
         late = local_at > scheduled + CATCH_UP_WINDOW
@@ -167,7 +167,7 @@ def run_daily_schedule(
             if cycle["state"] == "queued":
                 if late:
                     cycle = engine.mark_missed(cycle["cycle_id"], "启动已超过 15 分钟补偿窗口")
-                    results.append(_result(item.task_key, scheduled_for, "missed", cycle))
+                    results.append(_result(item.task_key, scheduled_for, "missed", cycle, engine=engine))
                     continue
             elif cycle["state"] in {"researching", "researching_m0"}:
                 stale = at.astimezone(SHANGHAI) >= parse(cycle["updated_at"]).astimezone(SHANGHAI) + RESEARCH_STALE_AFTER
@@ -175,7 +175,7 @@ def run_daily_schedule(
                     continue
                 if late:
                     cycle = engine.research_failed(cycle["cycle_id"], "研究进程中断且已超过补偿窗口")
-                    results.append(_result(item.task_key, scheduled_for, "failed", cycle))
+                    results.append(_result(item.task_key, scheduled_for, "failed", cycle, engine=engine))
                     continue
                 cycle = engine.recover_research(cycle["cycle_id"], "检测到中断的研究进程，自动恢复")
             else:
@@ -184,17 +184,17 @@ def run_daily_schedule(
             cycle = engine.start_cycle(item.task_key, scheduled_for, iso(at))
             if late:
                 cycle = engine.mark_missed(cycle["cycle_id"], "服务恢复时已超过 15 分钟补偿窗口")
-                results.append(_result(item.task_key, scheduled_for, "missed", cycle))
+                results.append(_result(item.task_key, scheduled_for, "missed", cycle, engine=engine))
                 continue
 
         try:
             cycle = execute_cycle(cycle)
-            results.append(_result(item.task_key, scheduled_for, "started", cycle))
+            results.append(_result(item.task_key, scheduled_for, "started", cycle, engine=engine))
         except Exception as exc:
             current = store.get_cycle(cycle["cycle_id"])
             if current["state"] != "failed":
                 current = engine.research_failed(cycle["cycle_id"], str(exc))
-            results.append(_result(item.task_key, scheduled_for, "failed", current, str(exc)))
+            results.append(_result(item.task_key, scheduled_for, "failed", current, str(exc), engine=engine))
     return results
 
 
@@ -222,21 +222,21 @@ def run_periodic_schedule(
         if cycle is not None:
             if cycle["state"] == "queued" and late:
                 cycle = engine.mark_missed(cycle["cycle_id"], "启动已超过 15 分钟补偿窗口")
-                results.append(_result(item.task_key, scheduled_for, "missed", cycle))
+                results.append(_result(item.task_key, scheduled_for, "missed", cycle, engine=engine))
             continue
         cycle = engine.start_cycle(item.task_key, scheduled_for, iso(at))
         if late:
             cycle = engine.mark_missed(cycle["cycle_id"], "服务恢复时已超过 15 分钟补偿窗口")
-            results.append(_result(item.task_key, scheduled_for, "missed", cycle))
+            results.append(_result(item.task_key, scheduled_for, "missed", cycle, engine=engine))
             continue
         try:
             cycle = execute_cycle(cycle)
-            results.append(_result(item.task_key, scheduled_for, "started", cycle))
+            results.append(_result(item.task_key, scheduled_for, "started", cycle, engine=engine))
         except Exception as exc:
             current = store.get_cycle(cycle["cycle_id"])
             if current["state"] != "failed":
                 current = engine.research_failed(cycle["cycle_id"], str(exc))
-            results.append(_result(item.task_key, scheduled_for, "failed", current, str(exc)))
+            results.append(_result(item.task_key, scheduled_for, "failed", current, str(exc), engine=engine))
     return results
 
 
@@ -246,6 +246,8 @@ def _result(
     action: str,
     cycle: dict[str, Any],
     error: str | None = None,
+    *,
+    engine: CompanionEngine | None = None,
 ) -> dict[str, Any]:
     result = {
         "task_key": task_key,
@@ -254,6 +256,11 @@ def _result(
         "cycle_id": cycle["cycle_id"],
         "state": cycle["state"],
     }
+    # The scheduler is a real runtime entry point.  Carry the immutable SPEC
+    # identity and current stage/provenance projection in its receipt so
+    # callers do not need to reconstruct lifecycle state from the database.
+    if engine is not None:
+        result["decision_cycle"] = engine.decision_cycle_contract(cycle["cycle_id"])
     if error:
         result["error"] = error[-2000:]
     return result

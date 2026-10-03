@@ -464,6 +464,16 @@ def test_runtime_packet_builder_does_not_embed_delivery_issue_status() -> None:
 
     cycle = {
         "cycle_id": "cycle-packet-qualification",
+        "cycle_contract_json": json.dumps({
+            "contract": "CompanionDecisionCycleSpec/v1",
+            "cycle_id": "cycle-packet-qualification",
+            "task_key": "daily.opportunity.0900",
+            "scheduled_for": "2026-09-21T09:00:00+08:00",
+            "as_of": "2026-09-21T01:00:00Z",
+            "schedule_id": None,
+            "schedule_revision": None,
+        }),
+        "cycle_contract_hash": "test-cycle-contract-hash",
         "task_key": "daily.opportunity.0900",
         "scheduled_for": "2026-09-21T09:00:00+08:00",
         "as_of": "2026-09-21T01:00:00Z",

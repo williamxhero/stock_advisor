@@ -700,7 +700,8 @@ class ExperimentAssessmentTests(unittest.TestCase):
         self.assertEqual("insufficient_evidence", insufficient.decision)
         self.assertIn("market_regime_coverage_incomplete", insufficient.decision_reasons)
 
-    def test_active_research_requires_frozen_incident_gate_and_mature_future_live_pairs(self) -> None:
+    @patch("ai_trading_companion.store.now", return_value="2026-09-30T00:00:00+00:00")
+    def test_active_research_requires_frozen_incident_gate_and_mature_future_live_pairs(self, _clock) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = CompanionStore(Path(directory) / "companion.sqlite3")
             store.initialize()
@@ -1108,7 +1109,8 @@ class ExperimentAssessmentTests(unittest.TestCase):
             self.assertEqual("succeeded", stored["state"])
             self.assertEqual("shadow-attempt", stored["candidate_attempt_id"])
 
-    def test_market_understanding_candidate_is_idempotent_and_formal_scope_only(self) -> None:
+    @patch("ai_trading_companion.store.now", return_value="2026-09-30T00:00:00+00:00")
+    def test_market_understanding_candidate_is_idempotent_and_formal_scope_only(self, _clock) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = CompanionStore(Path(directory) / "companion.sqlite3")
             store.initialize()

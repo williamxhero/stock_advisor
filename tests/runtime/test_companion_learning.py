@@ -814,7 +814,8 @@ class CompanionLearningTests(unittest.TestCase):
             self.store, cycle, "m1_judgment", packet, horizon="当前",
         )
 
-        attempt = self.store.verified_attempt(attempt_id, cycle["cycle_id"], "m1_judgment", "fallback-packet")
+        persisted = next(row for row in self.store.attempts(cycle["cycle_id"]) if row["attempt_id"] == attempt_id)
+        attempt = self.store.verified_attempt(attempt_id, cycle["cycle_id"], "m1_judgment", persisted["input_sha256"])
         self.assertTrue(CognitiveRouter().verify("m1_judgment", {}, fallback)["passed"])
         self.assertNotIn("verification_repair", json.loads(attempt["input_packet_json"]))
 
@@ -858,8 +859,9 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertNotIn("1.1821", fallback["narrative"])
         self.assertNotIn("1200", fallback["narrative"])
         self.assertTrue(CognitiveRouter().verify("m0_compose", packet, fallback)["passed"])
+        persisted = next(row for row in self.store.attempts(cycle["cycle_id"]) if row["attempt_id"] == attempt_id)
         attempt = self.store.verified_attempt(
-            attempt_id, cycle["cycle_id"], "m0_compose", "premarket-fallback-packet",
+            attempt_id, cycle["cycle_id"], "m0_compose", persisted["input_sha256"],
         )
         self.assertEqual("succeeded", attempt["status"])
 

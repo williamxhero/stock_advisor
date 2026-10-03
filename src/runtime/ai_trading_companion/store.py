@@ -1071,7 +1071,10 @@ class CompanionStore:
             "cycle_id": cycle_id,
             "task_key": cycle["task_key"],
         }
-        base.update(provenance or {})
+        # Runtime-owned identity and provenance cannot be supplied by a model
+        # or an adapter.  Apply extensions first, then pin the authoritative
+        # fields so retries and recovery cannot impersonate another contract.
+        base = {**(provenance or {}), **base}
 
         def insert(c: sqlite3.Connection) -> None:
             at = now()
@@ -1095,10 +1098,16 @@ class CompanionStore:
                 insert(c)
 
     def set_cycle_provenance(self, cycle_id: str, provenance: dict[str, Any]) -> None:
+        cycle = self.get_cycle(cycle_id)
+        supplied_cycle_id = provenance.get("cycle_id") if isinstance(provenance, dict) else None
+        if supplied_cycle_id is not None and str(supplied_cycle_id) != cycle_id:
+            raise ValueError("cycle provenance cycle_id does not match cycle")
         value = {
+            **(provenance or {}),
             "contract": "companion-decision-cycle-provenance/v1",
             "source": "runtime",
-            **provenance,
+            "cycle_id": cycle_id,
+            "task_key": cycle["task_key"],
         }
         with self.connection() as c:
             c.execute(
@@ -1175,7 +1184,7 @@ class CompanionStore:
                 "stage": stage,
                 "attempt": attempt,
             }
-            root.update(provenance or {})
+            root = {**(provenance or {}), **root}
             c.execute(
                 """INSERT INTO companion_stage_run(
                      stage_run_id,cycle_id,stage,attempt,state,as_of,idempotency_key,started_at,

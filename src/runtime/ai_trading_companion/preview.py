@@ -243,6 +243,15 @@ def build_bundle(
         item["kind"]: item["body_markdown"] for item in artifacts
         if item["kind"] in {"m0", "m1", "m2", "stage_failure"}
     }
+    legacy_cycle_spec_version = cycle.get("cycle_spec_version")
+    if legacy_cycle_spec_version in (None, "", 1, "1"):
+        cycle_spec_version = SPEC_VERSION
+    elif legacy_cycle_spec_version == SPEC_VERSION:
+        cycle_spec_version = SPEC_VERSION
+    else:
+        raise ValueError(
+            f"unsupported cycle_spec_version in preview cycle: {legacy_cycle_spec_version!r}"
+        )
     bundle: dict[str, Any] = {
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "preview_id": preview_id,
@@ -257,7 +266,10 @@ def build_bundle(
         "replay_mode": "original_cycle_inputs",
         "qualification_version": 2,
         "cycle_state": cycle["state"],
-        "cycle_spec_version": cycle.get("cycle_spec_version", 1),
+        # Preserve the immutable SPEC identity even for legacy rows created
+        # before the column was added. A numeric fallback would make a replay
+        # bundle unverifiable and detach it from the cycle contract.
+        "cycle_spec_version": cycle_spec_version,
         "cycle_provenance_json": cycle.get("cycle_provenance_json") or "{}",
         "private_context_json": cycle.get("private_context_json"),
         "private_context_sha256": cycle.get("private_context_sha256"),

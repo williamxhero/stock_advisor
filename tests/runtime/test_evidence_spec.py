@@ -90,6 +90,26 @@ def test_memoryhub_receipt_preserves_the_versioned_record() -> None:
     assert registered.context["memory_episode_id"] == episode["episode_id"]
 
 
+def test_memoryhub_accepts_titleless_evidence_using_url_fallback() -> None:
+    memory = InMemoryMemoryAdapter()
+    record = _record()
+    record["source"]["title"] = ""
+    record["record_id"] = fingerprint({
+        key: value for key, value in record.items() if key != "record_id"
+    })
+    registrar = MemoryEvidenceRegistrar(memory, clock=lambda: "2026-09-20T02:00:00Z")
+
+    registered = registrar.register_web_snapshot(
+        memory_space_id="replay", source_event_id="event-titleless",
+        url=record["source"]["url"], title=record["source"]["url"],
+        body=record["content"], occurred_at=record["occurred_at"], evidence_spec=record,
+    )
+
+    episode = memory.export_space("replay")["episodes"][0]
+    assert episode["metadata"]["evidence_spec"]["source"]["title"] == ""
+    assert registered.context["memory_episode_id"] == episode["episode_id"]
+
+
 def test_memoryhub_rejects_modified_evidence_before_recording() -> None:
     memory = InMemoryMemoryAdapter()
     record = _record()
@@ -147,6 +167,22 @@ def test_memoryhub_rejects_acquisition_identity_mismatch(field: str, value: str)
         registrar.register_web_snapshot(**arguments)
 
     assert memory.export_space("replay")["episodes"] == []
+
+
+def test_memoryhub_accepts_equivalent_occurrence_time() -> None:
+    memory = InMemoryMemoryAdapter()
+    record = _record()
+    registrar = MemoryEvidenceRegistrar(memory, clock=lambda: "2026-09-20T02:00:00Z")
+
+    registered = registrar.register_web_snapshot(
+        memory_space_id="replay", source_event_id="event-equivalent-time",
+        url=record["source"]["url"], title=record["source"]["title"],
+        body=record["content"], occurred_at="2026-09-20T09:00:00+08:00",
+        evidence_spec=record,
+    )
+
+    assert registered.context["memory_episode_id"]
+    assert memory.export_space("replay")["episodes"][0]["occurred_at"] == "2026-09-20T09:00:00+08:00"
 
 
 def test_legacy_memoryhub_snapshot_without_evidence_spec_remains_accepted(tmp_path: Path) -> None:

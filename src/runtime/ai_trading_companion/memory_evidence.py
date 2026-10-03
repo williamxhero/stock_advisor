@@ -7,7 +7,7 @@ from typing import Any
 
 from .evidence_qualification import qualify_record
 from .evidence_spec import fingerprint, validate
-from .temporal_integrity import resolve_temporal
+from .temporal_integrity import canonical_time, resolve_temporal
 from .memory_port import MemoryPort
 from .secret_guard import assert_safe
 
@@ -39,11 +39,16 @@ class MemoryEvidenceRegistrar:
         if spec:
             # Check the acquisition identity before deriving a receipt version.
             validate(spec)
+            expected_title = spec["source"]["title"] or spec["source"]["url"] or url
+            spec_occurred_at = (
+                canonical_time(spec["occurred_at"]) if spec["occurred_at"] else None
+            )
+            receipt_occurred_at = canonical_time(occurred_at) if occurred_at else None
             if (
                 spec["content"] != body
                 or (spec["source"]["url"] and spec["source"]["url"] != url)
-                or spec["source"]["title"] != title
-                or spec["occurred_at"] != occurred_at
+                or expected_title != title
+                or spec_occurred_at != receipt_occurred_at
             ):
                 raise ValueError("snapshot does not match evidence content or source")
             spec["known_at"] = known_at

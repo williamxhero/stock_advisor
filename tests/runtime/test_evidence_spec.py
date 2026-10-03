@@ -74,6 +74,7 @@ def test_acquisition_cannot_promote_ai_origin_to_market_fact(provenance: dict) -
 def test_memoryhub_receipt_preserves_the_versioned_record() -> None:
     memory = InMemoryMemoryAdapter()
     record = _record()
+    original = copy.deepcopy(record)
     registrar = MemoryEvidenceRegistrar(memory, clock=lambda: "2026-09-20T02:00:00Z")
 
     registered = registrar.register_web_snapshot(
@@ -84,9 +85,13 @@ def test_memoryhub_receipt_preserves_the_versioned_record() -> None:
 
     episode = memory.export_space("replay")["episodes"][0]
     stored = episode["metadata"]["evidence_spec"]
-    assert stored["contract"] == "EvidenceSpec/v1"
-    assert stored["known_at"] == registered.known_at
+    qualification = episode["metadata"]["evidence_qualification"]
+    assert stored == original
+    assert stored["record_id"] == original["record_id"]
     assert stored["market_propagation"]["status"] == "unknown"
+    assert episode["known_at"] == registered.known_at
+    assert qualification["input_record_refs"][0]["memory_receipt"]["known_at"] == registered.known_at
+    assert registered.context["known_at"] == registered.known_at
     assert registered.context["memory_episode_id"] == episode["episode_id"]
 
 

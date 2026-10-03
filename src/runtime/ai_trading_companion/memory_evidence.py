@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from .evidence_qualification import qualify_record
-from .evidence_spec import fingerprint, validate
-from .temporal_integrity import canonical_time, resolve_temporal
+from .evidence_spec import validate
+from .temporal_integrity import canonical_time
 from .memory_port import MemoryPort
 from .secret_guard import assert_safe
 
@@ -35,9 +36,9 @@ class MemoryEvidenceRegistrar:
         assert_safe(body, boundary="MemoryHub web snapshot")
         known_at = self.clock()
         content_hash = "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
-        spec = dict(evidence_spec or {})
+        spec = copy.deepcopy(evidence_spec or {})
         if spec:
-            # Check the acquisition identity before deriving a receipt version.
+            # Validate acquisition identity without rewriting the historical record.
             validate(spec)
             expected_title = spec["source"]["title"] or spec["source"]["url"] or url
             spec_occurred_at = (
@@ -51,18 +52,6 @@ class MemoryEvidenceRegistrar:
                 or spec_occurred_at != receipt_occurred_at
             ):
                 raise ValueError("snapshot does not match evidence content or source")
-            spec["known_at"] = known_at
-            temporal = spec.get("temporal_integrity")
-            if not isinstance(temporal, dict):
-                temporal = resolve_temporal({**spec, "known_at": known_at}, {"known_at": known_at})
-            else:
-                temporal = dict(temporal)
-                temporal["known_at"] = known_at
-                temporal["known_at_source"] = "memoryhub.receipt"
-            spec["published_at"] = spec.get("published_at")
-            spec["temporal_integrity"] = temporal
-            spec["record_id"] = fingerprint({k: v for k, v in spec.items() if k != "record_id"})
-            validate(spec)
         qualification = None
         if spec:
             qualification = qualify_record(

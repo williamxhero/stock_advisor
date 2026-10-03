@@ -390,6 +390,31 @@ def test_runtime_ledger_rejects_provenance_reference_drift(tmp_path: Path) -> No
         store.record_evidence(cycle, "m0_research", evidence, [observation])
 
 
+def test_runtime_restart_retry_preserves_frozen_evidence_and_qualification(tmp_path: Path) -> None:
+    path = tmp_path / "companion.sqlite3"
+    store = CompanionStore(path)
+    cycle = store.ensure_daily_conversation("2026-09-20")
+    observation, _ = AcquisitionBoundary("recovery-attempt").observe(
+        "web_read", {}, {"results": [{
+            "url": "https://example.test/recovery", "title": "Original source",
+            "excerpt_text": "Original observed material",
+            "fact_as_of": "2026-09-20T01:00:00Z", "factual_status": "verified",
+        }]}, True,
+    )
+    evidence = {"as_of": "2099-01-01T00:00:00Z", "sources": [{
+        "evidence_ref": observation["evidence_items"][0]["evidence_ref"],
+    }]}
+    store.record_evidence(cycle, "m0_research", evidence, [observation])
+    original = store.evidence_for_day("2026-09-20", "2099-01-01T00:00:00Z")
+    events = store.pending_events()
+
+    recovered = CompanionStore(path)
+    recovered.initialize()
+    assert recovered.record_evidence(cycle, "m0_research", evidence, [observation]) == []
+    assert recovered.evidence_for_day("2026-09-20", "2099-01-01T00:00:00Z") == original
+    assert recovered.pending_events() == events
+
+
 def test_runtime_ledger_rejects_missing_provenance_reference_for_bound_source(tmp_path: Path) -> None:
     store = CompanionStore(tmp_path / "companion.sqlite3")
     cycle = store.ensure_daily_conversation("2026-09-20")

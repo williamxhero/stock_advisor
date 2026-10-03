@@ -21,6 +21,9 @@ if ($ProjectRegression) {
     $regressionTests = @(
         "$root\tests\runtime\test_cycle_contract.py",
         "$root\tests\runtime\test_cycle_replay.py",
+        "$root\tests\runtime\test_evidence_spec.py",
+        "$root\tests\runtime\test_evidence_gate.py",
+        "$root\tests\runtime\test_memory_evidence_gate.py",
         "$root\tests\runtime\test_evidence_qualification.py",
         "$root\tests\runtime\test_evidence_snapshot.py",
         "$root\tests\runtime\test_temporal_integrity.py",
@@ -44,7 +47,7 @@ if ($Select -eq 'all') {
     if ($LASTEXITCODE -ne 0) { throw "Runtime tests failed with exit code $LASTEXITCODE." }
 }
 else {
-    py -m pytest "$root\tests\runtime\test_evidence_spec.py" "$root\tests\runtime\test_evidence_qualification.py" "$root\tests\runtime\test_evidence_snapshot.py" "$root\tests\runtime\test_evidence_gate.py" -q
+    py -m pytest "$root\tests\runtime\test_evidence_spec.py" "$root\tests\runtime\test_evidence_qualification.py" "$root\tests\runtime\test_evidence_snapshot.py" "$root\tests\runtime\test_evidence_gate.py" "$root\tests\runtime\test_memory_evidence_gate.py" -q
     if ($LASTEXITCODE -ne 0) { throw "EvidenceSpec regression tests failed with exit code $LASTEXITCODE." }
 }
 dotnet test "$root\AITradingCompanion.sln" $(if ($Release) { '--configuration'; 'Release' }) --nologo

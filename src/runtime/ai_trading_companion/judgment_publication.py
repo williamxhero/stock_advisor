@@ -270,13 +270,10 @@ def model_sources(packet: dict, *, required_refs: set[str] | None = None) -> dic
             }
         spec = row.get("evidence_spec")
         if isinstance(spec, dict):
-            item["evidence_spec"] = {
-                key: spec[key] for key in (
-                    "contract", "record_id", "kind", "truth_status", "occurred_at", "known_at",
-                    "published_at", "source", "market_propagation", "external_fact", "provenance",
-                )
-                if key in spec
-            }
+            # The immutable evidence ledger is the bounded-projection escape
+            # hatch: dropping contract fields here would leave the model
+            # unable to retain temporal status and provenance on its own.
+            item["evidence_spec"] = copy.deepcopy(spec)
         item["evidence_ref"] = ref
         item["excerpt"] = _bounded_model_text(row.get("excerpt"), excerpt_limit)
         projected[ref] = item

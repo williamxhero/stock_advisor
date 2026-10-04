@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from datetime import datetime
@@ -741,17 +742,11 @@ class RuntimePacketBuilder:
                 spec = source.get("evidence_spec")
                 if isinstance(spec, dict):
                     # EvidenceSpec is the versioned runtime identity of the
-                    # source.  M1 may consume its public, read-only metadata,
-                    # including the contract version and provenance chain;
-                    # keeping these fields prevents a source from becoming an
-                    # untraceable excerpt when it crosses the stage boundary.
-                    projected["evidence_spec"] = {
-                        key: spec[key] for key in (
-                            "contract", "record_id", "kind", "truth_status", "occurred_at", "known_at",
-                            "published_at", "source", "market_propagation", "external_fact", "provenance",
-                        )
-                        if key in spec
-                    }
+                    # source.  The stage boundary must carry the COMPLETE
+                    # frozen record — a field-subset projection breaks the
+                    # contract, its record_id integrity, and the downstream
+                    # ability to retain temporal status and provenance.
+                    projected["evidence_spec"] = copy.deepcopy(spec)
                 public["sources"].append(projected)
         return public
 

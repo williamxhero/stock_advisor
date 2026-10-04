@@ -211,6 +211,36 @@ def test_legacy_memoryhub_snapshot_without_evidence_spec_remains_accepted(tmp_pa
     }
 
 
+def test_stage_boundaries_preserve_the_complete_versioned_evidence_spec() -> None:
+    from ai_trading_companion.judgment_publication import model_sources
+    from ai_trading_companion.packet_builder import RuntimePacketBuilder
+
+    record = _record(propagation="observed")
+    record["expires_at"] = "2099-01-01T00:00:00Z"
+    record["propositions"] = [{"claim": "事件已获核验", "fact_status": "verified"}]
+    record["record_id"] = fingerprint({k: v for k, v in record.items() if k != "record_id"})
+    validate(record)
+    packet_as_of = str(record["known_at"])
+    source = {
+        "evidence_ref": "ev_full", "title": record["source"]["title"],
+        "excerpt": record["content"], "fact_as_of": record["occurred_at"],
+        "known_at": record["known_at"], "evidence_spec": copy.deepcopy(record),
+    }
+
+    frozen = RuntimePacketBuilder._validated_m1_evidence(
+        {"as_of": packet_as_of, "sources": [copy.deepcopy(source)]}, packet_as_of,
+    )
+    frozen_spec = frozen["sources"][0]["evidence_spec"]
+    assert frozen_spec == record
+    assert record["record_id"] == fingerprint({k: v for k, v in frozen_spec.items() if k != "record_id"})
+    validate(frozen_spec)
+
+    projected = model_sources({"evidence": {"sources": [copy.deepcopy(source)]}})
+    model_spec = projected["ev_full"]["evidence_spec"]
+    assert model_spec == record
+    validate(model_spec)
+
+
 def test_frozen_replay_rebuilds_the_same_qualification_without_mutating_history() -> None:
     record = _record(propagation="observed")
     frozen = json.loads(json.dumps(record, ensure_ascii=False, sort_keys=True))

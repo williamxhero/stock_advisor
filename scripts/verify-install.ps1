@@ -24,6 +24,7 @@ foreach ($required in @(
     'resources\contracts\narrative-review-m1-v1.schema.json',
     'resources\contracts\debate-spec-v1.schema.json',
     'resources\contracts\debate-input-v1.schema.json',
+    'resources\contracts\memory-type-spec-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
     'runtime\ai_trading_companion\cycle_replay.py',
@@ -34,6 +35,7 @@ foreach ($required in @(
     'runtime\ai_trading_companion\agent_role.py',
     'runtime\ai_trading_companion\judgment_publication.py',
     'runtime\ai_trading_companion\debate.py',
+    'runtime\ai_trading_companion\memory_type.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'
 )) {
@@ -191,6 +193,20 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
         foreach ($measurement in @('expected_backend_call', 'single_failed_acquisition', 'no_fabricated_evidence', 'no_qualified_fallback')) {
             if ($unavailableSmoke.measurements.$measurement -ne $true) {
                 throw "Installed EvidenceSpec source-unavailable measurement failed: $measurement"
+            }
+        }
+        $memoryTypeReplayOne = ((& $python -m ai_trading_companion.memory_type) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed MemoryType replay 1 failed with exit code $LASTEXITCODE." }
+        $memoryTypeReplayTwo = ((& $python -m ai_trading_companion.memory_type) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed MemoryType replay 2 failed with exit code $LASTEXITCODE." }
+        if ($memoryTypeReplayOne -ne $memoryTypeReplayTwo) { throw 'Installed MemoryType frozen replays were not deterministic.' }
+        $memoryTypeQualification = $memoryTypeReplayOne | ConvertFrom-Json
+        if ($memoryTypeQualification.contract -ne 'MemoryTypeInstallQualification/v1' -or $memoryTypeQualification.qualified -ne $true) {
+            throw 'Installed MemoryType qualification did not pass.'
+        }
+        foreach ($axis in @('delivery_speed', 'qualification_probability', 'research_quality', 'judgment_outcome', 'safety_reliability')) {
+            if ($memoryTypeQualification.evaluation_vector.PSObject.Properties.Name -notcontains $axis) {
+                throw "Installed MemoryType qualification is missing evaluation axis: $axis"
             }
         }
         $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")

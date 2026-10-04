@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from .learning import JudgmentLifecycle
 from .evidence_contract import EvidenceContractFactory
 from .message_presentation import MessageQualificationError, PresentedMessage, present_message, repair_message_draft
+from .memory_type import typed_episode
 from .publication_registry import published_event_types
 from .stage_expression import normalize_stage_output
 from .models import TASK_POLICIES
@@ -80,7 +81,7 @@ class CompanionEngine:
             submitted_at = str(message.get("submitted_at") or message["known_at"])
             provenance = json.loads(message.get("provenance_json") or "{}")
             is_test = is_structured_test_provenance(provenance)
-            self.memory.append({
+            self.memory.append(typed_episode({
                 "memory_space_id": self.memory_space_id,
                 "source_system": "stock-advisor",
                 "source_event_id": str(message["message_id"]),
@@ -98,7 +99,7 @@ class CompanionEngine:
                     "state": "submitted", "actor": "human",
                     "provenance": provenance,
                 },
-            })
+            }, semantic_type="message"))
 
     def recover_interrupted_streams(self) -> int:
         streams = self.store.interrupted_stream_messages()
@@ -1186,7 +1187,7 @@ class CompanionEngine:
         memory_message_id = stream_id or f"{cycle_id}:{kind}:{reply_to_batch_id or hashlib.sha256(presented.markdown.encode('utf-8')).hexdigest()}"
         memory_receipt = None
         if self.memory is not None:
-            memory_receipt = self.memory.append({
+            memory_receipt = self.memory.append(typed_episode({
                 "memory_space_id": self.memory_space_id,
                 "source_system": "stock-advisor",
                 "source_event_id": memory_message_id,
@@ -1200,7 +1201,7 @@ class CompanionEngine:
                     "kind": kind, "state": "published", "actor": "ai",
                     "published_message": presented.message(),
                 },
-            })
+            }, semantic_type="message"))
         batch_ids = reply_to_batch_ids or ([reply_to_batch_id] if reply_to_batch_id else [])
         artifact = self.store.append_artifact(
             cycle_id, kind, "model", presented.markdown, published_at,
@@ -1291,7 +1292,7 @@ class CompanionEngine:
         current = self.store.stream_message(stream_id)
         if self.memory is not None and current["text"]:
             occurred_at = str(current["created_at"])
-            self.memory.append({
+            self.memory.append(typed_episode({
                 "memory_space_id": self.memory_space_id,
                 "source_system": "stock-advisor", "source_event_id": stream_id,
                 "content_hash": "auto", "episode_type": "ai_message", "body": current["text"],
@@ -1301,7 +1302,7 @@ class CompanionEngine:
                     "message_id": stream_id, "cycle_id": cycle_id, "kind": "chat_incomplete",
                     "state": "incomplete", "actor": "ai", "batch_ids": current["batch_ids"],
                 },
-            })
+            }, semantic_type="message"))
         stream = self.store.finish_stream_message(stream_id, error=reason)
         self._emit_failure(
             cycle,
@@ -1480,7 +1481,11 @@ class CompanionEngine:
     def _append_published_memory(self, cycle: dict[str, Any], presented: PresentedMessage) -> None:
         if self.memory is None:
             return
-        self.memory.append({
+        semantic_type = {
+            "judgment": "judgment", "judgment_revision": "judgment",
+            "outcome": "outcome", "reflection": "lesson",
+        }.get(presented.kind, "message")
+        self.memory.append(typed_episode({
             "memory_space_id": self.memory_space_id, "source_system": "stock-advisor",
             "source_event_id": presented.message_id, "content_hash": "auto",
             "episode_type": "ai_message", "body": presented.markdown,
@@ -1492,7 +1497,7 @@ class CompanionEngine:
                 "kind": presented.kind, "state": "published", "actor": "ai",
                 "published_message": presented.message(),
             },
-        })
+        }, semantic_type=semantic_type))
 
     @staticmethod
     def present_for_publication(

@@ -8,6 +8,7 @@ from typing import Any
 
 from .evidence_qualification import qualify_record
 from .evidence_spec import validate
+from .memory_type import typed_episode
 from .temporal_integrity import canonical_time
 from .memory_port import MemoryPort
 from .secret_guard import assert_safe
@@ -62,7 +63,7 @@ class MemoryEvidenceRegistrar:
                     "known_at": known_at,
                 },
             )
-        receipt = self.memory.append(
+        receipt = self.memory.append(typed_episode(
             {
                 "memory_space_id": memory_space_id,
                 "source_system": "wag",
@@ -81,8 +82,8 @@ class MemoryEvidenceRegistrar:
                     **({"evidence_spec": spec} if spec else {}),
                     **({"evidence_qualification": qualification} if qualification else {}),
                 },
-            }
-        )
+            }, semantic_type="evidence"
+        ))
         return RegisteredEvidence(
             episode_id=str(receipt["episode_id"]),
             known_at=known_at,

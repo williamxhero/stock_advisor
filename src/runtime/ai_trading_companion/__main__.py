@@ -51,6 +51,7 @@ from .memory_commands import handle_memory_command
 from .memory_port import HttpMemoryAdapter, MemoryUnavailable
 from .memory_health import MemoryCapabilityPolicy
 from .memory_evidence import MemoryEvidenceRegistrar
+from .memory_type import typed_episode
 from .evidence_spec import fingerprint, validate
 from .temporal_integrity import resolve_temporal
 from .memoryhub_migration import LegacyWorkspaceImporter
@@ -2955,14 +2956,14 @@ def _discover_chat_external_evidence(
     else:
         reference = dict(action["source_reference"] or {})
         now = iso(datetime.now(timezone.utc))
-        receipt = engine.memory.append({
+        receipt = engine.memory.append(typed_episode({
             "memory_space_id": engine.memory_space_id,
             "source_system": "markethub" if operation == "markethub_quote" else "8815",
             "source_event_id": "chat:" + str(snapshot["snapshot_id"]) + ":" + hashlib.sha256(json.dumps(reference, sort_keys=True).encode("utf-8")).hexdigest(),
             "content_hash": "auto", "episode_type": "external_evidence", "source_reference": reference,
             "occurred_at": str(reference.get("date") or now), "known_at": now, "submitted_at": now,
             "authority": "immutable_source_reference", "protocol_version": "memoryhub/v1",
-        })
+        }, semantic_type="observation"))
         receipt_snapshot = engine.memory.begin_snapshot({
             "memory_space_id": engine.memory_space_id, "as_of": now, "stage": "chat", "cycle_id": snapshot.get("cycle_id"),
         })

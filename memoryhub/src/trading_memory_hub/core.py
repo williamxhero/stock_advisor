@@ -25,6 +25,12 @@ EVIDENCE_KINDS = {
 }
 EVIDENCE_TRUTH_STATUSES = {"verified", "unverified", "refuted", "conflicted", "unknown"}
 EVIDENCE_PROPAGATION_STATUSES = {"observed", "not_observed", "unknown"}
+MEMORY_TYPE_CONTRACT = "MemoryTypeSpec/v1"
+MEMORY_TYPE_VERSION = 1
+MEMORY_SEMANTIC_TYPES = {
+    "user_fact", "observation", "judgment", "outcome", "lesson", "preference", "rule",
+    "message", "evidence", "correction", "operational",
+}
 
 
 class MemoryHubError(RuntimeError):
@@ -220,6 +226,9 @@ class MemoryHub:
                     normalized_spec[name] = _canonical_time(str(normalized_spec[name]))
             self._validate_evidence_spec(normalized_spec, value)
             metadata = {**metadata, "evidence_spec": normalized_spec}
+        memory_type = metadata.get("memory_type") if isinstance(metadata, dict) else None
+        if memory_type is not None:
+            self._validate_memory_type(memory_type, value)
         if value.get("body"):
             actual_body_hash = _content_hash(str(value["body"]))
             if value["content_hash"] == "auto":
@@ -281,6 +290,36 @@ class MemoryHub:
                 (episode_id, value["submitted_at"]),
             )
             return AppendReceipt(episode_id, int(cursor.lastrowid), value["content_hash"])
+
+    @staticmethod
+    def _validate_memory_type(memory_type: Any, episode: dict[str, Any]) -> None:
+        if not isinstance(memory_type, dict) or memory_type.get("contract") != MEMORY_TYPE_CONTRACT:
+            raise MemoryHubError("unsupported memory type contract")
+        required = {"contract", "version", "semantic_type", "source", "temporal", "authority", "correction_of", "provenance"}
+        if set(memory_type) != required:
+            raise MemoryHubError("invalid memory type envelope fields")
+        if memory_type.get("version") != MEMORY_TYPE_VERSION or memory_type.get("semantic_type") not in MEMORY_SEMANTIC_TYPES:
+            raise MemoryHubError("invalid memory type identity")
+        source = memory_type["source"]
+        if not isinstance(source, dict) or set(source) != {"source_system", "source_event_id"}:
+            raise MemoryHubError("invalid memory type source")
+        if source["source_system"] != episode["source_system"] or source["source_event_id"] != episode["source_event_id"]:
+            raise SourceIntegrityError("memory type source does not match episode")
+        temporal = memory_type["temporal"]
+        if not isinstance(temporal, dict) or set(temporal) != {"occurred_at", "known_at", "submitted_at"}:
+            raise MemoryHubError("invalid memory type temporal envelope")
+        for field in ("occurred_at", "known_at", "submitted_at"):
+            if temporal[field] != episode[field]:
+                raise SourceIntegrityError(f"memory type {field} does not match episode")
+        if memory_type["authority"] != episode["authority"]:
+            raise SourceIntegrityError("memory type authority does not match episode")
+        if memory_type["correction_of"] != episode.get("corrects_episode_id"):
+            raise SourceIntegrityError("memory type correction does not match episode")
+        provenance = memory_type["provenance"]
+        if not isinstance(provenance, dict) or set(provenance) != {"episode_type"}:
+            raise MemoryHubError("invalid memory type provenance")
+        if provenance["episode_type"] != episode["episode_type"]:
+            raise SourceIntegrityError("memory type episode type does not match episode")
 
     @staticmethod
     def _validate_evidence_spec(spec: Any, episode: dict[str, Any]) -> None:

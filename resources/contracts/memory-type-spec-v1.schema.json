@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryTypeSpec/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "version", "semantic_type", "source", "temporal", "authority", "correction_of", "provenance"],
+  "properties": {
+    "contract": {"const": "MemoryTypeSpec/v1"},
+    "version": {"const": 1},
+    "semantic_type": {"enum": ["user_fact", "observation", "judgment", "outcome", "lesson", "preference", "rule", "message", "evidence", "correction", "operational"]},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_system", "source_event_id"],
+      "properties": {
+        "source_system": {"type": "string", "minLength": 1},
+        "source_event_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "temporal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["occurred_at", "known_at", "submitted_at"],
+      "properties": {
+        "occurred_at": {"type": "string", "minLength": 1},
+        "known_at": {"type": "string", "minLength": 1},
+        "submitted_at": {"type": "string", "minLength": 1}
+      }
+    },
+    "authority": {"type": "string", "minLength": 1},
+    "correction_of": {"type": ["string", "null"]},
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["episode_type"],
+      "properties": {"episode_type": {"type": "string", "minLength": 1}}
+    }
+  }
+}

@@ -11,6 +11,7 @@ from typing import Any, Callable
 from datetime import datetime
 
 from .memory_port import MemoryPort
+from .memory_type import build_envelope, typed_episode
 
 
 def _hash(body: str) -> str:
@@ -54,7 +55,7 @@ class LegacyWorkspaceImporter:
             body = path.read_text(encoding="utf-8-sig", errors="replace")
             relative = path.relative_to(self.root).as_posix()
             digest = _hash(body)
-            episodes.append({
+            episodes.append(typed_episode({
                 "memory_space_id": self.memory_space_id,
                 "source_system": "legacy-workspace-import",
                 "source_event_id": f"workspace:{relative}:{digest.removeprefix('sha256:')}",
@@ -71,7 +72,7 @@ class LegacyWorkspaceImporter:
                     "legacy_format": path.suffix.casefold().lstrip("."),
                     "time_provenance": "migration_time",
                 },
-            })
+            }, semantic_type="operational"))
             if relative.casefold() == "portfolio/01_current_portfolio.md":
                 portfolio_text = body
 
@@ -197,6 +198,11 @@ class MemoryHubMigrator:
                 value = dict(item); corrects = value.pop("corrects_source", None)
                 if corrects:
                     value["corrects_episode_id"] = receipt_by_source[str(corrects)]
+                    semantic_type = value["metadata"]["memory_type"]["semantic_type"]
+                    value["metadata"] = {
+                        **value["metadata"],
+                        "memory_type": build_envelope(value, semantic_type=semantic_type),
+                    }
                 payload.append(value)
             results = self.memory.append_batch(payload)
             for value, result in zip(payload, results):
@@ -294,7 +300,12 @@ class MemoryHubMigrator:
         except ValueError:
             normalized_occurred_at = self.migrated_at
             occurred_provenance = "migration_time"
-        return {
+        semantic_type = {
+            "personal_fact": "user_fact", "preference": "preference", "judgment": "judgment",
+            "outcome": "outcome", "reflection": "lesson", "proposition": "observation",
+            "correction": "correction", "evidence": "evidence",
+        }.get(episode_type, "operational")
+        return typed_episode({
             "memory_space_id": self.memory_space_id, "source_system": "stock-advisor-migration",
             "source_event_id": source_event_id, "episode_type": episode_type,
             "occurred_at": normalized_occurred_at, "known_at": known_at, "submitted_at": self.migrated_at,
@@ -302,7 +313,7 @@ class MemoryHubMigrator:
             "metadata": {**metadata, "known_at_provenance": provenance, "occurred_at_provenance": occurred_provenance,
                          **({"legacy_occurred_at": original_occurred_at} if occurred_provenance == "migration_time" else {})},
             "source_hash": source_hash, "body": body,
-        }
+        }, semantic_type=semantic_type)
 
 
 def run_shadow_comparison(

@@ -747,8 +747,8 @@ class RuntimePacketBuilder:
                     # untraceable excerpt when it crosses the stage boundary.
                     projected["evidence_spec"] = {
                         key: spec[key] for key in (
-                            "contract", "record_id", "truth_status", "occurred_at", "known_at",
-                            "published_at", "source", "provenance",
+                            "contract", "record_id", "kind", "truth_status", "occurred_at", "known_at",
+                            "published_at", "source", "market_propagation", "external_fact", "provenance",
                         )
                         if key in spec
                     }

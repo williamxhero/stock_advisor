@@ -272,8 +272,8 @@ def model_sources(packet: dict, *, required_refs: set[str] | None = None) -> dic
         if isinstance(spec, dict):
             item["evidence_spec"] = {
                 key: spec[key] for key in (
-                    "contract", "record_id", "truth_status", "occurred_at", "known_at",
-                    "published_at", "source", "provenance",
+                    "contract", "record_id", "kind", "truth_status", "occurred_at", "known_at",
+                    "published_at", "source", "market_propagation", "external_fact", "provenance",
                 )
                 if key in spec
             }

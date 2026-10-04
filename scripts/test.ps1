@@ -2,7 +2,7 @@
 param(
     [switch]$Release,
     [switch]$ProjectRegression,
-    [ValidateSet('all', 'EvidenceSpec', 'MemoryType')]
+    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryWrite')]
     [string]$Select = 'all'
 )
 
@@ -24,6 +24,8 @@ if ($ProjectRegression) {
         "$root\tests\runtime\test_evidence_spec.py",
         "$root\tests\runtime\test_memory_type.py",
         "$root\memoryhub\tests\test_memory_types.py",
+        "$root\tests\runtime\test_memory_write.py",
+        "$root\memoryhub\tests\test_append_only_ledger.py",
         "$root\tests\runtime\test_evidence_gate.py",
         "$root\tests\runtime\test_memory_evidence_gate.py",
         "$root\tests\runtime\test_evidence_qualification.py",
@@ -52,9 +54,13 @@ elseif ($Select -eq 'EvidenceSpec') {
     py -m pytest "$root\tests\runtime\test_evidence_spec.py" "$root\tests\runtime\test_evidence_qualification.py" "$root\tests\runtime\test_evidence_snapshot.py" "$root\tests\runtime\test_evidence_gate.py" "$root\tests\runtime\test_memory_evidence_gate.py" -q
     if ($LASTEXITCODE -ne 0) { throw "EvidenceSpec regression tests failed with exit code $LASTEXITCODE." }
 }
-else {
+elseif ($Select -eq 'MemoryType') {
     py -m pytest "$root\tests\runtime\test_memory_type.py" "$root\memoryhub\tests\test_memory_types.py" -q
     if ($LASTEXITCODE -ne 0) { throw "MemoryType regression tests failed with exit code $LASTEXITCODE." }
+}
+else {
+    py -m pytest "$root\tests\runtime\test_memory_write.py" "$root\memoryhub\tests\test_append_only_ledger.py" -q
+    if ($LASTEXITCODE -ne 0) { throw "MemoryWrite regression tests failed with exit code $LASTEXITCODE." }
 }
 dotnet test "$root\AITradingCompanion.sln" $(if ($Release) { '--configuration'; 'Release' }) --nologo
 if ($LASTEXITCODE -ne 0) { throw "Desktop tests failed with exit code $LASTEXITCODE." }

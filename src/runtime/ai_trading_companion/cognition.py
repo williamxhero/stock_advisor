@@ -17,7 +17,7 @@ from .portfolio import (
 )
 from .store import digest
 from .task_profiles import AnalysisClarificationRequired
-from .memory_type import typed_episode
+from .memory_write import write_memory
 from .user_learning import explicit_expression_preference, user_method_claim
 
 
@@ -363,7 +363,7 @@ class UnifiedCognition:
             "user_fact": "user_fact", "expression_preference": "preference",
             "method_claim": "rule",
         }.get(str(proposition["kind"]), "observation")
-        self.engine.memory.append(typed_episode({
+        write_memory(self.engine.memory, "user_fact", {
             "memory_space_id": self.engine.memory_space_id, "source_system": "stock-advisor",
             "source_event_id": proposition_id, "content_hash": "auto",
             "episode_type": "personal_fact" if proposition["kind"] in {"user_fact", "expression_preference"} else "proposition",
@@ -371,7 +371,7 @@ class UnifiedCognition:
             "known_at": known_at, "submitted_at": known_at,
             "authority": "user_private_fact", "protocol_version": "memoryhub/v1",
             "metadata": {"proposition_id": proposition_id, "cycle_id": cycle_id, "source_message_id": message["message_id"], "supersedes_id": proposition.get("supersedes_id")},
-        }, semantic_type=semantic_type))
+        }, semantic_type=semantic_type)
 
     @staticmethod
     def _validated_source_span(

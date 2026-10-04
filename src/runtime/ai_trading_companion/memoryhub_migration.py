@@ -12,6 +12,7 @@ from datetime import datetime
 
 from .memory_port import MemoryPort
 from .memory_type import build_envelope, typed_episode
+from .memory_write import MemoryWriter
 
 
 def _hash(body: str) -> str:
@@ -80,7 +81,7 @@ class LegacyWorkspaceImporter:
         imported = 0
         for offset in range(0, len(episodes), 50):
             values = episodes[offset:offset + 50]
-            results = self.memory.append_batch(values)
+            results = MemoryWriter(self.memory).write_batch("migrated", values)
             for value, result in zip(values, results):
                 if isinstance(result, dict) and result.get("receipt"):
                     imported += 1
@@ -204,7 +205,7 @@ class MemoryHubMigrator:
                         "memory_type": build_envelope(value, semantic_type=semantic_type),
                     }
                 payload.append(value)
-            results = self.memory.append_batch(payload)
+            results = MemoryWriter(self.memory).write_batch("migrated", payload)
             for value, result in zip(payload, results):
                 receipt = result.get("receipt") if isinstance(result, dict) else None
                 if receipt:

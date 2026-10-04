@@ -126,6 +126,22 @@ class MemoryHub:
                     UNIQUE(memory_space_id, source_system, source_event_id),
                     FOREIGN KEY(corrects_episode_id) REFERENCES episode(episode_id)
                 );
+                CREATE TRIGGER IF NOT EXISTS episode_append_only_update
+                BEFORE UPDATE ON episode
+                BEGIN
+                    SELECT RAISE(ABORT, 'episode ledger is append-only');
+                END;
+                -- Deletion is only the whole-space clear that was exported and
+                -- confirmed; a single historical episode can never be removed.
+                CREATE TRIGGER IF NOT EXISTS episode_append_only_delete
+                BEFORE DELETE ON episode
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM clear_request
+                    WHERE memory_space_id=OLD.memory_space_id AND state='pending'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'episode ledger is append-only');
+                END;
                 CREATE INDEX IF NOT EXISTS ix_episode_space_sequence
                     ON episode(memory_space_id, sequence);
                 CREATE INDEX IF NOT EXISTS ix_episode_space_known
@@ -212,8 +228,13 @@ class MemoryHub:
             raise MemoryHubError(f"unsupported protocol: {value['protocol_version']}")
         if not value.get("body") and not value.get("source_reference"):
             raise MemoryHubError("episode requires body or source_reference")
-        if value.get("body"):
-            assert_safe(str(value["body"]))
+        # Authentication secrets are blocked wherever a caller can place them,
+        # not only in the body: metadata and source references persist as well.
+        assert_safe(json.dumps(
+            {"body": value.get("body"), "metadata": value.get("metadata"),
+             "source_reference": value.get("source_reference")},
+            ensure_ascii=False, sort_keys=True, default=str,
+        ))
         value = dict(value)
         for name in ("occurred_at", "known_at", "submitted_at"):
             value[name] = _canonical_time(str(value[name]))

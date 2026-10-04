@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemoryWriteSpec/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "version", "kind", "mode", "append_only", "semantic_type", "episode_type", "authority", "idempotency_key", "content_hash", "corrects_episode_id", "projection_kinds"],
+  "properties": {
+    "contract": {"const": "MemoryWriteSpec/v1"},
+    "version": {"const": 1},
+    "kind": {"enum": ["user_message", "ai_message", "user_fact", "evidence", "correction", "migrated"]},
+    "mode": {"const": "authoritative_append"},
+    "append_only": {"const": true},
+    "semantic_type": {"enum": ["user_fact", "observation", "judgment", "outcome", "lesson", "preference", "rule", "message", "evidence", "correction", "operational"]},
+    "episode_type": {"type": "string", "minLength": 1},
+    "authority": {"type": "string", "minLength": 1},
+    "idempotency_key": {
+      "type": "array", "minItems": 3, "maxItems": 3,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "content_hash": {"type": ["string", "null"]},
+    "corrects_episode_id": {"type": ["string", "null"]},
+    "projection_kinds": {
+      "type": "array",
+      "items": {"enum": ["summary", "lexical_index", "entity", "relation", "event_cluster", "retrieval_bundle", "retrieval_audit", "markdown_export"]}
+    }
+  }
+}

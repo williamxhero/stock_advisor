@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from datetime import datetime
@@ -292,6 +293,9 @@ class RuntimePacketBuilder:
                     "title": item["source_title"], "url": item["source_url"],
                     "known_at": item["known_at"], "coverage_state": item["coverage_state"],
                     "text": item["body_text"],
+                    "evidence_spec": json.loads(item.get("evidence_spec_json") or "{}"),
+                    "provenance": json.loads(item.get("provenance_json") or "{}"),
+                    "market_propagation": json.loads(item.get("evidence_spec_json") or "{}").get("market_propagation"),
                 }
                 for item in ledger
             ],
@@ -737,10 +741,12 @@ class RuntimePacketBuilder:
                     }
                 spec = source.get("evidence_spec")
                 if isinstance(spec, dict):
-                    projected["evidence_spec"] = {
-                        key: spec[key] for key in ("record_id", "truth_status", "occurred_at", "known_at")
-                        if key in spec
-                    }
+                    # EvidenceSpec is the versioned runtime identity of the
+                    # source.  The stage boundary must carry the COMPLETE
+                    # frozen record — a field-subset projection breaks the
+                    # contract, its record_id integrity, and the downstream
+                    # ability to retain temporal status and provenance.
+                    projected["evidence_spec"] = copy.deepcopy(spec)
                 public["sources"].append(projected)
         return public
 

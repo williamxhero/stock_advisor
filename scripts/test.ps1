@@ -1,21 +1,29 @@
 [CmdletBinding()]
 param(
     [switch]$Release,
-    [switch]$ProjectRegression
+    [switch]$ProjectRegression,
+    [ValidateSet('all', 'EvidenceSpec')]
+    [string]$Select = 'all'
 )
 
 $ErrorActionPreference = 'Stop'
+if ($ProjectRegression -and $Select -ne 'all') {
+    throw 'ProjectRegression requires the complete regression suite; Select must be all.'
+}
 $root = Split-Path -Parent $PSScriptRoot
 $env:PYTHONPATH = "$root\memoryhub\src;$root\src\runtime" + $(if ($env:PYTHONPATH) { ";$env:PYTHONPATH" } else { "" })
 
 if ($ProjectRegression) {
     # The project-regression gate is the smallest deterministic suite that
     # exercises the decision-cycle contract, frozen replay, recovery and the
-    # two installed qualification paths.  Keep it independent of the full
+    # two installed qualification paths. Keep it independent of the full
     # MemoryHub and desktop suites so it can be used by ticket automation.
     $regressionTests = @(
         "$root\tests\runtime\test_cycle_contract.py",
         "$root\tests\runtime\test_cycle_replay.py",
+        "$root\tests\runtime\test_evidence_spec.py",
+        "$root\tests\runtime\test_evidence_gate.py",
+        "$root\tests\runtime\test_memory_evidence_gate.py",
         "$root\tests\runtime\test_evidence_qualification.py",
         "$root\tests\runtime\test_evidence_snapshot.py",
         "$root\tests\runtime\test_temporal_integrity.py",
@@ -32,9 +40,15 @@ if ($ProjectRegression) {
     exit 0
 }
 
-py -m pytest "$root\memoryhub\tests" -q
-if ($LASTEXITCODE -ne 0) { throw "MemoryHub tests failed with exit code $LASTEXITCODE." }
-py -m pytest "$root\tests\runtime" -q
-if ($LASTEXITCODE -ne 0) { throw "Runtime tests failed with exit code $LASTEXITCODE." }
+if ($Select -eq 'all') {
+    py -m pytest "$root\memoryhub\tests" -q
+    if ($LASTEXITCODE -ne 0) { throw "MemoryHub tests failed with exit code $LASTEXITCODE." }
+    py -m pytest "$root\tests\runtime" -q
+    if ($LASTEXITCODE -ne 0) { throw "Runtime tests failed with exit code $LASTEXITCODE." }
+}
+else {
+    py -m pytest "$root\tests\runtime\test_evidence_spec.py" "$root\tests\runtime\test_evidence_qualification.py" "$root\tests\runtime\test_evidence_snapshot.py" "$root\tests\runtime\test_evidence_gate.py" "$root\tests\runtime\test_memory_evidence_gate.py" -q
+    if ($LASTEXITCODE -ne 0) { throw "EvidenceSpec regression tests failed with exit code $LASTEXITCODE." }
+}
 dotnet test "$root\AITradingCompanion.sln" $(if ($Release) { '--configuration'; 'Release' }) --nologo
 if ($LASTEXITCODE -ne 0) { throw "Desktop tests failed with exit code $LASTEXITCODE." }

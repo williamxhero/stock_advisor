@@ -3,12 +3,14 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import uuid
 from pathlib import Path
 
 import pytest
 
 from ai_trading_companion.acquisition import AcquisitionBoundary
-from ai_trading_companion.evidence_spec import qualify, validate
+from ai_trading_companion.evidence_spec import fingerprint, frozen_replay, install_qualification, qualify, validate
+from ai_trading_companion.evidence_qualification import POLICY_VERSION, qualify_record
 from ai_trading_companion.memory_evidence import MemoryEvidenceRegistrar
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.store import CompanionStore
@@ -72,6 +74,7 @@ def test_acquisition_cannot_promote_ai_origin_to_market_fact(provenance: dict) -
 def test_memoryhub_receipt_preserves_the_versioned_record() -> None:
     memory = InMemoryMemoryAdapter()
     record = _record()
+    original = copy.deepcopy(record)
     registrar = MemoryEvidenceRegistrar(memory, clock=lambda: "2026-09-20T02:00:00Z")
 
     registered = registrar.register_web_snapshot(
@@ -82,10 +85,109 @@ def test_memoryhub_receipt_preserves_the_versioned_record() -> None:
 
     episode = memory.export_space("replay")["episodes"][0]
     stored = episode["metadata"]["evidence_spec"]
-    assert stored["contract"] == "EvidenceSpec/v1"
-    assert stored["known_at"] == registered.known_at
+    qualification = episode["metadata"]["evidence_qualification"]
+    assert stored == original
+    assert stored["record_id"] == original["record_id"]
     assert stored["market_propagation"]["status"] == "unknown"
+    assert episode["known_at"] == registered.known_at
+    assert qualification["input_record_refs"][0]["memory_receipt"]["known_at"] == registered.known_at
+    assert registered.context["known_at"] == registered.known_at
     assert registered.context["memory_episode_id"] == episode["episode_id"]
+
+
+def test_memoryhub_accepts_titleless_evidence_using_url_fallback() -> None:
+    memory = InMemoryMemoryAdapter()
+    record = _record()
+    record["source"]["title"] = ""
+    record["record_id"] = fingerprint({
+        key: value for key, value in record.items() if key != "record_id"
+    })
+    registrar = MemoryEvidenceRegistrar(memory, clock=lambda: "2026-09-20T02:00:00Z")
+
+    registered = registrar.register_web_snapshot(
+        memory_space_id="replay", source_event_id="event-titleless",
+        url=record["source"]["url"], title=record["source"]["url"],
+        body=record["content"], occurred_at=record["occurred_at"], evidence_spec=record,
+    )
+
+    episode = memory.export_space("replay")["episodes"][0]
+    assert episode["metadata"]["evidence_spec"]["source"]["title"] == ""
+    assert registered.context["memory_episode_id"] == episode["episode_id"]
+
+
+def test_memoryhub_rejects_modified_evidence_before_recording() -> None:
+    memory = InMemoryMemoryAdapter()
+    record = _record()
+    record["truth_status"] = "refuted"
+    registrar = MemoryEvidenceRegistrar(memory, clock=lambda: "2026-09-20T02:00:00Z")
+
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        registrar.register_web_snapshot(
+            memory_space_id="replay", source_event_id="tampered-event",
+            url=record["source"]["url"], title=record["source"]["title"],
+            body=record["content"], occurred_at=record["occurred_at"], evidence_spec=record,
+        )
+
+    assert memory.export_space("replay")["episodes"] == []
+
+
+@pytest.mark.parametrize("field,value", [
+    ("body", "different material"),
+    ("url", "https://example.test/different"),
+])
+def test_memoryhub_rejects_snapshot_that_does_not_match_evidence(field: str, value: str) -> None:
+    memory = InMemoryMemoryAdapter()
+    record = _record()
+    arguments = {
+        "memory_space_id": "replay", "source_event_id": "mismatched-event",
+        "url": record["source"]["url"], "title": record["source"]["title"],
+        "body": record["content"], "occurred_at": record["occurred_at"], "evidence_spec": record,
+    }
+    arguments[field] = value
+    registrar = MemoryEvidenceRegistrar(memory, clock=lambda: "2026-09-20T02:00:00Z")
+
+    with pytest.raises(ValueError, match="snapshot does not match evidence"):
+        registrar.register_web_snapshot(**arguments)
+
+    assert memory.export_space("replay")["episodes"] == []
+
+
+@pytest.mark.parametrize("field,value", [
+    ("title", "different title"),
+    ("occurred_at", "2026-09-19T00:00:00Z"),
+])
+def test_memoryhub_rejects_acquisition_identity_mismatch(field: str, value: str) -> None:
+    memory = InMemoryMemoryAdapter()
+    record = _record()
+    arguments = {
+        "memory_space_id": "replay", "source_event_id": "mismatched-identity",
+        "url": record["source"]["url"], "title": record["source"]["title"],
+        "body": record["content"], "occurred_at": record["occurred_at"],
+        "evidence_spec": record,
+    }
+    arguments[field] = value
+    registrar = MemoryEvidenceRegistrar(memory, clock=lambda: "2026-09-20T02:00:00Z")
+
+    with pytest.raises(ValueError, match="snapshot does not match evidence"):
+        registrar.register_web_snapshot(**arguments)
+
+    assert memory.export_space("replay")["episodes"] == []
+
+
+def test_memoryhub_accepts_equivalent_occurrence_time() -> None:
+    memory = InMemoryMemoryAdapter()
+    record = _record()
+    registrar = MemoryEvidenceRegistrar(memory, clock=lambda: "2026-09-20T02:00:00Z")
+
+    registered = registrar.register_web_snapshot(
+        memory_space_id="replay", source_event_id="event-equivalent-time",
+        url=record["source"]["url"], title=record["source"]["title"],
+        body=record["content"], occurred_at="2026-09-20T09:00:00+08:00",
+        evidence_spec=record,
+    )
+
+    assert registered.context["memory_episode_id"]
+    assert memory.export_space("replay")["episodes"][0]["occurred_at"] == "2026-09-20T09:00:00+08:00"
 
 
 def test_legacy_memoryhub_snapshot_without_evidence_spec_remains_accepted(tmp_path: Path) -> None:
@@ -109,6 +211,36 @@ def test_legacy_memoryhub_snapshot_without_evidence_spec_remains_accepted(tmp_pa
     }
 
 
+def test_stage_boundaries_preserve_the_complete_versioned_evidence_spec() -> None:
+    from ai_trading_companion.judgment_publication import model_sources
+    from ai_trading_companion.packet_builder import RuntimePacketBuilder
+
+    record = _record(propagation="observed")
+    record["expires_at"] = "2099-01-01T00:00:00Z"
+    record["propositions"] = [{"claim": "事件已获核验", "fact_status": "verified"}]
+    record["record_id"] = fingerprint({k: v for k, v in record.items() if k != "record_id"})
+    validate(record)
+    packet_as_of = str(record["known_at"])
+    source = {
+        "evidence_ref": "ev_full", "title": record["source"]["title"],
+        "excerpt": record["content"], "fact_as_of": record["occurred_at"],
+        "known_at": record["known_at"], "evidence_spec": copy.deepcopy(record),
+    }
+
+    frozen = RuntimePacketBuilder._validated_m1_evidence(
+        {"as_of": packet_as_of, "sources": [copy.deepcopy(source)]}, packet_as_of,
+    )
+    frozen_spec = frozen["sources"][0]["evidence_spec"]
+    assert frozen_spec == record
+    assert record["record_id"] == fingerprint({k: v for k, v in frozen_spec.items() if k != "record_id"})
+    validate(frozen_spec)
+
+    projected = model_sources({"evidence": {"sources": [copy.deepcopy(source)]}})
+    model_spec = projected["ev_full"]["evidence_spec"]
+    assert model_spec == record
+    validate(model_spec)
+
+
 def test_frozen_replay_rebuilds_the_same_qualification_without_mutating_history() -> None:
     record = _record(propagation="observed")
     frozen = json.loads(json.dumps(record, ensure_ascii=False, sort_keys=True))
@@ -121,6 +253,114 @@ def test_frozen_replay_rebuilds_the_same_qualification_without_mutating_history(
     ).hexdigest()
     assert qualify(expired, as_of="2099-01-01T00:00:00Z")["state"] == "expired"
     assert record["market_propagation"]["status"] == "observed"
+
+
+def test_frozen_replay_keeps_input_version_qualification_and_original_artifact() -> None:
+    record = _record(propagation="observed")
+    artifact = {"judgment": "条件成立", "published_at": "2026-09-20T03:00:00Z"}
+    first = frozen_replay(record, as_of="2099-01-01T00:00:00Z", original_artifact=artifact)
+    second = frozen_replay(copy.deepcopy(record), as_of="2099-01-01T00:00:00Z", original_artifact=artifact)
+    assert first == second
+    assert first["evidence_contract"] == "EvidenceSpec/v1"
+    assert first["qualification"]["state"] == "qualified"
+    assert first["original_artifact"] == artifact
+    assert record["record_id"] == first["evidence"]["record_id"]
+
+
+def test_install_qualification_is_deterministic_and_keeps_evaluation_axes_separate() -> None:
+    first = install_qualification()
+    second = install_qualification()
+    assert first == second
+    assert first["qualified"] is True
+    assert first["replay"]["evidence_contract"] == "EvidenceSpec/v1"
+    assert first["replay"]["original_artifact"]["artifact_id"] == "install-evidence-artifact"
+    assert set(first["evaluation_vector"]) == {
+        "delivery_speed", "qualification_probability", "research_quality",
+        "judgment_outcome", "safety_reliability",
+    }
+    smoke = first["source_unavailable_smoke"]
+    assert smoke["status"] == "failed"
+    assert smoke["available"] is False and smoke["qualified"] is False
+    assert smoke["verifier_passed"] is False and smoke["evidence_items"] == []
+    assert smoke["backend_calls"] == [{"operation": "web_read", "url": "https://example.test/unavailable"}]
+    assert all(smoke["measurements"].values())
+    assert first["evaluation_vector"]["judgment_outcome"]["status"] == "not_measured"
+    assert first["evaluation_vector"]["safety_reliability"]["measurements"]["unavailable_source_safe"] is True
+    for axis, value in first["evaluation_vector"].items():
+        assert isinstance(value, dict)
+        assert value["status"] in {"pass", "fail", "not_measured"}
+        assert isinstance(value["measurements"], dict)
+        assert isinstance(value["measurements"]["measured"], bool)
+        if value["status"] != "pass":
+            assert value["reason"]
+
+
+def test_replay_uses_production_weak_source_policy_and_binds_cutoff() -> None:
+    record = _record("market_fact")
+    record["source"]["reference"]["screenshot_only"] = True
+    record["record_id"] = fingerprint({k: v for k, v in record.items() if k != "record_id"})
+    replay = frozen_replay(record, as_of="2099-01-01T00:00:00Z")
+    assert replay["qualification"] == qualify_record(record, as_of="2099-01-01T00:00:00Z")
+    assert replay["qualification"]["state"] == "degraded"
+    assert replay["qualification"]["permitted_use"] == "context_only"
+    assert replay["qualification_inputs"]["qualification_policy_version"] == POLICY_VERSION
+    assert replay["input_sha256"] == fingerprint(replay["qualification_inputs"])
+    assert replay["input_sha256"] != frozen_replay(record, as_of="2099-01-02T00:00:00Z")["input_sha256"]
+
+
+def test_replay_receipt_persists_every_production_qualification_input() -> None:
+    record = _record("news_disclosure")
+    replay = frozen_replay(
+        record,
+        as_of="2026-09-20T08:00:00Z",
+        source_refs=("source-b", "source-a", "source-a"),
+        source_conflict_refs=("conflict-2", "conflict-1"),
+        memory_receipt={"episode_id": "episode-1", "content_hash": "hash-1"},
+        allow_post_cutoff_known_at=True,
+    )
+
+    inputs = replay["qualification_inputs"]
+    assert inputs["as_of"] == "2026-09-20T08:00:00Z"
+    assert inputs["qualification_policy_version"] == POLICY_VERSION
+    assert inputs["source_refs"] == ["source-a", "source-b"]
+    assert inputs["source_conflict_refs"] == ["conflict-1", "conflict-2"]
+    assert inputs["memory_receipt"] == {"episode_id": "episode-1", "content_hash": "hash-1"}
+    assert inputs["allow_post_cutoff_known_at"] is True
+    assert replay["input_sha256"] == fingerprint(inputs)
+    assert replay["qualification"]["input_record_refs"][0]["source_refs"] == ["source-a", "source-b"]
+    assert replay["qualification"]["qualification_policy_version"] == POLICY_VERSION
+    assert replay["qualification"]["as_of"] == "2026-09-20T08:00:00Z"
+    assert replay["qualification"]["source_conflict_refs"] == ["conflict-1", "conflict-2"]
+    assert replay["qualification"]["input_record_refs"][0]["memory_receipt"] == inputs["memory_receipt"]
+
+
+def test_frozen_replay_preserves_production_permission_boundaries() -> None:
+    ai_record = _record("ai_reasoning")
+    screenshot_record = _record("market_fact")
+    screenshot_record["source"]["reference"]["screenshot_only"] = True
+    screenshot_record["record_id"] = fingerprint({
+        key: value for key, value in screenshot_record.items() if key != "record_id"
+    })
+
+    ai_replay = frozen_replay(ai_record, as_of="2099-01-01T00:00:00Z")
+    screenshot_replay = frozen_replay(screenshot_record, as_of="2099-01-01T00:00:00Z")
+
+    assert ai_replay["qualification"]["state"] == "rejected"
+    assert ai_replay["qualification"]["permitted_use"] == "reasoning_only"
+    assert "ai_is_not_external_evidence" in ai_replay["qualification"]["reasons"]
+    assert screenshot_replay["qualification"]["state"] == "degraded"
+    assert screenshot_replay["qualification"]["permitted_use"] == "context_only"
+    assert "weak_source_screenshot_only" in screenshot_replay["qualification"]["reasons"]
+
+
+def test_replay_rejects_tampered_input_without_rewriting_original() -> None:
+    record = _record()
+    original_id = record["record_id"]
+    tampered = copy.deepcopy(record)
+    tampered["content"] = "被篡改"
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        frozen_replay(tampered)
+    assert record["record_id"] == original_id
 
 
 def test_runtime_ledger_keeps_record_fields_and_emits_exchange_contract(tmp_path: Path) -> None:
@@ -139,3 +379,144 @@ def test_runtime_ledger_keeps_record_fields_and_emits_exchange_contract(tmp_path
     assert json.loads(row["provenance_json"])["origin"] == "external_source"
     events = store.pending_events()
     assert any(event["event_type"] == "evidence.recorded" for event in events)
+
+
+def test_runtime_ledger_retries_are_idempotent_and_retain_versioned_provenance(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    cycle = store.ensure_daily_conversation("2026-09-20")
+    evidence = {"as_of": "2026-09-20T01:00:00Z", "sources": [{
+        "evidence_ref": "fact-1", "url": "https://example.test/fact", "title": "事实",
+        "fact_as_of": "2026-09-20T01:00:00Z", "excerpt": "2026-09-20 可核验事实",
+    }]}
+
+    first = store.record_evidence(cycle, "m0_research", evidence)
+    second = store.record_evidence(cycle, "m0_research", evidence)
+
+    rows = store.evidence_for_day("2026-09-20", "9999-01-01T00:00:00Z")
+    assert len(rows) == 1
+    spec = json.loads(rows[0]["evidence_spec_json"])
+    assert spec["contract"] == "EvidenceSpec/v1"
+    assert spec["record_id"]
+    assert spec["provenance"]["evidence_ref"] == "fact-1"
+    assert json.loads(rows[0]["qualification_spec_json"])["input_record_refs"][0]["record_id"] == spec["record_id"]
+    assert len(first) == 1
+    assert second == []
+
+
+def test_runtime_ledger_rejects_provenance_reference_drift(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    cycle = store.ensure_daily_conversation("2026-09-20")
+    observation, _ = AcquisitionBoundary("provenance-drift").observe("web_read", {}, {"results": [{
+        "url": "https://example.test/fact", "title": "Fact", "excerpt_text": "stable fact",
+        "fact_as_of": "2026-09-20T01:00:00Z",
+    }]}, True)
+    item = observation["evidence_items"][0]
+    item["evidence_spec"]["provenance"]["evidence_ref"] = "different-ref"
+    item["evidence_spec"]["record_id"] = fingerprint({
+        key: value for key, value in item["evidence_spec"].items() if key != "record_id"
+    })
+    evidence = {"sources": [{"evidence_ref": item["evidence_ref"]}]}
+    with pytest.raises(ValueError, match="provenance reference"):
+        store.record_evidence(cycle, "m0_research", evidence, [observation])
+
+
+def test_runtime_restart_retry_preserves_frozen_evidence_and_qualification(tmp_path: Path) -> None:
+    path = tmp_path / "companion.sqlite3"
+    store = CompanionStore(path)
+    cycle = store.ensure_daily_conversation("2026-09-20")
+    observation, _ = AcquisitionBoundary("recovery-attempt").observe(
+        "web_read", {}, {"results": [{
+            "url": "https://example.test/recovery", "title": "Original source",
+            "excerpt_text": "Original observed material",
+            "fact_as_of": "2026-09-20T01:00:00Z", "factual_status": "verified",
+        }]}, True,
+    )
+    evidence = {"as_of": "2099-01-01T00:00:00Z", "sources": [{
+        "evidence_ref": observation["evidence_items"][0]["evidence_ref"],
+    }]}
+    store.record_evidence(cycle, "m0_research", evidence, [observation])
+    original = store.evidence_for_day("2026-09-20", "2099-01-01T00:00:00Z")
+    events = store.pending_events()
+
+    recovered = CompanionStore(path)
+    recovered.initialize()
+    assert recovered.record_evidence(cycle, "m0_research", evidence, [observation]) == []
+    assert recovered.evidence_for_day("2026-09-20", "2099-01-01T00:00:00Z") == original
+    assert recovered.pending_events() == events
+
+
+def test_runtime_ledger_rejects_missing_provenance_reference_for_bound_source(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    cycle = store.ensure_daily_conversation("2026-09-20")
+    observation, _ = AcquisitionBoundary("missing-provenance-ref").observe(
+        "web_read", {}, {"results": [{
+            "url": "https://example.test/fact", "title": "Fact",
+            "excerpt_text": "stable fact", "fact_as_of": "2026-09-20T01:00:00Z",
+        }]}, True,
+    )
+    item = observation["evidence_items"][0]
+    item["evidence_spec"]["provenance"]["evidence_ref"] = ""
+    item["evidence_spec"]["record_id"] = fingerprint({
+        key: value for key, value in item["evidence_spec"].items() if key != "record_id"
+    })
+    evidence = {"sources": [{"evidence_ref": item["evidence_ref"]}]}
+    with pytest.raises(ValueError, match="provenance reference"):
+        store.record_evidence(cycle, "m0_research", evidence, [observation])
+
+
+def test_runtime_ledger_preserves_distinct_observed_versions_with_identical_content(tmp_path: Path) -> None:
+    store = CompanionStore(tmp_path / "companion.sqlite3")
+    cycle = store.ensure_daily_conversation("2026-09-20")
+    boundary = AcquisitionBoundary("versioned-attempt")
+    observations = []
+    for occurred_at in ("2026-09-20T01:00:00Z", "2026-09-20T02:00:00Z"):
+        observation, _ = boundary.observe("web_read", {}, {"results": [{
+            "url": "https://example.test/fact", "title": "Fact", "excerpt_text": "unchanged content",
+            "fact_as_of": occurred_at, "factual_status": "verified",
+        }]}, True)
+        observations.append(observation)
+    evidence = {"as_of": "2099-01-01T00:00:00Z", "sources": [
+        {"evidence_ref": observation["evidence_items"][0]["evidence_ref"]}
+        for observation in observations
+    ]}
+
+    assert len(store.record_evidence(cycle, "m0_research", evidence, observations)) == 2
+    assert store.record_evidence(cycle, "m0_research", evidence, observations) == []
+    rows = store.evidence_for_day("2026-09-20", "2099-01-01T00:00:00Z")
+    assert {row["occurred_at"] for row in rows} == {
+        "2026-09-20T01:00:00Z", "2026-09-20T02:00:00Z",
+    }
+    assert {json.loads(row["evidence_spec_json"])["record_id"] for row in rows} == {
+        observation["evidence_items"][0]["evidence_spec"]["record_id"] for observation in observations
+    }
+
+
+def test_runtime_ledger_upgrade_reuses_existing_acquisition_identity(tmp_path: Path) -> None:
+    path = tmp_path / "companion.sqlite3"
+    store = CompanionStore(path)
+    cycle = store.ensure_daily_conversation("2026-09-20")
+    observation, _ = AcquisitionBoundary("old-attempt").observe("web_read", {}, {"results": [{
+        "url": "https://example.test/fact", "title": "Fact", "excerpt_text": "original fact",
+        "fact_as_of": "2026-09-20T01:00:00Z",
+    }]}, True)
+    evidence = {"as_of": "2099-01-01T00:00:00Z", "sources": [{
+        "evidence_ref": observation["evidence_items"][0]["evidence_ref"],
+    }]}
+    store.record_evidence(cycle, "m0_research", evidence, [observation])
+    row = store.evidence_for_day("2026-09-20", "2099-01-01T00:00:00Z")[0]
+    old_id = str(uuid.uuid5(uuid.NAMESPACE_URL,
+        f"2026-09-20|{row['source_url']}|{row['content_sha256']}"))
+    # Reconstruct the pre-upgrade persisted identity and uniqueness index.
+    with store.connection() as connection:
+        connection.execute("DELETE FROM evidence_cycle_use")
+        connection.execute("UPDATE evidence_ledger_entry SET evidence_id=?", (old_id,))
+        connection.execute("CREATE UNIQUE INDEX ux_evidence_content ON evidence_ledger_entry(trading_date,source_url,content_sha256)")
+    event_count = len(store.pending_events())
+
+    upgraded = CompanionStore(path)
+    upgraded.initialize()
+    assert upgraded.record_evidence(cycle, "m0_research", evidence, [observation]) == []
+    assert [entry["evidence_id"] for entry in upgraded.evidence_for_day(
+        "2026-09-20", "2099-01-01T00:00:00Z"
+    )] == [old_id]
+    assert len(upgraded.pending_events()) == event_count

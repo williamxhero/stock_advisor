@@ -264,4 +264,3 @@ def _result(
     if error:
         result["error"] = error[-2000:]
     return result
-

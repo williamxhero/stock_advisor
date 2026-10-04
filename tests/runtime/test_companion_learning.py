@@ -65,6 +65,12 @@ class CompanionLearningTests(unittest.TestCase):
         self.assertEqual("baseline_recovery", scope["mode"])
         self.assertIn("公告A", [item["title"] for item in scope["daily_ledger"]])
         self.assertIn("missing", [item["coverage_state"] for item in scope["daily_ledger"]])
+        observed = next(item for item in scope["daily_ledger"] if item["title"] == "公告A")
+        self.assertEqual("EvidenceSpec/v1", observed["evidence_spec"]["contract"])
+        self.assertTrue(observed["evidence_spec"]["record_id"])
+        self.assertTrue(observed["evidence_spec"]["source"])
+        self.assertTrue(observed["provenance"])
+        self.assertIn("status", observed["market_propagation"])
 
     def test_missing_daily_baseline_is_explicit_recovery_not_fake_incremental(self):
         intraday = self.cycle("daily.execution.0945", "2026-08-25T09:45:00+08:00", "2026-08-25T01:45:00Z")

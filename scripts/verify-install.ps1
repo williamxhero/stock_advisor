@@ -12,6 +12,8 @@ foreach ($required in @(
     'resources\contracts\companion-client-event-v1.schema.json',
     'resources\contracts\companion-decision-cycle-v1.schema.json',
     'resources\contracts\evidence-snapshot-spec-v1.schema.json',
+    'resources\contracts\evidence-spec-v1.schema.json',
+    'resources\contracts\evidence-qualification-spec-v1.schema.json',
     'resources\contracts\temporal-integrity-spec-v1.schema.json',
     'resources\contracts\agent-contract-spec-v1.schema.json',
     'resources\contracts\agent-contract-input-v1.schema.json',
@@ -144,6 +146,52 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
         $roleQualification = $roleReplayOne | ConvertFrom-Json
         if ($roleQualification.contract -ne 'AgentRoleInstallQualification/v1' -or $roleQualification.qualified -ne $true) {
             throw 'Installed AgentRole qualification did not pass.'
+        }
+        $evidenceReplayOne = ((& $python -m ai_trading_companion.evidence_spec) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed EvidenceSpec replay 1 failed with exit code $LASTEXITCODE." }
+        $evidenceReplayTwo = ((& $python -m ai_trading_companion.evidence_spec) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed EvidenceSpec replay 2 failed with exit code $LASTEXITCODE." }
+        if ($evidenceReplayOne -ne $evidenceReplayTwo) { throw 'Installed EvidenceSpec frozen replays were not deterministic.' }
+        $evidenceQualification = $evidenceReplayOne | ConvertFrom-Json
+        if ($evidenceQualification.contract -ne 'EvidenceSpecInstallQualification/v1' -or $evidenceQualification.qualified -ne $true) {
+            throw 'Installed EvidenceSpec qualification did not pass.'
+        }
+        foreach ($axis in @('delivery_speed', 'qualification_probability', 'research_quality', 'judgment_outcome', 'safety_reliability')) {
+            if ($evidenceQualification.evaluation_vector.PSObject.Properties.Name -notcontains $axis) {
+                throw "Installed EvidenceSpec qualification is missing evaluation axis: $axis"
+            }
+            if ($evidenceQualification.evaluation_vector.$axis.status -notin @('pass', 'fail', 'not_measured')) {
+                throw "Installed EvidenceSpec evaluation axis lacks an explicit measurement status: $axis"
+            }
+            $measurements = $evidenceQualification.evaluation_vector.$axis.measurements
+            if ($null -eq $measurements -or $measurements.measured -isnot [bool]) {
+                throw "Installed EvidenceSpec evaluation axis lacks structured measurements: $axis"
+            }
+            if ($evidenceQualification.evaluation_vector.$axis.status -ne 'pass' -and
+                [string]::IsNullOrWhiteSpace([string]$evidenceQualification.evaluation_vector.$axis.reason)) {
+                throw "Installed EvidenceSpec non-passing evaluation axis lacks a reason: $axis"
+            }
+        }
+        if ($evidenceQualification.evaluation_vector.safety_reliability.status -ne 'pass' -or
+            $evidenceQualification.evaluation_vector.safety_reliability.measurements.replay_equal -ne $true -or
+            $evidenceQualification.evaluation_vector.safety_reliability.measurements.unavailable_source_safe -ne $true) {
+            throw 'Installed EvidenceSpec measured safety checks failed.'
+        }
+        $unavailableSmoke = $evidenceQualification.source_unavailable_smoke
+        if ($unavailableSmoke.contract -ne 'EvidenceSpecSourceAvailability/v1' -or
+            $unavailableSmoke.status -ne 'failed' -or
+            $unavailableSmoke.available -ne $false -or
+            $unavailableSmoke.qualified -ne $false -or
+            $unavailableSmoke.verifier_passed -ne $false -or
+            @($unavailableSmoke.backend_calls).Count -lt 1 -or
+            $unavailableSmoke.reason -ne 'source_unavailable' -or
+            @($unavailableSmoke.evidence_items).Count -ne 0) {
+            throw 'Installed EvidenceSpec source-unavailable smoke did not preserve an unqualified unavailable result.'
+        }
+        foreach ($measurement in @('expected_backend_call', 'single_failed_acquisition', 'no_fabricated_evidence', 'no_qualified_fallback')) {
+            if ($unavailableSmoke.measurements.$measurement -ne $true) {
+                throw "Installed EvidenceSpec source-unavailable measurement failed: $measurement"
+            }
         }
         $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")
         if ($LASTEXITCODE -ne 0) { throw "Installed Debate replay 1 failed with exit code $LASTEXITCODE." }

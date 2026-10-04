@@ -1830,6 +1830,13 @@ def run_research(
                 evidence = evidence_stage.output
                 evidence_attempt_id = evidence_stage.attempt_id
                 store.save_stage_checkpoint(cycle["cycle_id"], "m0_research", public_packet["sha256"], evidence_attempt_id, evidence)
+            # The checkpoint is only a durable stage output.  Reconcile it
+            # with the runtime-owned Evidence ledger on every delivery path,
+            # including recovery/replay from an existing checkpoint.  The
+            # ledger operation is idempotent and therefore preserves the
+            # original versioned record and provenance while repairing a
+            # partially completed attempt.
+            if evidence is not None:
                 store.record_evidence(cycle, "m0_research", evidence)
             if evidence is not None:
                 evidence_artifact = store.latest_artifact(cycle["cycle_id"], "evidence")

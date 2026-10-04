@@ -576,7 +576,8 @@ class CompanionStore:
             }.items():
                 if name not in evidence_columns:
                     c.execute(f"ALTER TABLE evidence_ledger_entry ADD COLUMN {name} {declaration}")
-            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_evidence_content ON evidence_ledger_entry(trading_date,source_url,content_sha256)")
+            c.execute("DROP INDEX IF EXISTS ux_evidence_content")
+            c.execute("CREATE INDEX IF NOT EXISTS ix_evidence_content ON evidence_ledger_entry(trading_date,source_url,content_sha256)")
             c.execute("""CREATE TABLE IF NOT EXISTS evidence_snapshot (
               snapshot_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               as_of TEXT NOT NULL, schema_version INTEGER NOT NULL, version INTEGER NOT NULL,
@@ -3624,6 +3625,34 @@ class CompanionStore:
                         "acquired_at": known_at,
                     })
                 validate(spec)
+                # The ledger is the runtime ownership boundary for EvidenceSpec.
+                # Never let a source excerpt cross that boundary with a record
+                # whose provenance points at a different acquisition reference.
+                # This keeps retries and stage projections traceable to the
+                # exact versioned input that was consumed.
+                spec_ref = str((spec.get("provenance") or {}).get("evidence_ref") or "")
+                # Once an acquisition reference exists, the supplied spec must
+                # carry that exact reference.  An empty spec reference is not a
+                # legacy case here: it would make the persisted fact
+                # untraceable to the consumed acquisition.  Legacy records are
+                # only accepted when the source itself has no reference.
+                if ref and spec_ref != ref:
+                    raise ValueError("evidence provenance reference does not match source reference")
+                # Acquired versions include clocks and provenance, even when
+                # the publisher's text is unchanged. Legacy inputs retain
+                # their content-based retry identity.
+                if observed_item:
+                    evidence_id = str(uuid.uuid5(
+                        uuid.NAMESPACE_URL, f"{trading_date}|{VERSION}|{spec['record_id']}"
+                    ))
+                    existing = c.execute(
+                        """SELECT evidence_id FROM evidence_ledger_entry
+                           WHERE trading_date=? AND source_url=? AND content_sha256=?
+                             AND json_extract(evidence_spec_json, '$.record_id')=?""",
+                        (trading_date, url, fingerprint, spec["record_id"]),
+                    ).fetchone()
+                    if existing:
+                        evidence_id = existing["evidence_id"]
                 qualification = qualify_record(
                     spec, as_of=evidence.get("as_of"),
                     source_refs=(ref, str(source.get("url") or "")),

@@ -16,6 +16,7 @@ from .cycle_contract import validate_m1_blind_packet
 from .evidence_snapshot import build_snapshot, descriptor
 from .m0_observation import canonical_json, sha256
 from .mandate_spec import validate_mandate
+from .research_isolation import validate_access_descriptor, validate_evidence
 
 
 CONTRACT = "M1JudgmentSpec/v1"
@@ -24,7 +25,8 @@ RESULT_CONTRACT = "M1JudgmentResult/v1"
 REPLAY_CONTRACT = "M1JudgmentReplay/v1"
 _BOUNDARY = {
     "allowed_inputs": ["frozen_m0", "frozen_public_evidence", "private_facts_before_h0",
-                       "as_of_bounded_memory", "prior_verified_market_context", "runtime_mandate"],
+                       "as_of_bounded_memory", "prior_verified_market_context", "runtime_mandate",
+                       "versioned_quantresearch_evidence"],
     "forbidden_inputs": ["h0_source_text", "h0_propositions", "h0_actions", "h0_action_results", "h0_derived_signals",
                          "current_chat", "m2", "premarket_raw_text", "private_reasoning"],
     "h0_visible": False, "m2_visible": False, "published_chat_after_cutoff_visible": False,
@@ -43,7 +45,7 @@ _PACKET_FIELDS = frozenset({
     "mandate", "mandate_reference", "m1_judgment_spec", "position_safety", "cycle_reference", "task_profile",
     "prior_opportunity_plans", "prior_opportunity_followups", "protocol", "risk_doctrine",
     "business_context", "frozen_m0", "frozen_public_evidence", "evidence_snapshot", "evidence",
-    "prior_market_understanding", "artifacts", "memories", "active_workflow_policy", "context",
+    "research_isolation", "research_evidence", "prior_market_understanding", "artifacts", "memories", "active_workflow_policy", "context",
     "verification_repair", "runtime_strategy_controls", "allowed_research_backends", "sha256",
     "agent_role_inputs", "spec_issue_states", "spec_evidence_gates", "spec95_baseline_sha256",
 })
@@ -123,28 +125,50 @@ def _validate_packet(packet: dict[str, Any]) -> None:
         raise ValueError("M1 requires a frozen M0 descriptor")
     if m0.get("as_of") and _time(m0["as_of"]) > cutoff:
         raise ValueError("M1 cannot consume a future M0")
+    research_access = packet.get("research_isolation")
+    research_evidence = packet.get("research_evidence")
+    if research_access is not None:
+        validate_access_descriptor(research_access)
+    if research_evidence is not None:
+        if research_access is None:
+            raise ValueError("M1 research evidence requires a QuantResearch access descriptor")
+        if mandate["quantresearch_permission"]["enabled"] is not True:
+            raise ValueError("M1 research evidence is not authorized by the mandate")
+        validate_evidence(research_evidence)
+        if (
+            _time(research_evidence["provenance"]["as_of"]) > cutoff
+            or _time(research_evidence["provenance"]["known_at"]) > cutoff
+        ):
+            raise ValueError("M1 cannot consume future research evidence")
 
 
 def build_input(packet: dict[str, Any]) -> dict[str, Any]:
     _validate_packet(packet)
+    research_evidence = packet.get("research_evidence")
+    evidence_refs = list(packet["evidence_snapshot"]["included_sources"])
+    if research_evidence is not None:
+        evidence_refs.extend(research_evidence["evidence_refs"])
     value = {
         "contract": CONTRACT, "version": VERSION, "stage": "m1_judgment",
         "source_packet": copy.deepcopy(packet),
         "evidence_snapshot": copy.deepcopy(packet["evidence_snapshot"]),
-        "evidence_refs": list(packet["evidence_snapshot"]["included_sources"]),
+        "evidence_refs": list(dict.fromkeys(evidence_refs)),
         "mandate_reference": {"contract": packet["mandate"]["contract"], "sha256": packet["mandate"]["sha256"]},
         "boundary": copy.deepcopy(_BOUNDARY), "permissions": {"write_permissions": []},
         "quantresearch": {"access": "read_only", "write_permissions": []},
         "provenance": {"source": "runtime", "cycle_id": packet["cycle_id"],
                        "as_of": packet["as_of"], "packet_sha256": packet["sha256"]},
     }
+    if research_evidence is not None:
+        value["research_evidence"] = copy.deepcopy(research_evidence)
     return validate_input(value)
 
 
 def validate_input(value: dict[str, Any]) -> dict[str, Any]:
     required = {"contract", "version", "stage", "source_packet", "evidence_snapshot", "evidence_refs",
                 "mandate_reference", "boundary", "permissions", "quantresearch", "provenance"}
-    if not isinstance(value, dict) or set(value) != required:
+    optional = {"research_evidence"}
+    if not isinstance(value, dict) or not set(value).issubset(required | optional) or not required.issubset(value):
         raise ValueError("M1JudgmentSpec input fields are not exact")
     if value["contract"] != CONTRACT or type(value["version"]) is not int or value["version"] != VERSION or value["stage"] != "m1_judgment":
         raise ValueError("unsupported M1JudgmentSpec input")
@@ -154,7 +178,15 @@ def validate_input(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("M1 blind read-only boundary mismatch")
     if value["quantresearch"] != {"access": "read_only", "write_permissions": []}:
         raise ValueError("M1 QuantResearch must be read_only")
-    if value["evidence_snapshot"] != packet["evidence_snapshot"] or value["evidence_refs"] != packet["evidence_snapshot"]["included_sources"]:
+    research_evidence = value.get("research_evidence")
+    if research_evidence is not None:
+        if packet.get("research_evidence") != research_evidence:
+            raise ValueError("M1 research evidence reference mismatch")
+        validate_evidence(research_evidence)
+    expected_refs = list(packet["evidence_snapshot"]["included_sources"])
+    if research_evidence is not None:
+        expected_refs.extend(research_evidence["evidence_refs"])
+    if value["evidence_snapshot"] != packet["evidence_snapshot"] or value["evidence_refs"] != list(dict.fromkeys(expected_refs)):
         raise ValueError("M1 frozen evidence reference mismatch")
     if value["mandate_reference"] != {"contract": packet["mandate"]["contract"], "sha256": packet["mandate"]["sha256"]}:
         raise ValueError("M1 mandate reference mismatch")

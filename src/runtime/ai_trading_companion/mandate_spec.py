@@ -233,7 +233,7 @@ def build_mandate(
     if supplied_quant is None:
         supplied_quant = {
             "version": QUANTRESEARCH_PERMISSION_VERSION,
-            "enabled": bool(quantresearch_enabled if quantresearch_enabled is not None else stage in {"m0_research", "m1_research"}),
+            "enabled": bool(quantresearch_enabled if quantresearch_enabled is not None else stage in {"m0_research", "m1_research", "m1_judgment"}),
             "access": "read_only", "scope": ["quantresearch_readonly"], "write_permissions": [],
         }
     supplied_risk = config.get("risk_level", risk_level) or {"version": RISK_LEVEL_VERSION, "value": default_risk}

@@ -1846,7 +1846,10 @@ def run_research(
     publish_observatory_forecast(store, cycle["cycle_id"], trigger="stage:m0_started")
     if on_progress:
         on_progress()
-    builder = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
+    builder = RuntimePacketBuilder(
+        PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id,
+        quant_research_port=engine.quant_research_port,
+    )
     public_packet = finalize_stage_packet(builder.build(cycle, "m0_research", context=memory_research), research_controls)
     compose_timeout = int(policy.m1_timeout.total_seconds())
     compose_controls = resolve_stage_controls(
@@ -1999,7 +2002,10 @@ def run_m1(
         cycle = engine.resume_m1_after_repair(cycle_id)
     if cycle["state"] not in {"researching_m1", "m1_retry_wait"}:
         raise RuntimeError(f"cycle is not waiting for M1: {cycle['state']}")
-    builder = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
+    builder = RuntimePacketBuilder(
+        PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id,
+        quant_research_port=engine.quant_research_port,
+    )
     if not execute:
         engine.m1_judgment_started(cycle_id)
         research_hash, judgment_hash = "fixture-m1-research", "fixture-m1-judgment"
@@ -2273,7 +2279,10 @@ def run_m2(engine: CompanionEngine, store: CompanionStore, cycle_id: str, execut
     timeout = int(TASK_POLICIES[cycle["task_key"]].m2_timeout.total_seconds())
     controls = resolve_stage_controls(store, "m2", timeout=timeout, search=False)
     packet = finalize_stage_packet(
-        RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(cycle, "m2", as_of=frozen_as_of), controls,
+        RuntimePacketBuilder(
+            PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id,
+            quant_research_port=engine.quant_research_port,
+        ).build(cycle, "m2", as_of=frozen_as_of), controls,
     )
     try:
         stage_result = _call_stage(
@@ -2358,7 +2367,10 @@ def run_reflection(
     if not execute:
         data = {"answer": {"points": ["Fixture 模式：结果已记录，等待真实复盘。"], "material_ids": []}, "memory_tags": ["fixture"], "workflow_proposal": None}
     else:
-        packet = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
+        packet = RuntimePacketBuilder(
+            PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id,
+            quant_research_port=engine.quant_research_port,
+        ).build(
             cycle, "reflection", context={"checkpoint_id": checkpoint_id},
             as_of=iso(datetime.now(timezone.utc)),
         )
@@ -2400,7 +2412,10 @@ def run_outcome(
             "observations": [], "data_gaps": ["fixture mode"],
         }
     else:
-        packet = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
+        packet = RuntimePacketBuilder(
+            PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id,
+            quant_research_port=engine.quant_research_port,
+        ).build(
             cycle,
             "outcome_research",
             context={
@@ -2515,7 +2530,10 @@ def run_chat_research(
         reply = "Fixture 模式：补查完成后，我会把新增信息继续发在这里。"
         data = None
     else:
-        builder = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id)
+        builder = RuntimePacketBuilder(
+            PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id,
+            quant_research_port=engine.quant_research_port,
+        )
         research_target = _conversation_research_target_as_of(
             str(source.get("body_markdown") or ""),
             str(source.get("known_at") or source.get("as_of") or cycle["as_of"]),
@@ -2607,7 +2625,10 @@ def run_pending_workflow_feedback(
         if not execute:
             data = {"answer": {"points": ["Fixture 模式：这条工作流反馈已记录。"], "material_ids": []}, "memory_tags": ["workflow_feedback"], "workflow_proposal": None}
         else:
-            packet = RuntimePacketBuilder(PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id).build(
+            packet = RuntimePacketBuilder(
+                PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id,
+                quant_research_port=engine.quant_research_port,
+            ).build(
                 cycle, "workflow_feedback", context={"source_artifact_id": h0["artifact_id"]},
                 as_of=iso(datetime.now(timezone.utc)),
             )

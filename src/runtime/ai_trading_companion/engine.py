@@ -28,6 +28,7 @@ from .decision_cycle import DECISION_CYCLE_CONTRACT
 from .mandate_spec import resolve_cycle_mandates
 from .evidence_snapshot import descriptor as evidence_snapshot_descriptor
 from .m1_judgment import build_input as build_m1_judgment_input, build_output as build_m1_judgment_output
+from .research_isolation import coerce_quant_research_port
 from .m0_observation import (
     build_input as build_m0_observation_input,
     sha256 as m0_observation_sha256,
@@ -57,6 +58,7 @@ class CompanionEngine:
         analysis_skills: SkillRegistry | None = None,
         skill_registry_spec: dict[str, Any] | None = None,
         adapter_registry: AdapterRegistry | None = None,
+        quant_research_port: Any | None = None,
     ) -> None:
         self.store = store
         self.store.initialize()
@@ -68,6 +70,7 @@ class CompanionEngine:
         self.analysis_skills = analysis_skills or SkillRegistry()
         self.skill_registry_spec = validate_registry(skill_registry_spec) if skill_registry_spec is not None else build_registry("runtime/v1", [])
         self.adapter_registry = adapter_registry or AdapterRegistry()
+        self.quant_research_port = coerce_quant_research_port(quant_research_port)
 
     def register_adapter(self, adapter: AdapterDefinition) -> None:
         self.adapter_registry.register(adapter)

@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stock-advisor.local/contracts/research-isolation-spec-v1.schema.json",
+  "title": "ResearchIsolationSpec/v1",
+  "oneOf": [
+    { "$ref": "#/$defs/access" },
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/evidence" },
+    { "$ref": "#/$defs/replay" }
+  ],
+  "$defs": {
+    "readOnly": {
+      "type": "object",
+      "properties": {
+        "access": { "const": "read_only" },
+        "write_permissions": { "const": [] }
+      },
+      "required": ["access", "write_permissions"],
+      "additionalProperties": false
+    },
+    "access": {
+      "type": "object",
+      "properties": {
+        "contract": { "const": "ResearchIsolationSpec/v1" },
+        "version": { "const": 1 },
+        "port": { "const": "QuantResearchPort/v1" },
+        "access": { "const": "read_only" },
+        "write_permissions": { "const": [] }
+      },
+      "required": ["contract", "version", "port", "access", "write_permissions"],
+      "additionalProperties": false
+    },
+    "request": {
+      "type": "object",
+      "properties": {
+        "contract": { "const": "ResearchEvidenceRequest/v1" },
+        "version": { "const": 1 },
+        "task_key": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "as_of": { "type": "string", "format": "date-time" },
+        "market_scope": { "type": "object", "minProperties": 1 },
+        "universe": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1, "pattern": "\\S" } },
+        "research_goal": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "baseline_strategy_version": { "type": ["string", "null"], "pattern": "\\S" },
+        "strategy_package": { "type": ["object", "null"], "minProperties": 1 },
+        "research_run_id": { "type": ["string", "null"], "pattern": "\\S" },
+        "permissions": { "$ref": "#/$defs/readOnly" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      },
+      "required": ["contract", "version", "task_key", "as_of", "market_scope", "universe", "research_goal", "baseline_strategy_version", "strategy_package", "research_run_id", "permissions", "sha256"],
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "contract": { "const": "ResearchEvidence/v1" },
+        "version": { "const": 1 },
+        "research_run_id": { "type": "string", "minLength": 1 },
+        "dataset_version": { "type": "string", "minLength": 1 },
+        "code_version": { "type": "string", "minLength": 1 },
+        "parameter_version": { "type": "string", "minLength": 1 },
+        "intervals": {
+          "type": "object", "minProperties": 1,
+          "additionalProperties": {
+            "type": "object", "minProperties": 2,
+            "required": ["start", "end"],
+            "properties": {
+              "start": { "type": "string", "minLength": 1 },
+              "end": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "out_of_sample": { "type": "object", "minProperties": 1 },
+        "cost_assumptions": { "type": "object", "minProperties": 1 },
+        "risk_metrics": { "type": "object", "minProperties": 1 },
+        "applicability": { "type": "object", "minProperties": 1 },
+        "baseline_comparison": { "type": "object", "minProperties": 1 },
+        "conclusion": { "type": "object", "minProperties": 1 },
+        "reproducibility": { "type": "object", "minProperties": 1 },
+        "evidence_refs": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "pattern": "\\S" } },
+        "provenance": {
+          "type": "object",
+          "properties": {
+            "source": { "const": "quantresearch" },
+            "as_of": { "type": "string", "format": "date-time" },
+            "known_at": { "type": "string", "format": "date-time" },
+            "artifact_ref": { "type": "string", "minLength": 1 },
+            "request_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          },
+          "required": ["source", "as_of", "known_at", "artifact_ref", "request_sha256"],
+          "additionalProperties": false
+        },
+        "permissions": { "$ref": "#/$defs/readOnly" },
+        "quantresearch": { "$ref": "#/$defs/readOnly" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      },
+      "required": ["contract", "version", "research_run_id", "dataset_version", "code_version", "parameter_version", "intervals", "out_of_sample", "cost_assumptions", "risk_metrics", "applicability", "baseline_comparison", "conclusion", "reproducibility", "evidence_refs", "provenance", "permissions", "quantresearch", "sha256"],
+      "additionalProperties": false
+    },
+    "replay": {
+      "type": "object",
+      "properties": {
+        "contract": { "const": "ResearchIsolationReplay/v1" },
+        "source": { "$ref": "#/$defs/evidence" },
+        "source_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "qualification": {
+          "type": "object",
+          "properties": {
+            "valid": { "const": true },
+            "read_only": { "const": true },
+            "m1_evidence_only": { "const": true },
+            "no_auto_override": { "const": true },
+            "no_auto_promotion": { "const": true }
+          },
+          "required": ["valid", "read_only", "m1_evidence_only", "no_auto_override", "no_auto_promotion"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["contract", "source", "source_sha256", "qualification"],
+      "additionalProperties": false
+    }
+  }
+}

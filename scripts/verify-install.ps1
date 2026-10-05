@@ -34,6 +34,7 @@ foreach ($required in @(
     'resources\contracts\m0-observation-spec-v1.schema.json',
     'resources\contracts\m1-judgment-spec-v1.schema.json',
     'resources\contracts\position-safety-spec-v1.schema.json',
+    'resources\contracts\research-isolation-spec-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
     'runtime\ai_trading_companion\cycle_replay.py',
@@ -54,6 +55,7 @@ foreach ($required in @(
     'runtime\ai_trading_companion\m0_observation.py',
     'runtime\ai_trading_companion\m1_judgment.py',
     'runtime\ai_trading_companion\position_safety.py',
+    'runtime\ai_trading_companion\research_isolation.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'
 )) {
@@ -109,6 +111,13 @@ if ($positionSafetySchema.title -ne 'PositionSafetySpec/v1' -or $positionSafetyS
 }
 foreach ($required in @('oneOf', '$defs')) {
     if ($null -eq $positionSafetySchema.$required) { throw "Installed PositionSafety schema is missing required section: $required." }
+}
+$researchIsolationSchema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\research-isolation-spec-v1.schema.json') -Raw | ConvertFrom-Json
+if ($researchIsolationSchema.title -ne 'ResearchIsolationSpec/v1' -or $researchIsolationSchema.'$schema' -ne 'https://json-schema.org/draft/2020-12/schema') {
+    throw 'Installed ResearchIsolation schema has an unexpected contract or schema dialect.'
+}
+foreach ($required in @('oneOf', '$defs')) {
+    if ($null -eq $researchIsolationSchema.$required) { throw "Installed ResearchIsolation schema is missing required section: $required." }
 }
 $m1Schema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\companion-m1-result-v5.schema.json') -Raw | ConvertFrom-Json
 $m1Publication = $m1Schema.properties.publication
@@ -362,6 +371,20 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
         }
         foreach ($check in @('frozen_replay', 'precise_qualified', 'stale_assets_refused', 'llm_order_refused', 'llm_write_refused', 'quantresearch_read_only', 'quantresearch_write_refused')) {
             if ($positionSafetyQualification.checks.$check -ne $true) { throw "Installed PositionSafety check failed: $check" }
+        }
+        $researchIsolationReplayOne = ((& $python -m ai_trading_companion.research_isolation) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed ResearchIsolation replay 1 failed with exit code $LASTEXITCODE." }
+        $researchIsolationReplayTwo = ((& $python -m ai_trading_companion.research_isolation) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed ResearchIsolation replay 2 failed with exit code $LASTEXITCODE." }
+        if ($researchIsolationReplayOne -ne $researchIsolationReplayTwo) { throw 'Installed ResearchIsolation qualification was not deterministic.' }
+        $researchIsolationQualification = $researchIsolationReplayOne | ConvertFrom-Json
+        if ($researchIsolationQualification.contract -ne 'ResearchIsolationInstallQualification/v1' -or $researchIsolationQualification.qualified -ne $true) {
+            throw 'Installed ResearchIsolation qualification did not pass.'
+        }
+        foreach ($check in @('versioned_evidence', 'read_only_port', 'write_attempt_rejected', 'frozen_replay', 'm1_evidence_only', 'no_auto_override', 'no_auto_promotion')) {
+            if ($researchIsolationQualification.evaluation_vector.$check -ne $true) {
+                throw "Installed ResearchIsolation qualification check failed: $check"
+            }
         }
         $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")
         if ($LASTEXITCODE -ne 0) { throw "Installed Debate replay 1 failed with exit code $LASTEXITCODE." }

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .analysis_skill import AnalysisSkill, SkillRegistry
 from .learning import JudgmentLifecycle
 from .evidence_contract import EvidenceContractFactory
 from .message_presentation import MessageQualificationError, PresentedMessage, present_message, repair_message_draft
@@ -43,6 +44,7 @@ class CompanionEngine:
         self, store: Any, *, task_profiles: ManualAnalysisProfileResolver | None = None,
         evidence_contract_factory: EvidenceContractFactory | None = None,
         memory: Any | None = None, memory_space_id: str = "ai-trading-companion",
+        analysis_skills: SkillRegistry | None = None,
     ) -> None:
         self.store = store
         self.store.initialize()
@@ -51,6 +53,19 @@ class CompanionEngine:
         self.evidence_contract_factory = evidence_contract_factory or EvidenceContractFactory(self.task_profiles.calendar)
         self.memory = memory
         self.memory_space_id = memory_space_id
+        self.analysis_skills = analysis_skills or SkillRegistry()
+
+    def register_analysis_skill(self, skill: AnalysisSkill) -> None:
+        self.analysis_skills.register(skill)
+
+    def execute_analysis_skill(
+        self, skill_id: str, inputs: dict[str, Any], *, as_of: str, cycle_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Run a bounded capability; the registry owns no task or business state."""
+        return self.analysis_skills.execute(skill_id, inputs, as_of=as_of, cycle_id=cycle_id)
+
+    def analysis_skill_health(self, skill_id: str) -> dict[str, Any]:
+        return self.analysis_skills.healthcheck(skill_id)
 
     def _stage_started(
         self, cycle_id: str, stage: str, *, as_of: str | None = None,

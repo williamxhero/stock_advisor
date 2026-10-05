@@ -81,6 +81,7 @@ from .multimodal_adapter import (
     validate_input as validate_multimodal_input,
     validate_market_data,
     validate_output as validate_multimodal_result,
+    validate_multimodal_adapter_input,
     validate_multimodal_adapter_output,
     sha256 as multimodal_sha256,
 )

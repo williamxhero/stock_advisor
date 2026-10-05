@@ -29,6 +29,7 @@ foreach ($required in @(
     'resources\contracts\reflection-spec-v1.schema.json',
     'resources\contracts\analysis-skill-spec-v1.schema.json',
     'resources\contracts\skill-registry-spec-v1.schema.json',
+    'resources\contracts\adapter-contract-spec-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
     'runtime\ai_trading_companion\cycle_replay.py',
@@ -44,6 +45,7 @@ foreach ($required in @(
     'runtime\ai_trading_companion\reflection.py',
     'runtime\ai_trading_companion\analysis_skill.py',
     'runtime\ai_trading_companion\skill_registry.py',
+    'runtime\ai_trading_companion\adapter_contract.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'
 )) {
@@ -269,6 +271,15 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
             if ($skillRegistryQualification.evaluation_vector.PSObject.Properties.Name -notcontains $axis) {
                 throw "Installed SkillRegistry qualification is missing evaluation axis: $axis"
             }
+        }
+        $adapterReplayOne = ((& $python -m ai_trading_companion.adapter_contract) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed AdapterContract replay 1 failed with exit code $LASTEXITCODE." }
+        $adapterReplayTwo = ((& $python -m ai_trading_companion.adapter_contract) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed AdapterContract replay 2 failed with exit code $LASTEXITCODE." }
+        if ($adapterReplayOne -ne $adapterReplayTwo) { throw 'Installed AdapterContract frozen replays were not deterministic.' }
+        $adapterQualification = $adapterReplayOne | ConvertFrom-Json
+        if ($adapterQualification.contract -ne 'AdapterContractInstallQualification/v1' -or $adapterQualification.qualified -ne $true) {
+            throw 'Installed AdapterContract qualification did not pass.'
         }
         $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")
         if ($LASTEXITCODE -ne 0) { throw "Installed Debate replay 1 failed with exit code $LASTEXITCODE." }

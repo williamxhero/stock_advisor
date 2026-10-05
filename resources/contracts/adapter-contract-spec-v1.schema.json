@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AdapterContractSpec/v1 input",
+  "type": "object", "additionalProperties": false,
+  "required": ["contract", "version", "adapter_id", "adapter_version", "input_contract", "output_contract", "mode", "inputs", "permissions", "provenance"],
+  "properties": {
+    "contract": {"const": "AdapterContractSpec/v1"}, "version": {"const": 1},
+    "adapter_id": {"type": "string", "minLength": 1}, "adapter_version": {"type": "string", "minLength": 1},
+    "input_contract": {"type": "string", "minLength": 1}, "output_contract": {"type": "string", "minLength": 1},
+    "mode": {"enum": ["deterministic", "probabilistic"]}, "inputs": {"type": "object"},
+    "permissions": {"type": "object", "required": ["write_permissions"], "properties": {"write_permissions": {"const": []}}},
+    "provenance": {"type": "object", "required": ["as_of"], "properties": {"as_of": {"type": "string", "minLength": 1}, "cycle_id": {"type": ["string", "null"]}, "timeout_seconds": {"type": "number", "exclusiveMinimum": 0}}}
+  }
+}

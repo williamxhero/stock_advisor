@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stock-advisor.local/contracts/fingpt-adapter-spec-v1.schema.json",
+  "title": "FinGPTAdapterSpec/v1",
+  "oneOf": [
+    { "$ref": "#/$defs/input" },
+    { "$ref": "#/$defs/providerOutput" },
+    { "$ref": "#/$defs/result" },
+    { "$ref": "#/$defs/replay" }
+  ],
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "capability": { "enum": ["financial_sentiment", "headline_classification", "entity_recognition", "relation_extraction"] },
+    "permissions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["write_permissions"],
+      "properties": { "write_permissions": { "const": [] } }
+    },
+    "quantresearch": {
+      "type": "object", "additionalProperties": false,
+      "required": ["access", "write_permissions"],
+      "properties": { "access": { "const": "read_only" }, "write_permissions": { "const": [] } }
+    },
+    "document": {
+      "type": "object", "additionalProperties": false,
+      "required": ["document_id", "text", "source", "source_ref", "as_of", "known_at", "language"],
+      "properties": {
+        "document_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 16000 },
+        "source": { "enum": ["public_evidence", "markethub", "deterministic_computation"] },
+        "source_ref": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "as_of": { "$ref": "#/$defs/timestamp" },
+        "known_at": { "$ref": "#/$defs/timestamp" },
+        "language": { "type": "string", "minLength": 1, "maxLength": 32 }
+      }
+    },
+    "input": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "capability", "stage", "documents", "model_version", "data_version", "permissions", "quantresearch", "provenance", "sha256"],
+      "properties": {
+        "contract": { "const": "FinGPTAdapterSpec/v1" },
+        "version": { "const": 1 },
+        "capability": { "$ref": "#/$defs/capability" },
+        "stage": { "enum": ["m0_research", "m0_compose", "m1_research", "m1_judgment", "m2", "chat_research", "chat", "reflection", "outcome_research"] },
+        "documents": { "type": "array", "minItems": 1, "maxItems": 200, "items": { "$ref": "#/$defs/document" } },
+        "model_version": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "data_version": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "permissions": { "$ref": "#/$defs/permissions" },
+        "quantresearch": { "$ref": "#/$defs/quantresearch" },
+        "provenance": {
+          "type": "object", "additionalProperties": false,
+          "required": ["source", "as_of", "cycle_id", "request_id"],
+          "properties": { "source": { "const": "runtime" }, "as_of": { "$ref": "#/$defs/timestamp" }, "cycle_id": {}, "request_id": {} }
+        },
+        "sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "confidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["score", "state", "method", "basis"],
+      "properties": {
+        "score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "state": { "enum": ["reported", "recomputed"] },
+        "method": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "basis": {
+          "type": "object", "additionalProperties": false,
+          "required": ["annotation_count", "document_count"],
+          "properties": { "annotation_count": { "type": "integer", "minimum": 0 }, "document_count": { "type": "integer", "minimum": 0 } }
+        }
+      }
+    },
+    "annotation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["document_id", "value", "evidence_ref", "confidence"],
+      "properties": {
+        "document_id": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "value": { "type": ["object", "array", "string", "number", "boolean", "null"] },
+        "evidence_ref": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "confidence": {
+          "type": "object", "additionalProperties": false,
+          "required": ["score", "state", "method"],
+          "properties": {
+            "score": { "type": "number", "minimum": 0, "maximum": 1 },
+            "state": { "enum": ["reported", "recomputed"] },
+            "method": { "type": "string", "minLength": 1, "maxLength": 160 }
+          }
+        }
+      }
+    },
+    "providerOutput": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "capability", "annotations", "model_version", "data_version", "provider", "confidence"],
+      "properties": {
+        "contract": { "const": "FinGPTAdapterProviderOutput/v1" },
+        "version": { "const": 1 },
+        "capability": { "$ref": "#/$defs/capability" },
+        "annotations": { "type": "array", "maxItems": 1000, "items": { "$ref": "#/$defs/annotation" } },
+        "model_version": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "data_version": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "provider": { "enum": ["fingpt", "swappable_provider", "controlled_llm"] },
+        "confidence": { "$ref": "#/$defs/confidence" }
+      }
+    },
+    "result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "spec_contract", "state", "capability", "annotations", "model_version", "data_version", "confidence", "input", "provider_output", "permissions", "quantresearch", "provenance", "degradation", "sha256"],
+      "properties": {
+        "contract": { "const": "FinGPTAdapterResult/v1" }, "version": { "const": 1 }, "spec_contract": { "const": "FinGPTAdapterSpec/v1" },
+        "state": { "enum": ["qualified", "degraded"] }, "capability": { "$ref": "#/$defs/capability" },
+        "annotations": { "type": "array", "maxItems": 1000, "items": { "$ref": "#/$defs/annotation" } },
+        "model_version": { "type": "string", "minLength": 1, "maxLength": 120 }, "data_version": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "confidence": { "$ref": "#/$defs/confidence" }, "input": { "$ref": "#/$defs/input" }, "provider_output": { "$ref": "#/$defs/providerOutput" },
+        "permissions": { "$ref": "#/$defs/permissions" }, "quantresearch": { "$ref": "#/$defs/quantresearch" },
+        "provenance": {
+          "type": "object", "additionalProperties": false,
+          "required": ["source", "provider", "input_sha256", "output_sha256", "model_version", "data_version", "code_version", "source_refs", "confidence_recomputed", "source_output_sha256"],
+          "properties": {
+            "source": { "enum": ["provider", "controlled_llm"] }, "provider": { "enum": ["fingpt", "swappable_provider", "controlled_llm"] },
+            "input_sha256": { "$ref": "#/$defs/digest" }, "output_sha256": { "$ref": "#/$defs/digest" },
+            "model_version": { "type": "string" }, "data_version": { "type": "string" }, "code_version": { "type": "string" },
+            "source_refs": { "type": "array", "items": { "type": "string" } }, "confidence_recomputed": { "type": "boolean" },
+            "source_output_sha256": { "type": ["string", "null"] }
+          }
+        },
+        "degradation": {
+          "type": "object", "additionalProperties": false,
+          "required": ["used", "path", "reason"],
+          "properties": { "used": { "type": "boolean" }, "path": { "type": ["string", "null"] }, "reason": { "type": ["string", "null"] } }
+        },
+        "sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "replay": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "source_input", "source_output", "source_input_sha256", "source_output_sha256", "qualification", "evaluation_vector", "sha256"],
+      "properties": {
+        "contract": { "const": "FinGPTAdapterReplay/v1" }, "version": { "const": 1 },
+        "source_input": { "$ref": "#/$defs/input" }, "source_output": { "$ref": "#/$defs/result" },
+        "source_input_sha256": { "$ref": "#/$defs/digest" }, "source_output_sha256": { "$ref": "#/$defs/digest" },
+        "qualification": { "type": "object" }, "evaluation_vector": { "type": "object" }, "sha256": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

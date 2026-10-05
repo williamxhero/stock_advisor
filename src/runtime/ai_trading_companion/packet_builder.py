@@ -33,6 +33,10 @@ from .multimodal_adapter import (
     validate_input as validate_multimodal_input,
     validate_output as validate_multimodal_output,
 )
+from .fingpt_adapter import (
+    validate_input as validate_fingpt_input,
+    validate_output as validate_fingpt_output,
+)
 
 
 _RESEARCH_EVIDENCE_UNSET = object()
@@ -81,6 +85,9 @@ class RuntimePacketBuilder:
         research_evidence: dict[str, Any] | None | object = _RESEARCH_EVIDENCE_UNSET,
         multimodal_input: dict[str, Any] | None = None,
         multimodal_result: dict[str, Any] | None = None,
+        fingpt_input: dict[str, Any] | None = None,
+        fingpt_result: dict[str, Any] | None = None,
+        fingpt_bindings: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if stage not in PUBLIC_STAGES | {"m0_compose", "m1_judgment", "m2", "chat", "reflection", "workflow_feedback"}:
             raise ValueError(f"unsupported packet stage: {stage}")
@@ -112,6 +119,37 @@ class RuntimePacketBuilder:
                 if multimodal_result["input"]["sha256"] != multimodal_input["sha256"]:
                     raise ValueError("multimodal result does not match Runtime-bound input")
                 packet["multimodal_adapter_result"] = copy.deepcopy(multimodal_result)
+        if fingpt_result is not None and fingpt_input is None:
+            raise ValueError("FinGPT result requires its Runtime-bound input")
+        if fingpt_input is not None:
+            if stage != "m0_compose":
+                raise ValueError("FinGPT annotations are visible only to M0")
+            validate_fingpt_input(fingpt_input)
+            if fingpt_input["stage"] != stage or fingpt_input["provenance"]["as_of"] != packet_as_of:
+                raise ValueError("FinGPT input does not match Runtime packet identity")
+            packet["fingpt_adapter"] = copy.deepcopy(fingpt_input)
+            if fingpt_result is not None:
+                validate_fingpt_output(fingpt_result)
+                if fingpt_result["input"]["sha256"] != fingpt_input["sha256"]:
+                    raise ValueError("FinGPT result does not match Runtime-bound input")
+                packet["fingpt_adapter_result"] = copy.deepcopy(fingpt_result)
+        if fingpt_bindings is not None:
+            if stage != "m0_compose":
+                raise ValueError("FinGPT annotations are visible only to M0")
+            if not isinstance(fingpt_bindings, list):
+                raise ValueError("FinGPT bindings must be a list")
+            packet["fingpt_adapters"] = []
+            for binding in fingpt_bindings:
+                if not isinstance(binding, dict) or set(binding) != {"input", "result"}:
+                    raise ValueError("FinGPT binding fields are not exact")
+                binding_input, binding_result = binding["input"], binding["result"]
+                validate_fingpt_input(binding_input)
+                validate_fingpt_output(binding_result)
+                if binding_input["stage"] != stage or binding_input["provenance"]["as_of"] != packet_as_of:
+                    raise ValueError("FinGPT binding does not match Runtime packet identity")
+                if binding_result["input"]["sha256"] != binding_input["sha256"]:
+                    raise ValueError("FinGPT binding result does not match input")
+                packet["fingpt_adapters"].append(copy.deepcopy(binding))
         if stage == "m0_compose":
             # Bind the observation contract before deriving the packet hash.
             packet["m0_observation_spec"] = {

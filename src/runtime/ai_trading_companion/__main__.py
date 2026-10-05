@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -55,6 +56,18 @@ from .memory_evidence import MemoryEvidenceRegistrar
 from .memory_write import write_memory
 from .evidence_spec import fingerprint, validate
 from .finrobot_adapter import build_analysis_skill as build_finrobot_analysis_skill
+from .fingpt_adapter import (
+    CONTRACT as FINGPT_INPUT_CONTRACT,
+    EXECUTION_CONTRACT as FINGPT_EXECUTION_CONTRACT,
+    PROVIDER_OUTPUT_CONTRACT as FINGPT_OUTPUT_CONTRACT,
+    build_adapter as build_fingpt_adapter,
+    build_input as build_fingpt_input,
+    build_output as build_fingpt_output,
+    controlled_degradation as fingpt_controlled_degradation,
+    validate_input as validate_fingpt_input,
+    validate_output as validate_fingpt_output,
+    sha256 as fingpt_sha256,
+)
 from .temporal_integrity import resolve_temporal
 from .memoryhub_migration import LegacyWorkspaceImporter
 from .migration import LegacyMigrator, LegacySources
@@ -514,6 +527,14 @@ def runtime() -> tuple[CompanionEngine, CompanionStore, LocalExchange, Portfolio
         validate_multimodal_adapter_input, validate_multimodal_adapter_output,
         qualify_multimodal_adapter_output, provider="runtime",
         capabilities=("deterministic_chart_interpretation",),
+    ))
+    # FinGPT is an optional, evidence-only NLP adapter.  The controlled local
+    # path keeps the installed runtime usable without a FinGPT package or
+    # provider; deployment code may register a swappable adapter under another
+    # id while preserving this contract and fallback.
+    engine.register_adapter(build_fingpt_adapter())
+    engine.register_adapter(build_fingpt_adapter(
+        adapter_id="controlled-llm-fingpt-nlp-v1", fallback=True,
     ))
     engine.recover_interrupted_streams()
     JudgmentLifecycle(store).backfill()
@@ -1958,6 +1979,134 @@ def _run_m0_multimodal(
         return None
 
 
+def _persist_fingpt_execution(
+    store: CompanionStore, cycle: dict[str, Any], execution: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Persist one source-bound NLP receipt without creating an authority write."""
+    input_contract = execution["input"]
+    execution_hash = str(execution["sha256"])
+    existing = store.latest_artifact(cycle["cycle_id"], "fingpt_nlp")
+    if existing is not None:
+        try:
+            metadata = json.loads(existing.get("metadata_json") or "{}")
+            payload = json.loads(existing.get("body_markdown") or "null")
+            if metadata.get("execution_sha256") == execution_hash:
+                receipt = payload.get("receipt") if isinstance(payload, dict) else None
+                if isinstance(receipt, dict):
+                    validate_fingpt_output(receipt)
+                    return receipt
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            pass
+    store.append_artifact(
+        cycle["cycle_id"], "fingpt_nlp", "runtime",
+        json.dumps(execution, ensure_ascii=False, sort_keys=True),
+        input_contract["provenance"]["as_of"],
+        {
+            "contract": FINGPT_EXECUTION_CONTRACT,
+            "execution_sha256": execution_hash,
+            "input_sha256": input_contract["sha256"],
+            "state": execution["state"],
+            "capability": input_contract["capability"],
+            "model_version": input_contract["model_version"],
+            "data_version": input_contract["data_version"],
+            "confidence_recomputed": bool(execution.get("receipt", {}).get("provenance", {}).get("confidence_recomputed")) if isinstance(execution.get("receipt"), dict) else False,
+            "write_permissions": [],
+        },
+    )
+    receipt = execution.get("receipt")
+    if not isinstance(receipt, dict) or execution["state"] not in {"qualified", "degraded"}:
+        return None
+    validate_fingpt_output(receipt)
+    return receipt
+
+
+def _run_m0_fingpt(
+    engine: CompanionEngine, store: CompanionStore, cycle: dict[str, Any],
+    inputs: list[dict[str, Any]] | None, *, adapter_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Run optional source-bound NLP before M0 composition, with controlled fallback."""
+    if inputs is None:
+        return []
+    if not isinstance(inputs, list):
+        raise ValueError("FinGPT inputs must be a list")
+    bindings: list[dict[str, Any]] = []
+    selected_adapter = adapter_id or os.environ.get(
+        "AI_TRADING_COMPANION_FINGPT_ADAPTER_ID", "deterministic-fingpt-nlp-v1",
+    )
+    fallback_adapter = os.environ.get(
+        "AI_TRADING_COMPANION_FINGPT_FALLBACK_ID", "controlled-llm-fingpt-nlp-v1",
+    )
+    for item in inputs:
+        if not isinstance(item, dict):
+            raise ValueError("FinGPT input must be an object")
+        if item.get("contract") == FINGPT_INPUT_CONTRACT:
+            input_contract = validate_fingpt_input(copy.deepcopy(item))
+        else:
+            input_contract = build_fingpt_input(
+                item.get("documents"), capability=item.get("capability"),
+                as_of=item.get("as_of", cycle["as_of"]), stage="m0_compose",
+                model_version=item.get("model_version", "provider-unspecified/v1"),
+                data_version=item.get("data_version", "runtime-evidence/v1"),
+                cycle_id=str(cycle["cycle_id"]), request_id=item.get("request_id"),
+            )
+        if input_contract["stage"] != "m0_compose" or input_contract["provenance"]["as_of"] != cycle["as_of"]:
+            raise ValueError("FinGPT input is outside the frozen M0 cutoff")
+        primary: dict[str, Any]
+        try:
+            primary = engine.execute_adapter(
+                selected_adapter, input_contract, as_of=input_contract["provenance"]["as_of"],
+                cycle_id=str(cycle["cycle_id"]), request_id=input_contract["provenance"].get("request_id"),
+            )
+        except Exception as exc:
+            primary = {
+                "adapter_id": selected_adapter, "status": "failed",
+                "error_code": type(exc).__name__, "error_detail": str(exc)[:240],
+            }
+        execution: dict[str, Any] = {
+            "contract": FINGPT_EXECUTION_CONTRACT, "version": 1, "state": "failed",
+            "input": input_contract, "adapter_result": primary, "fallback_result": None,
+            "receipt": None, "error_code": primary.get("error_code"),
+        }
+        if primary.get("status") == "succeeded":
+            try:
+                execution["receipt"] = build_fingpt_output(input_contract, primary["data"])
+                execution["state"] = "qualified"
+                execution["error_code"] = None
+            except (TypeError, ValueError) as exc:
+                execution["error_code"] = "fingpt_output_rejected"
+                execution["problems"] = [str(exc)[:240]]
+        if execution["state"] == "failed":
+            try:
+                fallback_result = engine.execute_adapter(
+                    fallback_adapter, input_contract, as_of=input_contract["provenance"]["as_of"],
+                    cycle_id=str(cycle["cycle_id"]), request_id=input_contract["provenance"].get("request_id"),
+                )
+            except Exception as exc:
+                fallback_result = {"adapter_id": fallback_adapter, "status": "failed", "error_code": type(exc).__name__}
+            execution["fallback_result"] = fallback_result
+            if fallback_result.get("status") == "succeeded":
+                try:
+                    execution["receipt"] = fingpt_controlled_degradation(
+                        input_contract, fallback_result["data"], failed_output=primary,
+                    )
+                    execution["state"] = "degraded"
+                    execution["error_code"] = None
+                except (TypeError, ValueError) as exc:
+                    execution["error_code"] = "fingpt_fallback_rejected"
+                    execution["problems"] = [str(exc)[:240]]
+        execution["sha256"] = fingpt_sha256({key: value for key, value in execution.items() if key != "sha256"})
+        receipt = _persist_fingpt_execution(store, cycle, execution)
+        if receipt is not None:
+            bindings.append({"input": input_contract, "result": receipt})
+        else:
+            store.queue_event(cycle["cycle_id"], "fingpt.adapter_failed", {
+                "adapter_id": selected_adapter, "request_id": input_contract["provenance"].get("request_id"),
+                "reason": str(execution.get("error_code") or "FinGPT output was not qualified")[:240],
+                "fallback": "controlled_llm_cognition",
+            })
+    return bindings
+
+
 def _run_finrobot_calculations(
     engine: CompanionEngine, store: CompanionStore, cycle: dict[str, Any],
     inputs: list[dict[str, Any]] | None,
@@ -2008,6 +2157,8 @@ def run_research(
     multimodal_adapter_id: str | None = None,
     multimodal_market_data: dict[str, Any] | None = None,
     finrobot_inputs: list[dict[str, Any]] | None = None,
+    fingpt_inputs: list[dict[str, Any]] | None = None,
+    fingpt_adapter_id: str | None = None,
 ) -> dict[str, Any]:
     if not execute:
         cycle = engine.research_started(cycle["cycle_id"], as_of=frozen_as_of)
@@ -2129,12 +2280,17 @@ def run_research(
                 engine, store, cycle, evidence,
                 adapter_id=multimodal_adapter_id, market_data=multimodal_market_data,
             )
+            fingpt_bindings = _run_m0_fingpt(
+                engine, store, cycle, fingpt_inputs, adapter_id=fingpt_adapter_id,
+            )
             packet_kwargs: dict[str, Any] = {}
             if multimodal_binding is not None:
-                packet_kwargs = {
+                packet_kwargs.update({
                     "multimodal_input": multimodal_binding[0],
                     "multimodal_result": multimodal_binding[1],
-                }
+                })
+            if fingpt_bindings:
+                packet_kwargs["fingpt_bindings"] = fingpt_bindings
             local_packet = finalize_stage_packet(
                 builder.build(cycle, "m0_compose", evidence=evidence, **packet_kwargs), compose_controls,
             )

@@ -2,7 +2,7 @@
 param(
     [switch]$Release,
     [switch]$ProjectRegression,
-    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryWrite', 'Reflection', 'AnalysisSkill', 'SkillRegistry', 'AdapterContract', 'MandateSpec', 'M0Observation', 'M1Judgment')]
+    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryWrite', 'Reflection', 'AnalysisSkill', 'SkillRegistry', 'AdapterContract', 'MandateSpec', 'M0Observation', 'M1Judgment', 'PositionSafety')]
     [string]$Select = 'all'
 )
 
@@ -42,6 +42,7 @@ if ($ProjectRegression) {
         "$root\tests\runtime\test_mandate_spec.py",
         "$root\tests\runtime\test_m0_observation.py",
         "$root\tests\runtime\test_m1_judgment.py",
+        "$root\tests\runtime\test_position_safety.py",
         "$root\tests\runtime\test_companion_exchange.py",
         "$root\tests\runtime\test_debate.py",
         "$root\tests\runtime\test_preview.py"
@@ -92,6 +93,10 @@ elseif ($Select -eq 'M0Observation') {
 elseif ($Select -eq 'M1Judgment') {
     py -m pytest "$root\tests\runtime\test_m1_judgment.py" -q
     if ($LASTEXITCODE -ne 0) { throw "M1Judgment regression tests failed with exit code $LASTEXITCODE." }
+}
+elseif ($Select -eq 'PositionSafety') {
+    py -m pytest "$root\tests\runtime\test_position_safety.py" -q
+    if ($LASTEXITCODE -ne 0) { throw "PositionSafety regression tests failed with exit code $LASTEXITCODE." }
 }
 else {
     py -m pytest "$root\tests\runtime\test_memory_write.py" "$root\memoryhub\tests\test_append_only_ledger.py" -q

@@ -33,6 +33,7 @@ foreach ($required in @(
     'resources\contracts\mandate-spec-v1.schema.json',
     'resources\contracts\m0-observation-spec-v1.schema.json',
     'resources\contracts\m1-judgment-spec-v1.schema.json',
+    'resources\contracts\position-safety-spec-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
     'runtime\ai_trading_companion\cycle_replay.py',
@@ -52,6 +53,7 @@ foreach ($required in @(
     'runtime\ai_trading_companion\mandate_spec.py',
     'runtime\ai_trading_companion\m0_observation.py',
     'runtime\ai_trading_companion\m1_judgment.py',
+    'runtime\ai_trading_companion\position_safety.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'
 )) {
@@ -100,6 +102,13 @@ foreach ($required in @('contract', 'version', 'spec_contract', 'stage', 'eviden
     if ($m0ObservationSchema.required -notcontains $required) {
         throw "Installed M0 observation schema is missing required field: $required."
     }
+}
+$positionSafetySchema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\position-safety-spec-v1.schema.json') -Raw | ConvertFrom-Json
+if ($positionSafetySchema.title -ne 'PositionSafetySpec/v1' -or $positionSafetySchema.'$schema' -ne 'https://json-schema.org/draft/2020-12/schema') {
+    throw 'Installed PositionSafety schema has an unexpected contract or schema dialect.'
+}
+foreach ($required in @('oneOf', '$defs')) {
+    if ($null -eq $positionSafetySchema.$required) { throw "Installed PositionSafety schema is missing required section: $required." }
 }
 $m1Schema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\companion-m1-result-v5.schema.json') -Raw | ConvertFrom-Json
 $m1Publication = $m1Schema.properties.publication
@@ -341,6 +350,18 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
         $m1JudgmentQualification = $m1JudgmentReplayOne | ConvertFrom-Json
         if ($m1JudgmentQualification.contract -ne 'M1JudgmentInstallQualification/v1' -or $m1JudgmentQualification.qualified -ne $true) {
             throw 'Installed M1Judgment qualification did not pass.'
+        }
+        $positionSafetyReplayOne = ((& $python -m ai_trading_companion.position_safety) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed PositionSafety replay 1 failed with exit code $LASTEXITCODE." }
+        $positionSafetyReplayTwo = ((& $python -m ai_trading_companion.position_safety) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed PositionSafety replay 2 failed with exit code $LASTEXITCODE." }
+        if ($positionSafetyReplayOne -ne $positionSafetyReplayTwo) { throw 'Installed PositionSafety frozen replays were not deterministic.' }
+        $positionSafetyQualification = $positionSafetyReplayOne | ConvertFrom-Json
+        if ($positionSafetyQualification.contract -ne 'PositionSafetyInstallQualification/v1' -or $positionSafetyQualification.qualified -ne $true) {
+            throw 'Installed PositionSafety qualification did not pass.'
+        }
+        foreach ($check in @('frozen_replay', 'precise_qualified', 'stale_assets_refused', 'llm_order_refused', 'llm_write_refused', 'quantresearch_read_only', 'quantresearch_write_refused')) {
+            if ($positionSafetyQualification.checks.$check -ne $true) { throw "Installed PositionSafety check failed: $check" }
         }
         $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")
         if ($LASTEXITCODE -ne 0) { throw "Installed Debate replay 1 failed with exit code $LASTEXITCODE." }

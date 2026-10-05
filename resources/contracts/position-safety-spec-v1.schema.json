@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PositionSafetySpec/v1",
+  "oneOf": [
+    {"$ref": "#/$defs/input"},
+    {"$ref": "#/$defs/result"},
+    {"$ref": "#/$defs/replay"}
+  ],
+  "$defs": {
+    "permissions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["write_permissions"],
+      "properties": {"write_permissions": {"type": "array", "const": []}}
+    },
+    "quantresearch": {
+      "type": "object", "additionalProperties": false,
+      "required": ["access", "write_permissions"],
+      "properties": {
+        "access": {"type": "string", "const": "read_only"},
+        "write_permissions": {"type": "array", "const": []}
+      }
+    },
+    "position": {
+      "type": "object", "additionalProperties": false,
+      "required": ["code", "shares", "last_price", "updated_at"],
+      "properties": {
+        "code": {"type": "string", "pattern": "^[0-9]{6}$"},
+        "shares": {"type": "integer", "minimum": 0},
+        "last_price": {"type": ["number", "null"], "minimum": 0},
+        "updated_at": {"type": ["string", "null"]}
+      }
+    },
+    "truth": {
+      "type": "object", "additionalProperties": false,
+      "required": ["positions", "total_assets", "holdings_as_of", "assets_as_of", "risk_state"],
+      "properties": {
+        "positions": {"type": "array", "items": {"$ref": "#/$defs/position"}},
+        "total_assets": {"type": ["number", "null"], "minimum": 0},
+        "holdings_as_of": {"type": ["string", "null"]},
+        "assets_as_of": {"type": ["string", "null"]},
+        "risk_state": {"type": "object"}
+      }
+    },
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "kind", "verified", "source_ref", "snapshot_sha256"],
+      "properties": {
+        "source": {"type": "string", "enum": ["runtime", "broker", "verified_user"]},
+        "kind": {"type": "string", "minLength": 1},
+        "verified": {"type": "boolean", "const": true},
+        "source_ref": {"type": "string", "minLength": 1},
+        "snapshot_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "input": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "stage", "as_of", "truth", "latest_trading_day", "risk_policy", "permissions", "quantresearch", "provenance", "sha256"],
+      "properties": {
+        "contract": {"type": "string", "const": "PositionSafetySpec/v1"},
+        "version": {"type": "integer", "const": 1},
+        "stage": {"type": "string", "enum": ["m0_compose", "m1_judgment", "m2", "chat", "reflection"]},
+        "as_of": {"type": "string", "minLength": 1},
+        "truth": {"$ref": "#/$defs/truth"},
+        "latest_trading_day": {"type": ["string", "null"]},
+        "risk_policy": {"type": "object"},
+        "permissions": {"$ref": "#/$defs/permissions"},
+        "quantresearch": {"$ref": "#/$defs/quantresearch"},
+        "provenance": {"$ref": "#/$defs/provenance"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "sizing": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["code", "target_shares", "stop_price", "leverage"],
+      "properties": {
+        "code": {"type": "string", "pattern": "^[0-9]{6}$"},
+        "target_shares": {"type": "integer", "minimum": 0},
+        "stop_price": {"type": "number", "minimum": 0},
+        "leverage": {"type": "boolean", "const": false}
+      }
+    },
+    "result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "spec_contract", "state", "input", "source_output", "sizing", "problems", "permissions", "quantresearch", "provenance", "sha256"],
+      "properties": {
+        "contract": {"type": "string", "const": "PositionSafetyResult/v1"},
+        "version": {"type": "integer", "const": 1},
+        "spec_contract": {"type": "string", "const": "PositionSafetySpec/v1"},
+        "state": {"type": "string", "enum": ["qualified", "refused", "directional_only"]},
+        "input": {"$ref": "#/$defs/input"},
+        "source_output": {"type": "object"},
+        "sizing": {"$ref": "#/$defs/sizing"},
+        "problems": {"type": "array", "items": {"type": "string"}},
+        "permissions": {"$ref": "#/$defs/permissions"},
+        "quantresearch": {"$ref": "#/$defs/quantresearch"},
+        "provenance": {
+          "type": "object", "additionalProperties": false,
+          "required": ["source", "input_sha256", "output_sha256"],
+          "properties": {
+            "source": {"type": "string", "const": "runtime"},
+            "input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "replay": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "source_input", "source_output", "source_output_sha256", "receipt", "qualification"],
+      "properties": {
+        "contract": {"type": "string", "const": "PositionSafetyReplay/v1"},
+        "source_input": {"$ref": "#/$defs/input"},
+        "source_output": {"type": "object"},
+        "source_output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "receipt": {"$ref": "#/$defs/result"},
+        "qualification": {"type": "object"}
+      }
+    }
+  }
+}

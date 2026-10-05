@@ -21,6 +21,7 @@ from .decision_cycle import assert_m1_blind
 from .evidence_snapshot import descriptor as evidence_snapshot_descriptor
 from .mandate_spec import mandate_for_stage
 from .m1_judgment import build_input as build_m1_judgment_input
+from .position_safety import build_input as build_position_safety_input
 
 
 PUBLIC_STAGES = {"m0_research", "m1_research", "outcome_research", "chat_research"}
@@ -157,8 +158,39 @@ class RuntimePacketBuilder:
                 packet["risk_doctrine"] = {"revision": doctrine["revision"],
                                            "doctrine": doctrine.get("doctrine") or json.loads(doctrine["doctrine_json"])}
             packet["business_context"] = self._business_context(cycle, stage)
+            if stage == "m2":
+                fact_view = packet["business_context"].get("portfolio_fact_view") or {}
+                fact_positions = list(fact_view.get("positions") or []) if isinstance(fact_view, dict) else []
+                packet["position_safety"] = build_position_safety_input(
+                    {
+                        "positions": fact_positions,
+                        "total_assets": fact_view.get("total_assets") if isinstance(fact_view, dict) else None,
+                        "holdings_as_of": fact_view.get("updated_at") if isinstance(fact_view, dict) else None,
+                        "assets_as_of": fact_view.get("assets_as_of") if isinstance(fact_view, dict) else None,
+                        "risk_state": {},
+                    },
+                    stage=stage, as_of=packet_as_of,
+                    source_ref=str(fact_view.get("fact_view_sha256") or cycle["cycle_id"]),
+                    source="runtime", verified=True,
+                )
             if stage == "m1_judgment":
                 evidence = self._validated_m1_evidence(evidence or {}, packet_as_of)
+                private = packet["business_context"].get("private_context_before_h0") or {}
+                private_positions = list(private.get("positions") or []) if isinstance(private, dict) else []
+                private_assets = private.get("total_assets") if isinstance(private, dict) else None
+                position_times = [str(row.get("updated_at")) for row in private_positions if row.get("updated_at")]
+                packet["position_safety"] = build_position_safety_input(
+                    {
+                        "positions": private_positions,
+                        "total_assets": private_assets,
+                        "holdings_as_of": max(position_times, default=None),
+                        "assets_as_of": private.get("assets_as_of") if isinstance(private, dict) else None,
+                        "risk_state": {},
+                    },
+                    stage=stage, as_of=packet_as_of,
+                    source_ref=str(cycle.get("private_context_sha256") or cycle["cycle_id"]),
+                    source="runtime", verified=True,
+                )
                 packet["frozen_m0"] = self._frozen_artifact_descriptor(cycle, "m0", packet_as_of)
                 packet["frozen_public_evidence"] = self._frozen_public_evidence_descriptor(
                     cycle, evidence, packet_as_of,

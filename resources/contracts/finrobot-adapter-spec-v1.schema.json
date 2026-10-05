@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stock-advisor.local/contracts/finrobot-adapter-spec-v1.schema.json",
+  "title": "FinRobotAdapterSpec/v1",
+  "oneOf": [
+    { "$ref": "#/$defs/input" },
+    { "$ref": "#/$defs/result" },
+    { "$ref": "#/$defs/replay" }
+  ],
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "permissions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["write_permissions"],
+      "properties": { "write_permissions": { "const": [] } }
+    },
+    "quantresearch": {
+      "type": "object", "additionalProperties": false,
+      "required": ["access", "write_permissions"],
+      "properties": { "access": { "const": "read_only" }, "write_permissions": { "const": [] } }
+    },
+    "period": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "start", "end"],
+      "properties": {
+        "kind": { "enum": ["annual", "quarter", "ttm", "instant", "scenario"] },
+        "start": { "type": "string", "format": "date" },
+        "end": { "type": "string", "format": "date" }
+      }
+    },
+    "fact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["value", "unit", "period", "instrument", "source", "source_ref", "as_of", "known_at"],
+      "properties": {
+        "value": { "type": ["string", "number", "null"], "pattern": "^-?(?:0|[1-9][0-9]{0,23})(?:\\.[0-9]{1,12})?$" },
+        "unit": { "type": "string", "pattern": "^(ratio|multiple|currency:[A-Z]{3}(?:/share)?)$" },
+        "period": { "$ref": "#/$defs/period" },
+        "instrument": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "source": { "enum": ["markethub", "runtime_scenario"] },
+        "source_ref": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "as_of": { "$ref": "#/$defs/timestamp" },
+        "known_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "formula": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": { "enum": ["growth", "valuation", "peer_comparison", "earnings_quality", "sensitivity"] },
+        "version": { "const": "v1" }
+      }
+    },
+    "input": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "formula", "facts", "instrument", "stage", "permissions", "quantresearch", "provenance", "sha256"],
+      "properties": {
+        "contract": { "const": "FinRobotAdapterSpec/v1" }, "version": { "const": 1 },
+        "formula": { "$ref": "#/$defs/formula" },
+        "facts": { "type": "object", "additionalProperties": { "$ref": "#/$defs/fact" } },
+        "instrument": { "type": "string", "minLength": 1 },
+        "stage": { "enum": ["m0_research", "m0_compose", "m1_research", "m1_judgment", "m2", "chat_research", "chat", "reflection", "outcome_research"] },
+        "permissions": { "$ref": "#/$defs/permissions" }, "quantresearch": { "$ref": "#/$defs/quantresearch" },
+        "provenance": {
+          "type": "object", "additionalProperties": false,
+          "required": ["source", "as_of", "cycle_id", "request_id"],
+          "properties": { "source": { "const": "runtime" }, "as_of": { "$ref": "#/$defs/timestamp" }, "cycle_id": {}, "request_id": {} }
+        },
+        "sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "spec_contract", "state", "value", "unit", "reason", "missing_fields", "input", "formula", "precision", "permissions", "quantresearch", "provenance", "sha256"],
+      "properties": {
+        "contract": { "const": "FinRobotAdapterResult/v1" }, "version": { "const": 1 }, "spec_contract": { "const": "FinRobotAdapterSpec/v1" },
+        "state": { "enum": ["COMPUTED", "NOT_COMPUTABLE"] }, "value": { "type": ["string", "null"] }, "unit": { "type": "string" }, "reason": { "type": ["string", "null"] }, "missing_fields": { "type": "array", "items": { "type": "string" } },
+        "input": { "$ref": "#/$defs/input" }, "formula": { "type": "object" }, "precision": { "type": "object" }, "permissions": { "$ref": "#/$defs/permissions" }, "quantresearch": { "$ref": "#/$defs/quantresearch" }, "provenance": { "type": "object" }, "sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "replay": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "source_input", "source_output", "source_input_sha256", "source_output_sha256", "qualification", "evaluation_vector", "sha256"],
+      "properties": {
+        "contract": { "const": "FinRobotAdapterReplay/v1" }, "version": { "const": 1 }, "source_input": { "$ref": "#/$defs/input" }, "source_output": { "$ref": "#/$defs/result" }, "source_input_sha256": { "$ref": "#/$defs/digest" }, "source_output_sha256": { "$ref": "#/$defs/digest" }, "qualification": { "type": "object" }, "evaluation_vector": { "type": "object" }, "sha256": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

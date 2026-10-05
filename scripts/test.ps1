@@ -2,7 +2,7 @@
 param(
     [switch]$Release,
     [switch]$ProjectRegression,
-    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryWrite', 'Reflection', 'AnalysisSkill', 'SkillRegistry', 'AdapterContract', 'MultimodalAdapter', 'MandateSpec', 'AuditSpec', 'M0Observation', 'M1Judgment', 'PositionSafety', 'ResearchIsolation')]
+    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryWrite', 'Reflection', 'AnalysisSkill', 'SkillRegistry', 'AdapterContract', 'FinRobotAdapter', 'MultimodalAdapter', 'MandateSpec', 'AuditSpec', 'M0Observation', 'M1Judgment', 'PositionSafety', 'ResearchIsolation')]
     [string]$Select = 'all'
 )
 
@@ -30,6 +30,7 @@ if ($ProjectRegression) {
         "$root\tests\runtime\test_analysis_skill.py",
         "$root\tests\runtime\test_skill_registry.py",
         "$root\tests\runtime\test_adapter_contract.py",
+        "$root\tests\runtime\test_finrobot_adapter.py",
         "$root\tests\runtime\test_multimodal_adapter.py",
         "$root\tests\runtime\test_evidence_gate.py",
         "$root\tests\runtime\test_memory_evidence_gate.py",
@@ -84,6 +85,10 @@ elseif ($Select -eq 'SkillRegistry') {
 elseif ($Select -eq 'AdapterContract') {
     py -m pytest "$root\tests\runtime\test_adapter_contract.py" -q
     if ($LASTEXITCODE -ne 0) { throw "AdapterContract regression tests failed with exit code $LASTEXITCODE." }
+}
+elseif ($Select -eq 'FinRobotAdapter') {
+    py -m pytest "$root\tests\runtime\test_finrobot_adapter.py" -q
+    if ($LASTEXITCODE -ne 0) { throw "FinRobotAdapter regression tests failed with exit code $LASTEXITCODE." }
 }
 elseif ($Select -eq 'MultimodalAdapter') {
     py -m pytest "$root\tests\runtime\test_multimodal_adapter.py" -q

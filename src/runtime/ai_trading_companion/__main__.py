@@ -39,6 +39,7 @@ from .broker_client import BrokerError, BrokerRequest, BrokerResponse, ProviderB
 from .config import load_settings, remove_legacy_provider_settings, save_research_settings
 from .cycle_contract import memory_boundary
 from .engine import CompanionEngine, iso
+from .adapter_contract import AdapterDefinition
 from .evidence_contract import EvidenceContractFactory
 from .evidence_gate import EvidenceGate, EvidenceInsufficient
 from .effort_policy import CognitiveEffortPolicy
@@ -69,6 +70,18 @@ from .m0_observation import bind_attempt as bind_m0_observation_attempt
 from .m1_judgment import (
     bind_attempt as bind_m1_judgment_attempt,
     build_input as build_m1_judgment_input,
+)
+from .multimodal_adapter import (
+    CONTRACT as MULTIMODAL_INPUT_CONTRACT,
+    RESULT_CONTRACT as MULTIMODAL_RESULT_CONTRACT,
+    build_input as build_multimodal_input,
+    execute_deterministic_chart_interpretation,
+    qualify_multimodal_adapter_output,
+    validate_input as validate_multimodal_input,
+    validate_market_data,
+    validate_output as validate_multimodal_result,
+    validate_multimodal_adapter_output,
+    sha256 as multimodal_sha256,
 )
 from .runtime_strategy_policy import RuntimeStrategyControls, RuntimeStrategyPolicy
 from .stage_expression import normalize_stage_output, safe_stage_output
@@ -487,6 +500,16 @@ def runtime() -> tuple[CompanionEngine, CompanionStore, LocalExchange, Portfolio
         memory=memory,
         memory_space_id=os.environ.get("MEMORYHUB_SPACE_ID", "ai-trading-companion"),
     )
+    # Keep a deterministic local fallback available. External vision adapters
+    # may be registered by deployment code under a different adapter id; the
+    # worker selects one only when structured MarketHub data is present.
+    engine.register_adapter(AdapterDefinition(
+        "deterministic-chart-vision-v1", "v1", MULTIMODAL_INPUT_CONTRACT,
+        MULTIMODAL_RESULT_CONTRACT, "deterministic", execute_deterministic_chart_interpretation,
+        validate_multimodal_adapter_input, validate_multimodal_adapter_output,
+        qualify_multimodal_adapter_output, provider="runtime",
+        capabilities=("deterministic_chart_interpretation",),
+    ))
     engine.recover_interrupted_streams()
     JudgmentLifecycle(store).backfill()
     exchange = LocalExchange(exchange_root())
@@ -1790,6 +1813,146 @@ def _frozen_m0_source_attempt(
     return None
 
 
+_MULTIMODAL_MARKET_DATA_CONTRACT = "MarketHubStructuredMarketData/v1"
+
+
+def _structured_market_data_from_evidence(evidence: dict[str, Any]) -> dict[str, Any] | None:
+    """Accept only an explicitly marked structured MarketHub excerpt.
+
+    Narrative evidence remains closed under the evidence-result schema. A chart
+    can consume data only when an acquisition result carries this separate
+    contract, so model prose cannot silently become a quote or OHLCV fact.
+    """
+    for source in evidence.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        excerpt = source.get("excerpt") or source.get("excerpt_text")
+        if not isinstance(excerpt, str):
+            continue
+        try:
+            payload = json.loads(excerpt)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("contract") != _MULTIMODAL_MARKET_DATA_CONTRACT:
+            continue
+        candidate = payload.get("market_data")
+        if not isinstance(candidate, dict) or candidate.get("source") != "markethub":
+            continue
+        if str(candidate.get("source_ref") or "") != str(source.get("evidence_ref") or ""):
+            continue
+        try:
+            return validate_market_data(candidate)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _persist_multimodal_execution(
+    store: CompanionStore, cycle: dict[str, Any], execution: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Persist the complete adapter receipt once and expose only its receipt."""
+    input_contract = execution["input"]
+    execution_hash = str(execution["sha256"])
+    existing = store.latest_artifact(cycle["cycle_id"], "multimodal")
+    if existing is not None:
+        try:
+            metadata = json.loads(existing.get("metadata_json") or "{}")
+            payload = json.loads(existing.get("body_markdown") or "null")
+            if metadata.get("execution_sha256") == execution_hash:
+                if execution.get("state") != "qualified":
+                    return None
+                validate_multimodal_result(payload["receipt"])
+                return payload["receipt"]
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            pass
+    body = json.dumps(execution, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    store.append_artifact(
+        cycle["cycle_id"], "multimodal", "runtime", body, input_contract["provenance"]["as_of"],
+        {
+            "contract": "FinAgentMultimodalAdapterExecution/v1",
+            "execution_sha256": execution_hash,
+            "input_sha256": input_contract["sha256"],
+            "state": execution["state"],
+            "chart_sha256": input_contract["chart"]["chart_sha256"],
+            "interpretation_only": execution.get("receipt") is not None,
+            "read_only": input_contract["permissions"] == {"write_permissions": []},
+        },
+    )
+    if execution.get("state") != "qualified" or not isinstance(execution.get("receipt"), dict):
+        return None
+    validate_multimodal_result(execution["receipt"])
+    return execution["receipt"]
+
+
+def _run_m0_multimodal(
+    engine: CompanionEngine, store: CompanionStore, cycle: dict[str, Any], evidence: dict[str, Any],
+    *, adapter_id: str | None = None, market_data: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Run optional chart interpretation without changing M0 failure semantics."""
+    candidate = market_data if market_data is not None else _structured_market_data_from_evidence(evidence)
+    if candidate is None:
+        return None
+    selected_adapter = adapter_id or os.environ.get(
+        "AI_TRADING_COMPANION_MULTIMODAL_ADAPTER_ID", "deterministic-chart-vision-v1",
+    )
+    request_id = f"{cycle['cycle_id']}:m0_compose:{candidate['source_ref']}"
+    input_contract: dict[str, Any] | None = None
+    try:
+        if str(candidate.get("as_of")) != str(cycle["as_of"]):
+            raise ValueError("multimodal market data is outside the frozen cycle cutoff")
+        input_contract = build_multimodal_input(
+            candidate, stage="m0_compose", as_of=str(cycle["as_of"]),
+            cycle_id=str(cycle["cycle_id"]), request_id=request_id,
+        )
+        execution = engine.execute_multimodal_adapter(
+            selected_adapter, candidate, as_of=str(cycle["as_of"]), stage="m0_compose",
+            cycle_id=str(cycle["cycle_id"]), request_id=request_id,
+        )
+        receipt = _persist_multimodal_execution(store, cycle, execution)
+        if receipt is None:
+            store.queue_event(cycle["cycle_id"], "multimodal.adapter_failed", {
+                "adapter_id": selected_adapter, "request_id": request_id,
+                "reason": str(execution.get("error_code") or "multimodal output was not qualified")[:240],
+                "fallback": "m0_without_multimodal",
+            })
+            return None
+        return input_contract, receipt
+    except (TypeError, ValueError, KeyError, RuntimeError) as exc:
+        # Keep a deterministic, Runtime-owned failure receipt for replay and
+        # diagnostics, while leaving the visual interpretation optional.
+        if input_contract is not None:
+            failed_execution = {
+                "contract": "FinAgentMultimodalAdapterExecution/v1",
+                "version": 1,
+                "state": "failed",
+                "input": input_contract,
+                "adapter_result": {
+                    "adapter_id": selected_adapter,
+                    "status": "failed",
+                    "error_code": "adapter_execution_failed",
+                },
+                "receipt": None,
+                "error_code": "adapter_execution_failed",
+                "problems": [str(exc)[:240]],
+            }
+            failed_execution["sha256"] = multimodal_sha256({
+                key: value for key, value in failed_execution.items() if key != "sha256"
+            })
+            try:
+                _persist_multimodal_execution(store, cycle, failed_execution)
+            except (TypeError, ValueError, KeyError, RuntimeError):
+                # Artifact persistence is diagnostic only and must not change
+                # the best-effort fallback semantics of M0.
+                pass
+        # Visual interpretation is optional; a provider outage must not turn a
+        # valid structured M0 evidence result into a failed research cycle.
+        store.queue_event(cycle["cycle_id"], "multimodal.adapter_failed", {
+            "adapter_id": selected_adapter, "request_id": request_id,
+            "reason": str(exc)[:240], "fallback": "m0_without_multimodal",
+        })
+        return None
+
+
 def run_research(
     engine: CompanionEngine,
     store: CompanionStore,
@@ -1797,6 +1960,9 @@ def run_research(
     execute: bool,
     on_progress: Any = None,
     frozen_as_of: str | None = None,
+    *,
+    multimodal_adapter_id: str | None = None,
+    multimodal_market_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not execute:
         cycle = engine.research_started(cycle["cycle_id"], as_of=frozen_as_of)
@@ -1910,8 +2076,18 @@ def run_research(
                             "evidence_snapshot_hash": evidence_artifact_snapshot["content_hash"],
                         },
                     )
+            multimodal_binding = _run_m0_multimodal(
+                engine, store, cycle, evidence,
+                adapter_id=multimodal_adapter_id, market_data=multimodal_market_data,
+            )
+            packet_kwargs: dict[str, Any] = {}
+            if multimodal_binding is not None:
+                packet_kwargs = {
+                    "multimodal_input": multimodal_binding[0],
+                    "multimodal_result": multimodal_binding[1],
+                }
             local_packet = finalize_stage_packet(
-                builder.build(cycle, "m0_compose", evidence=evidence), compose_controls,
+                builder.build(cycle, "m0_compose", evidence=evidence, **packet_kwargs), compose_controls,
             )
             compose_checkpoint = store.stage_checkpoint(cycle["cycle_id"], "m0_compose", local_packet["sha256"])
             if compose_checkpoint:

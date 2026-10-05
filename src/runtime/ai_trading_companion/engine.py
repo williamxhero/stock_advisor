@@ -35,6 +35,11 @@ from .m0_observation import (
     sha256 as m0_observation_sha256,
     validate_output as validate_m0_observation_output,
 )
+from .multimodal_adapter import (
+    build_input as build_multimodal_input,
+    build_output as build_multimodal_output,
+    sha256 as multimodal_sha256,
+)
 
 
 def utc_now() -> datetime:
@@ -79,9 +84,50 @@ class CompanionEngine:
     def execute_adapter(
         self, adapter_id: str, inputs: dict[str, Any], *, as_of: str,
         timeout_seconds: float = 10.0, cycle_id: str | None = None,
+        retries: int = 0, fallbacks: tuple[str, ...] = (), request_id: str | None = None,
     ) -> dict[str, Any]:
         """Run a read-only adapter before the downstream evidence qualification gate."""
-        return self.adapter_registry.execute(adapter_id, inputs, as_of=as_of, timeout_seconds=timeout_seconds, cycle_id=cycle_id)
+        return self.adapter_registry.execute(
+            adapter_id, inputs, as_of=as_of, timeout_seconds=timeout_seconds,
+            cycle_id=cycle_id, retries=retries, fallbacks=fallbacks, request_id=request_id,
+        )
+
+    def execute_multimodal_adapter(
+        self, adapter_id: str, market_data: dict[str, Any], *, as_of: str | None = None,
+        stage: str = "m0_compose", cycle_id: str | None = None,
+        request_id: str | None = None, timeout_seconds: float = 10.0,
+        retries: int = 0, fallbacks: tuple[str, ...] = (),
+        render_parameters: dict[str, Any] | None = None,
+        generation_version: str = "deterministic-chart-v1",
+        image_reference: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute vision only after Runtime binds facts to a deterministic chart."""
+        input_contract = build_multimodal_input(
+            market_data, stage=stage, as_of=as_of, cycle_id=cycle_id,
+            request_id=request_id, render_parameters=render_parameters,
+            generation_version=generation_version, image_reference=image_reference,
+        )
+        adapter_result = self.execute_adapter(
+            adapter_id, input_contract, as_of=input_contract["provenance"]["as_of"],
+            timeout_seconds=timeout_seconds, cycle_id=cycle_id, retries=retries,
+            fallbacks=fallbacks, request_id=request_id,
+        )
+        execution: dict[str, Any] = {
+            "contract": "FinAgentMultimodalAdapterExecution/v1", "version": 1,
+            "state": "failed" if adapter_result["status"] != "succeeded" else "rejected",
+            "input": input_contract, "adapter_result": adapter_result,
+            "receipt": None, "error_code": adapter_result.get("error_code"),
+        }
+        if adapter_result["status"] == "succeeded":
+            try:
+                execution["receipt"] = build_multimodal_output(input_contract, adapter_result["data"])
+                execution["state"] = "qualified"
+                execution["error_code"] = None
+            except (TypeError, ValueError) as exc:
+                execution["error_code"] = "multimodal_output_rejected"
+                execution["problems"] = [str(exc)[:240]]
+        execution["sha256"] = multimodal_sha256({key: value for key, value in execution.items() if key != "sha256"})
+        return execution
 
     def adapter_health(self, adapter_id: str) -> dict[str, Any]:
         return self.adapter_registry.healthcheck(adapter_id)

@@ -31,6 +31,7 @@ foreach ($required in @(
     'resources\contracts\skill-registry-spec-v1.schema.json',
     'resources\contracts\adapter-contract-spec-v1.schema.json',
     'resources\contracts\mandate-spec-v1.schema.json',
+    'resources\contracts\m0-observation-spec-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
     'runtime\ai_trading_companion\cycle_replay.py',
@@ -48,6 +49,7 @@ foreach ($required in @(
     'runtime\ai_trading_companion\skill_registry.py',
     'runtime\ai_trading_companion\adapter_contract.py',
     'runtime\ai_trading_companion\mandate_spec.py',
+    'runtime\ai_trading_companion\m0_observation.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'
 )) {
@@ -86,6 +88,15 @@ if ($mandateSchema.title -ne 'MandateSpec/v1' -or $mandateSchema.'$schema' -ne '
 foreach ($required in @('contract', 'version', 'task_key', 'stage', 'required_skills', 'optional_skills', 'memory_scope', 'quantresearch_permission', 'risk_level', 'visibility', 'provenance', 'permissions', 'sha256')) {
     if ($mandateSchema.required -notcontains $required) {
         throw "Installed MandateSpec schema is missing required field: $required."
+    }
+}
+$m0ObservationSchema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\m0-observation-spec-v1.schema.json') -Raw | ConvertFrom-Json
+if ($m0ObservationSchema.title -ne 'M0ObservationResult/v1' -or $m0ObservationSchema.'$schema' -ne 'https://json-schema.org/draft/2020-12/schema') {
+    throw 'Installed M0 observation schema has an unexpected contract or schema dialect.'
+}
+foreach ($required in @('contract', 'version', 'spec_contract', 'stage', 'evidence_snapshot', 'evidence_refs', 'semantic', 'permissions', 'boundary', 'quantresearch', 'provenance', 'sha256')) {
+    if ($m0ObservationSchema.required -notcontains $required) {
+        throw "Installed M0 observation schema is missing required field: $required."
     }
 }
 $m1Schema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\companion-m1-result-v5.schema.json') -Raw | ConvertFrom-Json
@@ -304,6 +315,20 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
         foreach ($check in @('schema', 'frozen_replay', 'm1_blind', 'read_only')) {
             if ($mandateQualification.evaluation_vector.$check -ne $true) {
                 throw "Installed MandateSpec qualification check failed: $check"
+            }
+        }
+        $m0ObservationReplayOne = ((& $python -m ai_trading_companion.m0_observation) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed M0Observation replay 1 failed with exit code $LASTEXITCODE." }
+        $m0ObservationReplayTwo = ((& $python -m ai_trading_companion.m0_observation) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed M0Observation replay 2 failed with exit code $LASTEXITCODE." }
+        if ($m0ObservationReplayOne -ne $m0ObservationReplayTwo) { throw 'Installed M0Observation frozen replays were not deterministic.' }
+        $m0ObservationQualification = $m0ObservationReplayOne | ConvertFrom-Json
+        if ($m0ObservationQualification.contract -ne 'M0ObservationInstallQualification/v1' -or $m0ObservationQualification.qualified -ne $true) {
+            throw 'Installed M0Observation qualification did not pass.'
+        }
+        foreach ($check in @('schema', 'facts_vs_inference', 'directional_language_blocked', 'unknowns_supported', 'frozen_replay', 'h0_m1_m2_isolation', 'quantresearch_read_only', 'write_permissions_empty')) {
+            if ($m0ObservationQualification.evaluation_vector.$check -ne $true) {
+                throw "Installed M0Observation qualification check failed: $check"
             }
         }
         $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")

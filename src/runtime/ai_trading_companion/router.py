@@ -9,6 +9,11 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .effort_policy import CognitiveEffortPolicy, EffortPolicyFacts
+from .m0_observation import (
+    build_input as build_m0_observation_input,
+    build_output as build_m0_observation_output,
+    validate_stage_output as validate_m0_stage_output,
+)
 from .opportunities import observation_problems, review_problems
 from .stage_expression import (
     canonical_direction, normalize_stage_output, semantic_snapshot_conflicts,
@@ -36,6 +41,19 @@ def _contains_human_input(value: Any) -> bool:
     elif isinstance(value, list):
         return any(_contains_human_input(item) for item in value)
     return False
+
+
+def _m0_observation_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    """Remove raw pre-market and later-stage artifacts from the M0 contract view."""
+    value = dict(packet)
+    artifacts = packet.get("artifacts")
+    if isinstance(artifacts, list):
+        value["artifacts"] = [
+            item for item in artifacts
+            if not isinstance(item, dict) or str(item.get("kind") or "").casefold()
+            not in {"h0", "m1", "m2", "pre_m0", "premarket", "premarket_chat"}
+        ]
+    return value
 
 
 @dataclass(frozen=True)
@@ -158,6 +176,7 @@ class CognitiveRouter:
 
     def verify(self, stage: str, packet: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
         problems: list[str] = []
+        m0_observation_receipt: dict[str, Any] | None = None
         profile = self.profile(stage, packet, 1)
         if stage == "m0_candidate_review":
             problems = review_problems(output)
@@ -175,6 +194,31 @@ class CognitiveRouter:
                     "fallback": bool((output.get("publication") or {}).get("fallback"))}
         normalized = normalize_stage_output(stage, output)
         if stage == "m0_compose":
+            # The router remains the domain-quality gate.  The versioned M0
+            # receipt separately binds the compatible v3 semantic result to
+            # this packet's frozen evidence and permanently read-only boundary.
+            if output.get("result_version") == 3:
+                # Older direct Router callers may only provide the compatible
+                # v3 semantic packet.  The real Runtime compose packet always
+                # has a frozen snapshot, as-of, and stage mandate; only that
+                # fully bound packet can claim the versioned receipt.
+                has_m0_boundary = (
+                    isinstance(packet.get("evidence_snapshot"), dict)
+                    and bool(str(packet.get("as_of") or "").strip())
+                    and isinstance(packet.get("mandate"), dict)
+                    and isinstance(packet["mandate"].get("quantresearch_permission"), dict)
+                )
+                if has_m0_boundary:
+                    try:
+                        validate_m0_stage_output(output, evidence_refs=_m0_frozen_evidence_refs(packet))
+                        m0_input = build_m0_observation_input({
+                            **_m0_observation_packet(packet), "stage": "m0_compose",
+                        })
+                        m0_observation_receipt = build_m0_observation_output(
+                            m0_input, output, packet_sha256=str(packet.get("sha256") or "") or None,
+                        )
+                    except ValueError as exc:
+                        problems.append("m0_observation_contract:" + str(exc))
             problems.extend(_m0_semantic_problems(packet, output, normalized.text))
             problems.extend(observation_problems(packet, output))
             calendar = packet.get("calendar_context") if isinstance(packet.get("calendar_context"), dict) else {}
@@ -325,7 +369,10 @@ class CognitiveRouter:
                 problems.extend(_formal_m1_expression_problems(packet, normalized.text))
                 problems.extend(_close_review_coverage_problems(packet, semantic))
                 problems.extend(_weekend_review_coverage_problems(packet, semantic))
-        return {"passed": not problems, "problems": problems, "profile": profile.as_json()}
+        result = {"passed": not problems, "problems": list(dict.fromkeys(problems)), "profile": profile.as_json()}
+        if m0_observation_receipt is not None and not problems:
+            result["m0_observation"] = m0_observation_receipt
+        return result
 
 
 def _close_review_coverage_problems(packet: dict[str, Any], semantic: dict[str, Any]) -> list[str]:

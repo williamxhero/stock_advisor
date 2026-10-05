@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "M0ObservationResult/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract", "version", "spec_contract", "stage", "evidence_snapshot", "evidence_refs",
+    "semantic", "source_result_version", "permissions", "boundary", "quantresearch", "provenance", "sha256"
+  ],
+  "properties": {
+    "contract": {"const": "M0ObservationResult/v1"},
+    "version": {"const": 1},
+    "spec_contract": {"const": "M0ObservationSpec/v1"},
+    "stage": {"const": "m0_compose"},
+    "evidence_snapshot": {"$ref": "#/$defs/evidence_snapshot"},
+    "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "semantic": {"$ref": "#/$defs/semantic"},
+    "source_result_version": {"const": 3},
+    "permissions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["write_permissions"],
+      "properties": {"write_permissions": {"const": []}}
+    },
+    "boundary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["allowed_inputs", "forbidden_inputs", "m1_visible", "m2_visible", "h0_visible"],
+      "properties": {
+        "allowed_inputs": {"type": "array", "items": {"type": "string"}},
+        "forbidden_inputs": {"type": "array", "items": {"type": "string"}},
+        "m1_visible": {"const": false}, "m2_visible": {"const": false}, "h0_visible": {"const": false}
+      }
+    },
+    "quantresearch": {
+      "type": "object", "additionalProperties": false,
+      "required": ["access", "write_permissions"],
+      "properties": {"access": {"const": "read_only"}, "write_permissions": {"const": []}}
+    },
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["input_sha256", "output_sha256", "as_of", "source"],
+      "properties": {
+        "input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "packet_sha256": {"type": ["string", "null"]},
+        "attempt_id": {"type": ["string", "null"]},
+        "as_of": {"type": "string", "minLength": 1},
+        "source": {"const": "runtime"}
+      }
+    }
+  },
+  "$defs": {
+    "evidence_snapshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "snapshot_id", "cycle_id", "as_of", "schema_version", "content_hash", "source_watermarks", "included_sources", "version"],
+      "properties": {
+        "contract": {"const": "EvidenceSnapshotSpec/v1"},
+        "snapshot_id": {"type": "string", "minLength": 1},
+        "cycle_id": {"type": "string", "minLength": 1},
+        "as_of": {"type": "string", "minLength": 1},
+        "schema_version": {"const": 1},
+        "content_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_watermarks": {"type": "object"},
+        "included_sources": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "version": {"type": "integer", "minimum": 1},
+        "parent_snapshot_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "item": {
+      "type": "object", "additionalProperties": false,
+      "required": ["text", "evidence_refs"],
+      "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 240},
+        "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "kind": {"enum": ["market_fact", "derived_calculation", "source_opinion", "market_propagation", "conflict", "unknown"]}
+      }
+    },
+    "typed_item": {
+      "allOf": [{"$ref": "#/$defs/item"}],
+      "required": ["kind"]
+    },
+    "semantic": {
+      "type": "object", "additionalProperties": false,
+      "required": ["summary", "facts", "derived_metrics", "source_opinions", "propagation", "conflicts", "observations", "connections", "attention", "unknowns"],
+      "properties": {
+        "summary": {"$ref": "#/$defs/item"},
+        "facts": {"type": "array", "maxItems": 4, "items": {"$ref": "#/$defs/typed_item"}},
+        "derived_metrics": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/typed_item"}},
+        "source_opinions": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/typed_item"}},
+        "propagation": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/typed_item"}},
+        "conflicts": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/typed_item"}},
+        "observations": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/item"}},
+        "connections": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/item"}},
+        "attention": {"type": "array", "maxItems": 1, "items": {"$ref": "#/$defs/item"}},
+        "unknowns": {"type": "array", "maxItems": 1, "items": {"$ref": "#/$defs/typed_item"}}
+      }
+    }
+  }
+}

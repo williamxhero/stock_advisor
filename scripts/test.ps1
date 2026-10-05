@@ -2,7 +2,7 @@
 param(
     [switch]$Release,
     [switch]$ProjectRegression,
-    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryWrite', 'Reflection', 'AnalysisSkill', 'SkillRegistry', 'AdapterContract', 'MandateSpec')]
+    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryWrite', 'Reflection', 'AnalysisSkill', 'SkillRegistry', 'AdapterContract', 'MandateSpec', 'M0Observation')]
     [string]$Select = 'all'
 )
 
@@ -40,6 +40,7 @@ if ($ProjectRegression) {
         "$root\tests\runtime\test_agent_role.py",
         "$root\tests\runtime\test_agent_contract.py",
         "$root\tests\runtime\test_mandate_spec.py",
+        "$root\tests\runtime\test_m0_observation.py",
         "$root\tests\runtime\test_companion_exchange.py",
         "$root\tests\runtime\test_debate.py",
         "$root\tests\runtime\test_preview.py"
@@ -82,6 +83,10 @@ elseif ($Select -eq 'AdapterContract') {
 elseif ($Select -eq 'MandateSpec') {
     py -m pytest "$root\tests\runtime\test_mandate_spec.py" -q
     if ($LASTEXITCODE -ne 0) { throw "MandateSpec regression tests failed with exit code $LASTEXITCODE." }
+}
+elseif ($Select -eq 'M0Observation') {
+    py -m pytest "$root\tests\runtime\test_m0_observation.py" -q
+    if ($LASTEXITCODE -ne 0) { throw "M0Observation regression tests failed with exit code $LASTEXITCODE." }
 }
 else {
     py -m pytest "$root\tests\runtime\test_memory_write.py" "$root\memoryhub\tests\test_append_only_ledger.py" -q

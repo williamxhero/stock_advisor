@@ -116,6 +116,21 @@ class SkillRegistry:
             raise ValueError("analysis skill already registered")
         self._skills[skill.skill_id] = skill
 
+    def replace(self, skill: AnalysisSkill) -> None:
+        if skill.skill_id not in self._skills:
+            raise ValueError("analysis skill is not registered")
+        self._skills[skill.skill_id] = skill
+
+    def replace_provider(self, old_skill_id: str, skill: AnalysisSkill) -> None:
+        if old_skill_id not in self._skills:
+            raise ValueError("analysis skill is not registered")
+        if old_skill_id != skill.skill_id and skill.skill_id in self._skills:
+            raise ValueError("replacement analysis skill is already registered")
+        updated = dict(self._skills)
+        del updated[old_skill_id]
+        updated[skill.skill_id] = skill
+        self._skills = updated
+
     def resolve(self, skill_id: str) -> AnalysisSkill:
         try:
             return self._skills[skill_id]

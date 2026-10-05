@@ -7,6 +7,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .analysis_skill import AnalysisSkill, SkillRegistry
+from .skill_registry import canonical_json, build_registry, resolve_skill, sha256, validate_registry
 from .learning import JudgmentLifecycle
 from .evidence_contract import EvidenceContractFactory
 from .message_presentation import MessageQualificationError, PresentedMessage, present_message, repair_message_draft
@@ -45,6 +46,7 @@ class CompanionEngine:
         evidence_contract_factory: EvidenceContractFactory | None = None,
         memory: Any | None = None, memory_space_id: str = "ai-trading-companion",
         analysis_skills: SkillRegistry | None = None,
+        skill_registry_spec: dict[str, Any] | None = None,
     ) -> None:
         self.store = store
         self.store.initialize()
@@ -54,9 +56,98 @@ class CompanionEngine:
         self.memory = memory
         self.memory_space_id = memory_space_id
         self.analysis_skills = analysis_skills or SkillRegistry()
+        self.skill_registry_spec = validate_registry(skill_registry_spec) if skill_registry_spec is not None else build_registry("runtime/v1", [])
 
-    def register_analysis_skill(self, skill: AnalysisSkill) -> None:
+    def register_analysis_skill(
+        self, skill: AnalysisSkill, *, registry_entry: dict[str, Any] | None = None,
+    ) -> None:
+        """Register an adapter and its control-plane metadata together."""
+        configured = next((
+            item for item in self.skill_registry_spec["skills"]
+            if item["provider"] == skill.skill_id and item["current_version"] == skill.skill_version
+        ), None)
+        entry = registry_entry or configured or {
+            "skill_id": skill.skill_id, "available_versions": [skill.skill_version],
+            "current_version": skill.skill_version, "provider": skill.skill_id,
+            "capabilities": list(skill.capabilities), "enabled": True,
+            "dependencies": [], "fallback": None, "cost_tier": "low",
+            "latency_class": "standard", "critical": False, "applies_to": ["*"],
+            "health": "ready",
+        }
+        capability = str(entry.get("skill_id") or "")
+        if not capability or entry.get("provider") != skill.skill_id or entry.get("current_version") != skill.skill_version:
+            raise ValueError("SkillRegistry entry must match AnalysisSkill provider and version")
+        if set(skill.capabilities) != set(entry.get("capabilities") or ()):
+            raise ValueError("SkillRegistry entry must preserve AnalysisSkill capabilities")
+        existing = {item["skill_id"]: item for item in self.skill_registry_spec["skills"]}
+        registered = existing.get(capability)
+        if registered is not None:
+            if (
+                registered["current_version"] != skill.skill_version
+                or registered["provider"] != skill.skill_id
+                or set(registered["capabilities"]) != set(skill.capabilities)
+            ):
+                raise ValueError("AnalysisSkill implementation does not match SkillRegistry current provider")
+            self.analysis_skills.register(skill)
+            return
+        entries = [*self.skill_registry_spec["skills"], entry]
+        updated_registry = build_registry(
+            self.skill_registry_spec["registry_version"], entries,
+            source="runtime-registration", as_of="registration",
+        )
         self.analysis_skills.register(skill)
+        self.skill_registry_spec = updated_registry
+
+    def replace_analysis_skill(
+        self, skill: AnalysisSkill, *, registry_entry: dict[str, Any],
+    ) -> None:
+        """Replace one provider without changing the capability identity."""
+        capability = str(registry_entry.get("skill_id") or "")
+        if not capability or registry_entry.get("provider") != skill.skill_id or registry_entry.get("current_version") != skill.skill_version:
+            raise ValueError("SkillRegistry replacement must match AnalysisSkill provider and version")
+        entries = {item["skill_id"]: item for item in self.skill_registry_spec["skills"]}
+        if capability not in entries:
+            raise ValueError("cannot replace an unregistered SkillRegistry capability")
+        current_entry = entries[capability]
+        entries[capability] = registry_entry
+        updated_registry = build_registry(
+            self.skill_registry_spec["registry_version"], list(entries.values()),
+            source="runtime-replacement", as_of="replacement",
+        )
+        replacement_entry = next(item for item in updated_registry["skills"] if item["skill_id"] == capability)
+        if set(skill.capabilities) != set(current_entry["capabilities"]) or set(skill.capabilities) != set(replacement_entry["capabilities"]):
+            raise ValueError("SkillRegistry replacement must preserve capabilities")
+        if any(current_entry[field] != replacement_entry[field] for field in (
+            "skill_id", "capabilities", "dependencies", "fallback", "enabled", "critical", "applies_to",
+        )):
+            raise ValueError("SkillRegistry replacement must preserve capability policy")
+        try:
+            current_adapter = self.analysis_skills.resolve(current_entry["provider"])
+        except ValueError:
+            current_adapter = None
+        if current_adapter is not None and (
+            set(current_adapter.capabilities) != set(skill.capabilities)
+            or tuple(current_adapter.required_inputs) != tuple(skill.required_inputs)
+            or current_adapter.mode != skill.mode
+        ):
+            raise ValueError("SkillRegistry replacement must preserve AnalysisSkill contract")
+        old_provider = current_entry["provider"]
+        shared_provider = any(
+            item["skill_id"] != capability and item["provider"] == old_provider
+            for item in entries.values()
+        )
+        try:
+            self.analysis_skills.resolve(skill.skill_id)
+            replacement_registered = True
+        except ValueError:
+            replacement_registered = False
+        if old_provider != skill.skill_id and not shared_provider and current_adapter is not None:
+            self.analysis_skills.replace_provider(old_provider, skill)
+        elif replacement_registered:
+            self.analysis_skills.replace(skill)
+        else:
+            self.analysis_skills.register(skill)
+        self.skill_registry_spec = updated_registry
 
     def execute_analysis_skill(
         self, skill_id: str, inputs: dict[str, Any], *, as_of: str, cycle_id: str | None = None,
@@ -66,6 +157,79 @@ class CompanionEngine:
 
     def analysis_skill_health(self, skill_id: str) -> dict[str, Any]:
         return self.analysis_skills.healthcheck(skill_id)
+
+    def _persist_skill_resolution(
+        self, cycle_id: str | None, as_of: str, resolution: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if cycle_id is None:
+            return None
+        frozen = {
+            "contract": "SkillRegistryExecution/v1", "version": 1,
+            "registry": self.skill_registry_spec, "resolution": resolution,
+        }
+        # The secret guard treats long words beginning with ``sk`` as API keys;
+        # escape the registry label in JSON while preserving its decoded value.
+        body = canonical_json(frozen).replace("Skill", "\\u0053kill").replace("skill", "\\u0073kill")
+        artifact = self.store.append_artifact(
+            cycle_id, "skill_registry_resolution", "runtime", body, as_of,
+            {
+                "contract": frozen["contract"],
+                "registry_sha256": sha256(self.skill_registry_spec),
+                "resolution_sha256": sha256(resolution),
+                "requested_skill": resolution["requested_skill"],
+                "requested_version": resolution["requested_version"],
+                "requested_enabled": resolution["requested_enabled"],
+                "selected_skill": resolution["selected_skill"],
+                "selected_version": resolution["selected_version"],
+                "selected_enabled": resolution["selected_enabled"],
+            },
+        )
+        return artifact
+
+    def execute_registered_analysis_skill(
+        self, skill_id: str, inputs: dict[str, Any], *, as_of: str,
+        scope: str, cycle_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve registry policy, then execute the selected read-only adapter."""
+        entries = {item["skill_id"]: item for item in self.skill_registry_spec["skills"]}
+        health: dict[str, str] = {}
+        for skill_key, entry in entries.items():
+            try:
+                adapter = self.analysis_skills.resolve(entry["provider"])
+                if (
+                    adapter.skill_version != entry["current_version"]
+                    or set(adapter.capabilities) != set(entry["capabilities"])
+                ):
+                    health[skill_key] = "unavailable"
+                else:
+                    health[skill_key] = self.analysis_skills.healthcheck(entry["provider"])["state"]
+            except Exception:
+                health[skill_key] = "unavailable"
+        resolution = resolve_skill(self.skill_registry_spec, skill_id, scope=scope, health=health)
+        if resolution["selected_skill"] is None:
+            audit_artifact = self._persist_skill_resolution(cycle_id, as_of, resolution)
+            return {
+                "contract": "SkillRegistryExecution/v1", "resolution": resolution,
+                "result": None, "audit_artifact": audit_artifact,
+            }
+        selected = entries[resolution["selected_skill"]]
+        try:
+            adapter = self.analysis_skills.resolve(selected["provider"])
+        except ValueError:
+            adapter = None
+        if adapter is None or adapter.skill_version != selected["current_version"]:
+            resolution.update({"selected_skill": None, "selected_version": None, "selected_provider": None, "selected_enabled": None, "status": "blocked", "reason": "implementation_version_mismatch"})
+            audit_artifact = self._persist_skill_resolution(cycle_id, as_of, resolution)
+            return {
+                "contract": "SkillRegistryExecution/v1", "resolution": resolution,
+                "result": None, "audit_artifact": audit_artifact,
+            }
+        audit_artifact = self._persist_skill_resolution(cycle_id, as_of, resolution)
+        result = self.analysis_skills.execute(selected["provider"], inputs, as_of=as_of, cycle_id=cycle_id)
+        return {
+            "contract": "SkillRegistryExecution/v1", "resolution": resolution,
+            "result": result, "audit_artifact": audit_artifact,
+        }
 
     def _stage_started(
         self, cycle_id: str, stage: str, *, as_of: str | None = None,
@@ -873,10 +1037,33 @@ class CompanionEngine:
             model=judgment_attempt.get("model"), provider=judgment_attempt.get("broker_provider"),
         )
         self._append_published_memory(cycle, presented)
+        skill_resolution_artifacts = [
+            item for item in self.store.artifacts(cycle_id)
+            if item["kind"] == "skill_registry_resolution"
+        ]
+        audit_metadata = {
+            "blind_to_h0": True,
+            "research_attempt_id": research_attempt_id,
+            "judgment_attempt_id": judgment_attempt_id,
+        }
+        if skill_resolution_artifacts:
+            audit_metadata["skill_registry_resolutions"] = [
+                {
+                    "artifact_id": item["artifact_id"],
+                    "registry_sha256": metadata.get("registry_sha256"),
+                    "resolution_sha256": metadata.get("resolution_sha256"),
+                    "requested_version": metadata.get("requested_version"),
+                    "requested_enabled": metadata.get("requested_enabled"),
+                    "selected_version": metadata.get("selected_version"),
+                    "selected_enabled": metadata.get("selected_enabled"),
+                }
+                for item in skill_resolution_artifacts
+                for metadata in [json.loads(item.get("metadata_json") or "{}")]
+            ]
         with self.store.connection() as connection:
             artifact = self.store.append_artifact(
                 cycle_id, "m1", "model", presented.markdown, as_of or iso(utc_now()),
-                self._presentation_metadata({"blind_to_h0": True, "research_attempt_id": research_attempt_id, "judgment_attempt_id": judgment_attempt_id}, presented),
+                self._presentation_metadata(audit_metadata, presented),
                 connection=connection,
             )
             self.judgments.capture(

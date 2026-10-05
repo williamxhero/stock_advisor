@@ -54,6 +54,7 @@ from .memory_health import MemoryCapabilityPolicy
 from .memory_evidence import MemoryEvidenceRegistrar
 from .memory_write import write_memory
 from .evidence_spec import fingerprint, validate
+from .finrobot_adapter import build_analysis_skill as build_finrobot_analysis_skill
 from .temporal_integrity import resolve_temporal
 from .memoryhub_migration import LegacyWorkspaceImporter
 from .migration import LegacyMigrator, LegacySources
@@ -500,6 +501,9 @@ def runtime() -> tuple[CompanionEngine, CompanionStore, LocalExchange, Portfolio
         memory=memory,
         memory_space_id=os.environ.get("MEMORYHUB_SPACE_ID", "ai-trading-companion"),
     )
+    # Financial numbers are computed by the Runtime-owned deterministic skill;
+    # a provider can only explain its qualified receipt downstream.
+    engine.register_analysis_skill(build_finrobot_analysis_skill())
     # Keep a deterministic local fallback available. External vision adapters
     # may be registered by deployment code under a different adapter id; the
     # worker selects one only when structured MarketHub data is present.
@@ -1953,6 +1957,45 @@ def _run_m0_multimodal(
         return None
 
 
+def _run_finrobot_calculations(
+    engine: CompanionEngine, store: CompanionStore, cycle: dict[str, Any],
+    inputs: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Persist Runtime-owned deterministic receipts before freezing M0 evidence."""
+    if inputs is None:
+        return []
+    if not isinstance(inputs, list):
+        raise ValueError("FinRobot inputs must be a list")
+    receipts: list[dict[str, Any]] = []
+    for item in inputs:
+        if not isinstance(item, dict):
+            raise ValueError("FinRobot input must be an object")
+        payload = {
+            "formula_id": item.get("formula_id"), "facts": item.get("facts"),
+            "instrument": item.get("instrument"), "as_of": item.get("as_of", cycle["as_of"]),
+        }
+        execution = engine.execute_registered_analysis_skill(
+            "deterministic_finance_v1", payload, as_of=str(cycle["as_of"]),
+            scope="m0_research", cycle_id=str(cycle["cycle_id"]),
+        )
+        result = execution.get("result")
+        if not isinstance(result, dict):
+            continue
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        artifact = store.append_artifact(
+            str(cycle["cycle_id"]), "derived_calculation", "runtime",
+            json.dumps(data, ensure_ascii=False, sort_keys=True), str(cycle["as_of"]),
+            {
+                "contract": "FinRobotAdapterSpec/v1", "formula_id": payload["formula_id"],
+                "state": data.get("state"), "result_sha256": data.get("sha256"),
+                "input_sha256": data.get("input", {}).get("sha256") if isinstance(data.get("input"), dict) else None,
+                "traceable": True, "write_permissions": [],
+            },
+        )
+        receipts.append({"result": data, "artifact_id": artifact["artifact_id"]})
+    return receipts
+
+
 def run_research(
     engine: CompanionEngine,
     store: CompanionStore,
@@ -1963,6 +2006,7 @@ def run_research(
     *,
     multimodal_adapter_id: str | None = None,
     multimodal_market_data: dict[str, Any] | None = None,
+    finrobot_inputs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not execute:
         cycle = engine.research_started(cycle["cycle_id"], as_of=frozen_as_of)
@@ -2016,6 +2060,10 @@ def run_research(
         PATHS.resources, store, memory=engine.memory, memory_space_id=engine.memory_space_id,
         quant_research_port=engine.quant_research_port,
     )
+    # These inputs must be supplied by the Runtime/MarketHub boundary, never
+    # extracted from provider prose.  Artifacts are therefore frozen into M0
+    # before the packet is handed to any probabilistic stage.
+    _run_finrobot_calculations(engine, store, cycle, finrobot_inputs)
     public_packet = finalize_stage_packet(builder.build(cycle, "m0_research", context=memory_research), research_controls)
     compose_timeout = int(policy.m1_timeout.total_seconds())
     compose_controls = resolve_stage_controls(

@@ -7,6 +7,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .analysis_skill import AnalysisSkill, SkillRegistry
+from .adapter_contract import AdapterDefinition, AdapterRegistry
 from .skill_registry import canonical_json, build_registry, resolve_skill, sha256, validate_registry
 from .learning import JudgmentLifecycle
 from .evidence_contract import EvidenceContractFactory
@@ -47,6 +48,7 @@ class CompanionEngine:
         memory: Any | None = None, memory_space_id: str = "ai-trading-companion",
         analysis_skills: SkillRegistry | None = None,
         skill_registry_spec: dict[str, Any] | None = None,
+        adapter_registry: AdapterRegistry | None = None,
     ) -> None:
         self.store = store
         self.store.initialize()
@@ -57,6 +59,20 @@ class CompanionEngine:
         self.memory_space_id = memory_space_id
         self.analysis_skills = analysis_skills or SkillRegistry()
         self.skill_registry_spec = validate_registry(skill_registry_spec) if skill_registry_spec is not None else build_registry("runtime/v1", [])
+        self.adapter_registry = adapter_registry or AdapterRegistry()
+
+    def register_adapter(self, adapter: AdapterDefinition) -> None:
+        self.adapter_registry.register(adapter)
+
+    def execute_adapter(
+        self, adapter_id: str, inputs: dict[str, Any], *, as_of: str,
+        timeout_seconds: float = 10.0, cycle_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Run a read-only adapter before the downstream evidence qualification gate."""
+        return self.adapter_registry.execute(adapter_id, inputs, as_of=as_of, timeout_seconds=timeout_seconds, cycle_id=cycle_id)
+
+    def adapter_health(self, adapter_id: str) -> dict[str, Any]:
+        return self.adapter_registry.healthcheck(adapter_id)
 
     def register_analysis_skill(
         self, skill: AnalysisSkill, *, registry_entry: dict[str, Any] | None = None,

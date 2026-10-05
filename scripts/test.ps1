@@ -2,7 +2,7 @@
 param(
     [switch]$Release,
     [switch]$ProjectRegression,
-    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryWrite', 'Reflection', 'AnalysisSkill', 'SkillRegistry')]
+    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryWrite', 'Reflection', 'AnalysisSkill', 'SkillRegistry', 'AdapterContract')]
     [string]$Select = 'all'
 )
 
@@ -29,6 +29,7 @@ if ($ProjectRegression) {
         "$root\tests\runtime\test_reflection.py",
         "$root\tests\runtime\test_analysis_skill.py",
         "$root\tests\runtime\test_skill_registry.py",
+        "$root\tests\runtime\test_adapter_contract.py",
         "$root\tests\runtime\test_evidence_gate.py",
         "$root\tests\runtime\test_memory_evidence_gate.py",
         "$root\tests\runtime\test_evidence_qualification.py",
@@ -72,6 +73,10 @@ elseif ($Select -eq 'AnalysisSkill') {
 elseif ($Select -eq 'SkillRegistry') {
     py -m pytest "$root\tests\runtime\test_skill_registry.py" -q
     if ($LASTEXITCODE -ne 0) { throw "SkillRegistry regression tests failed with exit code $LASTEXITCODE." }
+}
+elseif ($Select -eq 'AdapterContract') {
+    py -m pytest "$root\tests\runtime\test_adapter_contract.py" -q
+    if ($LASTEXITCODE -ne 0) { throw "AdapterContract regression tests failed with exit code $LASTEXITCODE." }
 }
 else {
     py -m pytest "$root\tests\runtime\test_memory_write.py" "$root\memoryhub\tests\test_append_only_ledger.py" -q

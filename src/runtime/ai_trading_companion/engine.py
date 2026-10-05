@@ -27,6 +27,7 @@ from .task_profiles import ManualAnalysisProfileResolver
 from .decision_cycle import DECISION_CYCLE_CONTRACT
 from .mandate_spec import resolve_cycle_mandates
 from .evidence_snapshot import descriptor as evidence_snapshot_descriptor
+from .m1_judgment import build_input as build_m1_judgment_input, build_output as build_m1_judgment_output
 from .m0_observation import (
     build_input as build_m0_observation_input,
     sha256 as m0_observation_sha256,
@@ -1104,8 +1105,10 @@ class CompanionEngine:
         snapshot: dict[str, Any] | None = None, qualified: bool = True,
     ) -> dict[str, Any]:
         cycle = self.store.get_cycle(cycle_id)
-        self.store.verified_attempt(research_attempt_id, cycle_id, "m1_research", research_packet_hash)
+        research_attempt = self.store.verified_attempt(research_attempt_id, cycle_id, "m1_research", research_packet_hash)
         judgment_attempt = self.store.verified_attempt(judgment_attempt_id, cycle_id, "m1_judgment", judgment_packet_hash)
+        if research_attempt.get("is_shadow") or judgment_attempt.get("is_shadow"):
+            raise ValueError("shadow M1 attempts cannot publish a formal judgment")
         verified_output = json.loads(judgment_attempt.get("output_json") or "null")
         normalized_output = normalize_stage_output("m1_judgment", verified_output if isinstance(verified_output, dict) else {})
         verified_m1 = normalized_output.text
@@ -1118,6 +1121,37 @@ class CompanionEngine:
         if snapshot is not None and verified_output.get("snapshot") is not None and snapshot != verified_output.get("snapshot"):
             raise ValueError("M1 snapshot does not match the verified judgment attempt")
         verifier = json.loads(judgment_attempt.get("verifier_json") or "{}")
+        raw_packet = json.loads(judgment_attempt.get("input_packet_json") or "null")
+        m1_receipt = verifier.get("m1_judgment")
+        if verified_output.get("result_version") == 5 or (
+            isinstance(raw_packet, dict) and "m1_judgment_spec" in raw_packet
+        ):
+            if not isinstance(m1_receipt, dict):
+                raise ValueError("M1 judgment attempt lacks its versioned judgment receipt")
+            try:
+                expected_input = build_m1_judgment_input(raw_packet)
+                if raw_packet["cycle_id"] != cycle_id or raw_packet["sha256"] != judgment_packet_hash:
+                    raise ValueError("M1 receipt packet identity mismatch")
+                stored_snapshot = self.store.evidence_snapshot(raw_packet["evidence_snapshot"]["snapshot_id"])
+                if not isinstance(stored_snapshot, dict) or (
+                    evidence_snapshot_descriptor(stored_snapshot) != raw_packet["evidence_snapshot"]
+                    or stored_snapshot["baseline"] != raw_packet["evidence"]
+                ):
+                    raise ValueError("M1 receipt snapshot is not Runtime-owned")
+                frozen_m0 = raw_packet["frozen_m0"]
+                stored_m0 = self.store.latest_artifact_before(cycle_id, "m0", raw_packet["as_of"])
+                if not isinstance(stored_m0, dict) or frozen_m0 != {
+                    "artifact_id": stored_m0["artifact_id"], "sha256": stored_m0["body_sha256"],
+                    "as_of": stored_m0["as_of"], "known_at": stored_m0.get("known_at"),
+                }:
+                    raise ValueError("M1 receipt M0 is not Runtime-owned")
+                expected_receipt = build_m1_judgment_output(
+                    expected_input, verified_output, attempt_id=judgment_attempt_id,
+                )
+                if m1_receipt != expected_receipt:
+                    raise ValueError("M1 receipt does not match its frozen input, output and attempt")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("M1 judgment receipt is not qualified") from exc
         prior_failed_attempt_ids = [
             attempt["attempt_id"] for attempt in self.store.attempts(cycle_id)
             if attempt["status"] in {"failed", "timed_out"}
@@ -1142,6 +1176,12 @@ class CompanionEngine:
             "research_attempt_id": research_attempt_id,
             "judgment_attempt_id": judgment_attempt_id,
         }
+        if isinstance(m1_receipt, dict):
+            audit_metadata["m1_judgment"] = {
+                "contract": m1_receipt["contract"], "version": m1_receipt["version"],
+                "sha256": m1_receipt["sha256"],
+                "snapshot_id": m1_receipt["input"]["evidence_snapshot"]["snapshot_id"],
+            }
         if skill_resolution_artifacts:
             audit_metadata["skill_registry_resolutions"] = [
                 {

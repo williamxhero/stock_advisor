@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "M1JudgmentResult/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract", "version", "spec_contract", "stage", "state", "source_result_version",
+    "input", "source_output", "product", "permissions", "quantresearch", "provenance", "sha256"
+  ],
+  "properties": {
+    "contract": {"type": "string", "const": "M1JudgmentResult/v1"},
+    "version": {"type": "integer", "const": 1},
+    "spec_contract": {"type": "string", "const": "M1JudgmentSpec/v1"},
+    "stage": {"type": "string", "const": "m1_judgment"},
+    "state": {"type": "string", "const": "qualified"},
+    "source_result_version": {"type": "integer", "const": 5},
+    "input": {"$ref": "#/$defs/input"},
+    "source_output": {"type": "object"},
+    "product": {"$ref": "#/$defs/product"},
+    "permissions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["write_permissions"],
+      "properties": {"write_permissions": {"type": "array", "const": []}}
+    },
+    "quantresearch": {
+      "type": "object", "additionalProperties": false,
+      "required": ["access", "write_permissions"],
+      "properties": {
+        "access": {"type": "string", "const": "read_only"},
+        "write_permissions": {"type": "array", "const": []}
+      }
+    },
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "input": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "contract", "version", "stage", "source_packet", "evidence_snapshot", "evidence_refs",
+        "mandate_reference", "boundary", "permissions", "quantresearch", "provenance"
+      ],
+      "properties": {
+        "contract": {"type": "string", "const": "M1JudgmentSpec/v1"},
+        "version": {"type": "integer", "const": 1},
+        "stage": {"type": "string", "const": "m1_judgment"},
+        "source_packet": {"type": "object"},
+        "evidence_snapshot": {"$ref": "#/$defs/evidence_snapshot"},
+        "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "mandate_reference": {
+          "type": "object", "additionalProperties": false,
+          "required": ["contract", "sha256"],
+          "properties": {
+            "contract": {"type": "string", "const": "MandateSpec/v1"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "boundary": {
+          "type": "object", "additionalProperties": false,
+          "required": ["allowed_inputs", "forbidden_inputs", "h0_visible", "m2_visible", "published_chat_after_cutoff_visible"],
+          "properties": {
+            "allowed_inputs": {"type": "array", "items": {"type": "string"}},
+            "forbidden_inputs": {"type": "array", "items": {"type": "string"}},
+            "h0_visible": {"type": "boolean", "const": false},
+            "m2_visible": {"type": "boolean", "const": false},
+            "published_chat_after_cutoff_visible": {"type": "boolean", "const": false}
+          }
+        },
+        "permissions": {"$ref": "#/$defs/permissions"},
+        "quantresearch": {"$ref": "#/$defs/quantresearch"},
+        "provenance": {
+          "type": "object", "additionalProperties": false,
+          "required": ["source", "cycle_id", "as_of", "packet_sha256"],
+          "properties": {
+            "source": {"type": "string", "const": "runtime"},
+            "cycle_id": {"type": "string", "minLength": 1},
+            "as_of": {"type": "string", "minLength": 1},
+            "packet_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        }
+      }
+    },
+    "permissions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["write_permissions"],
+      "properties": {"write_permissions": {"type": "array", "const": []}}
+    },
+    "quantresearch": {
+      "type": "object", "additionalProperties": false,
+      "required": ["access", "write_permissions"],
+      "properties": {
+        "access": {"type": "string", "const": "read_only"},
+        "write_permissions": {"type": "array", "const": []}
+      }
+    },
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "cycle_id", "as_of", "packet_sha256", "input_sha256", "output_sha256", "attempt_id"],
+      "properties": {
+        "source": {"type": "string", "const": "runtime"},
+        "cycle_id": {"type": "string", "minLength": 1},
+        "as_of": {"type": "string", "minLength": 1},
+        "packet_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "attempt_id": {"type": ["string", "null"]}
+      }
+    },
+    "evidence_snapshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "snapshot_id", "cycle_id", "as_of", "schema_version", "content_hash", "source_watermarks", "included_sources", "version"],
+      "properties": {
+        "contract": {"type": "string", "const": "EvidenceSnapshotSpec/v1"},
+        "snapshot_id": {"type": "string", "minLength": 1},
+        "cycle_id": {"type": "string", "minLength": 1},
+        "as_of": {"type": "string", "minLength": 1},
+        "schema_version": {"type": "integer", "const": 1},
+        "content_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_watermarks": {"type": "object"},
+        "included_sources": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "version": {"type": "integer", "minimum": 1},
+        "parent_snapshot_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "product": {
+      "type": "object", "additionalProperties": false,
+      "required": ["conclusion_claims", "supporting_evidence", "counter_evidence", "risks", "invalidation_conditions", "unknowns", "confidence_state"],
+      "properties": {
+        "conclusion_claims": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/conclusion"}},
+        "supporting_evidence": {"type": "array", "items": {"type": "object"}},
+        "counter_evidence": {"type": "array", "items": {"type": "object"}},
+        "risks": {"type": "array", "items": {"$ref": "#/$defs/risk"}},
+        "invalidation_conditions": {"type": "array", "items": {"type": "object"}},
+        "unknowns": {"type": "object"},
+        "confidence_state": {
+          "type": "object", "additionalProperties": false,
+          "required": ["level", "qualified"],
+          "properties": {
+            "level": {"type": "string", "enum": ["low", "medium", "high"]},
+            "qualified": {"type": "boolean", "const": true}
+          }
+        }
+      }
+    },
+    "conclusion": {
+      "type": "object", "additionalProperties": false,
+      "required": ["claim", "direction", "horizon", "evidence_refs"],
+      "properties": {
+        "claim": {"type": "string", "minLength": 1},
+        "direction": {"type": "string", "enum": ["bullish", "bearish", "neutral", "avoid"]},
+        "horizon": {"type": "string", "minLength": 1},
+        "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      }
+    },
+    "risk": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "text", "evidence_refs"],
+      "properties": {
+        "kind": {"type": "string", "minLength": 1},
+        "text": {"type": "string", "minLength": 1},
+        "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      }
+    }
+  }
+}

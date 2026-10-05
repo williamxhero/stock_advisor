@@ -20,6 +20,7 @@ from .cycle_contract import memory_boundary
 from .decision_cycle import assert_m1_blind
 from .evidence_snapshot import descriptor as evidence_snapshot_descriptor
 from .mandate_spec import mandate_for_stage
+from .m1_judgment import build_input as build_m1_judgment_input
 
 
 PUBLIC_STAGES = {"m0_research", "m1_research", "outcome_research", "chat_research"}
@@ -84,6 +85,8 @@ class RuntimePacketBuilder:
             packet["m0_observation_spec"] = {
                 "contract": "M0ObservationSpec/v1", "version": 1,
             }
+        if stage == "m1_judgment":
+            packet["m1_judgment_spec"] = {"contract": "M1JudgmentSpec/v1", "version": 1}
         frozen_cycle = json.loads(cycle["cycle_contract_json"])
         # Reference the immutable creation input without exposing workflow or
         # diagnostic metadata to the independent M1 path.
@@ -206,6 +209,15 @@ class RuntimePacketBuilder:
         ).hexdigest()
         if stage == "m1_judgment":
             self._assert_m1_blind(packet, cycle)
+            # Older packet-inspection callers may build an M1-shaped packet
+            # before an M0 artifact exists. Keep that packet builder operation
+            # backward-compatible; the formal provider path still requires the
+            # complete M1 input contract in _call_stage before invocation.
+            frozen_m0 = packet.get("frozen_m0")
+            if isinstance(frozen_m0, dict) and all(
+                frozen_m0.get(key) for key in ("artifact_id", "sha256", "as_of", "known_at")
+            ):
+                build_m1_judgment_input(packet)
         elif stage == "m1_research":
             self._assert_m1_blind(packet, cycle)
         # Defense in depth: packets can be given to a cloud-capable runner only

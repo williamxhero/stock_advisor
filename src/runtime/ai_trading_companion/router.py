@@ -14,6 +14,7 @@ from .m0_observation import (
     build_output as build_m0_observation_output,
     validate_stage_output as validate_m0_stage_output,
 )
+from .m1_judgment import build_input as build_m1_judgment_input, build_output as build_m1_judgment_output
 from .opportunities import observation_problems, review_problems
 from .stage_expression import (
     canonical_direction, normalize_stage_output, semantic_snapshot_conflicts,
@@ -189,9 +190,18 @@ class CognitiveRouter:
             if stage == "m1_judgment" and not profile.m1_blind:
                 problems.append("m1_packet_contains_human_input")
             problems.extend(_formal_m1_expression_problems(packet, output.get("narrative", "")))
-            return {"passed": not problems, "problems": problems, "profile": profile.as_json(),
-                    "publication": output.get("publication"),
-                    "fallback": bool((output.get("publication") or {}).get("fallback"))}
+            receipt = None
+            if stage == "m1_judgment" and ("m1_judgment_spec" in packet or "evidence_snapshot" in packet):
+                try:
+                    receipt = build_m1_judgment_output(build_m1_judgment_input(packet), output)
+                except (TypeError, ValueError) as exc:
+                    problems.append("m1_judgment_contract:" + str(exc))
+            result = {"passed": not problems, "problems": problems, "profile": profile.as_json(),
+                      "publication": output.get("publication"),
+                      "fallback": bool((output.get("publication") or {}).get("fallback"))}
+            if receipt is not None and not problems:
+                result["m1_judgment"] = receipt
+            return result
         normalized = normalize_stage_output(stage, output)
         if stage == "m0_compose":
             # The router remains the domain-quality gate.  The versioned M0

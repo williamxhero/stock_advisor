@@ -66,6 +66,10 @@ from .scheduler import SHANGHAI, conversation_auto_submit_at, ensure_registered_
 from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
 from .m0_observation import bind_attempt as bind_m0_observation_attempt
+from .m1_judgment import (
+    bind_attempt as bind_m1_judgment_attempt,
+    build_input as build_m1_judgment_input,
+)
 from .runtime_strategy_policy import RuntimeStrategyControls, RuntimeStrategyPolicy
 from .stage_expression import normalize_stage_output, safe_stage_output
 from .judgment_publication import (
@@ -892,6 +896,8 @@ def _call_stage(
     if stage in {"m1_research", "m1_judgment"}:
         from .decision_cycle import assert_m1_blind
         assert_m1_blind(packet)
+        if stage == "m1_judgment" and ("m1_judgment_spec" in packet or "evidence_snapshot" in packet):
+            build_m1_judgment_input(packet)
     if search:
         packet = attach_agent_contract(packet, capability=f"research:{stage}")
         packet = attach_role_inputs(packet, stage=stage)
@@ -1355,6 +1361,8 @@ def _call_stage(
                     **verifier, "passed": False,
                     "problems": [*verifier.get("problems", []), f"m0_observation_contract:{exc}"],
                 }
+        if stage == "m1_judgment" and verifier.get("passed") and isinstance(verifier.get("m1_judgment"), dict):
+            verifier["m1_judgment"] = bind_m1_judgment_attempt(verifier["m1_judgment"], attempt["attempt_id"])
         status = "succeeded" if verifier.get("passed") else "rejected"
         output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(
@@ -1553,8 +1561,11 @@ def run_router_shadow(store: CompanionStore, job: dict[str, Any], execute: bool)
         runner_fingerprint="provider-broker/v1",
         effort_policy_version=candidate.get("effort_policy_version"),
         effort_input_fingerprint=candidate.get("effort_input_fingerprint"),
+        input_packet=packet,
     )
     try:
+        if job["stage"] == "m1_judgment" and ("m1_judgment_spec" in packet or "evidence_snapshot" in packet):
+            build_m1_judgment_input(packet)
         request_packet = {key: value for key, value in packet.items() if key != "sha256"}
         router = CognitiveRouter()
         request = BrokerRequest(
@@ -1582,10 +1593,12 @@ def run_router_shadow(store: CompanionStore, job: dict[str, Any], execute: bool)
         if not isinstance(data, dict):
             raise BrokerError("Broker produced no qualified shadow result", category="broker_output_invalid")
         verifier = router.verify(job["stage"], packet, data)
+        if isinstance(verifier.get("m1_judgment"), dict):
+            verifier["m1_judgment"] = bind_m1_judgment_attempt(verifier["m1_judgment"], attempt["attempt_id"])
         output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(
             attempt["attempt_id"], "succeeded", output_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
-            usage=outcome.usage if outcome else {}, verifier=verifier,
+            output=data, usage=outcome.usage if outcome else {}, verifier=verifier,
             broker_metadata=outcome.audit_metadata() if outcome else {},
             tool_trace=[outcome.audit_metadata()] if outcome else [],
             actual_model=outcome.actual_model if outcome else "runtime-reviewed-core",

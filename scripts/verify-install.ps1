@@ -32,6 +32,7 @@ foreach ($required in @(
     'resources\contracts\adapter-contract-spec-v1.schema.json',
     'resources\contracts\mandate-spec-v1.schema.json',
     'resources\contracts\m0-observation-spec-v1.schema.json',
+    'resources\contracts\m1-judgment-spec-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
     'runtime\ai_trading_companion\cycle_replay.py',
@@ -50,6 +51,7 @@ foreach ($required in @(
     'runtime\ai_trading_companion\adapter_contract.py',
     'runtime\ai_trading_companion\mandate_spec.py',
     'runtime\ai_trading_companion\m0_observation.py',
+    'runtime\ai_trading_companion\m1_judgment.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'
 )) {
@@ -330,6 +332,15 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
             if ($m0ObservationQualification.evaluation_vector.$check -ne $true) {
                 throw "Installed M0Observation qualification check failed: $check"
             }
+        }
+        $m1JudgmentReplayOne = ((& $python -m ai_trading_companion.m1_judgment) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed M1Judgment replay 1 failed with exit code $LASTEXITCODE." }
+        $m1JudgmentReplayTwo = ((& $python -m ai_trading_companion.m1_judgment) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed M1Judgment replay 2 failed with exit code $LASTEXITCODE." }
+        if ($m1JudgmentReplayOne -ne $m1JudgmentReplayTwo) { throw 'Installed M1Judgment frozen replays were not deterministic.' }
+        $m1JudgmentQualification = $m1JudgmentReplayOne | ConvertFrom-Json
+        if ($m1JudgmentQualification.contract -ne 'M1JudgmentInstallQualification/v1' -or $m1JudgmentQualification.qualified -ne $true) {
+            throw 'Installed M1Judgment qualification did not pass.'
         }
         $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")
         if ($LASTEXITCODE -ne 0) { throw "Installed Debate replay 1 failed with exit code $LASTEXITCODE." }

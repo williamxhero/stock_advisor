@@ -697,6 +697,9 @@ class JudgmentPublicationPipeline:
                 _feedback: list[str] | None = None) -> dict:
         packet = copy.deepcopy(frozen_evidence)
         prefix = "m1" if stage == "m1_judgment" else "m2"
+        if prefix == "m1":
+            from .m1_judgment import assert_blind
+            assert_blind(packet)
         base = {key: value for key, value in packet.items() if key not in {"sha256", "verification_repair"}}
         source_map = evidence_sources(base)
         if not source_map:

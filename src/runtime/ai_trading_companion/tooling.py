@@ -1,6 +1,7 @@
 """Runtime-owned execution boundary for immutable local data tools."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import gzip
 import json
@@ -18,13 +19,23 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+from .adapter_contract import CONTRACT as ADAPTER_CONTRACT, VERSION as ADAPTER_VERSION
 from .secret_guard import find_secrets
 
 
 _MANIFEST_CONTRACT = "ai-trading-tool-manifest/v1"
 _CURRENT_CONTRACT = "ai-trading-tool-current/v1"
 _RESULT_CONTRACT = "ai-trading-tool-result/v1"
+_ADAPTER_RECEIPT_CONTRACT = "AdapterContractEvidenceReceipt/v1"
 _SHANGHAI = timezone(timedelta(hours=8))
+# Domain observations may describe positions, orders or schedules. These keys
+# instead claim authority owned by Runtime, MemoryHub or EvidenceGate.
+_PROTECTED_OUTPUT_KEYS = frozenset({
+    "memoryhub", "memoryhub_write", "memory_write", "portfolio_write",
+    "positions_write", "orders_write", "schedule_write", "task_state",
+    "production_strategy", "final_judgment", "write_permissions",
+    "evidence_gate", "evidence_gate_passed",
+})
 
 
 def _contains_access_restricted_url(value: Any) -> bool:
@@ -112,6 +123,7 @@ class EvidenceResolution:
     exit_code: int | None = None
     attempts: tuple[str, ...] = ()
     route_adapter: str | None = None
+    adapter_receipts: tuple[dict[str, Any], ...] = ()
 
     @classmethod
     def failed(cls, capability: str, code: str, *, tool_version: str | None = None,
@@ -281,12 +293,37 @@ class ToolRunner:
 
     def resolve(self, request: FactRequest, *, _tool: PublishedTool | None = None) -> EvidenceResolution:
         try:
-            wire_request = request.to_wire()
+            wire_request = copy.deepcopy(request.to_wire())
             tool = _tool or self.catalog.resolve(request.capability)
         except (ToolLookupError, ValueError) as exc:
             return EvidenceResolution.failed(request.capability, getattr(exc, "code", str(exc)))
         if find_secrets(json.dumps(wire_request, ensure_ascii=False, sort_keys=True)):
             return EvidenceResolution.failed(request.capability, "tool_secret_rejected", tool_version=tool.version)
+        result = self._execute(request, tool, wire_request)
+        health = self._health(tool)
+        receipt = {
+            "contract": _ADAPTER_RECEIPT_CONTRACT, "version": ADAPTER_VERSION,
+            "adapter_contract": ADAPTER_CONTRACT,
+            "adapter_id": tool.adapter, "adapter_version": tool.version,
+            "provider": tool.adapter, "fact_request": wire_request,
+            "input_sha256": hashlib.sha256(json.dumps(
+                wire_request, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
+            "status": "succeeded" if result.succeeded else "failed",
+            "succeeded": result.succeeded, "error_code": result.error_code,
+            "fact_as_of": result.fact_as_of, "acquired_at": result.acquired_at,
+            "raw_artifact_ref": result.raw_artifact_ref,
+            "diagnostic_artifact_ref": result.diagnostic_artifact_ref,
+            "output_sha256": (result.raw_artifact_ref or "").rsplit(":", 1)[-1] or None,
+            "exit_code": result.exit_code,
+            "technical_validation": list(result.technical_validation),
+            "health": {"state": "degraded" if health.get("degraded") else "ready", **health},
+            "evidence_gate": {"state": "not_evaluated", "owner": "EvidenceGate"},
+            "permissions": {"write_permissions": []},
+        }
+        return replace(result, route_adapter=tool.adapter, adapter_receipts=(receipt,))
+
+    def _execute(self, request: FactRequest, tool: PublishedTool, wire_request: dict[str, Any]) -> EvidenceResolution:
         if _contains_access_restricted_url(request.inputs):
             return EvidenceResolution.failed(request.capability, "tool_access_restricted", tool_version=tool.version)
         if not self.artifacts.can_accept_new_call():
@@ -378,6 +415,12 @@ class ToolRunner:
                     request.capability, "tool_result_invalid", tool_version=tool.version,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
                 )
+            protected_error = _validate_tool_output_bounds(output["data"])
+            if protected_error:
+                return EvidenceResolution.failed(
+                    request.capability, protected_error, tool_version=tool.version,
+                    raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                )
             try:
                 _parse_timestamp(str(output.get("fact_as_of") or ""))
             except ValueError:
@@ -429,7 +472,7 @@ class ToolRunner:
             ):
                 return False
             _parse_timestamp(str(output["fact_as_of"]))
-            if _validate_capability_result(request, output):
+            if _validate_tool_output_bounds(output["data"]) or _validate_capability_result(request, output):
                 return False
             if "technical_validation" in cached:
                 checks = cached["technical_validation"]
@@ -446,7 +489,7 @@ class ToolRunner:
         if cached is not None and request.freshness_seconds > 0:
             age = datetime.now(timezone.utc) - _parse_timestamp(cached.acquired_at)
             if age.total_seconds() <= request.freshness_seconds:
-                return replace(cached, attempts=("cache:succeeded",))
+                return replace(copy.deepcopy(cached), attempts=("cache:succeeded",))
         try:
             candidates = self._ordered_candidates(self.catalog.resolve_candidates(request.capability))
         except ToolLookupError as exc:
@@ -455,6 +498,7 @@ class ToolRunner:
             return failed
         attempts: list[str] = []
         failures: list[EvidenceResolution] = []
+        receipts: list[dict[str, Any]] = []
         last: EvidenceResolution | None = None
         deadline = datetime.now(timezone.utc).timestamp() + request.deadline_seconds
         for tool in candidates:
@@ -471,6 +515,7 @@ class ToolRunner:
                 result = replace(result, route_adapter=tool.adapter)
             attempts.append(f"{tool.adapter}:{'succeeded' if result.succeeded else result.error_code}")
             last = result
+            receipts.extend(copy.deepcopy(result.adapter_receipts))
             if not result.succeeded:
                 failures.append(result)
             self._record_health(tool, result)
@@ -478,8 +523,8 @@ class ToolRunner:
                 if circuit_key is not None:
                     self._open_circuits.add(circuit_key)
             if result.succeeded:
-                resolved = replace(result, attempts=tuple(attempts))
-                self._cache[cache_key] = resolved
+                resolved = replace(result, attempts=tuple(attempts), adapter_receipts=tuple(receipts))
+                self._cache[cache_key] = copy.deepcopy(resolved)
                 self._append_audit(request, resolved)
                 if request.context.get("capability_need_on_success") is True:
                     self._report_capability_need(request, resolved)
@@ -490,7 +535,7 @@ class ToolRunner:
                 "tool_circuit_open" if attempts and all(item.endswith(":circuit_open") for item in attempts)
                 else "tool_no_candidate_satisfied",
             ),
-            attempts=tuple(attempts),
+            attempts=tuple(attempts), adapter_receipts=tuple(receipts),
         )
         if (request.context.get("cycle_id") or request.context.get("attempt_id")) and failures and len(failures) == len(candidates) and all(self._is_deterministic_failure(item) for item in failures):
             failed = replace(failed, error_code="tool_routes_exhausted_deterministic")
@@ -539,6 +584,7 @@ class ToolRunner:
             "exit_code": result.exit_code,
             "route": {"adapter": result.route_adapter, "version": result.tool_version},
             "technical_validation": list(result.technical_validation),
+            "adapter_receipts": copy.deepcopy(list(result.adapter_receipts)),
         }
         with (audit_root / "resolutions.ndjson").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
@@ -599,6 +645,29 @@ class ToolRunner:
             )):
                 return False
         return True
+
+
+def _validate_tool_output_bounds(data: dict[str, Any]) -> str | None:
+    """Bound structural inspection without treating domain observations as writes."""
+    pending: list[tuple[Any, int]] = [(data, 0)]
+    visited = 0
+    while pending:
+        value, depth = pending.pop()
+        visited += 1
+        if visited > 100_000 or depth > 64:
+            return "tool_result_limits_exceeded"
+        if isinstance(value, dict):
+            if any(str(key).strip().casefold().replace("-", "_") in _PROTECTED_OUTPUT_KEYS for key in value):
+                return "tool_protected_output_rejected"
+            children = value.values()
+        elif isinstance(value, list):
+            children = value
+        else:
+            continue
+        if visited + len(pending) + len(value) > 100_000:
+            return "tool_result_limits_exceeded"
+        pending.extend((child, depth + 1) for child in children)
+    return None
 
 
 def _validate_capability_result(request: FactRequest, output: dict[str, Any]) -> str | None:

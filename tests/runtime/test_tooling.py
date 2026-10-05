@@ -178,6 +178,15 @@ class ToolRunnerTests(unittest.TestCase):
             self.assertIn("tool_result_schema_valid", result.technical_validation)
             self.assertIn(b'"exchange": "SSE"', runner.read_artifact(result.raw_artifact_ref))
             self.assertEqual([], list((root / ".runs").glob("*")))
+            receipt = result.adapter_receipts[0]
+            self.assertEqual("AdapterContractEvidenceReceipt/v1", receipt["contract"])
+            self.assertEqual("succeeded", receipt["status"])
+            self.assertEqual("ready", receipt["health"]["state"])
+            self.assertEqual("not_evaluated", receipt["evidence_gate"]["state"])
+            self.assertEqual(64, len(receipt["input_sha256"]))
+            self.assertEqual(result.raw_artifact_ref.split(":")[-1], receipt["output_sha256"])
+            self.assertEqual([], receipt["permissions"]["write_permissions"])
+            self.assertEqual([receipt], json.loads(json.dumps(list(result.adapter_receipts))))
 
     def test_rejects_protected_output_keys_before_success_and_audits_the_raw_failure(self) -> None:
         for key in ("MemoryHub", "task_state", "production_strategy", "final_judgment", "write_permissions", "evidence_gate_passed"):
@@ -447,7 +456,10 @@ class ToolRunnerTests(unittest.TestCase):
             self.assertTrue(result.succeeded, result.error_code)
             self.assertEqual("backup", result.data["source"])
             self.assertEqual(["default:tool_process_failed", "backup:succeeded"], list(result.attempts))
-            self.assertTrue((root / ".audit" / "resolutions.ndjson").exists())
+            self.assertEqual(["failed", "succeeded"], [item["status"] for item in result.adapter_receipts])
+            self.assertEqual(["default", "backup"], [item["provider"] for item in result.adapter_receipts])
+            audit = json.loads((root / ".audit" / "resolutions.ndjson").read_text(encoding="utf-8"))
+            self.assertEqual(list(result.adapter_receipts), audit["adapter_receipts"])
 
     def test_deterministic_route_failure_is_audited_and_circuit_broken_per_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -492,6 +504,11 @@ class ToolRunnerTests(unittest.TestCase):
 
             self.assertTrue(first.succeeded and second.succeeded and changed_time.succeeded)
             self.assertEqual("xx", (version_root / "calls.txt").read_text(encoding="utf-8"))
+            first.adapter_receipts[0]["permissions"]["write_permissions"].append("portfolio")
+            first.data["symbol"] = "corrupted"
+            cached = runner.resolve_with_fallback(request)
+            self.assertEqual([], cached.adapter_receipts[0]["permissions"]["write_permissions"])
+            self.assertEqual("600000", cached.data["symbol"])
 
     def test_exhausted_tool_resolution_reports_a_nonblocking_capability_need(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

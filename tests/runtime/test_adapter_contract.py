@@ -129,6 +129,62 @@ def test_unavailable_health_prevents_execution() -> None:
     assert result["provenance"]["health"]["state"] == "unavailable"
 
 
+def test_declared_provider_capabilities_and_permissions_are_read_only() -> None:
+    definition = AdapterDefinition(
+        "fixture", "v1", "Input/v1", "Output/v1", "deterministic", execute_increment,
+        validate_input_value, validate_output_value, qualify_value,
+        provider="fixture-provider", capabilities=("increment",),
+        network_permissions=("example.test",), state_permissions=("read:fixture",),
+    )
+    registry = AdapterRegistry()
+    registry.register(definition)
+    declaration = registry.manifest()[0]
+    assert declaration["provider"] == "fixture-provider"
+    assert declaration["capabilities"] == ["increment"]
+    assert declaration["permissions"] == {
+        "write_permissions": [], "network_permissions": ["example.test"],
+        "state_permissions": ["read:fixture"],
+    }
+    result = registry.execute("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z")
+    assert result["provenance"]["declaration"] == declaration
+    assert result["provenance"]["evidence_gate"]["state"] == "not_evaluated"
+    with pytest.raises(ValueError, match="read-only"):
+        AdapterDefinition(
+            "fixture", "v1", "Input/v1", "Output/v1", "deterministic", execute_increment,
+            validate_input_value, validate_output_value, qualify_value,
+            state_permissions=("write:portfolio",),
+        )
+
+
+def test_health_failure_can_recover_on_retry() -> None:
+    checks = []
+
+    def healthcheck():
+        checks.append(True)
+        if len(checks) == 1:
+            raise RuntimeError("health unavailable")
+        return {"state": "ready"}
+
+    registry = AdapterRegistry()
+    registry.register(AdapterDefinition(
+        "fixture", "v1", "Input/v1", "Output/v1", "deterministic", execute_increment,
+        validate_input_value, validate_output_value, qualify_value, healthcheck=healthcheck,
+    ))
+    result = registry.execute("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z", retries=1)
+    assert result["status"] == "succeeded"
+    assert result["attempts"] == ["fixture:unavailable", "fixture:succeeded"]
+    assert result["provenance"]["retry_limit"] == 1
+    assert result["provenance"]["health"]["state"] == "ready"
+
+
+@pytest.mark.parametrize("timeout,retries", [(float("nan"), 0), (float("inf"), 0), (1, 0.5), (1, True)])
+def test_invalid_execution_policy_is_rejected(timeout, retries) -> None:
+    registry = AdapterRegistry()
+    registry.register(adapter())
+    with pytest.raises(ValueError, match="timeout or retry"):
+        registry.execute("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z", timeout_seconds=timeout, retries=retries)
+
+
 def test_adapter_definition_execution_health_and_normalization() -> None:
     registry = AdapterRegistry()
     registry.register(AdapterDefinition("fixture", "v1", "Input/v1", "Output/v1", "deterministic", execute_increment, validate_input_value, validate_output_value, qualify_value, healthcheck=lambda: {"state": "ready"}))
@@ -198,6 +254,12 @@ def test_adapter_replay_preserves_inputs_output_qualification_and_schema() -> No
     assert replay["source_input"]["inputs"] == {"value": 1}
     assert replay["source_output"]["qualification"]["passed"] is True
     assert replay == frozen_replay(copy.deepcopy(request), copy.deepcopy(result))
+    for field in ("data", "raw_output"):
+        altered = copy.deepcopy(result)
+        altered[field]["value"] = 999
+        with pytest.raises(ValueError, match="digest mismatch"):
+            frozen_replay(request, altered)
+    assert request["permissions"] == {"write_permissions": []}
     root = Path(__file__).parents[2]
     schema = json.loads((root / "resources/contracts/adapter-contract-spec-v1.schema.json").read_text(encoding="utf-8"))
     assert list(Draft202012Validator(schema).iter_errors(request)) == []

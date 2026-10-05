@@ -9,7 +9,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import multiprocessing as mp
+import time
 from dataclasses import dataclass
 from queue import Empty
 from typing import Any, Callable
@@ -20,7 +22,7 @@ RESULT_CONTRACT = "AdapterContractResult/v1"
 REPLAY_CONTRACT = "AdapterContractReplay/v1"
 STATUSES = frozenset({"succeeded", "timed_out", "failed", "schema_mismatch", "untrusted_output", "unavailable"})
 _RETRYABLE = frozenset({"timed_out", "failed", "unavailable"})
-_FORBIDDEN = frozenset({"memoryhub", "memory", "portfolio", "positions", "orders", "schedule", "production_strategy", "final_judgment", "task_state"})
+_FORBIDDEN = frozenset({"runtime", "memoryhub", "memory", "portfolio", "positions", "orders", "schedule", "production_strategy", "final_judgment", "task_state", "write_permissions", "network_permissions", "state_permissions", "evidence_gate", "evidence_gate_passed", "memoryhub_write", "memory_write", "portfolio_write", "positions_write", "orders_write", "schedule_write"})
 
 
 def canonical_json(value: Any) -> str:
@@ -36,9 +38,13 @@ def _normalized_request(value: dict[str, Any]) -> dict[str, Any]:
     provenance = dict(normalized.get("provenance") or {})
     if "timeout_seconds" in provenance:
         provenance["timeout_seconds"] = float(provenance["timeout_seconds"])
-    if "retry_limit" in provenance:
-        provenance["retry_limit"] = int(provenance["retry_limit"])
+    provenance["retry_limit"] = int(provenance.get("retry_limit", 0))
+    provenance.setdefault("provider", normalized["adapter_id"])
+    provenance.setdefault("capabilities", [normalized["adapter_id"]])
     normalized["provenance"] = provenance
+    permissions = normalized["permissions"]
+    permissions.setdefault("network_permissions", [])
+    permissions.setdefault("state_permissions", [])
     return normalized
 
 
@@ -49,14 +55,22 @@ def _bounded(value: Any, field: str) -> str:
 
 
 def _walk_forbidden(value: Any, path: str = "adapter") -> None:
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if str(key).casefold() in _FORBIDDEN:
-                raise ValueError(f"AdapterContract forbids protected field at {path}.{key}")
-            _walk_forbidden(child, f"{path}.{key}")
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            _walk_forbidden(child, f"{path}[{index}]")
+    pending = [(value, path, 0)]
+    visited = 0
+    while pending:
+        child, child_path, depth = pending.pop()
+        visited += 1
+        if depth > 64 or visited > 100_000:
+            raise ValueError("AdapterContract payload limits exceeded")
+        if isinstance(child, dict):
+            for key, item in child.items():
+                if str(key).strip().casefold().replace("-", "_") in _FORBIDDEN:
+                    raise ValueError(f"AdapterContract forbids protected field at {child_path}.{key}")
+                pending.append((item, f"{child_path}.{key}", depth + 1))
+        elif isinstance(child, (list, tuple)):
+            pending.extend((item, f"{child_path}[{index}]", depth + 1) for index, item in enumerate(child))
+        if visited + len(pending) > 100_000:
+            raise ValueError("AdapterContract payload limits exceeded")
 
 
 def validate_input(value: dict[str, Any]) -> None:
@@ -67,8 +81,17 @@ def validate_input(value: dict[str, Any]) -> None:
         raise ValueError("invalid AdapterContract identity")
     for field in ("adapter_id", "adapter_version", "input_contract", "output_contract"):
         _bounded(value[field], field)
-    if not isinstance(value["inputs"], dict) or value["permissions"] != {"write_permissions": []}:
+    if not isinstance(value["inputs"], dict) or not isinstance(value["permissions"], dict):
         raise ValueError("AdapterContract input must be bounded and read-only")
+    permissions = value["permissions"]
+    if permissions.get("write_permissions") != []:
+        raise ValueError("AdapterContract input must not grant write permissions")
+    for field in ("network_permissions", "state_permissions"):
+        entries = permissions.get(field, [])
+        if not isinstance(entries, list) or any(not isinstance(item, str) or not item.strip() for item in entries):
+            raise ValueError(f"AdapterContract {field} are invalid")
+        if field == "state_permissions" and any(not item.strip().casefold().startswith("read:") for item in entries):
+            raise ValueError("AdapterContract state permissions must be read-only")
     if not isinstance(value["provenance"], dict) or not value["provenance"].get("as_of"):
         raise ValueError("AdapterContract provenance.as_of is required")
     _walk_forbidden(value["inputs"], "adapter.inputs")
@@ -93,25 +116,35 @@ def validate_output(value: dict[str, Any]) -> None:
         raise ValueError("failed AdapterContract output requires an error")
     if not isinstance(value["provenance"], dict) or not value["provenance"].get("input_sha256"):
         raise ValueError("AdapterContract output provenance is required")
+    for field, payload in (("output_sha256", value["raw_output"]), ("data_sha256", value["data"])):
+        expected = value["provenance"].get(field)
+        if expected is not None and expected != sha256(payload):
+            raise ValueError("AdapterContract output digest mismatch")
     _walk_forbidden(value["data"], "adapter.data")
     if value["status"] == "succeeded":
         _walk_forbidden(value["raw_output"], "adapter.raw_output")
+        _walk_forbidden(value["qualification"], "adapter.qualification")
 
 
 def _process_adapter(execute: Callable[[dict[str, Any]], dict[str, Any]], normalize: Callable[[dict[str, Any]], dict[str, Any]] | None, inputs: dict[str, Any], queue: Any) -> None:
     try:
-        data = execute(copy.deepcopy(inputs))
+        raw_output = execute(copy.deepcopy(inputs))
+        if not isinstance(raw_output, dict):
+            raise ValueError("adapter output must be an object")
+        data = copy.deepcopy(raw_output)
         if normalize is not None:
-            data = normalize(data)
-        queue.put({"status": "succeeded", "data": data})
+            data = normalize(copy.deepcopy(data))
+        if not isinstance(data, dict):
+            raise ValueError("normalized adapter output must be an object")
+        queue.put({"status": "succeeded", "data": data, "raw_output": raw_output})
     except TimeoutError:
-        queue.put({"status": "timed_out", "error_code": "adapter_timeout", "data": {}})
+        queue.put({"status": "timed_out", "error_code": "adapter_timeout", "data": {}, "raw_output": {}})
     except PermissionError:
-        queue.put({"status": "untrusted_output", "error_code": "adapter_permission", "data": {}})
+        queue.put({"status": "untrusted_output", "error_code": "adapter_permission", "data": {}, "raw_output": {}})
     except ValueError as exc:
-        queue.put({"status": "schema_mismatch", "error_code": str(exc)[:200], "data": {}})
+        queue.put({"status": "schema_mismatch", "error_code": str(exc)[:200], "data": {}, "raw_output": {}})
     except Exception as exc:
-        queue.put({"status": "failed", "error_code": type(exc).__name__, "data": {}})
+        queue.put({"status": "failed", "error_code": type(exc).__name__, "data": {}, "raw_output": {}})
 
 
 @dataclass(frozen=True)
@@ -127,14 +160,42 @@ class AdapterDefinition:
     qualify: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     normalize: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     healthcheck: Callable[[], dict[str, Any]] | None = None
+    provider: str | None = None
+    capabilities: tuple[str, ...] = ()
+    network_permissions: tuple[str, ...] = ()
+    state_permissions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.mode not in {"deterministic", "probabilistic"}:
             raise ValueError("unsupported adapter mode")
         for field in ("adapter_id", "adapter_version", "input_contract", "output_contract"):
             _bounded(getattr(self, field), field)
-        if not callable(self.execute) or self.output_validate is None or self.qualify is None:
+        if not all(callable(hook) for hook in (self.execute, self.output_validate, self.qualify)):
             raise ValueError("AdapterDefinition requires execute, output_validate and qualify")
+        for hook in (self.validate, self.normalize, self.healthcheck):
+            if hook is not None and not callable(hook):
+                raise ValueError("AdapterDefinition hooks must be callable")
+        if self.provider is not None:
+            _bounded(self.provider, "provider")
+        for name in ("capabilities", "network_permissions", "state_permissions"):
+            values = getattr(self, name)
+            if not isinstance(values, tuple):
+                raise ValueError(f"{name} must be an immutable tuple")
+            for value in values:
+                _bounded(value, name)
+        if any(not value.strip().casefold().startswith("read:") for value in self.state_permissions):
+            raise ValueError("AdapterDefinition state permissions must be read-only")
+
+    def declaration(self) -> dict[str, Any]:
+        return {
+            "adapter_id": self.adapter_id, "adapter_version": self.adapter_version,
+            "provider": self.provider or self.adapter_id,
+            "capabilities": list(self.capabilities or (self.adapter_id,)),
+            "input_contract": self.input_contract, "output_contract": self.output_contract,
+            "mode": self.mode,
+            "permissions": {"write_permissions": [], "network_permissions": list(self.network_permissions),
+                            "state_permissions": list(self.state_permissions)},
+        }
 
 
 class AdapterRegistry:
@@ -157,9 +218,15 @@ class AdapterRegistry:
 
     def execute(self, adapter_id: str, inputs: dict[str, Any], *, as_of: str, timeout_seconds: float = 10.0, cycle_id: str | None = None, retries: int = 0, fallbacks: tuple[str, ...] = (), request_id: str | None = None) -> dict[str, Any]:
         candidates = tuple(dict.fromkeys((adapter_id, *fallbacks)))
-        if timeout_seconds <= 0 or retries < 0:
+        if (not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool)
+                or not math.isfinite(timeout_seconds) or timeout_seconds <= 0
+                or not isinstance(retries, int) or isinstance(retries, bool) or retries < 0):
             raise ValueError("invalid adapter timeout or retry count")
-        cache_key = sha256({"adapter": adapter_id, "inputs": inputs, "as_of": as_of, "request_id": request_id})
+        cache_key = sha256({
+            "adapter": adapter_id, "candidates": candidates, "inputs": inputs,
+            "as_of": as_of, "cycle_id": cycle_id, "request_id": request_id,
+            "timeout_seconds": float(timeout_seconds), "retries": retries,
+        })
         if cache_key in self._cache:
             return copy.deepcopy(self._cache[cache_key])
         attempts: list[str] = []
@@ -167,7 +234,16 @@ class AdapterRegistry:
         for candidate_id in candidates:
             adapter = self.resolve(candidate_id)
             for attempt in range(retries + 1):
-                result = self._attempt(adapter, inputs, as_of=as_of, timeout_seconds=timeout_seconds, cycle_id=cycle_id, request_id=request_id, attempt=attempt, attempts=attempts)
+                try:
+                    health = self.healthcheck(candidate_id)
+                except Exception as exc:
+                    health = {"state": "unavailable", "error_code": type(exc).__name__}
+                result = self._attempt(
+                    adapter, inputs, as_of=as_of, timeout_seconds=timeout_seconds,
+                    cycle_id=cycle_id, request_id=request_id, attempt=attempt,
+                    attempts=attempts, health=health, retry_limit=retries,
+                )
+                result["provenance"]["health"] = copy.deepcopy(health)
                 attempts.append(f"{candidate_id}:{result['status']}")
                 final = result
                 if result["status"] == "succeeded":
@@ -180,15 +256,17 @@ class AdapterRegistry:
         final["attempts"] = list(attempts)
         return final
 
-    def _attempt(self, adapter: AdapterDefinition, inputs: dict[str, Any], *, as_of: str, timeout_seconds: float, cycle_id: str | None, request_id: str | None, attempt: int, attempts: list[str]) -> dict[str, Any]:
+    def _attempt(self, adapter: AdapterDefinition, inputs: dict[str, Any], *, as_of: str, timeout_seconds: float, cycle_id: str | None, request_id: str | None, attempt: int, attempts: list[str], health: dict[str, Any], retry_limit: int) -> dict[str, Any]:
         request = {
             "contract": CONTRACT, "version": VERSION, "adapter_id": adapter.adapter_id,
             "adapter_version": adapter.adapter_version, "input_contract": adapter.input_contract,
             "output_contract": adapter.output_contract, "mode": adapter.mode, "inputs": copy.deepcopy(inputs),
-            "permissions": {"write_permissions": []},
-            "provenance": {"as_of": as_of, "cycle_id": cycle_id, "timeout_seconds": float(timeout_seconds), "request_id": request_id, "attempt": attempt},
+            "permissions": {"write_permissions": [], "network_permissions": list(adapter.network_permissions), "state_permissions": list(adapter.state_permissions)},
+            "provenance": {"as_of": as_of, "cycle_id": cycle_id, "timeout_seconds": float(timeout_seconds), "retry_limit": retry_limit, "request_id": request_id, "attempt": attempt, "provider": adapter.provider or adapter.adapter_id, "capabilities": list(adapter.capabilities or (adapter.adapter_id,))},
         }
         validate_input(request)
+        if health["state"] == "unavailable":
+            return self._result(adapter, "unavailable", {}, "adapter_unavailable", request, None, attempts)
         try:
             if adapter.validate is not None:
                 adapter.validate(copy.deepcopy(inputs))
@@ -198,44 +276,72 @@ class AdapterRegistry:
         queue = context.Queue(1)
         process = context.Process(target=_process_adapter, args=(adapter.execute, adapter.normalize, copy.deepcopy(inputs), queue))
         try:
+            deadline = time.monotonic() + timeout_seconds
             process.start()
-            process.join(timeout_seconds)
+            # Drain the queue before joining: a large output can otherwise block
+            # the child's feeder thread and look like an execution timeout.
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return self._result(adapter, "timed_out", {}, "adapter_timeout", request, None, attempts)
+                try:
+                    payload = queue.get(timeout=min(remaining, 0.05))
+                    break
+                except Empty:
+                    if not process.is_alive():
+                        return self._result(adapter, "failed", {}, "adapter_no_result", request, None, attempts)
+            process.join(max(0, deadline - time.monotonic()))
             if process.is_alive():
-                process.terminate(); process.join(2)
                 return self._result(adapter, "timed_out", {}, "adapter_timeout", request, None, attempts)
-            try:
-                payload = queue.get(timeout=1)
-            except Empty:
-                return self._result(adapter, "failed", {}, "adapter_no_result", request, None, attempts)
         except Exception as exc:
-            if process.is_alive():
-                process.terminate(); process.join(2)
             return self._result(adapter, "failed", {}, type(exc).__name__, request, None, attempts)
         finally:
-            queue.close(); queue.join_thread()
-        status, data, error = payload.get("status"), payload.get("data") or {}, payload.get("error_code")
+            if process.is_alive():
+                process.terminate()
+                process.join(2)
+                if process.is_alive():
+                    process.kill()
+                    process.join(2)
+            queue.close()
+            queue.join_thread()
+        status, data, error = payload.get("status"), payload.get("data"), payload.get("error_code")
+        raw_output = payload.get("raw_output", {})
         if status != "succeeded":
-            return self._result(adapter, status, data, error, request, None, attempts)
+            return self._result(adapter, status, {}, error, request, None, attempts, raw_output=raw_output)
         try:
-            if not isinstance(data, dict):
-                raise ValueError("adapter output must be an object")
+            _walk_forbidden(data, "adapter.data")
+            _walk_forbidden(raw_output, "adapter.raw_output")
+        except ValueError as exc:
+            return self._result(adapter, "untrusted_output", {}, str(exc)[:200], request, None, attempts, raw_output=raw_output)
+        try:
             adapter.output_validate(copy.deepcopy(data))
+        except Exception as exc:
+            return self._result(adapter, "schema_mismatch", {}, str(exc)[:200] or type(exc).__name__, request, None, attempts, raw_output=raw_output)
+        try:
             qualification = adapter.qualify(copy.deepcopy(data))
             if not isinstance(qualification, dict) or qualification.get("passed") is not True:
-                return self._result(adapter, "untrusted_output", data, "adapter_qualification_failed", request, qualification, attempts)
-            return self._result(adapter, "succeeded", data, None, request, qualification, attempts)
-        except ValueError as exc:
-            return self._result(adapter, "schema_mismatch", data, str(exc)[:200], request, None, attempts)
+                return self._result(adapter, "untrusted_output", {}, "adapter_qualification_failed", request, None, attempts, raw_output=raw_output)
+            _walk_forbidden(qualification, "adapter.qualification")
+            return self._result(adapter, "succeeded", data, None, request, qualification, attempts, raw_output=raw_output)
         except Exception as exc:
-            return self._result(adapter, "untrusted_output", data, type(exc).__name__, request, None, attempts)
+            return self._result(adapter, "untrusted_output", {}, type(exc).__name__, request, None, attempts, raw_output=raw_output)
 
-    def _result(self, adapter: AdapterDefinition, status: str, data: dict[str, Any], error: str | None, request: dict[str, Any], qualification: dict[str, Any] | None, attempts: list[str]) -> dict[str, Any]:
+    def _result(self, adapter: AdapterDefinition, status: str, data: dict[str, Any], error: str | None, request: dict[str, Any], qualification: dict[str, Any] | None, attempts: list[str], *, raw_output: dict[str, Any] | None = None) -> dict[str, Any]:
         result = {
             "contract": RESULT_CONTRACT, "version": VERSION, "adapter_id": adapter.adapter_id,
             "adapter_version": adapter.adapter_version, "status": status, "data": copy.deepcopy(data),
-            "raw_output": copy.deepcopy(data), "provenance": {"input_sha256": sha256(_normalized_request(request)), "as_of": request["provenance"]["as_of"], "cycle_id": request["provenance"].get("cycle_id"), "request_id": request["provenance"].get("request_id"), "attempt": request["provenance"]["attempt"]},
+            "raw_output": copy.deepcopy(data if raw_output is None else raw_output),
+            "provenance": {"input_sha256": sha256(_normalized_request(request)), "as_of": request["provenance"]["as_of"], "cycle_id": request["provenance"].get("cycle_id"), "request_id": request["provenance"].get("request_id"), "attempt": request["provenance"]["attempt"]},
             "permissions": {"write_permissions": []}, "error_code": error, "qualification": qualification, "attempts": list(attempts),
         }
+        result["provenance"].update({
+            "declaration": adapter.declaration(),
+            "timeout_seconds": request["provenance"]["timeout_seconds"],
+            "retry_limit": request["provenance"]["retry_limit"],
+            "output_sha256": sha256(result["raw_output"]),
+            "data_sha256": sha256(result["data"]),
+            "evidence_gate": {"state": "not_evaluated", "owner": "EvidenceGate"},
+        })
         validate_output(result)
         return result
 
@@ -247,7 +353,7 @@ class AdapterRegistry:
         return {"adapter_id": adapter_id, "adapter_version": adapter.adapter_version, **health}
 
     def manifest(self) -> list[dict[str, Any]]:
-        return [{"adapter_id": item.adapter_id, "adapter_version": item.adapter_version, "input_contract": item.input_contract, "output_contract": item.output_contract, "mode": item.mode} for item in self._adapters.values()]
+        return [item.declaration() for item in self._adapters.values()]
 
 
 def frozen_replay(request: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:

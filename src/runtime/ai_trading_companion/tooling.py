@@ -300,17 +300,24 @@ class ToolRunner:
         if find_secrets(json.dumps(wire_request, ensure_ascii=False, sort_keys=True)):
             return EvidenceResolution.failed(request.capability, "tool_secret_rejected", tool_version=tool.version)
         result = self._execute(request, tool, wire_request)
+        health = self._health(tool)
         receipt = {
             "contract": _ADAPTER_RECEIPT_CONTRACT, "version": ADAPTER_VERSION,
             "adapter_contract": ADAPTER_CONTRACT,
             "adapter_id": tool.adapter, "adapter_version": tool.version,
             "provider": tool.adapter, "fact_request": wire_request,
+            "input_sha256": hashlib.sha256(json.dumps(
+                wire_request, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
+            "status": "succeeded" if result.succeeded else "failed",
             "succeeded": result.succeeded, "error_code": result.error_code,
             "fact_as_of": result.fact_as_of, "acquired_at": result.acquired_at,
             "raw_artifact_ref": result.raw_artifact_ref,
             "diagnostic_artifact_ref": result.diagnostic_artifact_ref,
+            "output_sha256": (result.raw_artifact_ref or "").rsplit(":", 1)[-1] or None,
             "exit_code": result.exit_code,
             "technical_validation": list(result.technical_validation),
+            "health": {"state": "degraded" if health.get("degraded") else "ready", **health},
             "evidence_gate": {"state": "not_evaluated", "owner": "EvidenceGate"},
             "permissions": {"write_permissions": []},
         }
@@ -482,7 +489,7 @@ class ToolRunner:
         if cached is not None and request.freshness_seconds > 0:
             age = datetime.now(timezone.utc) - _parse_timestamp(cached.acquired_at)
             if age.total_seconds() <= request.freshness_seconds:
-                return replace(cached, attempts=("cache:succeeded",))
+                return replace(copy.deepcopy(cached), attempts=("cache:succeeded",))
         try:
             candidates = self._ordered_candidates(self.catalog.resolve_candidates(request.capability))
         except ToolLookupError as exc:
@@ -491,6 +498,7 @@ class ToolRunner:
             return failed
         attempts: list[str] = []
         failures: list[EvidenceResolution] = []
+        receipts: list[dict[str, Any]] = []
         last: EvidenceResolution | None = None
         deadline = datetime.now(timezone.utc).timestamp() + request.deadline_seconds
         for tool in candidates:
@@ -507,6 +515,7 @@ class ToolRunner:
                 result = replace(result, route_adapter=tool.adapter)
             attempts.append(f"{tool.adapter}:{'succeeded' if result.succeeded else result.error_code}")
             last = result
+            receipts.extend(copy.deepcopy(result.adapter_receipts))
             if not result.succeeded:
                 failures.append(result)
             self._record_health(tool, result)
@@ -514,8 +523,8 @@ class ToolRunner:
                 if circuit_key is not None:
                     self._open_circuits.add(circuit_key)
             if result.succeeded:
-                resolved = replace(result, attempts=tuple(attempts))
-                self._cache[cache_key] = resolved
+                resolved = replace(result, attempts=tuple(attempts), adapter_receipts=tuple(receipts))
+                self._cache[cache_key] = copy.deepcopy(resolved)
                 self._append_audit(request, resolved)
                 if request.context.get("capability_need_on_success") is True:
                     self._report_capability_need(request, resolved)
@@ -526,7 +535,7 @@ class ToolRunner:
                 "tool_circuit_open" if attempts and all(item.endswith(":circuit_open") for item in attempts)
                 else "tool_no_candidate_satisfied",
             ),
-            attempts=tuple(attempts),
+            attempts=tuple(attempts), adapter_receipts=tuple(receipts),
         )
         if (request.context.get("cycle_id") or request.context.get("attempt_id")) and failures and len(failures) == len(candidates) and all(self._is_deterministic_failure(item) for item in failures):
             failed = replace(failed, error_code="tool_routes_exhausted_deterministic")
@@ -575,6 +584,7 @@ class ToolRunner:
             "exit_code": result.exit_code,
             "route": {"adapter": result.route_adapter, "version": result.tool_version},
             "technical_validation": list(result.technical_validation),
+            "adapter_receipts": copy.deepcopy(list(result.adapter_receipts)),
         }
         with (audit_root / "resolutions.ndjson").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")

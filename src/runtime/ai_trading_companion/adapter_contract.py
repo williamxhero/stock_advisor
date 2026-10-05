@@ -64,7 +64,14 @@ def _walk_forbidden(value: Any, path: str = "adapter") -> None:
             raise ValueError("AdapterContract payload limits exceeded")
         if isinstance(child, dict):
             for key, item in child.items():
-                if str(key).strip().casefold().replace("-", "_") in _FORBIDDEN:
+                normalized_key = str(key).strip().casefold().replace("-", "_")
+                # Multimodal contracts carry explicit empty read-only capability
+                # descriptors inside their frozen input.  Empty lists grant no
+                # authority; non-empty protected permissions remain forbidden.
+                empty_read_only_descriptor = normalized_key in {
+                    "write_permissions", "network_permissions", "state_permissions",
+                } and item == []
+                if normalized_key in _FORBIDDEN and not empty_read_only_descriptor:
                     raise ValueError(f"AdapterContract forbids protected field at {child_path}.{key}")
                 pending.append((item, f"{child_path}.{key}", depth + 1))
         elif isinstance(child, (list, tuple)):

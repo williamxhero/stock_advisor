@@ -28,6 +28,11 @@ from .research_isolation import (
     coerce_quant_research_port,
     validate_evidence as validate_research_evidence,
 )
+from .multimodal_adapter import (
+    build_output as build_multimodal_output,
+    validate_input as validate_multimodal_input,
+    validate_output as validate_multimodal_output,
+)
 
 
 _RESEARCH_EVIDENCE_UNSET = object()
@@ -74,6 +79,8 @@ class RuntimePacketBuilder:
         context: dict[str, Any] | None = None,
         as_of: str | None = None,
         research_evidence: dict[str, Any] | None | object = _RESEARCH_EVIDENCE_UNSET,
+        multimodal_input: dict[str, Any] | None = None,
+        multimodal_result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if stage not in PUBLIC_STAGES | {"m0_compose", "m1_judgment", "m2", "chat", "reflection", "workflow_feedback"}:
             raise ValueError(f"unsupported packet stage: {stage}")
@@ -93,6 +100,18 @@ class RuntimePacketBuilder:
                 "sha256": mandate["sha256"],
             },
         }
+        if multimodal_result is not None and multimodal_input is None:
+            raise ValueError("multimodal result requires its Runtime-bound input")
+        if multimodal_input is not None:
+            validate_multimodal_input(multimodal_input)
+            if multimodal_input["stage"] != stage or multimodal_input["provenance"]["as_of"] != packet_as_of:
+                raise ValueError("multimodal input does not match Runtime packet identity")
+            packet["multimodal_adapter"] = copy.deepcopy(multimodal_input)
+            if multimodal_result is not None:
+                validate_multimodal_output(multimodal_result)
+                if multimodal_result["input"]["sha256"] != multimodal_input["sha256"]:
+                    raise ValueError("multimodal result does not match Runtime-bound input")
+                packet["multimodal_adapter_result"] = copy.deepcopy(multimodal_result)
         if stage == "m0_compose":
             # Bind the observation contract before deriving the packet hash.
             packet["m0_observation_spec"] = {

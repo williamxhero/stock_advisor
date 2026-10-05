@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FinAgentMultimodalAdapterSpec/v1",
+  "oneOf": [
+    {"$ref": "#/$defs/input"},
+    {"$ref": "#/$defs/result"},
+    {"$ref": "#/$defs/replay"}
+  ],
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "timestamp": {"type": "string", "minLength": 1},
+    "source": {"enum": ["markethub", "deterministic_computation"]},
+    "permissions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["write_permissions"],
+      "properties": {"write_permissions": {"const": []}}
+    },
+    "quantresearch": {
+      "type": "object", "additionalProperties": false,
+      "required": ["access", "write_permissions"],
+      "properties": {"access": {"const": "read_only"}, "write_permissions": {"const": []}}
+    },
+    "fact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "value", "source"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 120},
+        "value": {"type": "number", "minimum": 0},
+        "source": {"$ref": "#/$defs/source"}
+      }
+    },
+    "bar": {
+      "type": "object", "additionalProperties": false,
+      "required": ["timestamp", "open", "high", "low", "close", "volume", "source"],
+      "properties": {
+        "timestamp": {"$ref": "#/$defs/timestamp"},
+        "open": {"type": "number", "exclusiveMinimum": 0},
+        "high": {"type": "number", "exclusiveMinimum": 0},
+        "low": {"type": "number", "exclusiveMinimum": 0},
+        "close": {"type": "number", "exclusiveMinimum": 0},
+        "volume": {"type": "number", "minimum": 0},
+        "source": {"$ref": "#/$defs/source"}
+      }
+    },
+    "market_data": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "source_ref", "as_of", "instrument", "interval", "ohlcv", "quotes", "indicators"],
+      "properties": {
+        "source": {"$ref": "#/$defs/source"},
+        "source_ref": {"type": "string", "minLength": 1, "maxLength": 300},
+        "as_of": {"$ref": "#/$defs/timestamp"},
+        "instrument": {"type": "string", "minLength": 1, "maxLength": 80},
+        "interval": {"type": "string", "minLength": 1, "maxLength": 40},
+        "ohlcv": {"type": "array", "minItems": 1, "maxItems": 10000, "items": {"$ref": "#/$defs/bar"}},
+        "quotes": {"type": "array", "maxItems": 500, "items": {"$ref": "#/$defs/fact"}},
+        "indicators": {"type": "array", "maxItems": 500, "items": {"$ref": "#/$defs/fact"}}
+      }
+    },
+    "render_parameters": {
+      "type": "object", "additionalProperties": false,
+      "required": ["width", "height", "theme", "show_volume", "indicator_names"],
+      "properties": {
+        "width": {"type": "integer", "minimum": 160, "maximum": 4096},
+        "height": {"type": "integer", "minimum": 120, "maximum": 4096},
+        "theme": {"enum": ["light", "dark"]},
+        "show_volume": {"type": "boolean"},
+        "indicator_names": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "image_reference": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "uri", "media_type", "content_sha256", "chart_sha256", "market_data_sha256", "render_parameters_sha256", "generation_version"],
+      "properties": {
+        "kind": {"const": "deterministic_chart"},
+        "uri": {"type": "string", "pattern": "^generated://chart/[0-9a-f]{64}\\.svg$"},
+        "media_type": {"const": "image/svg+xml"},
+        "content_sha256": {"$ref": "#/$defs/digest"},
+        "chart_sha256": {"$ref": "#/$defs/digest"},
+        "market_data_sha256": {"$ref": "#/$defs/digest"},
+        "render_parameters_sha256": {"$ref": "#/$defs/digest"},
+        "generation_version": {"type": "string", "minLength": 1, "maxLength": 80}
+      }
+    },
+    "chart": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "generation_version", "market_data_sha256", "ohlcv_sha256", "render_parameters", "render_parameters_sha256", "image_content_sha256", "chart_sha256", "image_reference"],
+      "properties": {
+        "contract": {"const": "DeterministicChartReference/v1"},
+        "version": {"const": 1},
+        "generation_version": {"type": "string", "minLength": 1},
+        "market_data_sha256": {"$ref": "#/$defs/digest"},
+        "ohlcv_sha256": {"$ref": "#/$defs/digest"},
+        "render_parameters": {"$ref": "#/$defs/render_parameters"},
+        "render_parameters_sha256": {"$ref": "#/$defs/digest"},
+        "image_content_sha256": {"$ref": "#/$defs/digest"},
+        "chart_sha256": {"$ref": "#/$defs/digest"},
+        "image_reference": {"$ref": "#/$defs/image_reference"}
+      }
+    },
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "market_data_source", "as_of", "cycle_id", "request_id"],
+      "properties": {
+        "source": {"const": "runtime"},
+        "market_data_source": {"$ref": "#/$defs/source"},
+        "as_of": {"$ref": "#/$defs/timestamp"},
+        "cycle_id": {"type": ["string", "null"]},
+        "request_id": {"type": ["string", "null"]}
+      }
+    },
+    "input": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "stage", "market_data", "chart", "image_reference", "permissions", "quantresearch", "provenance", "sha256"],
+      "properties": {
+        "contract": {"const": "FinAgentMultimodalAdapterSpec/v1"},
+        "version": {"const": 1},
+        "stage": {"enum": ["m0_compose", "m1_judgment", "m2", "chat", "reflection"]},
+        "market_data": {"$ref": "#/$defs/market_data"},
+        "chart": {"$ref": "#/$defs/chart"},
+        "image_reference": {"$ref": "#/$defs/image_reference"},
+        "permissions": {"$ref": "#/$defs/permissions"},
+        "quantresearch": {"$ref": "#/$defs/quantresearch"},
+        "provenance": {"$ref": "#/$defs/provenance"},
+        "sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "vision_fact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "source"],
+      "properties": {
+        "kind": {"type": "string", "minLength": 1},
+        "source": {"$ref": "#/$defs/source"},
+        "value": {"type": "number", "minimum": 0}
+      }
+    },
+    "result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "spec_contract", "state", "input", "output_kind", "interpretation", "facts", "source_output", "permissions", "quantresearch", "provenance", "sha256"],
+      "properties": {
+        "contract": {"const": "FinAgentMultimodalAdapterResult/v1"},
+        "version": {"const": 1},
+        "spec_contract": {"const": "FinAgentMultimodalAdapterSpec/v1"},
+        "state": {"const": "qualified"},
+        "input": {"$ref": "#/$defs/input"},
+        "output_kind": {"const": "interpretation"},
+        "interpretation": {"type": "object", "minProperties": 1, "maxProperties": 64},
+        "facts": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/vision_fact"}},
+        "source_output": {"type": "object", "maxProperties": 64},
+        "permissions": {"$ref": "#/$defs/permissions"},
+        "quantresearch": {"$ref": "#/$defs/quantresearch"},
+        "provenance": {"type": "object", "additionalProperties": false, "required": ["source", "input_sha256", "output_sha256", "chart_sha256", "image_reference_sha256"], "properties": {"source": {"const": "runtime"}, "input_sha256": {"$ref": "#/$defs/digest"}, "output_sha256": {"$ref": "#/$defs/digest"}, "chart_sha256": {"$ref": "#/$defs/digest"}, "image_reference_sha256": {"$ref": "#/$defs/digest"}}},
+        "sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "replay": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "source_input", "source_output", "source_input_sha256", "source_output_sha256", "receipt", "qualification", "evaluation_vector"],
+      "properties": {
+        "contract": {"const": "FinAgentMultimodalAdapterReplay/v1"},
+        "version": {"const": 1},
+        "source_input": {"$ref": "#/$defs/input"},
+        "source_output": {"type": "object"},
+        "source_input_sha256": {"$ref": "#/$defs/digest"},
+        "source_output_sha256": {"$ref": "#/$defs/digest"},
+        "receipt": {"$ref": "#/$defs/result"},
+        "qualification": {"type": "object", "required": ["valid", "interpretation_only", "read_only", "chart_bound", "fact_sources_enforced"], "properties": {"valid": {"const": true}, "interpretation_only": {"const": true}, "read_only": {"const": true}, "chart_bound": {"const": true}, "fact_sources_enforced": {"const": true}}},
+        "evaluation_vector": {"type": "object"}
+      }
+    }
+  }
+}

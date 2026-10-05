@@ -11,6 +11,8 @@ import hashlib
 import json
 from typing import Any
 
+from .mandate_spec import validate_mandate
+
 
 CONTRACT = "AgentContractSpec/v1"
 VERSION = 1
@@ -76,6 +78,8 @@ def validate_input(value: dict[str, Any]) -> None:
         raise ValueError("AgentContractSpec input requires an evidence snapshot reference")
     if not isinstance(value["mandate"], dict) or not str(value["mandate"].get("goal") or "").strip():
         raise ValueError("AgentContractSpec input mandate.goal is required")
+    if value["mandate"].get("contract") == "MandateSpec/v1":
+        validate_mandate(value["mandate"])
     if not isinstance(value["controlled_context"], dict) or not str(value["controlled_context"].get("as_of") or ""):
         raise ValueError("AgentContractSpec input controlled_context.as_of is required")
     if not isinstance(value["memory_references"], list):
@@ -130,13 +134,18 @@ def build_input(packet: dict[str, Any], *, capability: str) -> dict[str, Any]:
         "contract": "evidence-snapshot-spec/v1", "snapshot_id": None,
         "as_of": packet.get("as_of"), "content_hash": None, "state": "pending",
     })
+    mandate = copy.deepcopy(packet.get("mandate"))
+    if isinstance(mandate, dict) and mandate.get("contract") == "MandateSpec/v1":
+        validate_mandate(mandate)
+    else:
+        mandate = {
+            "goal": "Acquire and qualify evidence for the internal research capability.",
+            "constraints": ["runtime_owned", "as_of_bounded", "structured_artifact_only"],
+        }
     value = {
         "contract": CONTRACT, "version": VERSION, "capability": capability,
         "evidence_snapshot": snapshot,
-        "mandate": {
-            "goal": "Acquire and qualify evidence for the internal research capability.",
-            "constraints": ["runtime_owned", "as_of_bounded", "structured_artifact_only"],
-        },
+        "mandate": mandate,
         "controlled_context": {
             "cycle_id": packet.get("cycle_id"), "stage": packet.get("stage"),
             "as_of": packet.get("as_of"), "allowed_sources": ["packet", "configured_research_backends"],

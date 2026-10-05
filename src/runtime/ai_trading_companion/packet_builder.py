@@ -19,6 +19,7 @@ from .opportunities import is_premarket, OBSERVATION_INSTRUCTION, REVIEW_RESULT_
 from .cycle_contract import memory_boundary
 from .decision_cycle import assert_m1_blind
 from .evidence_snapshot import descriptor as evidence_snapshot_descriptor
+from .mandate_spec import mandate_for_stage
 
 
 PUBLIC_STAGES = {"m0_research", "m1_research", "outcome_research", "chat_research"}
@@ -63,6 +64,7 @@ class RuntimePacketBuilder:
         if stage not in PUBLIC_STAGES | {"m0_compose", "m1_judgment", "m2", "chat", "reflection", "workflow_feedback"}:
             raise ValueError(f"unsupported packet stage: {stage}")
         packet_as_of = as_of or cycle["as_of"]
+        mandate = mandate_for_stage(cycle, stage, memory_space_id=self.memory_space_id)
         packet: dict[str, Any] = {
             "schema_version": 2,
             "cycle_id": cycle["cycle_id"],
@@ -71,6 +73,11 @@ class RuntimePacketBuilder:
             "as_of": packet_as_of,
             "scheduled_for": cycle["scheduled_for"],
             "calendar_context": self._calendar_context(cycle["scheduled_for"]),
+            "mandate": copy.deepcopy(mandate),
+            "mandate_reference": {
+                "contract": mandate["contract"], "stage": mandate["stage"],
+                "sha256": mandate["sha256"],
+            },
         }
         frozen_cycle = json.loads(cycle["cycle_contract_json"])
         # Reference the immutable creation input without exposing workflow or
@@ -84,7 +91,7 @@ class RuntimePacketBuilder:
         }
         if cycle.get("task_profile_json"):
             packet["task_profile"] = json.loads(cycle["task_profile_json"])
-        memory_cards = self._memory_cards(cycle, stage, packet_as_of, evidence)
+        memory_cards = self._memory_cards(cycle, stage, packet_as_of, evidence, mandate)
         if cycle["task_key"].startswith("daily.execution.") or cycle["task_key"] == "daily.review.1520" or stage == "reflection":
             packet["prior_opportunity_plans"] = self.store.opportunity_plans_before(cycle["scheduled_for"][:10], packet_as_of)
             if cycle["task_key"] == "daily.review.1520" or stage == "reflection":
@@ -219,19 +226,39 @@ class RuntimePacketBuilder:
             "authority": authority,
         }
 
-    def _memory_cards(self, cycle: dict[str, Any], stage: str, packet_as_of: str, evidence: dict[str, Any] | None) -> list[dict[str, Any]]:
+    def _memory_cards(
+        self, cycle: dict[str, Any], stage: str, packet_as_of: str,
+        evidence: dict[str, Any] | None, mandate: dict[str, Any],
+    ) -> list[dict[str, Any]]:
         if self.memory is None:
             raise MemoryUnavailable("MemoryHub is required; local long-term memory fallback is disabled")
+        scope = mandate["memory_scope"]
+        if stage not in scope["allowed_stages"]:
+            raise ValueError("frozen mandate does not permit memory access for this stage")
         access_stage = {"m2": "m2_synthesis", "outcome_research": "reflection"}.get(stage, stage)
         memory_cycle_id, memory_as_of = memory_boundary(cycle, stage, packet_as_of)
         snapshot = self.memory.begin_snapshot({
-            "memory_space_id": self.memory_space_id, "as_of": memory_as_of,
+            "memory_space_id": scope["memory_space_id"], "as_of": memory_as_of,
             "stage": access_stage, "cycle_id": memory_cycle_id,
         })
         bundle = self.memory.retrieve_bundle(
-            str(snapshot["snapshot_id"]), self._memory_query_text(evidence), limit=80,
+            str(snapshot["snapshot_id"]), self._memory_query_text(evidence),
+            limit=scope["max_results"],
         )
-        return list(bundle.get("results") or [])
+        results = list(bundle.get("results") or [])
+        allowed_kinds = set(scope["allowed_kinds"])
+        if allowed_kinds and "*" not in allowed_kinds:
+            filtered: list[dict[str, Any]] = []
+            for row in results:
+                if not isinstance(row, dict):
+                    continue
+                metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                memory_type = metadata.get("memory_type") if isinstance(metadata.get("memory_type"), dict) else {}
+                kind = row.get("kind") or row.get("episode_type") or memory_type.get("semantic_type")
+                if kind in allowed_kinds:
+                    filtered.append(row)
+            results = filtered
+        return results[:scope["max_results"]]
 
     def _public_scope(
         self,

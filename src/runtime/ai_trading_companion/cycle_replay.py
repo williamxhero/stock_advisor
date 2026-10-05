@@ -13,6 +13,7 @@ from .evidence_snapshot import validate_snapshot
 from .store import CompanionStore
 from .decision_cycle import cycle_contract
 from .stage_expression import normalize_stage_output
+from .mandate_spec import validate_mandate, validate_mandate_set
 
 CONTRACT = 'CompanionDecisionCycleReplay/v1'
 
@@ -61,12 +62,31 @@ def replay_cycle(frozen: dict[str, Any]) -> dict[str, Any]:
     source = copy.deepcopy(frozen['source'])
     if source['cycle']['cycle_spec_version'] != SPEC_VERSION:
         raise ValueError('unsupported cycle SPEC version')
+    mandate_set = None
+    try:
+        cycle_provenance = json.loads(str(source.get('cycle_record', {}).get('cycle_provenance_json') or '{}'))
+    except (AttributeError, json.JSONDecodeError):
+        cycle_provenance = {}
+    if isinstance(cycle_provenance, dict) and cycle_provenance.get('mandates') is not None:
+        mandate_set = validate_mandate_set(cycle_provenance['mandates'])
+        cycle_task_key = str(source.get('cycle_record', {}).get('task_key') or '')
+        if any(mandate.get('task_key') != cycle_task_key for mandate in mandate_set['mandates'].values()):
+            raise ValueError('cycle replay mandate task identity mismatch')
     for snapshot in source['evidence_snapshots']:
         validate_snapshot(snapshot)
     attempts = []
     for attempt in source['attempts']:
         packet = json.loads(attempt.get('input_packet_json') or 'null')
         verifier = json.loads(attempt.get('verifier_json') or '{}')
+        if mandate_set is not None and isinstance(packet, dict) and isinstance(packet.get('mandate'), dict):
+            packet_mandate = validate_mandate(packet['mandate'])
+            packet_stage = str(attempt.get('stage') or packet_mandate.get('stage') or '')
+            expected_mandate = mandate_set['mandates'].get(packet_stage)
+            if expected_mandate is not None and packet_mandate != expected_mandate:
+                raise ValueError('cycle replay mandate identity mismatch')
+            reference = packet.get('mandate_reference')
+            if isinstance(reference, dict) and reference.get('sha256') != packet_mandate['sha256']:
+                raise ValueError('cycle replay mandate reference mismatch')
         if str(attempt['stage']).startswith('m1') and packet is not None:
             validate_m1_blind_packet(packet)
             # Replay the exact frozen boundary.  Human material sealed after

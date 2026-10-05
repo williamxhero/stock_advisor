@@ -1099,11 +1099,31 @@ class CompanionStore:
 
     def set_cycle_provenance(self, cycle_id: str, provenance: dict[str, Any]) -> None:
         cycle = self.get_cycle(cycle_id)
-        supplied_cycle_id = provenance.get("cycle_id") if isinstance(provenance, dict) else None
+        supplied = dict(provenance or {})
+        supplied_cycle_id = supplied.get("cycle_id")
         if supplied_cycle_id is not None and str(supplied_cycle_id) != cycle_id:
             raise ValueError("cycle provenance cycle_id does not match cycle")
+        try:
+            existing = json.loads(str(cycle.get("cycle_provenance_json") or "{}"))
+        except json.JSONDecodeError:
+            existing = {}
+        existing_mandates = existing.get("mandates") if isinstance(existing, dict) else None
+        supplied_mandates = supplied.get("mandates")
+        if existing_mandates is not None:
+            from .mandate_spec import validate_mandate_set
+            validate_mandate_set(existing_mandates)
+        if supplied_mandates is not None:
+            from .mandate_spec import validate_mandate_set
+            supplied_mandates = validate_mandate_set(supplied_mandates)
+            if existing_mandates is not None and supplied_mandates != existing_mandates:
+                raise ValueError("cycle mandate set is immutable")
+            supplied["mandates"] = supplied_mandates
+        elif existing_mandates is not None:
+            # Later provenance updates may add audit metadata, but cannot erase
+            # the mandate frozen when the cycle was created.
+            supplied["mandates"] = existing_mandates
         value = {
-            **(provenance or {}),
+            **supplied,
             "contract": "companion-decision-cycle-provenance/v1",
             "source": "runtime",
             "cycle_id": cycle_id,
@@ -1344,7 +1364,12 @@ class CompanionStore:
         })
         return {"cycle": cycle, "stage": result}
 
-    def create_cycle(self, task_key: str, scheduled_for: str, as_of: str, *, schedule_id: str | None = None, schedule_revision: int | None = None, schedule_snapshot: dict[str, Any] | None = None, kind: str = "scheduled", work_start_at: str | None = None) -> dict[str, Any]:
+    def create_cycle(
+        self, task_key: str, scheduled_for: str, as_of: str, *,
+        schedule_id: str | None = None, schedule_revision: int | None = None,
+        schedule_snapshot: dict[str, Any] | None = None, kind: str = "scheduled",
+        work_start_at: str | None = None, mandate_set: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         self.initialize(); cycle_id = str(uuid.uuid4()); at = now()
         validate_state("queued")
         created_cycle = False
@@ -1388,10 +1413,13 @@ class CompanionStore:
                     created_cycle = True
                 c.execute("INSERT INTO companion_schedule_claim(task_key,scheduled_for,cycle_id,claimed_at) VALUES(?,?,?,?)", (task_key, scheduled_for, cycle_id, at))
         if created_cycle:
-            self.set_cycle_provenance(cycle_id, {
+            provenance = {
                 "task_key": task_key, "schedule_id": schedule_id,
                 "schedule_revision": schedule_revision, "kind": kind,
-            })
+            }
+            if mandate_set is not None:
+                provenance["mandates"] = mandate_set
+            self.set_cycle_provenance(cycle_id, provenance)
         frozen = self.get_cycle(cycle_id)
         self.initialize_cycle_stages(
             cycle_id, provenance={"schedule_revision": frozen.get("schedule_revision")},
@@ -1409,6 +1437,7 @@ class CompanionStore:
         task_profile_version: int,
         task_profile: dict[str, Any] | None = None,
         evidence_contract: dict[str, Any] | None = None,
+        mandate_set: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Create one manual formal-analysis occurrence without claiming a schedule slot.
 
@@ -1483,9 +1512,12 @@ class CompanionStore:
                 "INSERT INTO companion_manual_analysis_claim(request_id,cycle_id,claimed_at) VALUES(?,?,?)",
                 (request_id, cycle_id, claimed_at),
             )
-        self.set_cycle_provenance(cycle_id, {
+        provenance = {
             "task_key": task_key, "request_id": request_id, "kind": "manual",
-        })
+        }
+        if mandate_set is not None:
+            provenance["mandates"] = mandate_set
+        self.set_cycle_provenance(cycle_id, provenance)
         self.initialize_cycle_stages(cycle_id, provenance={"request_id": request_id, "source": "manual_analysis"})
         return self.get_cycle(cycle_id), True
 
@@ -1686,10 +1718,17 @@ class CompanionStore:
                     "UPDATE companion_cycle SET h0_artifact_id=?, updated_at=?, revision=revision+1 WHERE cycle_id=?",
                     (copied_artifacts["h0"]["artifact_id"], now(), cycle_id),
                 )
-        self.set_cycle_provenance(cycle_id, {
+        try:
+            source_provenance = json.loads(str(source.get("cycle_provenance_json") or "{}"))
+        except json.JSONDecodeError:
+            source_provenance = {}
+        provenance = {
             "task_key": source["task_key"], "source_cycle_id": source_cycle_id,
             "kind": "diagnostic_rerun",
-        })
+        }
+        if isinstance(source_provenance, dict) and source_provenance.get("mandates") is not None:
+            provenance["mandates"] = source_provenance["mandates"]
+        self.set_cycle_provenance(cycle_id, provenance)
         self.initialize_cycle_stages(cycle_id, provenance={"source_cycle_id": source_cycle_id, "kind": "diagnostic_rerun"})
         return self.get_cycle(cycle_id)
 
@@ -1737,10 +1776,17 @@ class CompanionStore:
                 provenance={"source": "preview_rerun", "source_cycle_id": source_cycle_id},
                 payload=contract.to_dict(),
             )
-        self.set_cycle_provenance(cycle_id, {
+        try:
+            source_provenance = json.loads(str(source.get("cycle_provenance_json") or "{}"))
+        except json.JSONDecodeError:
+            source_provenance = {}
+        provenance = {
             "task_key": source["task_key"], "source_cycle_id": source_cycle_id,
             "kind": "preview_rerun",
-        })
+        }
+        if isinstance(source_provenance, dict) and source_provenance.get("mandates") is not None:
+            provenance["mandates"] = source_provenance["mandates"]
+        self.set_cycle_provenance(cycle_id, provenance)
         self.initialize_cycle_stages(cycle_id, provenance={"source_cycle_id": source_cycle_id, "kind": "preview_rerun"})
         return self.get_cycle(cycle_id)
 

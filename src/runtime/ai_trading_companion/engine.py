@@ -25,6 +25,7 @@ from .store import (
 )
 from .task_profiles import ManualAnalysisProfileResolver
 from .decision_cycle import DECISION_CYCLE_CONTRACT
+from .mandate_spec import resolve_cycle_mandates
 
 
 def utc_now() -> datetime:
@@ -302,21 +303,36 @@ class CompanionEngine:
             self.chat_stream_failed(stream["cycle_id"], stream["stream_id"], "runtime restarted")
         return len(streams)
 
+    def _resolve_cycle_mandates(
+        self, task_key: str, *, as_of: str, task_profile: dict[str, Any] | None = None,
+        mandate_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return resolve_cycle_mandates(
+            task_key, as_of=as_of, task_profile=task_profile,
+            config=mandate_config, memory_space_id=self.memory_space_id,
+            skill_registry=self.skill_registry_spec,
+        )
+
     def start_cycle(
         self, task_key: str, scheduled_for: str, as_of: str | None = None, *,
         schedule_id: str | None = None, schedule_revision: int | None = None,
         schedule_snapshot: dict[str, Any] | None = None,
+        mandate_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if task_key not in TASK_POLICIES:
             raise ValueError(f"unregistered task_key: {task_key}")
+        frozen_as_of = as_of or iso(utc_now())
+        mandates = self._resolve_cycle_mandates(
+            task_key, as_of=frozen_as_of, mandate_config=mandate_config,
+        )
         work_start_at = scheduled_for
         if schedule_snapshot:
             lead = int((schedule_snapshot.get("trigger") or {}).get("lead_minutes", 0))
             work_start_at = (parse(scheduled_for) - timedelta(minutes=lead)).isoformat(timespec="seconds")
         cycle = self.store.create_cycle(
-            task_key, scheduled_for, as_of or iso(utc_now()), schedule_id=schedule_id,
+            task_key, scheduled_for, frozen_as_of, schedule_id=schedule_id,
             schedule_revision=schedule_revision, schedule_snapshot=schedule_snapshot,
-            work_start_at=work_start_at,
+            work_start_at=work_start_at, mandate_set=mandates,
         )
         self.emit(cycle, "cycle.created", cycle)
         return cycle
@@ -375,6 +391,13 @@ class CompanionEngine:
             raise ValueError("formal analysis request task_profile.version is required") from exc
         if profile_version < 1:
             raise ValueError("formal analysis request task_profile.version must be positive")
+        mandate_config = request.get("mandate_config")
+        if mandate_config is not None and not isinstance(mandate_config, dict):
+            raise ValueError("formal analysis request mandate_config must be an object")
+        mandates = self._resolve_cycle_mandates(
+            task_key, as_of=requested_at, task_profile=profile_snapshot,
+            mandate_config=mandate_config,
+        )
 
         cycle, created = self.store.create_manual_analysis_cycle(
             request_id=str(request["request_id"]),
@@ -385,6 +408,7 @@ class CompanionEngine:
             task_profile_version=profile_version,
             task_profile=profile_snapshot,
             evidence_contract=evidence_contract,
+            mandate_set=mandates,
         )
         receipt = {
             "kind": "analysis.request",

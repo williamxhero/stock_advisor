@@ -26,6 +26,7 @@ from .router import CognitiveRouter
 from .secret_guard import assert_safe
 from .stage_expression import normalize_stage_output
 from .store import CompanionStore, digest, now
+from .mandate_spec import validate_mandate_set
 
 BUNDLE_SCHEMA_VERSION = 3
 PREVIEW_SIGNING_KEY_FIELD = "signing_key"
@@ -319,6 +320,15 @@ def verify_bundle(
     ).hexdigest()
     if not hmac.compare_digest(str(bundle.get("bundle_hmac_sha256") or ""), expected_signature):
         raise ValueError("preview bundle signature mismatch")
+    try:
+        provenance = json.loads(str(bundle.get("cycle_provenance_json") or "{}"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("preview cycle provenance is invalid") from exc
+    if isinstance(provenance, dict) and provenance.get("mandates") is not None:
+        mandate_set = validate_mandate_set(provenance["mandates"])
+        task_key = str(bundle.get("task_key") or bundle.get("source_task_key") or "")
+        if any(item.get("task_key") != task_key for item in mandate_set["mandates"].values()):
+            raise ValueError("preview mandate task identity mismatch")
     assert_safe(json.dumps(bundle, ensure_ascii=False), boundary="preview approval")
     artifacts = bundle.get("artifacts") or []
     for artifact in artifacts:

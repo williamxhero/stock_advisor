@@ -22,6 +22,15 @@ from .evidence_snapshot import descriptor as evidence_snapshot_descriptor
 from .mandate_spec import mandate_for_stage
 from .m1_judgment import build_input as build_m1_judgment_input
 from .position_safety import build_input as build_position_safety_input
+from .research_isolation import (
+    access_descriptor as research_access_descriptor,
+    build_request as build_research_request,
+    coerce_quant_research_port,
+    validate_evidence as validate_research_evidence,
+)
+
+
+_RESEARCH_EVIDENCE_UNSET = object()
 
 
 PUBLIC_STAGES = {"m0_research", "m1_research", "outcome_research", "chat_research"}
@@ -44,6 +53,7 @@ class RuntimePacketBuilder:
         memory: MemoryPort | None = None,
         memory_space_id: str = "ai-trading-companion",
         evidence_contract_factory: EvidenceContractFactory | None = None,
+        quant_research_port: Any | None = None,
     ) -> None:
         self.resources_root = Path(resources_root)
         # The third positional argument is accepted during one release only so
@@ -52,6 +62,7 @@ class RuntimePacketBuilder:
         self.memory = memory
         self.memory_space_id = memory_space_id
         self.evidence_contract_factory = evidence_contract_factory or EvidenceContractFactory()
+        self.quant_research_port = coerce_quant_research_port(quant_research_port)
 
     def build(
         self,
@@ -62,6 +73,7 @@ class RuntimePacketBuilder:
         message_batch: str | None = None,
         context: dict[str, Any] | None = None,
         as_of: str | None = None,
+        research_evidence: dict[str, Any] | None | object = _RESEARCH_EVIDENCE_UNSET,
     ) -> dict[str, Any]:
         if stage not in PUBLIC_STAGES | {"m0_compose", "m1_judgment", "m2", "chat", "reflection", "workflow_feedback"}:
             raise ValueError(f"unsupported packet stage: {stage}")
@@ -199,6 +211,40 @@ class RuntimePacketBuilder:
                     cycle, evidence, packet_as_of,
                 )
             packet["evidence"] = evidence or {}
+            if stage == "m1_judgment":
+                # QuantResearch is an optional, mandate-controlled evidence
+                # source. Its descriptor is always hash-bound; its result is
+                # accepted only through the read-only versioned port.
+                packet["research_isolation"] = research_access_descriptor()
+                quant_permission = packet["mandate"].get("quantresearch_permission") or {}
+                if quant_permission.get("enabled") is True:
+                    profile = packet.get("task_profile") if isinstance(packet.get("task_profile"), dict) else {}
+                    universe = [
+                        str(item) for item in profile.get("required_entities") or [] if str(item).strip()
+                    ]
+                    if not universe and cycle.get("evidence_contract_json"):
+                        frozen_contract = json.loads(cycle["evidence_contract_json"])
+                        universe = [
+                            str(entity)
+                            for requirement in frozen_contract.get("requirements") or []
+                            if isinstance(requirement, dict)
+                            for entity in (requirement.get("required_entities") or [])
+                            if str(entity).strip()
+                        ]
+                    research_request = build_research_request(
+                        task_key=cycle["task_key"],
+                        as_of=packet_as_of,
+                        market_scope={"market": "CN_A_SHARE", "stage": "m1_judgment"},
+                        universe=list(dict.fromkeys(universe)),
+                        research_goal="Return versioned strategy research evidence for independent M1 consideration.",
+                        baseline_strategy_version="runtime-baseline-v1",
+                        strategy_package={"contract": "CompanionResearchSubject/v1", "task_key": cycle["task_key"]},
+                    )
+                    packet["research_request"] = research_request
+                    if research_evidence is _RESEARCH_EVIDENCE_UNSET:
+                        research_evidence = self.quant_research_port.read(research_request)
+                    if research_evidence is not None:
+                        packet["research_evidence"] = validate_research_evidence(research_evidence)
             if stage in {"m1_judgment", "m2"} and cycle["task_key"] in {
                 "daily.execution.0945", "daily.execution.1030", "daily.execution.1430", "daily.review.1520",
             }:

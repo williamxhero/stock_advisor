@@ -14,6 +14,7 @@ from .store import CompanionStore
 from .decision_cycle import cycle_contract
 from .stage_expression import normalize_stage_output
 from .mandate_spec import validate_mandate, validate_mandate_set
+from .research_isolation import validate_access_descriptor, validate_evidence, validate_request
 
 CONTRACT = 'CompanionDecisionCycleReplay/v1'
 
@@ -89,7 +90,32 @@ def replay_cycle(frozen: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError('cycle replay mandate reference mismatch')
         if str(attempt['stage']).startswith('m1') and packet is not None:
             validate_m1_blind_packet(packet)
-            # Replay the exact frozen boundary.  Human material sealed after
+            research_access = packet.get('research_isolation')
+            research_request = packet.get('research_request')
+            research_evidence = packet.get('research_evidence')
+            if research_access is not None:
+                validate_access_descriptor(research_access)
+            if research_request is not None:
+                validate_request(research_request)
+                if (research_request['task_key'] != packet.get('task_key')
+                        or _instant(research_request['as_of']) != _instant(str(packet.get('as_of') or ''))
+                        or research_request['market_scope'].get('stage') != 'm1_judgment'):
+                    raise ValueError('cycle replay research request identity mismatch')
+            if research_evidence is not None:
+                if research_access is None or research_request is None:
+                    raise ValueError('cycle replay research evidence lacks access descriptor or request')
+                validate_evidence(research_evidence)
+                if research_evidence['provenance']['request_sha256'] != research_request['sha256']:
+                    raise ValueError('cycle replay research evidence request binding mismatch')
+                mandate = packet.get('mandate') or {}
+                if (mandate.get('quantresearch_permission') or {}).get('enabled') is not True:
+                    raise ValueError('cycle replay research evidence is not mandate-authorized')
+                cutoff = _instant(str(packet.get('as_of') or ''))
+                for field in ('as_of', 'known_at'):
+                    timestamp = _instant(str(research_evidence['provenance'][field]))
+                    if timestamp > cutoff:
+                        raise ValueError('cycle replay research evidence is future-dated')
+            # Replay the exact frozen boundary. Human material sealed after
             # this attempt started was unavailable to the original M1 input
             # and must not change the historical leakage result.
             boundary = attempt.get('started_at') or attempt.get('as_of')

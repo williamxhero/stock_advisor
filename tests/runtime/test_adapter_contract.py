@@ -7,40 +7,158 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
-from ai_trading_companion.adapter_contract import (
-    AdapterDefinition, AdapterRegistry, frozen_replay, install_qualification, validate_output,
-)
+from ai_trading_companion.adapter_contract import AdapterDefinition, AdapterRegistry, frozen_replay, install_qualification, validate_output
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.store import CompanionStore
 
 
-def adapter(execute=lambda data: {"value": data["value"] + 1}) -> AdapterDefinition:
-    return AdapterDefinition("fixture", "v1", "Input/v1", "Output/v1", "deterministic", execute)
+def execute_increment(data: dict[str, object]) -> dict[str, object]:
+    return {"value": int(data["value"]) + 1}
+
+
+def execute_sleep(data: dict[str, object]) -> dict[str, object]:
+    import time
+    time.sleep(float(data.get("seconds", 1)))
+    return {"value": 2}
+
+
+def execute_fail_timeout(_: dict[str, object]) -> dict[str, object]:
+    raise TimeoutError("timeout")
+
+
+def execute_fail_crash(_: dict[str, object]) -> dict[str, object]:
+    raise RuntimeError("crash")
+
+
+def execute_fail_schema(_: dict[str, object]) -> dict[str, object]:
+    raise ValueError("schema")
+
+
+def execute_fail_permission(_: dict[str, object]) -> dict[str, object]:
+    raise PermissionError("denied")
+
+
+def validate_input_value(data: dict[str, object]) -> None:
+    if not isinstance(data.get("value"), int):
+        raise ValueError("value must be integer")
+
+
+def validate_output_value(data: dict[str, object]) -> None:
+    if not isinstance(data.get("value"), int):
+        raise ValueError("value must be integer")
+
+
+def qualify_value(data: dict[str, object]) -> dict[str, object]:
+    return {"passed": isinstance(data.get("value"), int), "evidence_refs": ["adapter:fixture"]}
+
+
+def adapter(execute=execute_increment) -> AdapterDefinition:
+    return AdapterDefinition("fixture", "v1", "Input/v1", "Output/v1", "deterministic", execute, validate_input_value, validate_output_value, qualify_value)
+
+
+def execute_raw(data: dict[str, object]) -> dict[str, object]:
+    data["value"] = "2"
+    return {"value": "2", "source": "fixture"}
+
+
+def normalize_value(data: dict[str, object]) -> dict[str, object]:
+    data["value"] = int(data["value"])
+    return data
+
+
+def execute_protected(_: dict[str, object]) -> dict[str, object]:
+    return {"value": 2, "nested": [{" Write-Permissions ": ["portfolio"]}]}
+
+
+def execute_non_object(_: dict[str, object]) -> list[int]:
+    return [2]
+
+
+def execute_large(_: dict[str, object]) -> dict[str, object]:
+    return {"value": 2, "text": "x" * 100_000}
+
+
+def test_normalization_preserves_original_output_and_inputs() -> None:
+    registry = AdapterRegistry()
+    registry.register(AdapterDefinition(
+        "fixture", "v1", "Input/v1", "Output/v1", "deterministic", execute_raw,
+        validate_input_value, validate_output_value, qualify_value, normalize_value,
+    ))
+    inputs = {"value": 1}
+    result = registry.execute("fixture", inputs, as_of="2026-09-20T01:00:00Z")
+    assert result["status"] == "succeeded"
+    assert result["data"] == {"value": 2, "source": "fixture"}
+    assert result["raw_output"] == {"value": "2", "source": "fixture"}
+    assert inputs == {"value": 1}
+
+
+@pytest.mark.parametrize("execute,status", [
+    (execute_protected, "untrusted_output"),
+    (execute_non_object, "schema_mismatch"),
+    (execute_large, "succeeded"),
+])
+def test_output_boundary_returns_structured_results(execute, status: str) -> None:
+    registry = AdapterRegistry()
+    registry.register(adapter(execute))
+    result = registry.execute("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z", timeout_seconds=3)
+    assert result["status"] == status
+    validate_output(result)
+    if status != "succeeded":
+        assert result["data"] == {}
+
+
+def test_duplicate_request_cache_preserves_cycle_provenance_and_is_immutable() -> None:
+    registry = AdapterRegistry()
+    registry.register(adapter())
+    first = registry.execute("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z", cycle_id="cycle-1")
+    first["data"]["value"] = 100
+    second = registry.execute("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z", cycle_id="cycle-2")
+    assert second["data"] == {"value": 2}
+    assert second["provenance"]["cycle_id"] == "cycle-2"
+
+
+def test_unavailable_health_prevents_execution() -> None:
+    registry = AdapterRegistry()
+    registry.register(AdapterDefinition(
+        "fixture", "v1", "Input/v1", "Output/v1", "deterministic", execute_fail_crash,
+        validate_input_value, validate_output_value, qualify_value,
+        healthcheck=lambda: {"state": "unavailable"},
+    ))
+    result = registry.execute("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z")
+    assert result["status"] == "unavailable"
+    assert result["provenance"]["health"]["state"] == "unavailable"
 
 
 def test_adapter_definition_execution_health_and_normalization() -> None:
     registry = AdapterRegistry()
-    registry.register(AdapterDefinition("fixture", "v1", "Input/v1", "Output/v1", "deterministic", lambda data: {"value": str(data["value"])}, normalize=lambda data: {"value": int(data["value"])}, healthcheck=lambda: {"state": "ready"}))
+    registry.register(AdapterDefinition("fixture", "v1", "Input/v1", "Output/v1", "deterministic", execute_increment, validate_input_value, validate_output_value, qualify_value, healthcheck=lambda: {"state": "ready"}))
     result = registry.execute("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z")
-    assert result["data"]["value"] == 1
+    assert result["data"]["value"] == 2
     assert result["status"] == "succeeded"
+    assert result["qualification"]["passed"] is True
+    assert result["provenance"]["input_sha256"]
     assert registry.healthcheck("fixture")["state"] == "ready"
-    assert registry.manifest()[0]["output_contract"] == "Output/v1"
 
 
-@pytest.mark.parametrize("error,status", [
-    (TimeoutError("timeout"), "timed_out"),
-    (RuntimeError("crash"), "failed"),
-    (ValueError("schema"), "schema_mismatch"),
-    (PermissionError("denied"), "untrusted_output"),
+@pytest.mark.parametrize("execute,status", [
+    (execute_fail_timeout, "timed_out"), (execute_fail_crash, "failed"),
+    (execute_fail_schema, "schema_mismatch"), (execute_fail_permission, "untrusted_output"),
 ])
-def test_adapter_failure_is_explicit(error: Exception, status: str) -> None:
+def test_adapter_failure_is_explicit(execute, status: str) -> None:
     registry = AdapterRegistry()
-    registry.register(adapter(lambda _: (_ for _ in ()).throw(error)))
+    registry.register(adapter(execute))
     result = registry.execute("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z")
     assert result["status"] == status
     assert result["error_code"]
     assert result["data"] == {}
+
+
+def test_timeout_is_enforced_by_process_boundary() -> None:
+    registry = AdapterRegistry()
+    registry.register(adapter(execute_sleep))
+    result = registry.execute("fixture", {"value": 1, "seconds": 2}, as_of="2026-09-20T01:00:00Z", timeout_seconds=0.05)
+    assert result["status"] == "timed_out"
+    assert result["error_code"] == "adapter_timeout"
 
 
 def test_adapter_permissions_and_protected_business_state_are_rejected() -> None:
@@ -49,7 +167,7 @@ def test_adapter_permissions_and_protected_business_state_are_rejected() -> None
     with pytest.raises(ValueError, match="protected field"):
         registry.execute("fixture", {"value": 1, "portfolio": {}}, as_of="2026-09-20T01:00:00Z")
     with pytest.raises(ValueError, match="protected field"):
-        validate_output({"contract": "AdapterContractResult/v1", "version": 1, "adapter_id": "x", "adapter_version": "v1", "status": "succeeded", "data": {"final_judgment": "buy"}, "provenance": {"input_sha256": "x"}, "permissions": {"write_permissions": []}, "error_code": None})
+        validate_output({"contract": "AdapterContractResult/v1", "version": 1, "adapter_id": "x", "adapter_version": "v1", "status": "succeeded", "data": {"final_judgment": "buy"}, "raw_output": {}, "provenance": {"input_sha256": "x"}, "permissions": {"write_permissions": []}, "error_code": None, "qualification": {"passed": True}, "attempts": []})
 
 
 def test_engine_adapter_seam_is_read_only(tmp_path: Path) -> None:
@@ -60,12 +178,26 @@ def test_engine_adapter_seam_is_read_only(tmp_path: Path) -> None:
     assert result["permissions"]["write_permissions"] == []
 
 
-def test_adapter_replay_schema_and_install_qualification() -> None:
+def test_retry_fallback_and_idempotency() -> None:
+    registry = AdapterRegistry()
+    registry.register(adapter(execute_fail_crash))
+    registry.register(AdapterDefinition("fallback", "v1", "Input/v1", "Output/v1", "deterministic", execute_increment, validate_input_value, validate_output_value, qualify_value))
+    result = registry.execute("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z", retries=1, fallbacks=("fallback",), request_id="request-1")
+    assert result["adapter_id"] == "fallback"
+    assert result["attempts"] == ["fixture:failed", "fixture:failed", "fallback:succeeded"]
+    replay = registry.execute("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z", retries=1, fallbacks=("fallback",), request_id="request-1")
+    assert replay == result
+
+
+def test_adapter_replay_preserves_inputs_output_qualification_and_schema() -> None:
     registry = AdapterRegistry()
     registry.register(adapter())
-    request = {"contract": "AdapterContractSpec/v1", "version": 1, "adapter_id": "fixture", "adapter_version": "v1", "input_contract": "Input/v1", "output_contract": "Output/v1", "mode": "deterministic", "inputs": {"value": 1}, "permissions": {"write_permissions": []}, "provenance": {"as_of": "2026-09-20T01:00:00Z", "cycle_id": None, "timeout_seconds": 10}}
+    request = {"contract": "AdapterContractSpec/v1", "version": 1, "adapter_id": "fixture", "adapter_version": "v1", "input_contract": "Input/v1", "output_contract": "Output/v1", "mode": "deterministic", "inputs": {"value": 1}, "permissions": {"write_permissions": []}, "provenance": {"as_of": "2026-09-20T01:00:00Z", "cycle_id": None, "timeout_seconds": 10, "request_id": None, "attempt": 0}}
     result = registry.execute("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z")
-    assert frozen_replay(request, result) == frozen_replay(copy.deepcopy(request), copy.deepcopy(result))
+    replay = frozen_replay(request, result)
+    assert replay["source_input"]["inputs"] == {"value": 1}
+    assert replay["source_output"]["qualification"]["passed"] is True
+    assert replay == frozen_replay(copy.deepcopy(request), copy.deepcopy(result))
     root = Path(__file__).parents[2]
     schema = json.loads((root / "resources/contracts/adapter-contract-spec-v1.schema.json").read_text(encoding="utf-8"))
     assert list(Draft202012Validator(schema).iter_errors(request)) == []

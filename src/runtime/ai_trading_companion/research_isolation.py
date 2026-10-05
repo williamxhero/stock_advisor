@@ -205,8 +205,8 @@ def build_evidence(
     artifact_ref: str,
     known_at: str | None = None,
     evidence_refs: list[str] | None = None,
-    request_sha256: str | None = None,
-    reproducibility: dict[str, Any] | None = None,
+    request_sha256: str,
+    reproducibility: dict[str, Any],
 ) -> dict[str, Any]:
     """Create a complete ResearchEvidence envelope; no implicit versioning."""
     run_id = _required_string(research_run_id, "research_run_id")
@@ -239,6 +239,15 @@ def build_evidence(
     }
     value["sha256"] = sha256(value)
     return validate_evidence(value)
+
+
+def _validate_evidence_for_request(value: dict[str, Any], request: dict[str, Any]) -> None:
+    if value["provenance"]["request_sha256"] != request["sha256"]:
+        raise ValueError("research evidence request binding mismatch")
+    cutoff = _research_clock(request["as_of"], "as_of")
+    for field in ("as_of", "known_at"):
+        if _research_clock(value["provenance"][field], f"provenance.{field}") > cutoff:
+            raise ValueError("research evidence exceeds request cutoff")
 
 
 def validate_evidence(value: dict[str, Any]) -> dict[str, Any]:
@@ -311,8 +320,7 @@ class QuantResearchPort:
         # return the complete versioned envelope itself and bind it to this
         # exact request.
         validated = validate_evidence(result)
-        if validated["provenance"]["request_sha256"] != request["sha256"]:
-            raise ValueError("research evidence request binding mismatch")
+        _validate_evidence_for_request(validated, request)
         return copy.deepcopy(validated)
 
     def read_evidence(self, request: dict[str, Any]) -> dict[str, Any] | None:
@@ -363,8 +371,7 @@ class InMemoryQuantResearchPort(QuantResearchPort):
         request = validate_request(copy.deepcopy(request))
         if self._evidence is None:
             return None
-        if self._evidence["provenance"]["request_sha256"] != request["sha256"]:
-            raise ValueError("research evidence request binding mismatch")
+        _validate_evidence_for_request(self._evidence, request)
         return copy.deepcopy(self._evidence)
 
 

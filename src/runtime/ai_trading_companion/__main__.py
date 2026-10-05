@@ -2086,6 +2086,21 @@ def run_m1(
     verification_feedback: dict[str, Any] | None = None
     frozen_expression_decision: dict[str, Any] | None = None
     local_packet: dict[str, Any] | None = None
+    frozen_research_evidence: dict[str, Any] | None = None
+    research_evidence_frozen = False
+    for prior_attempt in reversed(store.attempts(cycle_id)):
+        if prior_attempt.get("stage") != "m1_judgment" or not prior_attempt.get("input_packet_json"):
+            continue
+        try:
+            prior_packet = json.loads(prior_attempt["input_packet_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(prior_packet, dict) and (
+            "research_isolation" in prior_packet or "research_evidence" in prior_packet
+        ):
+            frozen_research_evidence = prior_packet.get("research_evidence")
+            research_evidence_frozen = True
+            break
     for number in range(1, M1_MAX_JUDGMENT_ATTEMPTS + 1):
         # Keep a durable boundary record for failures that happen before
         # _call_stage can create its normal m1_judgment attempt.  The raw
@@ -2107,10 +2122,16 @@ def run_m1(
             judgment_controls = resolve_stage_controls(
                 store, "m1_judgment", timeout=judgment_timeout, search=False,
             )
-            judgment_packet = builder.build(
-                cycle, "m1_judgment", evidence=evidence,
-                as_of=str(evidence.get("as_of") or research_as_of),
-            )
+            judgment_build_kwargs: dict[str, Any] = {
+                "evidence": evidence,
+                "as_of": str(evidence.get("as_of") or research_as_of),
+            }
+            if research_evidence_frozen:
+                judgment_build_kwargs["research_evidence"] = frozen_research_evidence
+            judgment_packet = builder.build(cycle, "m1_judgment", **judgment_build_kwargs)
+            if not research_evidence_frozen:
+                frozen_research_evidence = judgment_packet.get("research_evidence")
+                research_evidence_frozen = True
             if verification_feedback is not None:
                 judgment_packet["verification_repair"] = {
                     **verification_feedback,

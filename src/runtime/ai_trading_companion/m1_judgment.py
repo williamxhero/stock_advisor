@@ -16,7 +16,7 @@ from .cycle_contract import validate_m1_blind_packet
 from .evidence_snapshot import build_snapshot, descriptor
 from .m0_observation import canonical_json, sha256
 from .mandate_spec import validate_mandate
-from .research_isolation import validate_access_descriptor, validate_evidence
+from .research_isolation import validate_access_descriptor, validate_evidence, validate_request
 
 
 CONTRACT = "M1JudgmentSpec/v1"
@@ -45,7 +45,7 @@ _PACKET_FIELDS = frozenset({
     "mandate", "mandate_reference", "m1_judgment_spec", "position_safety", "cycle_reference", "task_profile",
     "prior_opportunity_plans", "prior_opportunity_followups", "protocol", "risk_doctrine",
     "business_context", "frozen_m0", "frozen_public_evidence", "evidence_snapshot", "evidence",
-    "research_isolation", "research_evidence", "prior_market_understanding", "artifacts", "memories", "active_workflow_policy", "context",
+    "research_isolation", "research_request", "research_evidence", "prior_market_understanding", "artifacts", "memories", "active_workflow_policy", "context",
     "verification_repair", "runtime_strategy_controls", "allowed_research_backends", "sha256",
     "agent_role_inputs", "spec_issue_states", "spec_evidence_gates", "spec95_baseline_sha256",
 })
@@ -126,15 +126,24 @@ def _validate_packet(packet: dict[str, Any]) -> None:
     if m0.get("as_of") and _time(m0["as_of"]) > cutoff:
         raise ValueError("M1 cannot consume a future M0")
     research_access = packet.get("research_isolation")
+    research_request = packet.get("research_request")
     research_evidence = packet.get("research_evidence")
     if research_access is not None:
         validate_access_descriptor(research_access)
+    if research_request is not None:
+        validate_request(research_request)
+        if (research_request["task_key"] != packet["task_key"]
+                or _time(research_request["as_of"]) != cutoff
+                or research_request["market_scope"].get("stage") != "m1_judgment"):
+            raise ValueError("M1 research request identity mismatch")
     if research_evidence is not None:
-        if research_access is None:
-            raise ValueError("M1 research evidence requires a QuantResearch access descriptor")
+        if research_access is None or research_request is None:
+            raise ValueError("M1 research evidence requires a QuantResearch access descriptor and request")
         if mandate["quantresearch_permission"]["enabled"] is not True:
             raise ValueError("M1 research evidence is not authorized by the mandate")
         validate_evidence(research_evidence)
+        if research_evidence["provenance"]["request_sha256"] != research_request["sha256"]:
+            raise ValueError("M1 research evidence request binding mismatch")
         if (
             _time(research_evidence["provenance"]["as_of"]) > cutoff
             or _time(research_evidence["provenance"]["known_at"]) > cutoff
@@ -159,6 +168,8 @@ def build_input(packet: dict[str, Any]) -> dict[str, Any]:
         "provenance": {"source": "runtime", "cycle_id": packet["cycle_id"],
                        "as_of": packet["as_of"], "packet_sha256": packet["sha256"]},
     }
+    if packet.get("research_request") is not None:
+        value["research_request"] = copy.deepcopy(packet["research_request"])
     if research_evidence is not None:
         value["research_evidence"] = copy.deepcopy(research_evidence)
     return validate_input(value)
@@ -167,7 +178,7 @@ def build_input(packet: dict[str, Any]) -> dict[str, Any]:
 def validate_input(value: dict[str, Any]) -> dict[str, Any]:
     required = {"contract", "version", "stage", "source_packet", "evidence_snapshot", "evidence_refs",
                 "mandate_reference", "boundary", "permissions", "quantresearch", "provenance"}
-    optional = {"research_evidence"}
+    optional = {"research_request", "research_evidence"}
     if not isinstance(value, dict) or not set(value).issubset(required | optional) or not required.issubset(value):
         raise ValueError("M1JudgmentSpec input fields are not exact")
     if value["contract"] != CONTRACT or type(value["version"]) is not int or value["version"] != VERSION or value["stage"] != "m1_judgment":
@@ -178,11 +189,20 @@ def validate_input(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("M1 blind read-only boundary mismatch")
     if value["quantresearch"] != {"access": "read_only", "write_permissions": []}:
         raise ValueError("M1 QuantResearch must be read_only")
+    research_request = value.get("research_request")
+    if packet.get("research_request") != research_request:
+        raise ValueError("M1 research request reference mismatch")
+    if research_request is not None:
+        validate_request(research_request)
     research_evidence = value.get("research_evidence")
+    if packet.get("research_evidence") != research_evidence:
+        raise ValueError("M1 research evidence reference mismatch")
     if research_evidence is not None:
-        if packet.get("research_evidence") != research_evidence:
+        if research_request is None:
             raise ValueError("M1 research evidence reference mismatch")
         validate_evidence(research_evidence)
+        if research_evidence["provenance"]["request_sha256"] != research_request["sha256"]:
+            raise ValueError("M1 research evidence request binding mismatch")
     expected_refs = list(packet["evidence_snapshot"]["included_sources"])
     if research_evidence is not None:
         expected_refs.extend(research_evidence["evidence_refs"])

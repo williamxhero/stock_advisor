@@ -68,6 +68,7 @@
         },
         "permissions": {"$ref": "#/$defs/permissions"},
         "quantresearch": {"$ref": "#/$defs/quantresearch"},
+        "research_request": {"$ref": "#/$defs/research_request"},
         "research_evidence": {"$ref": "#/$defs/research_evidence"},
         "provenance": {
           "type": "object", "additionalProperties": false,
@@ -94,6 +95,24 @@
         "write_permissions": {"type": "array", "const": []}
       }
     },
+    "research_request": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "task_key", "as_of", "market_scope", "universe", "research_goal", "baseline_strategy_version", "strategy_package", "research_run_id", "permissions", "sha256"],
+      "properties": {
+        "contract": {"type": "string", "const": "ResearchEvidenceRequest/v1"},
+        "version": {"type": "integer", "const": 1},
+        "task_key": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "as_of": {"type": "string", "minLength": 1, "format": "date-time"},
+        "market_scope": {"type": "object", "minProperties": 1},
+        "universe": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "pattern": "\\S"}},
+        "research_goal": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "baseline_strategy_version": {"type": ["string", "null"], "pattern": "\\S"},
+        "strategy_package": {"type": ["object", "null"], "minProperties": 1},
+        "research_run_id": {"type": ["string", "null"], "pattern": "\\S"},
+        "permissions": {"$ref": "#/$defs/quantresearch"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
     "research_evidence": {
       "type": "object", "additionalProperties": false,
       "required": ["contract", "version", "research_run_id", "dataset_version", "code_version", "parameter_version", "intervals", "out_of_sample", "cost_assumptions", "risk_metrics", "applicability", "baseline_comparison", "conclusion", "reproducibility", "evidence_refs", "provenance", "permissions", "quantresearch", "sha256"],
@@ -110,8 +129,8 @@
             "type": "object", "minProperties": 2,
             "required": ["start", "end"],
             "properties": {
-              "start": {"type": "string", "minLength": 1},
-              "end": {"type": "string", "minLength": 1}
+              "start": {"anyOf": [{"type": "string", "format": "date"}, {"type": "string", "format": "date-time"}]},
+              "end": {"anyOf": [{"type": "string", "format": "date"}, {"type": "string", "format": "date-time"}]}
             }
           }
         },

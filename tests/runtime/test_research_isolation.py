@@ -27,7 +27,7 @@ from ai_trading_companion.research_isolation import (
     validate_evidence,
     validate_replay,
 )
-from test_m1_judgment import AS_OF, m1_output, m1_packet
+from test_m1_judgment import AS_OF, TASK_KEY, m1_output, m1_packet
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -61,13 +61,13 @@ def evidence(**overrides):
 
 def request():
     return build_request(
-        task_key="daily.execution.0945",
+        task_key=TASK_KEY,
         as_of=AS_OF,
         market_scope={"market": "CN_A_SHARE", "stage": "m1_judgment"},
         universe=["000001", "600000"],
         research_goal="independent evidence",
         baseline_strategy_version="runtime-baseline-v1",
-        strategy_package={"contract": "CompanionResearchSubject/v1", "task_key": "daily.execution.0945"},
+        strategy_package={"contract": "CompanionResearchSubject/v1", "task_key": TASK_KEY},
     )
 
 
@@ -115,10 +115,19 @@ def test_port_reads_only_and_rejects_writes_and_raw_provider_results():
     with pytest.raises(ValueError, match="fields|versioned"):
         raw.read(request())
 
+    future = copy.deepcopy(evidence())
+    future["provenance"]["as_of"] = "2026-10-06T01:45:00Z"
+    future["provenance"]["known_at"] = "2026-10-06T02:00:00Z"
+    future["sha256"] = sha256({key: value for key, value in future.items() if key != "sha256"})
+    future["provenance"]["request_sha256"] = request()["sha256"]
+    future["sha256"] = sha256({key: value for key, value in future.items() if key != "sha256"})
+    with pytest.raises(ValueError, match="cutoff"):
+        QuantResearchPort(lambda _request: future).read(request())
+
 
 def test_m1_rejects_research_evidence_when_mandate_disables_quantresearch():
     research = evidence()
-    packet = m1_packet(research_isolation=access_descriptor(), research_evidence=research)
+    packet = m1_packet(research_isolation=access_descriptor(), research_request=request(), research_evidence=research)
     packet["mandate"] = build_mandate(
         packet["task_key"], "m1_judgment", as_of=packet["as_of"], quantresearch_enabled=False,
     )
@@ -127,9 +136,27 @@ def test_m1_rejects_research_evidence_when_mandate_disables_quantresearch():
         build_m1_input(packet)
 
 
+def test_m1_rejects_evidence_bound_to_a_different_request():
+    packet = m1_packet(
+        research_isolation=access_descriptor(), research_request=request(), research_evidence=evidence(),
+    )
+    packet["research_request"] = build_request(
+        task_key=TASK_KEY,
+        as_of=AS_OF,
+        market_scope={"market": "CN_A_SHARE", "stage": "m1_judgment"},
+        universe=["different-subject"],
+        research_goal="independent evidence",
+        baseline_strategy_version="runtime-baseline-v1",
+        strategy_package={"contract": "CompanionResearchSubject/v1", "task_key": TASK_KEY},
+    )
+    packet["sha256"] = canonical_packet_hash({key: value for key, value in packet.items() if key != "sha256"})
+    with pytest.raises(ValueError, match="request binding"):
+        build_m1_input(packet)
+
+
 def test_research_conclusion_cannot_override_m1_verdict():
     research = evidence()
-    packet = m1_packet(research_isolation=access_descriptor(), research_evidence=research)
+    packet = m1_packet(research_isolation=access_descriptor(), research_request=request(), research_evidence=research)
     contract = build_m1_input(packet)
     assert contract["research_evidence"] == research
     assert "quantresearch:run-319" in contract["evidence_refs"]
@@ -149,8 +176,10 @@ def test_runtime_packet_builder_binds_port_evidence_before_m1_hash(tmp_path):
     store, engine, cycle, _raw_packet = _runtime_builder_fixture(tmp_path)
     research = evidence()
     seen = {}
+    calls = []
 
     def reader(value):
+        calls.append(value)
         seen.update(value)
         result = copy.deepcopy(research)
         result["provenance"]["request_sha256"] = value["sha256"]
@@ -175,6 +204,19 @@ def test_runtime_packet_builder_binds_port_evidence_before_m1_hash(tmp_path):
     assert packet["research_evidence"]["provenance"]["request_sha256"] == seen["sha256"]
     assert seen["permissions"] == {"access": "read_only", "write_permissions": []}
     assert build_m1_input(packet)["research_evidence"] == packet["research_evidence"]
+
+    frozen_packet = RuntimePacketBuilder(
+        PROJECT_ROOT / "resources", store, memory=InMemoryMemoryAdapter(),
+        quant_research_port=QuantResearchPort(reader),
+    ).build(
+        cycle, "m1_judgment", evidence={
+            "schema_version": 3, "as_of": AS_OF, "spoken_summary": "公开证据",
+            "sources": [{"evidence_ref": "ev_market", "excerpt": "市场观察", "fact_as_of": AS_OF}],
+            "coverage": [], "critical_gaps": [], "conflicts": [], "high_impact_events": [],
+        }, research_evidence=packet["research_evidence"],
+    )
+    assert len(calls) == 1
+    assert frozen_packet["research_evidence"] == packet["research_evidence"]
 
 
 def test_frozen_replay_and_install_qualification_are_deterministic():

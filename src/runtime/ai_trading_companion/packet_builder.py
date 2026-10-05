@@ -26,7 +26,11 @@ from .research_isolation import (
     access_descriptor as research_access_descriptor,
     build_request as build_research_request,
     coerce_quant_research_port,
+    validate_evidence as validate_research_evidence,
 )
+
+
+_RESEARCH_EVIDENCE_UNSET = object()
 
 
 PUBLIC_STAGES = {"m0_research", "m1_research", "outcome_research", "chat_research"}
@@ -69,6 +73,7 @@ class RuntimePacketBuilder:
         message_batch: str | None = None,
         context: dict[str, Any] | None = None,
         as_of: str | None = None,
+        research_evidence: dict[str, Any] | None | object = _RESEARCH_EVIDENCE_UNSET,
     ) -> dict[str, Any]:
         if stage not in PUBLIC_STAGES | {"m0_compose", "m1_judgment", "m2", "chat", "reflection", "workflow_feedback"}:
             raise ValueError(f"unsupported packet stage: {stage}")
@@ -235,9 +240,11 @@ class RuntimePacketBuilder:
                         baseline_strategy_version="runtime-baseline-v1",
                         strategy_package={"contract": "CompanionResearchSubject/v1", "task_key": cycle["task_key"]},
                     )
-                    research_evidence = self.quant_research_port.read(research_request)
+                    packet["research_request"] = research_request
+                    if research_evidence is _RESEARCH_EVIDENCE_UNSET:
+                        research_evidence = self.quant_research_port.read(research_request)
                     if research_evidence is not None:
-                        packet["research_evidence"] = research_evidence
+                        packet["research_evidence"] = validate_research_evidence(research_evidence)
             if stage in {"m1_judgment", "m2"} and cycle["task_key"] in {
                 "daily.execution.0945", "daily.execution.1030", "daily.execution.1430", "daily.review.1520",
             }:

@@ -2635,7 +2635,17 @@ class CompanionStore:
                 "SELECT code,name,shares,average_cost,last_price,price_as_of,market_value,unrealized_pnl,weight,updated_at,revision FROM portfolio_position ORDER BY code"
             )]
             meta = {row["key"]: row["value"] for row in c.execute("SELECT key,value FROM portfolio_meta")}
-            context = {"positions": positions, "total_assets": float(meta["total_assets"]) if meta.get("total_assets") else None, "frozen_at": at}
+            assets_as_of = c.execute(
+                "SELECT occurred_at FROM portfolio_transaction "
+                "WHERE action='asset_correction' AND reverted_by IS NULL "
+                "ORDER BY occurred_at DESC,created_at DESC LIMIT 1"
+            ).fetchone()
+            context = {
+                "positions": positions,
+                "total_assets": float(meta["total_assets"]) if meta.get("total_assets") else None,
+                "assets_as_of": assets_as_of[0] if assets_as_of else None,
+                "frozen_at": at,
+            }
             raw = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             c.execute(
                 """UPDATE companion_cycle SET private_context_json=?,private_context_sha256=?,private_context_frozen_at=?,updated_at=?,revision=revision+1
@@ -2758,12 +2768,18 @@ class CompanionStore:
             total_assets = c.execute(
                 "SELECT value FROM portfolio_meta WHERE key='total_assets'"
             ).fetchone()
+            assets_as_of = c.execute(
+                "SELECT occurred_at FROM portfolio_transaction "
+                "WHERE action='asset_correction' AND reverted_by IS NULL "
+                "ORDER BY occurred_at DESC,created_at DESC LIMIT 1"
+            ).fetchone()
             updated_at = max((str(row.get("updated_at") or "") for row in positions), default=known_at)
             view = {
                 "fact_source": "runtime_database",
                 "source_artifact_id": source_artifact_id,
                 "known_at": known_at,
                 "updated_at": updated_at,
+                "assets_as_of": assets_as_of[0] if assets_as_of else None,
                 "positions": positions,
                 "total_assets": float(total_assets[0]) if total_assets else None,
             }

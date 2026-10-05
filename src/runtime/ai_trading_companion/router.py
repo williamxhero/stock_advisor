@@ -21,6 +21,7 @@ from .stage_expression import (
     verified_weekly_market_comparison,
 )
 from .transition_conditions import is_valid_condition
+from .position_safety import publication_receipt
 
 
 RESEARCH_STAGES = frozenset({"m0_research", "m1_research", "outcome_research", "chat_research"})
@@ -196,11 +197,21 @@ class CognitiveRouter:
                     receipt = build_m1_judgment_output(build_m1_judgment_input(packet), output)
                 except (TypeError, ValueError) as exc:
                     problems.append("m1_judgment_contract:" + str(exc))
-            result = {"passed": not problems, "problems": problems, "profile": profile.as_json(),
+            position_receipt = None
+            if isinstance(packet.get("position_safety"), dict):
+                try:
+                    position_receipt = publication_receipt(packet, output)
+                    if position_receipt and position_receipt["state"] == "refused":
+                        problems.extend("position_safety:" + str(problem) for problem in position_receipt["problems"])
+                except (TypeError, ValueError) as exc:
+                    problems.append("position_safety_contract:" + str(exc))
+            result = {"passed": not problems, "problems": list(dict.fromkeys(problems)), "profile": profile.as_json(),
                       "publication": output.get("publication"),
                       "fallback": bool((output.get("publication") or {}).get("fallback"))}
             if receipt is not None and not problems:
                 result["m1_judgment"] = receipt
+            if position_receipt is not None:
+                result["position_safety"] = position_receipt
             return result
         normalized = normalize_stage_output(stage, output)
         if stage == "m0_compose":

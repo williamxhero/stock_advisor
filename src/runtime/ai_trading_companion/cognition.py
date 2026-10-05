@@ -15,6 +15,7 @@ from .portfolio import (
     is_portfolio_statement,
     is_portfolio_write_statement,
 )
+from .position_safety import assert_no_execution, assert_operation
 from .store import digest
 from .task_profiles import AnalysisClarificationRequired
 from .memory_write import write_memory
@@ -50,6 +51,10 @@ def verify_cognition_result(messages: list[dict[str, Any]], result: dict[str, An
         if is_complete_portfolio_snapshot_statement(str(message.get("body_text") or ""))
     }
     problems: list[str] = []
+    try:
+        assert_no_execution(result)
+    except ValueError as exc:
+        problems.append("position_safety:" + str(exc))
     snapshot_message_ids = {
         str((action.get("source_span") or {}).get("message_id") or "")
         for action in result.get("actions") or []
@@ -406,13 +411,19 @@ class UnifiedCognition:
         }
 
     def _execute(self, action_id: str, action_type: str, action: dict[str, Any], message: dict[str, Any], cycle: dict[str, Any], source_artifact: dict[str, Any]) -> dict[str, Any]:
+        try:
+            assert_no_execution(action)
+        except ValueError as exc:
+            return {"action_id": action_id, "action_type": action_type, "state": "rejected", "reason": str(exc)}
         if action_type == "portfolio.apply":
+            assert_operation("runtime", "record_verified_fact")
             extraction = {"statement_type": action.get("statement_type"), "changes": action.get("changes") or []}
             applied = self.portfolio.apply_extraction(
                 message["body_text"], extraction, cycle["cycle_id"], source_artifact["artifact_id"]
             )
             return {"action_id": action_id, "action_type": action_type, **applied}
         if action_type == "portfolio.replace_complete_snapshot":
+            assert_operation("runtime", "record_verified_fact")
             applied = self.portfolio.replace_complete_snapshot(
                 message["body_text"], action.get("changes") or [], cycle["cycle_id"], source_artifact["artifact_id"]
             )

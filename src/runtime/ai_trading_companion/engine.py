@@ -26,6 +26,12 @@ from .store import (
 from .task_profiles import ManualAnalysisProfileResolver
 from .decision_cycle import DECISION_CYCLE_CONTRACT
 from .mandate_spec import resolve_cycle_mandates
+from .evidence_snapshot import descriptor as evidence_snapshot_descriptor
+from .m0_observation import (
+    build_input as build_m0_observation_input,
+    sha256 as m0_observation_sha256,
+    validate_output as validate_m0_observation_output,
+)
 
 
 def utc_now() -> datetime:
@@ -563,6 +569,45 @@ class CompanionEngine:
         self.store.verified_attempt(evidence_attempt_id, cycle_id, "m0_research", evidence_packet_hash)
         compose_attempt = self.store.verified_attempt(compose_attempt_id, cycle_id, "m0_compose", packet_hash)
         compose_output = json.loads(compose_attempt.get("output_json") or "null")
+        compose_verifier = compose_attempt.get("verifier") if isinstance(compose_attempt.get("verifier"), dict) else {}
+        m0_observation = compose_verifier.get("m0_observation")
+        if isinstance(compose_output, dict) and compose_output.get("result_version") == 3:
+            if not isinstance(m0_observation, dict):
+                raise ValueError("M0 compose attempt lacks its versioned observation receipt")
+            try:
+                validate_m0_observation_output(m0_observation)
+                if m0_observation["provenance"].get("attempt_id") != compose_attempt_id:
+                    raise ValueError("receipt attempt identity mismatch")
+                if m0_observation["provenance"].get("packet_sha256") != packet_hash:
+                    raise ValueError("receipt packet identity mismatch")
+                if m0_observation["provenance"].get("output_sha256") != m0_observation_sha256(compose_output):
+                    raise ValueError("receipt output identity mismatch")
+                raw_packet = json.loads(compose_attempt.get("input_packet_json") or "null")
+                if not isinstance(raw_packet, dict):
+                    raise ValueError("compose attempt has no frozen packet")
+                if raw_packet.get("sha256") != packet_hash:
+                    raise ValueError("compose attempt packet identity mismatch")
+                stored_snapshot = self.store.evidence_snapshot(
+                    (m0_observation.get("evidence_snapshot") or {}).get("snapshot_id")
+                )
+                if not isinstance(stored_snapshot, dict):
+                    raise ValueError("receipt snapshot is not Runtime-owned")
+                if evidence_snapshot_descriptor(stored_snapshot) != m0_observation["evidence_snapshot"]:
+                    raise ValueError("receipt snapshot identity mismatch")
+                if raw_packet.get("evidence") != stored_snapshot.get("baseline"):
+                    raise ValueError("compose packet evidence baseline mismatch")
+                contract_packet = dict(raw_packet)
+                if isinstance(contract_packet.get("artifacts"), list):
+                    contract_packet["artifacts"] = [
+                        item for item in contract_packet["artifacts"]
+                        if not isinstance(item, dict) or str(item.get("kind") or "").casefold()
+                        not in {"h0", "m1", "m2", "pre_m0", "premarket", "premarket_chat"}
+                    ]
+                expected_input = build_m0_observation_input(contract_packet)
+                if m0_observation["provenance"].get("input_sha256") != m0_observation_sha256(expected_input):
+                    raise ValueError("receipt input identity mismatch")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("M0 observation receipt is not qualified") from exc
         verified_m0 = normalize_stage_output("m0_compose", compose_output if isinstance(compose_output, dict) else {}).text
         if verified_m0 != m0:
             raise ValueError("M0 body does not match the verified compose attempt")
@@ -585,11 +630,21 @@ class CompanionEngine:
             m0, evidence_as_of or cycle["as_of"], "m0",
             model=compose_attempt.get("model"), provider=compose_attempt.get("broker_provider"),
         )
+        observation_metadata = {
+            "contract": m0_observation.get("contract") if isinstance(m0_observation, dict) else None,
+            "version": m0_observation.get("version") if isinstance(m0_observation, dict) else None,
+            "sha256": m0_observation_sha256(m0_observation) if isinstance(m0_observation, dict) else None,
+            "snapshot_id": (m0_observation.get("evidence_snapshot") or {}).get("snapshot_id")
+            if isinstance(m0_observation, dict) else None,
+        }
         self._append_published_memory(cycle, presented)
         with self.store.connection() as connection:
             artifact = self.store.append_artifact(
                 cycle_id, "m0", "model", presented.markdown, evidence_as_of or cycle["as_of"],
-                self._presentation_metadata({"direction_free": True, "evidence_attempt_id": evidence_attempt_id, "compose_attempt_id": compose_attempt_id}, presented),
+                self._presentation_metadata({
+                    "direction_free": True, "evidence_attempt_id": evidence_attempt_id,
+                    "compose_attempt_id": compose_attempt_id, "m0_observation": observation_metadata,
+                }, presented),
                 connection=connection,
             )
             cycle = self.store.transition(
@@ -610,6 +665,7 @@ class CompanionEngine:
                 "m0": presented.markdown,
                 "presentation": presented.metadata()["presentation"],
                 "message": presented.message(),
+                "m0_observation": observation_metadata,
                 "source_artifact_id": artifact["artifact_id"],
                 "resolved_fault_episode_ids": resolved_fault_episode_ids,
                 "h0_auto_submit_at": cycle["h0_auto_submit_at"],

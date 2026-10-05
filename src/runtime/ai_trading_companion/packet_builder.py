@@ -79,6 +79,11 @@ class RuntimePacketBuilder:
                 "sha256": mandate["sha256"],
             },
         }
+        if stage == "m0_compose":
+            # Bind the observation contract before deriving the packet hash.
+            packet["m0_observation_spec"] = {
+                "contract": "M0ObservationSpec/v1", "version": 1,
+            }
         frozen_cycle = json.loads(cycle["cycle_contract_json"])
         # Reference the immutable creation input without exposing workflow or
         # diagnostic metadata to the independent M1 path.

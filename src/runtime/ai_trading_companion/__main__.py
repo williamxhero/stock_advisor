@@ -65,6 +65,7 @@ from .preview import approve_bundle, build_bundle, find_source_cycle, launch_pre
 from .scheduler import SHANGHAI, conversation_auto_submit_at, ensure_registered_policy, run_registry_schedule
 from .schedule_registry import ScheduleRegistry, _target_for_day
 from .router import CognitiveRouter
+from .m0_observation import bind_attempt as bind_m0_observation_attempt
 from .runtime_strategy_policy import RuntimeStrategyControls, RuntimeStrategyPolicy
 from .stage_expression import normalize_stage_output, safe_stage_output
 from .judgment_publication import (
@@ -230,6 +231,16 @@ def _save_safe_stage_fallback(
         "fallback": True,
         "reason": "provider_candidate_not_publishable",
     }
+    if (
+        stage == "m0_compose" and output.get("result_version") == 3
+        and verifier.get("passed") and isinstance(verifier.get("m0_observation"), dict)
+    ):
+        verifier = {
+            **verifier,
+            "m0_observation": bind_m0_observation_attempt(
+                verifier["m0_observation"], attempt["attempt_id"],
+            ),
+        }
     if not business_verifier.get("passed"):
         store.finish_attempt(
             attempt["attempt_id"], "failed", output=output, verifier=verifier,
@@ -344,7 +355,10 @@ def _model_stage_packet(stage: str, packet: dict[str, Any]) -> dict[str, Any]:
     if stage == "m0_compose":
         projected["artifacts"] = [
             row for row in packet.get("artifacts") or []
-            if isinstance(row, dict) and row.get("kind") not in {"evidence", "m1_evidence"}
+            if isinstance(row, dict) and row.get("kind") not in {
+                "evidence", "m1_evidence", "h0", "m1", "m2", "pre_m0",
+                "premarket", "premarket_chat",
+            }
         ]
         periodic = str(packet.get("task_key") or "").startswith("periodic.")
         projected["memories"] = model_memories(
@@ -1323,6 +1337,24 @@ def _call_stage(
                 "agent_role_outputs": [role_output],
             }
             coordinator_claim_finished = True
+        if (
+            stage == "m0_compose" and isinstance(data, dict)
+            and data.get("result_version") == 3
+            and verifier.get("passed")
+            and isinstance(verifier.get("m0_observation"), dict)
+        ):
+            try:
+                verifier = {
+                    **verifier,
+                    "m0_observation": bind_m0_observation_attempt(
+                        verifier["m0_observation"], attempt["attempt_id"],
+                    ),
+                }
+            except ValueError as exc:
+                verifier = {
+                    **verifier, "passed": False,
+                    "problems": [*verifier.get("problems", []), f"m0_observation_contract:{exc}"],
+                }
         status = "succeeded" if verifier.get("passed") else "rejected"
         output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(

@@ -30,6 +30,7 @@ foreach ($required in @(
     'resources\contracts\analysis-skill-spec-v1.schema.json',
     'resources\contracts\skill-registry-spec-v1.schema.json',
     'resources\contracts\adapter-contract-spec-v1.schema.json',
+    'resources\contracts\mandate-spec-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
     'runtime\ai_trading_companion\cycle_replay.py',
@@ -46,6 +47,7 @@ foreach ($required in @(
     'runtime\ai_trading_companion\analysis_skill.py',
     'runtime\ai_trading_companion\skill_registry.py',
     'runtime\ai_trading_companion\adapter_contract.py',
+    'runtime\ai_trading_companion\mandate_spec.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'
 )) {
@@ -75,6 +77,15 @@ if ($skillRegistrySchema.title -ne 'SkillRegistrySpec/v1' -or $skillRegistrySche
 foreach ($required in @('contract', 'version', 'registry_version', 'skills', 'provenance', 'permissions')) {
     if ($skillRegistrySchema.required -notcontains $required) {
         throw "Installed SkillRegistry schema is missing required field: $required."
+    }
+}
+$mandateSchema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\mandate-spec-v1.schema.json') -Raw | ConvertFrom-Json
+if ($mandateSchema.title -ne 'MandateSpec/v1' -or $mandateSchema.'$schema' -ne 'https://json-schema.org/draft/2020-12/schema') {
+    throw 'Installed MandateSpec schema has an unexpected contract or schema dialect.'
+}
+foreach ($required in @('contract', 'version', 'task_key', 'stage', 'required_skills', 'optional_skills', 'memory_scope', 'quantresearch_permission', 'risk_level', 'visibility', 'provenance', 'permissions', 'sha256')) {
+    if ($mandateSchema.required -notcontains $required) {
+        throw "Installed MandateSpec schema is missing required field: $required."
     }
 }
 $m1Schema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\companion-m1-result-v5.schema.json') -Raw | ConvertFrom-Json
@@ -280,6 +291,20 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
         $adapterQualification = $adapterReplayOne | ConvertFrom-Json
         if ($adapterQualification.contract -ne 'AdapterContractInstallQualification/v1' -or $adapterQualification.qualified -ne $true) {
             throw 'Installed AdapterContract qualification did not pass.'
+        }
+        $mandateReplayOne = ((& $python -m ai_trading_companion.mandate_spec) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed MandateSpec replay 1 failed with exit code $LASTEXITCODE." }
+        $mandateReplayTwo = ((& $python -m ai_trading_companion.mandate_spec) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed MandateSpec replay 2 failed with exit code $LASTEXITCODE." }
+        if ($mandateReplayOne -ne $mandateReplayTwo) { throw 'Installed MandateSpec frozen replays were not deterministic.' }
+        $mandateQualification = $mandateReplayOne | ConvertFrom-Json
+        if ($mandateQualification.contract -ne 'MandateSpecInstallQualification/v1' -or $mandateQualification.qualified -ne $true) {
+            throw 'Installed MandateSpec qualification did not pass.'
+        }
+        foreach ($check in @('schema', 'frozen_replay', 'm1_blind', 'read_only')) {
+            if ($mandateQualification.evaluation_vector.$check -ne $true) {
+                throw "Installed MandateSpec qualification check failed: $check"
+            }
         }
         $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")
         if ($LASTEXITCODE -ne 0) { throw "Installed Debate replay 1 failed with exit code $LASTEXITCODE." }

@@ -422,6 +422,11 @@ def test_engine_m1_ready_reconstructs_receipt_metadata_and_rejects_tampering(tmp
     assert metadata["m1_judgment"]["version"] == 1
     assert metadata["m1_judgment"]["sha256"] == bound["sha256"]
     assert metadata["m1_judgment"]["snapshot_id"] == raw_packet["evidence_snapshot"]["snapshot_id"]
+    assert metadata["audit"]["contract"] == "AuditSpec/v1"
+    audit_rows = store.audit_records(cycle["cycle_id"])
+    m1_audit = next(item["record"] for item in audit_rows if item["record"]["stage"] == "m1_judgment")
+    assert m1_audit["attempt_id"] == judgment["attempt_id"]
+    assert m1_audit["propositions"]
 
 
 def test_engine_m1_ready_rejects_foreign_stale_tampered_and_shadow_attempts(tmp_path):

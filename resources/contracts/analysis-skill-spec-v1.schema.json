@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AnalysisSkillSpec/v1 input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "version", "skill_id", "skill_version", "capabilities", "required_inputs", "mode", "inputs", "provenance", "permissions"],
+  "properties": {
+    "contract": {"const": "AnalysisSkillSpec/v1"}, "version": {"const": 1},
+    "skill_id": {"type": "string", "minLength": 1}, "skill_version": {"type": "string", "minLength": 1},
+    "capabilities": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+    "required_inputs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "mode": {"enum": ["deterministic", "probabilistic"]},
+    "inputs": {"type": "object"},
+    "provenance": {"type": "object", "required": ["as_of"], "properties": {"as_of": {"type": "string", "minLength": 1}, "cycle_id": {"type": ["string", "null"]}}},
+    "permissions": {"type": "object", "required": ["write_permissions"], "properties": {"write_permissions": {"const": []}}}
+  }
+}

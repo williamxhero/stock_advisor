@@ -26,6 +26,7 @@ foreach ($required in @(
     'resources\contracts\debate-input-v1.schema.json',
     'resources\contracts\memory-type-spec-v1.schema.json',
     'resources\contracts\memory-write-spec-v1.schema.json',
+    'resources\contracts\reflection-spec-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
     'runtime\ai_trading_companion\cycle_replay.py',
@@ -38,6 +39,7 @@ foreach ($required in @(
     'runtime\ai_trading_companion\debate.py',
     'runtime\ai_trading_companion\memory_type.py',
     'runtime\ai_trading_companion\memory_write.py',
+    'runtime\ai_trading_companion\reflection.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'
 )) {
@@ -222,6 +224,15 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
         }
         foreach ($check in $memoryWriteQualification.checks.PSObject.Properties) {
             if ($check.Value -ne $true) { throw "Installed MemoryWrite check failed: $($check.Name)" }
+        }
+        $reflectionReplayOne = ((& $python -m ai_trading_companion.reflection) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed Reflection replay 1 failed with exit code $LASTEXITCODE." }
+        $reflectionReplayTwo = ((& $python -m ai_trading_companion.reflection) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed Reflection replay 2 failed with exit code $LASTEXITCODE." }
+        if ($reflectionReplayOne -ne $reflectionReplayTwo) { throw 'Installed Reflection frozen replays were not deterministic.' }
+        $reflectionQualification = $reflectionReplayOne | ConvertFrom-Json
+        if ($reflectionQualification.contract -ne 'ReflectionInstallQualification/v1' -or $reflectionQualification.qualified -ne $true) {
+            throw 'Installed Reflection qualification did not pass.'
         }
         $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")
         if ($LASTEXITCODE -ne 0) { throw "Installed Debate replay 1 failed with exit code $LASTEXITCODE." }

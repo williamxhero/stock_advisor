@@ -484,6 +484,25 @@ class CompanionStore:
               claimed_at TEXT, completed_at TEXT, error TEXT);
             CREATE INDEX IF NOT EXISTS ix_capability_need_state_priority
               ON capability_need(state, urgency, updated_at);
+            CREATE TABLE IF NOT EXISTS audit_record (
+              record_id TEXT PRIMARY KEY,
+              cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              stage TEXT NOT NULL,
+              attempt_id TEXT NOT NULL,
+              writer_source TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              content_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              UNIQUE(cycle_id, stage, attempt_id)
+            );
+            CREATE INDEX IF NOT EXISTS ix_audit_record_cycle
+              ON audit_record(cycle_id, stage, created_at);
+            CREATE TRIGGER IF NOT EXISTS audit_record_no_update
+              BEFORE UPDATE ON audit_record
+              BEGIN SELECT RAISE(ABORT, 'audit records are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS audit_record_no_delete
+              BEFORE DELETE ON audit_record
+              BEGIN SELECT RAISE(ABORT, 'audit records are immutable'); END;
             PRAGMA user_version = 21;
             """)
             cycle_columns = {row[1] for row in c.execute("PRAGMA table_info(companion_cycle)")}
@@ -1958,6 +1977,88 @@ class CompanionStore:
                                 provenance=provenance,
                                 payload={"stage": stage, "rerun_cycle_id": rerun["cycle_id"]})
         return rerun
+
+    def append_audit_record(
+        self, record: dict[str, Any], *, writer_identity: dict[str, Any] | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        """Append one immutable Runtime execution audit record.
+
+        EvaluationObservatory deliberately has no write path here.  The
+        identity is checked against the record and only ``source=runtime`` is
+        accepted, so an evaluator or provider cannot impersonate an executor.
+        """
+        from .audit_contract import validate_output
+        expected = writer_identity or record.get("writer_identity")
+        validate_output(record, expected_writer_identity=expected)
+        writer = record["writer_identity"]
+        if writer.get("source") != "runtime":
+            raise PermissionError("only Runtime execution components may write audit records")
+        raw = canonical_json(record)
+        record_id = str(record.get("sha256") or digest(raw))
+        cycle_id = str(record["cycle_id"])
+        stage = str(record["stage"])
+        attempt_id = str(record["attempt_id"])
+
+        def insert(c: sqlite3.Connection) -> dict[str, Any]:
+            existing = c.execute("SELECT * FROM audit_record WHERE record_id=?", (record_id,)).fetchone()
+            if existing is not None:
+                if existing["payload_json"] != raw:
+                    raise ValueError("audit record identity collision")
+                return dict(existing)
+            conflict = c.execute(
+                "SELECT * FROM audit_record WHERE cycle_id=? AND stage=? AND attempt_id=?",
+                (cycle_id, stage, attempt_id),
+            ).fetchone()
+            if conflict is not None:
+                if conflict["payload_json"] != raw:
+                    raise ValueError("audit execution fact already exists with different content")
+                return dict(conflict)
+            created = now()
+            c.execute(
+                """INSERT INTO audit_record(
+                     record_id,cycle_id,stage,attempt_id,writer_source,payload_json,content_sha256,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (record_id, cycle_id, stage, attempt_id, writer["source"], raw, record["sha256"], created),
+            )
+            return dict(c.execute("SELECT * FROM audit_record WHERE record_id=?", (record_id,)).fetchone())
+
+        if connection is not None:
+            return insert(connection)
+        with self.connection() as current:
+            return insert(current)
+
+    # Short aliases keep the storage seam discoverable without exposing a
+    # second mutable representation of the contract.
+    append_audit = append_audit_record
+
+    def audit_record(self, record_id: str) -> dict[str, Any] | None:
+        with self.connection() as c:
+            row = c.execute("SELECT * FROM audit_record WHERE record_id=?", (record_id,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["record"] = json.loads(result.pop("payload_json"))
+        return result
+
+    def audit_records(self, cycle_id: str) -> list[dict[str, Any]]:
+        with self.connection() as c:
+            rows = c.execute(
+                "SELECT * FROM audit_record WHERE cycle_id=? ORDER BY created_at,record_id", (cycle_id,)
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["record"] = json.loads(item.pop("payload_json"))
+            result.append(item)
+        return result
+
+    def reference_audit_record(self, record_id: str) -> dict[str, Any]:
+        """Read one immutable audit fact for evaluators without a write API."""
+        value = self.audit_record(record_id)
+        if value is None:
+            raise ValueError("unknown audit record")
+        return value
 
     def append_artifact(self, cycle_id: str, kind: str, actor: str, body: str, as_of: str, metadata: dict[str, Any] | None=None, *, occurred_at: str | None=None, known_at: str | None=None, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
         if not body.strip(): raise ValueError("artifact body must not be empty")

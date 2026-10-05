@@ -29,6 +29,7 @@ from .mandate_spec import resolve_cycle_mandates
 from .evidence_snapshot import descriptor as evidence_snapshot_descriptor
 from .m1_judgment import build_input as build_m1_judgment_input, build_output as build_m1_judgment_output
 from .research_isolation import coerce_quant_research_port
+from .audit_contract import build_output as build_audit_output, expected_writer_identity
 from .m0_observation import (
     build_input as build_m0_observation_input,
     sha256 as m0_observation_sha256,
@@ -257,6 +258,69 @@ class CompanionEngine:
             "contract": "SkillRegistryExecution/v1", "resolution": resolution,
             "result": result, "audit_artifact": audit_artifact,
         }
+
+    def _record_audit(
+        self, cycle: dict[str, Any], *, stage: str, attempt_id: str,
+        output: dict[str, Any] | None, judgment_text: str, qualified: bool,
+        artifact_id: str | None = None, connection: Any | None = None,
+    ) -> dict[str, Any]:
+        """Write the compact audit fact after the executing attempt is known."""
+        attempts = {str(row["attempt_id"]): row for row in self.store.attempts(cycle["cycle_id"])}
+        attempt = attempts.get(str(attempt_id), {})
+        packet: dict[str, Any] = {}
+        try:
+            packet_value = json.loads(attempt.get("input_packet_json") or "{}")
+            if isinstance(packet_value, dict):
+                packet = packet_value
+        except (TypeError, ValueError, json.JSONDecodeError):
+            packet = {}
+        if not packet:
+            packet = {"cycle_id": cycle["cycle_id"], "task_key": cycle["task_key"],
+                      "stage": stage, "as_of": cycle["as_of"], "schema_version": 1}
+        packet.setdefault("cycle_id", cycle["cycle_id"])
+        packet.setdefault("stage", stage)
+        packet.setdefault("as_of", cycle["as_of"])
+        qualification = {
+            "verdict": "qualified" if qualified else "rejected",
+            "passed": bool(qualified),
+            "reasons": [] if qualified else ["execution_or_publication_not_qualified"],
+        }
+        text = str(judgment_text or "No judgment was published.").strip() or "No judgment was published."
+        # Legacy fixture attempts use human-readable packet hashes.  The audit
+        # identity is still deterministic and records the actual packet digest.
+        packet_hash = packet.get("sha256")
+        if not isinstance(packet_hash, str) or len(packet_hash) != 64:
+            packet.pop("sha256", None)
+            packet["sha256"] = hashlib.sha256(
+                json.dumps(packet, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+        audit_stage = stage if stage in {"m0", "m0_research", "m0_compose", "m1", "m1_research", "m1_judgment", "m2"} else stage
+        expected_writer = expected_writer_identity(
+            cycle_id=cycle["cycle_id"], stage=audit_stage, attempt_id=str(attempt_id),
+            component="companion-engine",
+        )
+        stage_name = {"m0_compose": "m0", "m1_judgment": "m1", "m2": "m2"}.get(audit_stage)
+        stage_run = self.store.stage_status(cycle["cycle_id"], stage_name) if stage_name else None
+        output_hash = str(attempt.get("output_sha256") or "")
+        if len(output_hash) != 64:
+            output_hash = hashlib.sha256(
+                json.dumps(output if isinstance(output, dict) else {}, ensure_ascii=False,
+                           sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+        record = build_audit_output(
+            cycle_id=cycle["cycle_id"], stage=audit_stage, attempt_id=str(attempt_id),
+            packet=packet, output=output if isinstance(output, dict) else {}, attempt=attempt,
+            qualification=qualification,
+            judgment={"state": "published" if artifact_id else "not_published", "text": text,
+                      "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                      "proposition_ids": []},
+            writer_identity=expected_writer,
+            stage_run_id=str(stage_run["stage_run_id"]) if stage_run else None,
+            input_sha256=packet["sha256"], output_sha256=output_hash,
+        )
+        return self.store.append_audit_record(
+            record, writer_identity=expected_writer, connection=connection,
+        )
 
     def _stage_started(
         self, cycle_id: str, stage: str, *, as_of: str | None = None,
@@ -643,11 +707,23 @@ class CompanionEngine:
         }
         self._append_published_memory(cycle, presented)
         with self.store.connection() as connection:
+            audit_row = self._record_audit(
+                cycle, stage="m0_compose", attempt_id=compose_attempt_id,
+                output=compose_output if isinstance(compose_output, dict) else {},
+                judgment_text=presented.markdown, qualified=True, artifact_id="pending",
+                connection=connection,
+            )
+            audit_metadata = {
+                "record_id": audit_row["record_id"],
+                "sha256": audit_row["content_sha256"],
+                "contract": "AuditSpec/v1",
+            }
             artifact = self.store.append_artifact(
                 cycle_id, "m0", "model", presented.markdown, evidence_as_of or cycle["as_of"],
                 self._presentation_metadata({
                     "direction_free": True, "evidence_attempt_id": evidence_attempt_id,
                     "compose_attempt_id": compose_attempt_id, "m0_observation": observation_metadata,
+                    "audit": audit_metadata,
                 }, presented),
                 connection=connection,
             )
@@ -1200,6 +1276,17 @@ class CompanionEngine:
                 for metadata in [json.loads(item.get("metadata_json") or "{}")]
             ]
         with self.store.connection() as connection:
+            audit_row = self._record_audit(
+                cycle, stage="m1_judgment", attempt_id=judgment_attempt_id,
+                output=verified_output if isinstance(verified_output, dict) else {},
+                judgment_text=presented.markdown, qualified=verified_qualified,
+                artifact_id="pending", connection=connection,
+            )
+            audit_metadata["audit"] = {
+                "record_id": audit_row["record_id"],
+                "sha256": audit_row["content_sha256"],
+                "contract": "AuditSpec/v1",
+            }
             artifact = self.store.append_artifact(
                 cycle_id, "m1", "model", presented.markdown, as_of or iso(utc_now()),
                 self._presentation_metadata(audit_metadata, presented),
@@ -1459,9 +1546,24 @@ class CompanionEngine:
         )
         self._append_published_memory(cycle, presented)
         with self.store.connection() as connection:
+            audit_row = self._record_audit(
+                cycle, stage="m2", attempt_id=attempt_id,
+                output=verified_output if isinstance(verified_output, dict) else {},
+                judgment_text=presented.markdown,
+                qualified=bool(snapshot.get("qualified")) if isinstance(snapshot, dict) else True,
+                artifact_id="pending", connection=connection,
+            )
+            artifact_metadata = {
+                "attempt_id": attempt_id,
+                "audit": {
+                    "record_id": audit_row["record_id"],
+                    "sha256": audit_row["content_sha256"],
+                    "contract": "AuditSpec/v1",
+                },
+            }
             artifact = self.store.append_artifact(
                 cycle_id, "m2", "model", presented.markdown, as_of or iso(utc_now()),
-                self._presentation_metadata({"attempt_id": attempt_id}, presented), connection=connection,
+                self._presentation_metadata(artifact_metadata, presented), connection=connection,
             )
             self.judgments.capture(
                 artifact, "m2", presented.markdown, snapshot=snapshot,

@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuditSpec/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "version", "cycle_id", "stage", "attempt_id", "writer_identity", "data_versions", "code_versions", "parameter_versions", "capabilities", "evidence_catalog", "propositions", "risks", "qualification", "judgment", "provenance", "sha256"],
+  "properties": {
+    "contract": {"const": "AuditSpec/v1"},
+    "version": {"type": "integer", "const": 1},
+    "cycle_id": {"type": "string", "minLength": 1},
+    "stage": {"type": "string", "enum": ["m0", "m0_research", "m0_compose", "h0", "m1", "m1_research", "m1_judgment", "m2", "outcome", "reflection", "chat"]},
+    "attempt_id": {"type": "string", "minLength": 1},
+    "writer_identity": {"$ref": "#/$defs/writer"},
+    "data_versions": {"type": "object", "minProperties": 1},
+    "code_versions": {"type": "object", "minProperties": 1},
+    "parameter_versions": {"type": "object", "minProperties": 1},
+    "capabilities": {"$ref": "#/$defs/capabilities"},
+    "evidence_catalog": {"type": "array", "items": {"$ref": "#/$defs/evidence"}, "uniqueItems": true},
+    "propositions": {"type": "array", "items": {"$ref": "#/$defs/proposition"}, "uniqueItems": true},
+    "risks": {"type": "array", "items": {"$ref": "#/$defs/risk"}},
+    "qualification": {"$ref": "#/$defs/qualification"},
+    "judgment": {"$ref": "#/$defs/judgment"},
+    "provenance": {"$ref": "#/$defs/provenance"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "writer": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "component", "cycle_id", "stage", "attempt_id"],
+      "properties": {
+        "source": {"const": "runtime"}, "component": {"type": "string", "minLength": 1},
+        "cycle_id": {"type": "string", "minLength": 1}, "stage": {"type": "string", "minLength": 1},
+        "attempt_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "capabilities": {
+      "type": "object", "additionalProperties": false,
+      "required": ["models", "providers", "agents", "skills", "adapters"],
+      "properties": {
+        "models": {"type": "array"}, "providers": {"type": "array"}, "agents": {"type": "array"},
+        "skills": {"type": "array"}, "adapters": {"type": "array"}
+      }
+    },
+    "evidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ref", "source", "sha256", "as_of", "known_at"],
+      "properties": {
+        "ref": {"type": "string", "minLength": 1}, "source": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "as_of": {"type": "string", "format": "date-time"}, "known_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "proposition": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "kind", "text", "evidence_refs", "counterevidence_refs"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1}, "kind": {"type": "string", "minLength": 1},
+        "text": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "counterevidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      }
+    },
+    "risk": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "text", "evidence_refs"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1}, "text": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      }
+    },
+    "qualification": {
+      "type": "object", "additionalProperties": false, "required": ["verdict", "passed", "reasons"],
+      "properties": {"verdict": {"enum": ["qualified", "rejected", "blocked", "unknown"]}, "passed": {"type": "boolean"}, "reasons": {"type": "array", "items": {"type": "string"}}}
+    },
+    "judgment": {
+      "type": "object", "additionalProperties": false, "required": ["state", "text", "sha256", "proposition_ids"],
+      "properties": {"state": {"enum": ["published", "not_published"]}, "text": {"type": "string", "minLength": 1, "maxLength": 4000}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "proposition_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}}
+    },
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "cycle_id", "stage", "attempt_id", "stage_run_id", "packet_sha256", "input_sha256", "output_sha256"],
+      "properties": {
+        "source": {"const": "runtime"}, "cycle_id": {"type": "string", "minLength": 1}, "stage": {"type": "string", "minLength": 1}, "attempt_id": {"type": "string", "minLength": 1}, "stage_run_id": {"type": ["string", "null"]},
+        "packet_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "output_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

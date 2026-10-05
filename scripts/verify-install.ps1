@@ -28,6 +28,7 @@ foreach ($required in @(
     'resources\contracts\memory-write-spec-v1.schema.json',
     'resources\contracts\reflection-spec-v1.schema.json',
     'resources\contracts\analysis-skill-spec-v1.schema.json',
+    'resources\contracts\skill-registry-spec-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
     'runtime\ai_trading_companion\cycle_replay.py',
@@ -42,6 +43,7 @@ foreach ($required in @(
     'runtime\ai_trading_companion\memory_write.py',
     'runtime\ai_trading_companion\reflection.py',
     'runtime\ai_trading_companion\analysis_skill.py',
+    'runtime\ai_trading_companion\skill_registry.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'
 )) {
@@ -62,6 +64,15 @@ if ($coordinatorSchema.title -ne 'CoordinatorSpec/v1' -or $coordinatorSchema.'$s
 foreach ($required in @('contract', 'version', 'dependency_graph', 'states', 'frontier', 'lifecycles')) {
     if ($coordinatorSchema.required -notcontains $required) {
         throw "Installed CoordinatorSpec schema is missing required field: $required."
+    }
+}
+$skillRegistrySchema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\skill-registry-spec-v1.schema.json') -Raw | ConvertFrom-Json
+if ($skillRegistrySchema.title -ne 'SkillRegistrySpec/v1' -or $skillRegistrySchema.'$schema' -ne 'https://json-schema.org/draft/2020-12/schema') {
+    throw 'Installed SkillRegistry schema has an unexpected contract or schema dialect.'
+}
+foreach ($required in @('contract', 'version', 'registry_version', 'skills', 'provenance', 'permissions')) {
+    if ($skillRegistrySchema.required -notcontains $required) {
+        throw "Installed SkillRegistry schema is missing required field: $required."
     }
 }
 $m1Schema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\companion-m1-result-v5.schema.json') -Raw | ConvertFrom-Json
@@ -244,6 +255,20 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
         $analysisSkillQualification = $analysisSkillReplayOne | ConvertFrom-Json
         if ($analysisSkillQualification.contract -ne 'AnalysisSkillInstallQualification/v1' -or $analysisSkillQualification.qualified -ne $true) {
             throw 'Installed AnalysisSkill qualification did not pass.'
+        }
+        $skillRegistryReplayOne = ((& $python -m ai_trading_companion.skill_registry) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed SkillRegistry replay 1 failed with exit code $LASTEXITCODE." }
+        $skillRegistryReplayTwo = ((& $python -m ai_trading_companion.skill_registry) -join "`n")
+        if ($LASTEXITCODE -ne 0) { throw "Installed SkillRegistry replay 2 failed with exit code $LASTEXITCODE." }
+        if ($skillRegistryReplayOne -ne $skillRegistryReplayTwo) { throw 'Installed SkillRegistry frozen replays were not deterministic.' }
+        $skillRegistryQualification = $skillRegistryReplayOne | ConvertFrom-Json
+        if ($skillRegistryQualification.contract -ne 'SkillRegistryInstallQualification/v1' -or $skillRegistryQualification.qualified -ne $true) {
+            throw 'Installed SkillRegistry qualification did not pass.'
+        }
+        foreach ($axis in @('delivery_speed', 'qualification_probability', 'research_quality', 'judgment_outcome', 'safety_reliability')) {
+            if ($skillRegistryQualification.evaluation_vector.PSObject.Properties.Name -notcontains $axis) {
+                throw "Installed SkillRegistry qualification is missing evaluation axis: $axis"
+            }
         }
         $debateReplayOne = ((& $python -m ai_trading_companion.debate) -join "`n")
         if ($LASTEXITCODE -ne 0) { throw "Installed Debate replay 1 failed with exit code $LASTEXITCODE." }

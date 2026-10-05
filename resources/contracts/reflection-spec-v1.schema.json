@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReflectionSpec/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "version", "status", "diagnosis", "reason", "diagnostic_evidence_refs", "judgment_snapshot", "outcome", "lesson_candidate", "provenance", "permissions"],
+  "properties": {
+    "contract": {"const": "ReflectionSpec/v1"}, "version": {"const": 1},
+    "status": {"enum": ["qualified", "partial", "inconclusive", "failed"]},
+    "diagnosis": {"enum": ["judgment_error", "reasoning_error", "evidence_error", "timing_error", "risk_estimation_error", "random_outcome", "inconclusive"]},
+    "reason": {"type": "string", "minLength": 1},
+    "diagnostic_evidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "judgment_snapshot": {"type": "object", "required": ["snapshot_id", "sha256", "as_of"], "properties": {"snapshot_id": {"type": "string"}, "sha256": {"type": "string"}, "as_of": {"type": "string"}}},
+    "outcome": {"type": "object", "required": ["checkpoint_id", "horizon", "as_of", "verification_status", "sha256"], "properties": {"checkpoint_id": {"type": "string"}, "horizon": {"type": "string"}, "as_of": {"type": "string"}, "verification_status": {"type": "string"}, "sha256": {"type": "string"}}},
+    "lesson_candidate": {"anyOf": [{"type": "null"}, {"type": "object", "required": ["title", "hypothesis", "evidence_refs", "state"], "properties": {"title": {"type": "string"}, "hypothesis": {"type": "string"}, "evidence_refs": {"type": "array", "items": {"type": "string"}}, "state": {"const": "candidate"}}}]},
+    "provenance": {"type": "object", "required": ["input_sha256", "cycle_id"], "properties": {"input_sha256": {"type": "string"}, "cycle_id": {"type": "string"}}},
+    "permissions": {"type": "object", "required": ["write_permissions"], "properties": {"write_permissions": {"const": []}}}
+  }
+}

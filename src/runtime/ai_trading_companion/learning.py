@@ -7,6 +7,7 @@ from datetime import datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .reflection import from_outcome
 from .store import now
 
 
@@ -162,12 +163,24 @@ class JudgmentLifecycle:
         cycle_id = checkpoint["cycle_id"]
         as_of = str(result.get("as_of") or now())
         summary = str(result.get("summary") or "本次结果数据不足，暂不结案。")
+        reflection_checkpoint = dict(checkpoint)
+        if not reflection_checkpoint.get("snapshot_json"):
+            snapshot = next((item for item in self.store.judgment_snapshots()
+                             if item.get("snapshot_id") == checkpoint.get("snapshot_id")), None)
+            if snapshot:
+                reflection_checkpoint.update(snapshot)
+                artifact = next((item for item in self.store.artifacts(checkpoint["cycle_id"])
+                                 if item.get("artifact_id") == snapshot.get("artifact_id")), None)
+                if artifact:
+                    reflection_checkpoint["judgment_text"] = artifact.get("body_markdown", "")
+        reflection = from_outcome(reflection_checkpoint, result)
         metadata = {
             "checkpoint_id": checkpoint["checkpoint_id"],
             "snapshot_id": checkpoint["snapshot_id"],
             "horizon": checkpoint["horizon"],
             "verification_status": result.get("verification_status", "unverified"),
             "memory_tags": ["outcome", str(result.get("verification_status", "unverified"))],
+            "reflection": reflection,
         }
         if isinstance(result.get("presentation"), dict):
             metadata["presentation"] = result["presentation"]

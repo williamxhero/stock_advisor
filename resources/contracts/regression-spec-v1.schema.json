@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "RegressionSpec/v1",
+  "title": "Versioned cross-contract RegressionSpec/v1",
+  "oneOf": [
+    { "$ref": "#/$defs/case" },
+    { "$ref": "#/$defs/registry" },
+    { "$ref": "#/$defs/result" },
+    { "$ref": "#/$defs/verdict" },
+    { "$ref": "#/$defs/replay" },
+    { "$ref": "#/$defs/install" }
+  ],
+  "$defs": {
+    "case": {
+      "type": "object", "additionalProperties": false,
+      "required": ["case_id", "version", "category", "title", "fixture", "safety_assertions", "quality_assertions", "recovery_assertions", "provenance", "sha256"],
+      "properties": {
+        "case_id": {"type": "string", "minLength": 1}, "version": {"const": 1},
+        "category": {"type": "string", "minLength": 1}, "title": {"type": "string", "minLength": 1},
+        "fixture": {"type": "object", "minProperties": 1},
+        "safety_assertions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "quality_assertions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "recovery_assertions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "provenance": {"type": "object", "required": ["source", "contract"], "properties": {"source": {"const": "runtime-frozen-registry"}, "contract": {"const": "RegressionSpec/v1"}}},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "registry": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "spec_contract", "spec_version", "cases", "sha256"],
+      "properties": {
+        "contract": {"const": "RegressionCaseRegistry/v1"}, "version": {"const": 1},
+        "spec_contract": {"const": "RegressionSpec/v1"}, "spec_version": {"const": 1},
+        "cases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/case"}},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "axis": {
+      "type": "object", "additionalProperties": false,
+      "required": ["passed", "checks", "reasons"],
+      "properties": {
+        "passed": {"type": "boolean"}, "checks": {"type": "object", "additionalProperties": {"type": "boolean"}},
+        "reasons": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "protection_axes": {
+      "type": "object", "additionalProperties": false, "required": ["safety", "quality", "recovery"],
+      "properties": {"safety": {"$ref": "#/$defs/axis"}, "quality": {"$ref": "#/$defs/axis"}, "recovery": {"$ref": "#/$defs/axis"}}
+    },
+    "protection_vector": {
+      "type": "object", "additionalProperties": false, "required": ["safety", "quality", "recovery"],
+      "properties": {"safety": {"$ref": "#/$defs/vector"}, "quality": {"$ref": "#/$defs/vector"}, "recovery": {"$ref": "#/$defs/vector"}}
+    },
+    "evaluation_dimension": {
+      "type": "object", "additionalProperties": false, "required": ["passed", "evidence", "reasons"],
+      "properties": {"passed": {"type": "boolean"}, "evidence": {"type": "array", "items": {"type": "string"}}, "reasons": {"type": "array", "items": {"type": "string"}}}
+    },
+    "evaluation": {
+      "type": "object", "additionalProperties": false, "required": ["delivery_speed", "qualification_probability", "research_quality", "judgment_outcome", "safety_reliability"],
+      "properties": {
+        "delivery_speed": {"$ref": "#/$defs/evaluation_dimension"}, "qualification_probability": {"$ref": "#/$defs/evaluation_dimension"},
+        "research_quality": {"$ref": "#/$defs/evaluation_dimension"}, "judgment_outcome": {"$ref": "#/$defs/evaluation_dimension"},
+        "safety_reliability": {"$ref": "#/$defs/evaluation_dimension"}
+      }
+    },
+    "vector_case": {
+      "type": "object", "additionalProperties": false, "required": ["case_id", "passed", "reasons"],
+      "properties": {"case_id": {"type": "string"}, "passed": {"type": "boolean"}, "evidence": {"type": "array", "items": {"type": "string"}}, "reasons": {"type": "array", "items": {"type": "string"}}}
+    },
+    "vector": {
+      "type": "object", "additionalProperties": false, "required": ["passed", "cases"],
+      "properties": {"passed": {"type": "boolean"}, "cases": {"type": "array", "items": {"$ref": "#/$defs/vector_case"}}}
+    },
+    "result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["case_id", "case_version", "category", "axes", "baseline_axes", "evaluation", "evidence", "non_regression", "provenance", "sha256"],
+      "properties": {
+        "case_id": {"type": "string", "minLength": 1}, "case_version": {"const": 1}, "category": {"type": "string", "minLength": 1},
+        "axes": {"$ref": "#/$defs/protection_axes"},
+        "baseline_axes": {"$ref": "#/$defs/protection_axes"},
+        "evaluation": {"$ref": "#/$defs/evaluation"},
+        "evidence": {"type": "object", "minProperties": 1},
+        "non_regression": {"type": "object", "additionalProperties": false, "required": ["passed", "reasons"], "properties": {"passed": {"type": "boolean"}, "reasons": {"type": "array", "items": {"type": "string"}}}},
+        "provenance": {"type": "object", "required": ["source", "contract", "registry_sha256", "fixture_sha256", "case_id", "case_version"], "properties": {"source": {"const": "runtime-regression-gate"}, "contract": {"const": "RegressionSpec/v1"}, "registry_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "fixture_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "case_id": {"type": "string"}, "case_version": {"const": 1}}},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "verdict": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "registry_contract", "registry_version", "registry_sha256", "case_results", "evaluation_vector", "protection_vector", "passed", "failure_cases", "provenance", "sha256"],
+      "properties": {
+        "contract": {"const": "RegressionGateVerdict/v1"}, "version": {"const": 1},
+        "registry_contract": {"const": "RegressionCaseRegistry/v1"}, "registry_version": {"const": 1}, "registry_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "case_results": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/result"}},
+        "evaluation_vector": {"type": "object", "additionalProperties": false, "required": ["delivery_speed", "qualification_probability", "research_quality", "judgment_outcome", "safety_reliability"], "properties": {"delivery_speed": {"$ref": "#/$defs/vector"}, "qualification_probability": {"$ref": "#/$defs/vector"}, "research_quality": {"$ref": "#/$defs/vector"}, "judgment_outcome": {"$ref": "#/$defs/vector"}, "safety_reliability": {"$ref": "#/$defs/vector"}}},
+        "protection_vector": {"type": "object", "additionalProperties": false, "required": ["safety", "quality", "recovery"], "properties": {"safety": {"$ref": "#/$defs/vector"}, "quality": {"$ref": "#/$defs/vector"}, "recovery": {"$ref": "#/$defs/vector"}}},
+        "passed": {"type": "boolean"}, "failure_cases": {"type": "array", "items": {"type": "string"}},
+        "provenance": {"type": "object", "required": ["source", "contract", "registry_sha256"], "properties": {"source": {"const": "runtime-regression-gate"}, "contract": {"const": "RegressionSpec/v1"}, "registry_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "replay": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "registry_sha256", "source", "source_sha256", "qualification", "sha256"],
+      "properties": {
+        "contract": {"const": "RegressionSpecReplay/v1"}, "version": {"const": 1}, "registry_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source": {"type": "object", "required": ["registry", "verdict"], "properties": {"registry": {"$ref": "#/$defs/registry"}, "verdict": {"$ref": "#/$defs/verdict"}}},
+        "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "qualification": {"type": "object", "required": ["valid", "deterministic", "cases_reconstructed", "per_case_axes", "safety_non_regression", "quality_non_regression", "recovery_paths_checked", "evaluation_dimensions", "aggregate_score_forbidden"],
+          "properties": {"valid": {"const": true}, "deterministic": {"const": true}, "cases_reconstructed": {"type": "array", "minItems": 1}, "per_case_axes": {"const": true}, "safety_non_regression": {"type": "boolean"}, "quality_non_regression": {"type": "boolean"}, "recovery_paths_checked": {"type": "boolean"}, "evaluation_dimensions": {"type": "object", "additionalProperties": false, "required": ["delivery_speed", "qualification_probability", "research_quality", "judgment_outcome", "safety_reliability"], "properties": {"delivery_speed": {"type": "boolean"}, "qualification_probability": {"type": "boolean"}, "research_quality": {"type": "boolean"}, "judgment_outcome": {"type": "boolean"}, "safety_reliability": {"type": "boolean"}}}, "aggregate_score_forbidden": {"const": true}}},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "install": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "qualified", "registry_contract", "registry_version", "registry_sha256", "verdict_sha256", "replay_sha256", "evaluation_vector", "protection_vector", "case_results", "provenance", "sha256"],
+      "properties": {
+        "contract": {"const": "RegressionSpecInstallQualification/v1"}, "version": {"const": 1}, "qualified": {"type": "boolean"},
+        "registry_contract": {"const": "RegressionCaseRegistry/v1"}, "registry_version": {"const": 1}, "registry_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "verdict_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "replay_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "evaluation_vector": {"type": "object", "additionalProperties": false, "required": ["delivery_speed", "qualification_probability", "research_quality", "judgment_outcome", "safety_reliability"], "properties": {"delivery_speed": {"$ref": "#/$defs/vector"}, "qualification_probability": {"$ref": "#/$defs/vector"}, "research_quality": {"$ref": "#/$defs/vector"}, "judgment_outcome": {"$ref": "#/$defs/vector"}, "safety_reliability": {"$ref": "#/$defs/vector"}}}, "protection_vector": {"$ref": "#/$defs/protection_vector"}, "case_results": {"type": "array", "items": {"$ref": "#/$defs/result"}},
+        "provenance": {"type": "object", "required": ["source", "contract"], "properties": {"source": {"const": "runtime-regression-gate"}, "contract": {"const": "RegressionSpec/v1"}}}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

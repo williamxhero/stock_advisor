@@ -35,8 +35,12 @@ foreach ($required in @(
     'resources\contracts\m1-judgment-spec-v1.schema.json',
     'resources\contracts\position-safety-spec-v1.schema.json',
     'resources\contracts\research-isolation-spec-v1.schema.json',
+    'resources\contracts\regression-spec-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
+    'runtime\ai_trading_companion\regression_gate.py',
+    'runtime\ai_trading_companion\regression_probes.py',
+    'runtime\ai_trading_companion\regression_spec.py',
     'runtime\ai_trading_companion\cycle_replay.py',
     'runtime\ai_trading_companion\evidence_snapshot.py',
     'runtime\ai_trading_companion\temporal_integrity.py',
@@ -162,6 +166,26 @@ try {
         $resolvedModulePath = [IO.Path]::GetFullPath($modulePath)
         if (-not $resolvedModulePath.StartsWith($resolvedInstallRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Source-unavailable smoke resolved runtime outside the release directory: $resolvedModulePath"
+        }
+        # The RegressionSpec module must qualify twice from the installed tree
+        # without importing the source checkout or contacting any provider.
+        $regressionFirst = ((& $python -m ai_trading_companion.regression_spec) -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0) { throw "Installed RegressionSpec qualification failed with exit code $LASTEXITCODE." }
+        $regressionSecond = ((& $python -m ai_trading_companion.regression_spec) -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0) { throw "Installed RegressionSpec replay qualification failed with exit code $LASTEXITCODE." }
+        if ($regressionFirst -ne $regressionSecond) { throw 'Installed RegressionSpec qualification was not deterministic.' }
+        if ($regressionFirst -match '"(aggregate|aggregate_score|overall_score|score|scores|weighted_score|weighted_average)"\s*:') { throw 'Installed RegressionSpec exposed a forbidden aggregate score.' }
+        $regressionQualification = $regressionFirst | ConvertFrom-Json
+        if ($regressionQualification.contract -ne 'RegressionSpecInstallQualification/v1' -or $regressionQualification.qualified -ne $true) {
+            throw 'Installed RegressionSpec did not produce a qualified installation result.'
+        }
+        foreach ($axis in @('delivery_speed', 'qualification_probability', 'research_quality', 'judgment_outcome', 'safety_reliability')) {
+            if ($regressionQualification.evaluation_vector.PSObject.Properties.Name -notcontains $axis) {
+                throw "Installed RegressionSpec is missing evaluation axis: $axis"
+            }
+            if ($regressionQualification.evaluation_vector.$axis.passed -ne $true) {
+                throw "Installed RegressionSpec evaluation axis did not qualify: $axis"
+            }
         }
         # Run only from the installed runtime path and replay the same frozen
         # cycle twice, preserving the original receipt and published artifact.

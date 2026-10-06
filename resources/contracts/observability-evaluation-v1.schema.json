@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ObservabilityEvaluation/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "contract_version", "dimensions", "provenance", "sha256"],
+  "properties": {
+    "contract": {"const": "ObservabilityEvaluation/v1"},
+    "contract_version": {"type": "integer", "const": 1},
+    "dimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["delivery_speed", "qualification_probability", "research_quality", "judgment_outcome", "safety_reliability"],
+      "properties": {
+        "delivery_speed": {"type": "object"},
+        "qualification_probability": {"type": "object"},
+        "research_quality": {"type": "object"},
+        "judgment_outcome": {"type": "object"},
+        "safety_reliability": {"type": "object"}
+      }
+    },
+    "provenance": {"type": "object"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -13,6 +13,7 @@ from ai_trading_companion.exchange import LocalExchange
 from ai_trading_companion.governance import (
     ActiveResearchPolicyExecutor, EvolutionGovernance, RouterGovernance, StrategyPolicyExecutor,
 )
+from ai_trading_companion.observability_contract import build_event
 from ai_trading_companion.observatory import (
     EvaluationObservatory, EvaluationRequest, ExperimentRequest, ForecastRequest, SnapshotQuery,
     SourceHealthRequest,
@@ -66,6 +67,137 @@ class EvaluationObservatoryTests(unittest.TestCase):
         self.assertEqual("2026-08-25T10:30:00+08:00", snapshot.qualified_published_at)
         self.assertEqual(40 * 60, snapshot.qualified_duration_seconds)
         self.assertEqual(snapshot.snapshot_id, self.observatory.get_snapshot(snapshot.snapshot_id).snapshot_id)
+
+    def test_delayed_observation_uses_occurrence_time_and_overlays_outbox_once(self) -> None:
+        scheduled = "2026-08-25T09:45:00+08:00"
+        occurred = "2026-08-25T09:50:00+08:00"
+        known = "2026-08-25T09:55:00+08:00"
+        recorded = "2026-08-25T09:59:00+08:00"
+        published = "2026-08-25T10:00:00+08:00"
+        with patch("ai_trading_companion.store.now", return_value=scheduled):
+            cycle = self.store.create_cycle("daily.execution.0945", scheduled, scheduled)
+        with patch("ai_trading_companion.store.now", return_value=recorded):
+            start_id = self.store.queue_event(cycle["cycle_id"], "m0.started", {
+                "occurred_at": occurred, "known_at": known,
+            })
+            compose = self.store.begin_attempt(cycle["cycle_id"], "m0_compose", scheduled, "compose")
+        with patch("ai_trading_companion.store.now", return_value=published):
+            self.store.finish_attempt(compose["attempt_id"], "succeeded", verifier={"passed": True})
+            self.store.append_artifact(
+                cycle["cycle_id"], "m0", "model", "M0", scheduled,
+                {"compose_attempt_id": compose["attempt_id"]},
+            )
+        with patch("ai_trading_companion.store.now", return_value="2026-08-25T10:20:00+08:00"):
+            delivery_id = self.store.queue_event(cycle["cycle_id"], "m0.ready", {
+                "occurred_at": published, "known_at": "2026-08-25T10:15:00+08:00",
+            })
+        request = EvaluationRequest(cycle["cycle_id"], "2026-08-25T10:31:00+08:00", request_id="delayed")
+
+        snapshot = self.observatory.evaluate(request)
+
+        self.assertEqual(occurred, snapshot.actual_start_at)
+        self.assertEqual(600, snapshot.qualified_duration_seconds)
+        self.assertEqual(len(snapshot.timeline), len({event.event_id for event in snapshot.timeline}))
+        for event_id in (start_id, delivery_id):
+            self.assertEqual(1, sum(event.event_id == event_id for event in snapshot.timeline))
+        start = next(event for event in snapshot.timeline if event.event_id == start_id)
+        self.assertEqual("m0.started", start.event_type)
+        self.assertEqual("observability_event", start.source_kind)
+        self.assertEqual((occurred, known, recorded), (start.occurred_at, start.known_at, start.recorded_at))
+        delivery = next(event for event in snapshot.timeline if event.event_id == delivery_id)
+        self.assertEqual("m0.ready", delivery.event_type)
+        self.assertEqual(published, delivery.occurred_at)
+        self.assertEqual(snapshot, self.observatory.get_snapshot(snapshot.snapshot_id))
+        self.assertEqual(snapshot, self.observatory.evaluate(request))
+
+    def test_observation_start_without_outbox_and_workload_only_start_are_distinct(self) -> None:
+        scheduled = "2026-08-25T09:45:00+08:00"
+        with patch("ai_trading_companion.store.now", return_value=scheduled):
+            cycle = self.store.create_cycle("daily.execution.0945", scheduled, scheduled)
+        workload = build_event(
+            event_id="workload-only", event_type="actual_started", stage="m0",
+            cycle_id=cycle["cycle_id"], task_key=cycle["task_key"], occurred_at=scheduled,
+            attribution={"user_wait": {}, "workload": {"kind": "stage"}},
+            provenance={"runtime_event_type": "stage.started"},
+        )
+        with self.store.connection() as connection:
+            connection.execute(
+                "INSERT INTO observability_event "
+                "(event_id,cycle_id,task_key,event_type,stage,occurred_at,known_at,recorded_at,sha256,event_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    workload["event_id"], cycle["cycle_id"], cycle["task_key"], workload["event_type"], "m0",
+                    scheduled, scheduled, scheduled, workload["sha256"], json.dumps(workload), scheduled,
+                ),
+            )
+        self.assertIsNone(workload["attribution"]["user_wait"]["started_at"])
+
+        workload_snapshot = self.observatory.evaluate(EvaluationRequest(
+            cycle["cycle_id"], "2026-08-25T09:46:00+08:00",
+        ))
+
+        self.assertIsNone(workload_snapshot.actual_start_at)
+        self.assertIn(workload["event_id"], {event.event_id for event in workload_snapshot.timeline})
+        with patch("ai_trading_companion.store.now", return_value="2026-08-25T10:00:00+08:00"):
+            start = self.store.record_observation_event(cycle["cycle_id"], "m0.started", {
+                "occurred_at": "2026-08-25T09:50:00+08:00", "known_at": "2026-08-25T09:55:00+08:00",
+            })
+            self.store.record_observation_event(cycle["cycle_id"], "m1.started", {
+                "occurred_at": "2026-08-25T09:47:00+08:00",
+            })
+        snapshot = self.observatory.evaluate(EvaluationRequest(cycle["cycle_id"], "2026-08-25T10:01:00+08:00"))
+
+        self.assertEqual(start["occurred_at"], snapshot.actual_start_at)
+        self.assertEqual(1, sum(event.event_id == start["event_id"] for event in snapshot.timeline))
+
+    def test_historical_outbox_start_and_prior_snapshot_decoding_remain_supported(self) -> None:
+        scheduled = "2026-08-25T09:45:00+08:00"
+        started = "2026-08-25T09:50:00+08:00"
+        with patch("ai_trading_companion.store.now", return_value=scheduled):
+            cycle = self.store.create_cycle("daily.execution.0945", scheduled, scheduled)
+        with self.store.connection() as connection:
+            connection.execute(
+                "INSERT INTO companion_outbox VALUES(?,?,?,?,?,NULL)",
+                ("historical-start", cycle["cycle_id"], "m0.started", "{}", started),
+            )
+        snapshot = self.observatory.evaluate(EvaluationRequest(cycle["cycle_id"], "2026-08-25T10:01:00+08:00"))
+        self.assertEqual(started, snapshot.actual_start_at)
+        event = next(event for event in snapshot.timeline if event.event_id == "historical-start")
+        self.assertEqual("outbox", event.source_kind)
+        self.assertEqual(started, event.occurred_at)
+        with self.store.connection() as connection:
+            payload = json.loads(connection.execute(
+                "SELECT payload_json FROM observatory_snapshot WHERE snapshot_id=?", (snapshot.snapshot_id,),
+            ).fetchone()["payload_json"])
+        for item in payload["timeline"]:
+            item.pop("known_at", None)
+            item.pop("recorded_at", None)
+
+        prior = self.observatory._decode_snapshot("evaluation", json.dumps(payload))
+
+        self.assertEqual(snapshot, prior)
+        self.assertIsNone(prior.timeline[0].known_at)
+        self.assertIsNone(prior.timeline[0].recorded_at)
+
+    def test_observation_digest_is_validated_before_evaluation(self) -> None:
+        scheduled = "2026-08-25T09:45:00+08:00"
+        with patch("ai_trading_companion.store.now", return_value=scheduled):
+            cycle = self.store.create_cycle("daily.execution.0945", scheduled, scheduled)
+            observation = self.store.record_observation_event(cycle["cycle_id"], "m0.started", {})
+        observation["status"] = "tampered"
+        with self.store.connection() as connection:
+            connection.execute(
+                "INSERT INTO observability_event "
+                "(event_id,cycle_id,task_key,event_type,occurred_at,known_at,recorded_at,sha256,event_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "tampered", cycle["cycle_id"], cycle["task_key"], "actual_started",
+                    scheduled, scheduled, scheduled, "0" * 64, json.dumps(observation), scheduled,
+                ),
+            )
+
+        with self.assertRaisesRegex(ValueError, "digest mismatch"):
+            self.observatory.evaluate(EvaluationRequest(cycle["cycle_id"], "2026-08-25T10:01:00+08:00"))
 
     def test_public_observatory_surface_is_limited_to_the_five_contract_methods(self) -> None:
         methods = {

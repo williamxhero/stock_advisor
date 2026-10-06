@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ObservabilitySpecReplay/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "contract_version", "source_sha256", "source", "sha256"],
+  "properties": {
+    "contract": {"const": "ObservabilitySpecReplay/v1"},
+    "contract_version": {"type": "integer", "const": 1},
+    "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source": {"$ref": "./observability-spec-v1.schema.json"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

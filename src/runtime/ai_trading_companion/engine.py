@@ -599,11 +599,11 @@ class CompanionEngine:
             })
         frozen_as_of = as_of or iso(utc_now())
         cycle = self.store.transition(cycle_id, "researching_m0", as_of=frozen_as_of)
-        self._stage_started(
+        stage_run = self._stage_started(
             cycle_id, "m0", as_of=frozen_as_of,
             input_sha256=cycle.get("evidence_contract_hash"), source="m0_research",
         )
-        self.emit(cycle, "m0.started", cycle)
+        self.emit(cycle, "m0.started", {**cycle, "stage_run_id": stage_run["stage_run_id"]})
         return cycle
 
     def research_waiting(self, cycle_id: str, reason: str) -> dict[str, Any]:
@@ -793,6 +793,10 @@ class CompanionEngine:
                 "presentation": presented.metadata()["presentation"],
                 "message": presented.message(),
                 "m0_observation": observation_metadata,
+                "evidence_attempt_id": evidence_attempt_id,
+                "compose_attempt_id": compose_attempt_id,
+                "evidence_packet_sha256": evidence_packet_hash,
+                "packet_sha256": packet_hash,
                 "source_artifact_id": artifact["artifact_id"],
                 "resolved_fault_episode_ids": resolved_fault_episode_ids,
                 "h0_auto_submit_at": cycle["h0_auto_submit_at"],
@@ -1104,7 +1108,7 @@ class CompanionEngine:
             self.store.skip_stage(cycle["cycle_id"], "h0", reason="empty H0 submission")
         else:
             self._stage_succeeded(cycle["cycle_id"], "h0", output_sha256=artifact["sha256"])
-        self._stage_started(
+        stage_run = self._stage_started(
             cycle["cycle_id"], "m1", as_of=locked_at,
             input_sha256=cycle.get("packet_hash"), source="blind_m1",
         )
@@ -1120,7 +1124,7 @@ class CompanionEngine:
                 "source_artifact_id": artifact["artifact_id"] if artifact else None,
             },
         )
-        self.emit(cycle, "m1.started", {"cycle": cycle})
+        self.emit(cycle, "m1.started", {"cycle": cycle, "stage_run_id": stage_run["stage_run_id"]})
         return self._projection(cycle)
 
     def _commit_chat(self, cycle: dict[str, Any]) -> dict[str, Any]:
@@ -1200,11 +1204,11 @@ class CompanionEngine:
         if cycle["state"] not in {"researching_m1", "m1_retry_wait"}:
             raise ValueError(f"M1 judgment cannot start from: {cycle['state']}")
         cycle = self.store.transition(cycle_id, "judging_m1", m1_started_at=cycle.get("m1_started_at") or iso(utc_now()))
-        self._stage_started(
+        stage_run = self._stage_started(
             cycle_id, "m1", as_of=cycle["as_of"], input_sha256=cycle.get("packet_hash"),
             source="m1_judgment",
         )
-        self.emit(cycle, "m1.judging", {"cycle": cycle})
+        self.emit(cycle, "m1.judging", {"cycle": cycle, "stage_run_id": stage_run["stage_run_id"]})
         return cycle
 
     def resume_m1_after_repair(self, cycle_id: str) -> dict[str, Any]:
@@ -1360,6 +1364,10 @@ class CompanionEngine:
                     "m1": presented.markdown,
                     "presentation": presented.metadata()["presentation"],
                     "message": presented.message(),
+                    "research_attempt_id": research_attempt_id,
+                    "judgment_attempt_id": judgment_attempt_id,
+                    "research_packet_sha256": research_packet_hash,
+                    "judgment_packet_sha256": judgment_packet_hash,
                     "source_artifact_id": artifact["artifact_id"],
                     "resolved_fault_episode_ids": resolved_fault_episode_ids,
                 },
@@ -1687,6 +1695,8 @@ class CompanionEngine:
                     "m2": presented.markdown,
                     "presentation": presented.metadata()["presentation"],
                     "message": presented.message(),
+                    "attempt_id": attempt_id,
+                    "packet_sha256": packet_hash,
                     "source_artifact_id": artifact["artifact_id"],
                     "resolved_fault_episode_ids": resolved_fault_episode_ids,
                 },

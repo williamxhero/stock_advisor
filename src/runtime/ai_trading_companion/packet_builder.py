@@ -21,6 +21,7 @@ from .decision_cycle import assert_m1_blind
 from .evidence_snapshot import descriptor as evidence_snapshot_descriptor
 from .mandate_spec import mandate_for_stage
 from .m1_judgment import build_input as build_m1_judgment_input
+from .m2_judgment import build_input as build_m2_judgment_input
 from .position_safety import build_input as build_position_safety_input
 from .research_isolation import (
     access_descriptor as research_access_descriptor,
@@ -157,6 +158,8 @@ class RuntimePacketBuilder:
             }
         if stage == "m1_judgment":
             packet["m1_judgment_spec"] = {"contract": "M1JudgmentSpec/v1", "version": 1}
+        if stage == "m2":
+            packet["m2_synthesis_spec"] = {"contract": "M2SynthesisSpec/v1", "version": 1}
         frozen_cycle = json.loads(cycle["cycle_contract_json"])
         # Reference the immutable creation input without exposing workflow or
         # diagnostic metadata to the independent M1 path.
@@ -242,6 +245,25 @@ class RuntimePacketBuilder:
                     source_ref=str(fact_view.get("fact_view_sha256") or cycle["cycle_id"]),
                     source="runtime", verified=True,
                 )
+                # M2 receives only frozen, Runtime-owned stage identities.  A
+                # missing descriptor keeps packet inspection backward-compatible;
+                # the formal provider boundary below refuses that packet.
+                packet["current_position_facts"] = copy.deepcopy(fact_view)
+                packet["frozen_m0"] = self._frozen_artifact_descriptor(cycle, "m0", packet_as_of)
+                packet["frozen_h0"] = self._frozen_h0_descriptor(cycle, packet_as_of)
+                packet["frozen_m1"] = self._frozen_m1_descriptor(cycle, packet_as_of)
+                packet["user_preferences"] = self._user_preferences(memory_cards)
+                packet["risk_constraints"] = {
+                    "risk_doctrine": copy.deepcopy(packet.get("risk_doctrine") or {}),
+                    "position_safety": copy.deepcopy(packet.get("position_safety") or {}),
+                    "mandate_risk_level": copy.deepcopy(packet["mandate"].get("risk_level") or {}),
+                    "write_permissions": [],
+                }
+                packet["conflicts"] = self._frozen_conflicts(
+                    evidence or packet.get("evidence") or {},
+                    self.store.artifacts(cycle["cycle_id"]),
+                )
+                packet["research_isolation"] = research_access_descriptor()
             if stage == "m1_judgment":
                 evidence = self._validated_m1_evidence(evidence or {}, packet_as_of)
                 private = packet["business_context"].get("private_context_before_h0") or {}
@@ -355,6 +377,10 @@ class RuntimePacketBuilder:
                 build_m1_judgment_input(packet)
         elif stage == "m1_research":
             self._assert_m1_blind(packet, cycle)
+        elif stage == "m2":
+            descriptors = (packet.get("frozen_m0"), packet.get("frozen_h0"), packet.get("frozen_m1"))
+            if all(isinstance(item, dict) and item.get("artifact_id") for item in descriptors):
+                build_m2_judgment_input(packet)
         # Defense in depth: packets can be given to a cloud-capable runner only
         # after every selected memory and all local inputs have passed the guard.
         assert_safe(json.dumps(packet, ensure_ascii=False), boundary="LLM packet")
@@ -864,6 +890,60 @@ class RuntimePacketBuilder:
         except (TypeError, ValueError):
             return False
         return metadata.get("public_only") is True
+
+    @staticmethod
+    def _user_preferences(memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        result = []
+        for item in memories:
+            if not isinstance(item, dict):
+                continue
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            memory_type = metadata.get("memory_type") if isinstance(metadata.get("memory_type"), dict) else {}
+            kind = item.get("kind") or item.get("semantic_type") or item.get("episode_type") or memory_type.get("semantic_type")
+            if kind in {"preference", "user_preference"} or item.get("subject") == "user.expression":
+                result.append(copy.deepcopy(item))
+        return result
+
+    @staticmethod
+    def _frozen_conflicts(evidence: dict[str, Any], artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        conflicts = list(evidence.get("conflicts") or []) if isinstance(evidence, dict) else []
+        if conflicts:
+            return copy.deepcopy(conflicts)
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or artifact.get("kind") not in {"evidence", "m1_evidence"}:
+                continue
+            try:
+                body = json.loads(artifact.get("body") or artifact.get("body_markdown") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(body, dict) and body.get("conflicts"):
+                return copy.deepcopy(body["conflicts"])
+        return []
+
+    def _frozen_h0_descriptor(self, cycle: dict[str, Any], packet_as_of: str) -> dict[str, Any]:
+        artifact = self.store.latest_artifact_before(cycle["cycle_id"], "h0", packet_as_of)
+        if artifact is None:
+            return {"artifact_id": None, "sha256": None, "as_of": None, "known_at": None, "source_text": ""}
+        return {
+            "artifact_id": artifact["artifact_id"], "sha256": artifact["body_sha256"],
+            "as_of": artifact["as_of"], "known_at": artifact.get("known_at"),
+            "source_text": artifact["body_markdown"],
+        }
+
+    def _frozen_m1_descriptor(self, cycle: dict[str, Any], packet_as_of: str) -> dict[str, Any]:
+        artifact = self.store.latest_artifact_before(cycle["cycle_id"], "m1", packet_as_of)
+        if artifact is None:
+            return {"artifact_id": None, "sha256": None, "as_of": None, "known_at": None,
+                    "original_judgment_text": "", "snapshot": {}, "snapshot_sha256": None}
+        snapshot_row = next((row for row in self.store.judgment_snapshots(cycle["cycle_id"])
+                             if row.get("artifact_id") == artifact["artifact_id"]), None)
+        snapshot = json.loads(snapshot_row["snapshot_json"]) if snapshot_row else {}
+        return {
+            "artifact_id": artifact["artifact_id"], "sha256": artifact["body_sha256"],
+            "as_of": artifact["as_of"], "known_at": artifact.get("known_at"),
+            "original_judgment_text": artifact["body_markdown"], "snapshot": snapshot,
+            "snapshot_sha256": hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        }
 
     def _frozen_artifact_descriptor(
         self, cycle: dict[str, Any], kind: str, packet_as_of: str,

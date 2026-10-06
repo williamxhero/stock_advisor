@@ -15,6 +15,7 @@ from .m0_observation import (
     validate_stage_output as validate_m0_stage_output,
 )
 from .m1_judgment import build_input as build_m1_judgment_input, build_output as build_m1_judgment_output
+from .m2_judgment import build_input as build_m2_judgment_input, build_output as build_m2_judgment_output
 from .opportunities import observation_problems, review_problems
 from .stage_expression import (
     canonical_direction, normalize_stage_output, semantic_snapshot_conflicts,
@@ -197,6 +198,21 @@ class CognitiveRouter:
                     receipt = build_m1_judgment_output(build_m1_judgment_input(packet), output)
                 except (TypeError, ValueError) as exc:
                     problems.append("m1_judgment_contract:" + str(exc))
+            if stage == "m2":
+                # Keep direct legacy Router inspection compatible with the
+                # provider result contract. The Runtime path supplies all
+                # frozen descriptors and is validated before provider access;
+                # only that fully bound packet claims the M2 receipt.
+                descriptors = (
+                    packet.get("frozen_m0"),
+                    packet.get("frozen_h0"),
+                    packet.get("frozen_m1"),
+                )
+                if all(isinstance(item, dict) and item.get("artifact_id") for item in descriptors):
+                    try:
+                        receipt = build_m2_judgment_output(build_m2_judgment_input(packet), output)
+                    except (TypeError, ValueError) as exc:
+                        problems.append("m2_synthesis_contract:" + str(exc))
             position_receipt = None
             if isinstance(packet.get("position_safety"), dict):
                 try:
@@ -209,7 +225,7 @@ class CognitiveRouter:
                       "publication": output.get("publication"),
                       "fallback": bool((output.get("publication") or {}).get("fallback"))}
             if receipt is not None and not problems:
-                result["m1_judgment"] = receipt
+                result["m1_judgment" if stage == "m1_judgment" else "m2_synthesis"] = receipt
             if position_receipt is not None:
                 result["position_safety"] = position_receipt
             return result

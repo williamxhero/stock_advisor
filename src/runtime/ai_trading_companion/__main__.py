@@ -86,6 +86,7 @@ from .m1_judgment import (
     build_input as build_m1_judgment_input,
 )
 from .m2_judgment import build_input as build_m2_judgment_input
+from . import regression_gate
 from .multimodal_adapter import (
     CONTRACT as MULTIMODAL_INPUT_CONTRACT,
     RESULT_CONTRACT as MULTIMODAL_RESULT_CONTRACT,
@@ -496,6 +497,10 @@ def handle_effort_capability_fault(
 
 
 def runtime() -> tuple[CompanionEngine, CompanionStore, LocalExchange, PortfolioService]:
+    # Run the provider-free cross-contract qualification before opening any
+    # external dependency.  A changed adapter, skill, prompt, or retrieval
+    # boundary therefore fails closed before it can consume business facts.
+    regression_gate.runtime_qualification()
     PATHS.ensure()
     # The old direct-provider block can contain API keys.  Erase it before any
     # runtime work and never copy it into a backup or another configuration.

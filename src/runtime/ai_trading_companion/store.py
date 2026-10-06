@@ -28,6 +28,11 @@ from .evidence_snapshot import (
     validate_snapshot,
 )
 from .secret_guard import assert_safe
+from .observability_contract import (
+    build_event as build_observation_event,
+    event_type_for_runtime_event,
+    validate_event as validate_observation_event,
+)
 from .decision_cycle import (
     DECISION_CYCLE_CONTRACT,
     DECISION_CYCLE_STAGES,
@@ -175,6 +180,22 @@ class CompanionStore:
               UNIQUE(cycle_id, sequence));
             CREATE INDEX IF NOT EXISTS ix_companion_cycle_event_cycle
               ON companion_cycle_event(cycle_id, sequence);
+            CREATE TABLE IF NOT EXISTS observability_event (
+              event_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+              task_key TEXT NOT NULL, event_type TEXT NOT NULL, stage TEXT,
+              stage_run_id TEXT, attempt_id TEXT, occurred_at TEXT NOT NULL,
+              known_at TEXT NOT NULL, recorded_at TEXT NOT NULL, sha256 TEXT NOT NULL,
+              event_json TEXT NOT NULL, created_at TEXT NOT NULL,
+              UNIQUE(cycle_id, event_id), UNIQUE(cycle_id, sha256)
+            );
+            CREATE INDEX IF NOT EXISTS ix_observability_event_cycle
+              ON observability_event(cycle_id, occurred_at, event_id);
+            CREATE TRIGGER IF NOT EXISTS observability_event_no_update
+              BEFORE UPDATE ON observability_event
+              BEGIN SELECT RAISE(ABORT, 'observability events are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS observability_event_no_delete
+              BEFORE DELETE ON observability_event
+              BEGIN SELECT RAISE(ABORT, 'observability events are immutable'); END;
             CREATE TABLE IF NOT EXISTS narrative_artifact (
               artifact_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
               kind TEXT NOT NULL, revision INTEGER NOT NULL, actor TEXT NOT NULL, body_markdown TEXT NOT NULL,
@@ -716,6 +737,25 @@ class CompanionStore:
                 "CREATE INDEX IF NOT EXISTS ix_companion_cycle_event_cycle "
                 "ON companion_cycle_event(cycle_id, sequence)"
             )
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS observability_event (
+                     event_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL REFERENCES companion_cycle(cycle_id),
+                     task_key TEXT NOT NULL, event_type TEXT NOT NULL, stage TEXT,
+                     stage_run_id TEXT, attempt_id TEXT, occurred_at TEXT NOT NULL,
+                     known_at TEXT NOT NULL, recorded_at TEXT NOT NULL, sha256 TEXT NOT NULL,
+                     event_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                     UNIQUE(cycle_id, event_id), UNIQUE(cycle_id, sha256))"""
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS ix_observability_event_cycle "
+                "ON observability_event(cycle_id, occurred_at, event_id)"
+            )
+            c.execute("""CREATE TRIGGER IF NOT EXISTS observability_event_no_update
+              BEFORE UPDATE ON observability_event
+              BEGIN SELECT RAISE(ABORT, 'observability events are immutable'); END""")
+            c.execute("""CREATE TRIGGER IF NOT EXISTS observability_event_no_delete
+              BEFORE DELETE ON observability_event
+              BEGIN SELECT RAISE(ABORT, 'observability events are immutable'); END""")
             for row in c.execute(
                 "SELECT cycle_id,task_key,scheduled_for,as_of,schedule_id,schedule_revision,schedule_snapshot_json "
                 "FROM companion_cycle WHERE cycle_contract_json IS NULL"
@@ -1165,16 +1205,19 @@ class CompanionStore:
     def _stage_event(
         connection: sqlite3.Connection, *, cycle_id: str, stage: str, stage_run_id: str,
         event_type: str, state: str, payload: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> tuple[str, str]:
+        event_id = str(uuid.uuid4())
+        occurred_at = now()
         connection.execute(
             """INSERT INTO companion_stage_event(
                  event_id,cycle_id,stage,stage_run_id,event_type,state,created_at,payload_json
                ) VALUES(?,?,?,?,?,?,?,?)""",
             (
-                str(uuid.uuid4()), cycle_id, stage, stage_run_id, event_type, state, now(),
+                event_id, cycle_id, stage, stage_run_id, event_type, state, occurred_at,
                 canonical_json(payload or {}),
             ),
         )
+        return event_id, occurred_at
 
     @staticmethod
     def _stage_visibility(stage: str) -> dict[str, Any]:
@@ -1234,10 +1277,19 @@ class CompanionStore:
                     input_sha256, canonical_json(root), canonical_json(self._stage_visibility(stage)), at, at,
                 ),
             )
-            self._stage_event(
+            stage_event_id, stage_event_at = self._stage_event(
                 c, cycle_id=cycle_id, stage=stage, stage_run_id=run_id,
                 event_type="stage.started", state="running",
                 payload={"as_of": as_of or cycle["as_of"], "input_sha256": input_sha256, "provenance": root},
+            )
+            self.record_observation_event(
+                cycle_id, "stage.started", {
+                    "observability_event_id": stage_event_id, "event_id": stage_event_id,
+                    "occurred_at": stage_event_at, "stage": stage,
+                    "stage_run_id": run_id, "cycle": cycle,
+                    "observations": {"workload": {"kind": "stage", "state": "running", "input_sha256": input_sha256}},
+                    "attribution": {"user_wait": {}, "workload": {"kind": "stage"}},
+                }, connection=c,
             )
             return dict(c.execute("SELECT * FROM companion_stage_run WHERE stage_run_id=?", (run_id,)).fetchone())
 
@@ -1281,10 +1333,19 @@ class CompanionStore:
                 f"UPDATE companion_stage_run SET {', '.join(fields)} WHERE stage_run_id=? AND cycle_id=?",
                 values,
             )
-            self._stage_event(
+            stage_event_id, stage_event_at = self._stage_event(
                 c, cycle_id=cycle_id, stage=stage, stage_run_id=row["stage_run_id"],
                 event_type=event_type or f"stage.{state}", state=state,
                 payload={"output_sha256": output_sha256, "error": error, "retry_at": retry_at},
+            )
+            self.record_observation_event(
+                cycle_id, event_type or f"stage.{state}", {
+                    "observability_event_id": stage_event_id, "event_id": stage_event_id,
+                    "occurred_at": stage_event_at, "stage": stage,
+                    "stage_run_id": row["stage_run_id"],
+                    "observations": {"workload": {"kind": "stage", "state": state, "output_sha256": output_sha256, "error": error, "retry_at": retry_at}},
+                    "attribution": {"user_wait": {}, "workload": {"kind": "stage"}},
+                }, connection=c,
             )
             return dict(c.execute("SELECT * FROM companion_stage_run WHERE stage_run_id=?", (row["stage_run_id"],)).fetchone())
 
@@ -3293,6 +3354,18 @@ class CompanionStore:
                  json.dumps(input_packet, ensure_ascii=False, sort_keys=True) if input_packet is not None else None,
                  effort_policy_version, effort_input_fingerprint),
             )
+            self.record_observation_event(
+                cycle_id, "attempt.started", {
+                    "observability_event_id": attempt_id, "event_id": attempt_id,
+                    "occurred_at": started, "stage": stage, "attempt_id": attempt_id,
+                    "cycle": self.get_cycle(cycle_id, connection=c),
+                    "attribution": {"user_wait": {}, "workload": {"kind": "attempt"}},
+                    "observations": {"workload": {
+                        "kind": "attempt", "input_sha256": input_sha256,
+                        "is_shadow": bool(is_shadow), "timeout_seconds": timeout_seconds,
+                    }},
+                }, connection=c,
+            )
         return {"attempt_id": attempt_id, "attempt_number": number, "started_at": started}
 
     def finish_attempt(self, attempt_id: str, status: str, *, output_sha256: str | None = None, output: dict[str, Any] | None = None, error: str | None = None, usage: dict[str, Any] | None = None, verifier: dict[str, Any] | None = None, broker_metadata: dict[str, Any] | None = None, tool_trace: list[dict[str, Any]] | None = None, actual_model: str | None = None) -> None:
@@ -3319,6 +3392,26 @@ class CompanionStore:
             )
             if cursor.rowcount != 1:
                 raise ValueError("attempt is already terminal or does not exist")
+            if status in {"rejected", "failed", "timed_out"}:
+                row = c.execute(
+                    "SELECT * FROM llm_attempt WHERE attempt_id=?", (attempt_id,)
+                ).fetchone()
+                self.record_observation_event(
+                    str(row["cycle_id"]), f"attempt.{status}", {
+                        "observability_event_id": f"{attempt_id}:{status}",
+                        "event_id": f"{attempt_id}:{status}",
+                        "occurred_at": str(row["completed_at"]),
+                        "stage": str(row["stage"]), "attempt_id": attempt_id,
+                        "cycle": self.get_cycle(str(row["cycle_id"]), connection=c),
+                        "attribution": {"user_wait": {}, "workload": {"kind": "attempt"}},
+                        "observations": {"workload": {
+                            "kind": "attempt", "status": status,
+                            "input_sha256": row["input_sha256"],
+                            "output_sha256": row["output_sha256"],
+                            "duration_ms": row["duration_ms"],
+                        }},
+                    }, connection=c,
+                )
 
     def attempts(self, cycle_id: str) -> list[dict[str, Any]]:
         with self.connection() as c:
@@ -4140,16 +4233,168 @@ class CompanionStore:
         with self.connection() as current:
             current.execute("INSERT INTO companion_command_receipt VALUES(?,?,?,?,?,?)", values)
 
+    def record_observation_event(
+        self, cycle_id: str, runtime_event_type: str, payload: dict[str, Any], *,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any] | None:
+        """Project one existing Runtime event into ObservabilitySpec/v1.
+
+        This is deliberately a Runtime-only write boundary.  It accepts the
+        existing lifecycle vocabulary and never accepts a caller-selected
+        writer/source identity.  Replaying the same event id is idempotent;
+        reusing it for different content is a conflict.
+        """
+        observation_type = event_type_for_runtime_event(runtime_event_type)
+        if observation_type is None:
+            return None
+        if not isinstance(payload, dict):
+            raise ValueError("Runtime observation payload must be an object")
+
+        def write(c: sqlite3.Connection) -> dict[str, Any]:
+            cycle = self.get_cycle(cycle_id, connection=c)
+            cycle_payload = payload.get("cycle") if isinstance(payload.get("cycle"), dict) else {}
+            event_id = str(payload.get("observability_event_id") or payload.get("event_id") or uuid.uuid4())
+            existing = c.execute(
+                "SELECT event_json FROM observability_event WHERE event_id=?", (event_id,)
+            ).fetchone()
+            existing_event = json.loads(existing["event_json"]) if existing else None
+            occurred_at = str(
+                payload.get("occurred_at") or payload.get("known_at")
+                or (existing_event or {}).get("occurred_at") or now()
+            )
+            # Domain time is explicit when supplied.  Runtime record time is
+            # intentionally separate, so delayed/recovered events remain visible.
+            recorded_at = str(existing_event.get("recorded_at")) if existing_event else now()
+            stage = payload.get("stage") or {
+                "m0": "m0", "m1": "m1", "m2": "m2", "chat": "chat",
+            }.get(str(runtime_event_type).split(".")[0])
+            stage_run_id = payload.get("stage_run_id")
+            if stage and not stage_run_id and stage in DECISION_CYCLE_STAGES:
+                row = c.execute(
+                    "SELECT stage_run_id FROM companion_stage_run WHERE cycle_id=? AND stage=? ORDER BY attempt DESC LIMIT 1",
+                    (cycle_id, stage),
+                ).fetchone()
+                stage_run_id = row["stage_run_id"] if row else None
+            attempt_id = payload.get("attempt_id") or payload.get("compose_attempt_id") or payload.get("judgment_attempt_id")
+            previous_start = c.execute(
+                """SELECT occurred_at FROM observability_event
+                   WHERE cycle_id=? AND event_type='actual_started'
+                     AND (stage=? OR (? IS NULL AND stage IS NULL))
+                   ORDER BY occurred_at DESC LIMIT 1""",
+                (cycle_id, stage, stage),
+            ).fetchone()
+            supplied_attribution = payload.get("attribution") if isinstance(payload.get("attribution"), dict) else None
+            attribution = json.loads(json.dumps(supplied_attribution, ensure_ascii=False, default=str)) if supplied_attribution is not None else None
+            if observation_type == "actual_started":
+                # Stage ledger and attempt facts are background workload. Public
+                # lifecycle starts omit attribution so build_event opens user wait.
+                if runtime_event_type == "stage.started":
+                    attribution = {"user_wait": {}, "workload": {"kind": "stage"}}
+            elif observation_type == "qualified_delivery":
+                attribution = attribution or {}
+                wait = attribution.setdefault("user_wait", {})
+                if runtime_event_type == "stage.succeeded":
+                    attribution.setdefault("workload", {"kind": "stage"})
+                elif previous_start:
+                    if not wait.get("started_at"):
+                        wait["started_at"] = previous_start["occurred_at"]
+                    if not wait.get("ended_at"):
+                        wait["ended_at"] = occurred_at
+            elif attribution is None:
+                attribution = {}
+            selected = {
+                key: payload[key] for key in (
+                    "latency", "latency_ms", "duration_ms", "workload", "upstream",
+                    "evidence_attempt_id", "compose_attempt_id", "evidence_packet_sha256", "packet_sha256",
+                    "research_attempt_id", "judgment_attempt_id", "research_packet_sha256", "judgment_packet_sha256",
+                    "source_artifact_id", "retry", "retry_count", "fallback", "adapter", "agent", "memory",
+                    "memory_retrieval", "evidence", "coverage", "conflicts", "failure",
+                    "qualification", "window", "metrics",
+                ) if key in payload
+            }
+            # Only bounded, explicitly whitelisted observation fields cross
+            # the Runtime boundary; arbitrary provider/client payloads do not.
+            if isinstance(payload.get("observations"), dict):
+                selected = {**selected, **{
+                    key: payload["observations"][key]
+                    for key in ("latency", "latency_ms", "duration_ms", "workload", "upstream", "evidence_attempt_id", "compose_attempt_id", "evidence_packet_sha256", "packet_sha256", "research_attempt_id", "judgment_attempt_id", "research_packet_sha256", "judgment_packet_sha256", "source_artifact_id", "retry", "retry_count", "fallback", "adapter", "agent", "memory_retrieval", "evidence", "coverage", "conflicts", "failure", "qualification", "window", "metrics", "quantresearch", "isolation")
+                    if key in payload["observations"]
+                }}
+            if "workload" not in selected and any(key in payload for key in ("retry_count", "duration_ms")):
+                selected["workload"] = {key: payload[key] for key in ("retry_count", "duration_ms") if key in payload}
+            event = build_observation_event(
+                event_id=event_id, event_type=observation_type, cycle_id=cycle_id,
+                task_key=str(cycle["task_key"]), stage=stage, stage_run_id=stage_run_id,
+                attempt_id=str(attempt_id) if attempt_id else None, occurred_at=occurred_at,
+                known_at=str(payload.get("known_at") or occurred_at), recorded_at=recorded_at,
+                status=str(payload.get("status") or runtime_event_type),
+                source={"source": "runtime", "component": "companion-store", "writer": "runtime"},
+                attribution=attribution, observations=selected,
+                provenance={"runtime_event_type": runtime_event_type, "contract": "companion-client-event/v1"},
+            )
+            existing = c.execute(
+                "SELECT event_json,sha256 FROM observability_event WHERE event_id=?", (event_id,)
+            ).fetchone()
+            if existing:
+                if existing["sha256"] != event["sha256"]:
+                    raise ValueError("observability event id conflict")
+                return json.loads(existing["event_json"])
+            try:
+                c.execute(
+                    """INSERT INTO observability_event(
+                         event_id,cycle_id,task_key,event_type,stage,stage_run_id,attempt_id,
+                         occurred_at,known_at,recorded_at,sha256,event_json,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        event["event_id"], event["cycle_id"], event["task_key"], event["event_type"],
+                        event["stage"], event["stage_run_id"], event["attempt_id"], event["occurred_at"],
+                        event["known_at"], event["recorded_at"], event["sha256"],
+                        canonical_json(event), recorded_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                row = c.execute("SELECT event_json,sha256 FROM observability_event WHERE sha256=?", (event["sha256"],)).fetchone()
+                if row:
+                    return json.loads(row["event_json"])
+                raise ValueError("conflicting observability event") from exc
+            return event
+
+        if connection is not None:
+            # The caller owns an active transaction; opening a second connection
+            # here can contend on SQLite's write lock.  All Runtime call sites
+            # initialize the schema before entering their transaction.
+            return write(connection)
+        self.initialize()
+        with self.connection() as c:
+            return write(c)
+
+    def observation_events(self, cycle_id: str | None = None) -> list[dict[str, Any]]:
+        self.initialize()
+        with self.connection() as c:
+            if cycle_id is None:
+                rows = c.execute("SELECT event_json FROM observability_event ORDER BY recorded_at,event_id").fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT event_json FROM observability_event WHERE cycle_id=? ORDER BY occurred_at,event_id",
+                    (cycle_id,),
+                ).fetchall()
+        return [validate_observation_event(json.loads(row["event_json"])) for row in rows]
+
     def queue_event(self, cycle_id: str, event_type: str, payload: dict[str, Any], *, connection: sqlite3.Connection | None = None) -> str:
         event_id=str(uuid.uuid4())
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         created_at = now()
         values = (event_id, cycle_id, event_type, payload_json, created_at)
+        observation_payload = dict(payload)
+        if "observability_event_id" not in observation_payload and "event_id" not in observation_payload:
+            observation_payload["observability_event_id"] = event_id
         if connection is not None:
+            self.record_observation_event(cycle_id, event_type, observation_payload, connection=connection)
             connection.execute("INSERT INTO companion_outbox VALUES(?,?,?,?,?,NULL)", values)
             self._queue_client_event(event_id, "companion-client-event/v1", cycle_id, event_type, payload_json, created_at, connection)
         else:
             with self.connection() as c:
+                self.record_observation_event(cycle_id, event_type, observation_payload, connection=c)
                 c.execute("INSERT INTO companion_outbox VALUES(?,?,?,?,?,NULL)", values)
                 self._queue_client_event(event_id, "companion-client-event/v1", cycle_id, event_type, payload_json, created_at, c)
         return event_id

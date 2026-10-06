@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "observability-spec-v1.schema.json",
+  "title": "Runtime ObservabilitySpec v1 event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "contract_version", "event_id", "event_type", "cycle_id", "task_key", "stage", "stage_run_id", "attempt_id", "occurred_at", "known_at", "recorded_at", "status", "source", "attribution", "observations", "provenance", "sha256"],
+  "properties": {
+    "contract": {"const": "ObservabilitySpec/v1"},
+    "contract_version": {"type": "integer", "const": 1},
+    "event_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "event_type": {"enum": ["plan_started", "actual_started", "qualified_delivery", "failed"]},
+    "cycle_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "task_key": {"type": "string", "minLength": 1, "maxLength": 512},
+    "stage": {"type": ["string", "null"], "minLength": 1, "maxLength": 512},
+    "stage_run_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 512},
+    "attempt_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 512},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "known_at": {"type": "string", "format": "date-time"},
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "status": {"type": "string", "minLength": 1, "maxLength": 512},
+    "source": {
+      "type": "object", "required": ["source", "component", "writer"], "additionalProperties": true,
+      "properties": {"source": {"const": "runtime"}, "component": {"type": "string", "minLength": 1, "maxLength": 512}, "writer": {"type": "string", "minLength": 1, "maxLength": 512}}
+    },
+    "attribution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["user_wait", "workload", "upstream"],
+      "properties": {
+        "user_wait": {"$ref": "#/$defs/wait"},
+        "workload": {
+          "type": "object",
+          "properties": {"duration_ms": {"type": "integer", "minimum": 0}}
+        },
+        "upstream": {
+          "type": "object",
+          "properties": {
+            "source_cycle_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 512},
+            "source_task_key": {"type": ["string", "null"], "minLength": 1, "maxLength": 512},
+            "source_stage": {"type": ["string", "null"], "minLength": 1, "maxLength": 512},
+            "source_event_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 512},
+            "known_at": {"type": ["string", "null"], "format": "date-time"},
+            "reused_at": {"type": ["string", "null"], "format": "date-time"}
+          }
+        }
+      }
+    },
+    "observations": {"type": "object"},
+    "provenance": {"type": "object"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "wait": {
+      "type": "object", "additionalProperties": false,
+      "required": ["started_at", "ended_at", "duration_ms"],
+      "properties": {
+        "started_at": {"type": ["string", "null"], "format": "date-time"},
+        "ended_at": {"type": ["string", "null"], "format": "date-time"},
+        "duration_ms": {"type": ["integer", "null"], "minimum": 0}
+      }
+    }
+  }
+}

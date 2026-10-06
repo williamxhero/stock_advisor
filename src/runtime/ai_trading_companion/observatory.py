@@ -9,6 +9,8 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from .observability_contract import validate_event
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -80,6 +82,8 @@ class TimelineEvent:
     status: str
     source_kind: str
     duration_seconds: int | None = None
+    known_at: str | None = None
+    recorded_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -329,7 +333,18 @@ class EvaluationObservatory:
         planned = _parse(cycle["scheduled_for"])
         window_end = datetime.combine(planned.date(), time(10, 30), planned.tzinfo)
 
-        start_events = [event["created_at"] for event in events if event["event_type"] == "m0.started"]
+        start_events = [
+            event["observation"]["occurred_at"] for event in events
+            if event.get("observation")
+            and event["observation"]["event_type"] == "actual_started"
+            and event["observation"]["stage"] == "m0"
+            and event["observation"]["attribution"]["user_wait"].get("started_at") is not None
+        ]
+        if not start_events:
+            start_events = [
+                event["created_at"] for event in events
+                if not event.get("observation") and event["event_type"] == "m0.started"
+            ]
         completeness = ["cycle"]
         if request.legacy_incomplete:
             completeness.append("legacy_incomplete")
@@ -418,6 +433,23 @@ class EvaluationObservatory:
                 "SELECT event_id,cycle_id,event_type,payload_json,created_at FROM companion_outbox WHERE cycle_id=? ORDER BY created_at,event_id",
                 (cycle_id,),
             )]
+            # queue_event shares identities with immutable execution facts. Overlay
+            # before projecting, retaining unmatched historical outbox rows.
+            events_by_id = {event["event_id"]: event for event in events}
+            for row in connection.execute(
+                "SELECT event_json FROM observability_event WHERE cycle_id=? ORDER BY occurred_at,event_id",
+                (cycle_id,),
+            ):
+                observation = validate_event(json.loads(row["event_json"]))
+                event_id = observation["event_id"]
+                outbox = events_by_id.get(event_id, {})
+                events_by_id[event_id] = {
+                    **outbox,
+                    "event_id": event_id,
+                    "event_type": outbox.get("event_type") or observation["provenance"].get("runtime_event_type") or observation["event_type"],
+                    "observation": observation,
+                }
+            events = list(events_by_id.values())
             regime_row = connection.execute(
                 "SELECT regime FROM market_regime_snapshot WHERE cycle_id=?", (cycle_id,),
             ).fetchone()
@@ -551,9 +583,14 @@ class EvaluationObservatory:
                 raise ValueError(f"runtime event id conflict: {event.event_id}")
 
         for event in events:
+            observation = event.get("observation")
             add(TimelineEvent(
                 event_id=event["event_id"], phase="runtime", event_type=event["event_type"],
-                occurred_at=event["created_at"], status="observed", source_kind="outbox",
+                occurred_at=observation["occurred_at"] if observation else event["created_at"],
+                status=observation["status"] if observation else "observed",
+                source_kind="observability_event" if observation else "outbox",
+                known_at=observation["known_at"] if observation else None,
+                recorded_at=observation["recorded_at"] if observation else None,
             ))
         for attempt in attempts:
             attempt_id = attempt["attempt_id"]

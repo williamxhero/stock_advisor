@@ -36,11 +36,15 @@ foreach ($required in @(
     'resources\contracts\position-safety-spec-v1.schema.json',
     'resources\contracts\research-isolation-spec-v1.schema.json',
     'resources\contracts\regression-spec-v1.schema.json',
+    'resources\contracts\observability-spec-v1.schema.json',
+    'resources\contracts\observability-evaluation-v1.schema.json',
+    'resources\contracts\observability-replay-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
     'runtime\ai_trading_companion\__main__.py',
     'runtime\ai_trading_companion\regression_gate.py',
     'runtime\ai_trading_companion\regression_probes.py',
     'runtime\ai_trading_companion\regression_spec.py',
+    'runtime\ai_trading_companion\observability_contract.py',
     'runtime\ai_trading_companion\cycle_replay.py',
     'runtime\ai_trading_companion\evidence_snapshot.py',
     'runtime\ai_trading_companion\temporal_integrity.py',
@@ -187,6 +191,69 @@ try {
                 throw "Installed RegressionSpec evaluation axis did not qualify: $axis"
             }
         }
+        # Validate the ObservabilitySpec event, independent evaluation vector, and
+        # frozen replay twice from the installed runtime without contacting a provider.
+        $observabilitySmoke = @'
+import json
+from ai_trading_companion.observability_contract import (
+    build_evaluation_vector,
+    build_event,
+    frozen_replay,
+    validate_evaluation_vector,
+    validate_event,
+    validate_replay,
+)
+
+
+def qualification():
+    event = build_event(
+        event_id='install-observability-event',
+        event_type='actual_started',
+        cycle_id='install-observability-cycle',
+        task_key='install.observability.smoke',
+        stage='m0',
+        occurred_at='2026-10-06T01:00:00Z',
+        known_at='2026-10-06T01:00:01Z',
+        recorded_at='2026-10-06T01:00:02Z',
+        source={'source': 'runtime', 'component': 'install-smoke', 'writer': 'install-smoke'},
+        observations={'workload': {'retry_count': 0}},
+        provenance={'source': 'install-smoke'},
+    )
+    vector = build_evaluation_vector(
+        {
+            axis: {'status': 'pass', 'measurements': {'measured': True}}
+            for axis in (
+                'delivery_speed', 'qualification_probability', 'research_quality',
+                'judgment_outcome', 'safety_reliability',
+            )
+        },
+        provenance={'source': 'install-smoke'},
+    )
+    replay = frozen_replay(event)
+    validate_event(event)
+    validate_evaluation_vector(vector)
+    validate_replay(replay)
+    return {'event': event, 'vector': vector, 'replay': replay}
+
+
+first = qualification()
+second = qualification()
+if first != second:
+    raise RuntimeError('Installed ObservabilitySpec smoke was not deterministic.')
+print(json.dumps(first, sort_keys=True, separators=(',', ':')))
+'@
+        $observabilityFirst = ((& $python -c $observabilitySmoke) -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0) { throw "Installed ObservabilitySpec smoke 1 failed with exit code $LASTEXITCODE." }
+        $observabilitySecond = ((& $python -c $observabilitySmoke) -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0) { throw "Installed ObservabilitySpec smoke 2 failed with exit code $LASTEXITCODE." }
+        if ($observabilityFirst -ne $observabilitySecond) { throw 'Installed ObservabilitySpec smoke receipts were not deterministic.' }
+        $observabilityQualification = $observabilityFirst | ConvertFrom-Json
+        if ($observabilityQualification.event.contract -ne 'ObservabilitySpec/v1' -or
+            $observabilityQualification.vector.contract -ne 'ObservabilityEvaluation/v1' -or
+            $observabilityQualification.replay.contract -ne 'ObservabilitySpecReplay/v1') {
+            throw 'Installed ObservabilitySpec smoke returned an unexpected contract.'
+        }
+
         # Run only from the installed runtime path and replay the same frozen
         # cycle twice, preserving the original receipt and published artifact.
         $cycleSmoke = @'

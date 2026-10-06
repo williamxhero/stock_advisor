@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "M2SynthesisSpec/v1",
+  "title": "Runtime-owned M2 synthesis contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "version", "stage", "source_packet", "frozen_m0", "frozen_h0", "frozen_m1", "current_position_facts", "user_preferences", "risk_constraints", "conflicts", "mandate_reference", "boundary", "permissions", "quantresearch", "provenance"],
+  "properties": {
+    "contract": {"const": "M2SynthesisSpec/v1"},
+    "version": {"const": 1, "type": "integer"},
+    "stage": {"const": "m2"},
+    "source_packet": {"type": "object"},
+    "frozen_m0": {"$ref": "#/$defs/artifact"},
+    "frozen_h0": {"$ref": "#/$defs/h0"},
+    "frozen_m1": {"$ref": "#/$defs/m1"},
+    "current_position_facts": {
+      "type": "object",
+      "required": ["fact_source", "positions", "fact_view_sha256"],
+      "properties": {
+        "fact_source": {"const": "runtime_database"},
+        "positions": {"type": "array"},
+        "fact_view_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "user_preferences": {"type": "array"},
+    "risk_constraints": {
+      "type": "object",
+      "required": ["write_permissions"],
+      "properties": {"write_permissions": {"const": []}}
+    },
+    "conflicts": {"type": "array"},
+    "mandate_reference": {
+      "type": "object",
+      "required": ["contract", "sha256"],
+      "properties": {
+        "contract": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "boundary": {"type": "object"},
+    "permissions": {"const": {"write_permissions": []}},
+    "quantresearch": {"const": {"access": "read_only", "write_permissions": []}},
+    "provenance": {"type": "object"}
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "sha256", "as_of", "known_at"],
+      "properties": {
+        "artifact_id": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "as_of": {"type": "string", "minLength": 1},
+        "known_at": {"type": "string", "minLength": 1}
+      }
+    },
+    "h0": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "sha256", "as_of", "known_at", "source_text"],
+      "properties": {
+        "artifact_id": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "as_of": {"type": "string", "minLength": 1},
+        "known_at": {"type": "string", "minLength": 1},
+        "source_text": {"type": "string", "minLength": 1}
+      }
+    },
+    "m1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "sha256", "as_of", "known_at", "original_judgment_text", "snapshot", "snapshot_sha256"],
+      "properties": {
+        "artifact_id": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "as_of": {"type": "string", "minLength": 1},
+        "known_at": {"type": "string", "minLength": 1},
+        "original_judgment_text": {"type": "string", "minLength": 1},
+        "snapshot": {"type": "object"},
+        "snapshot_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    }
+  }
+}

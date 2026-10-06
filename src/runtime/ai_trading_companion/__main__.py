@@ -85,6 +85,7 @@ from .m1_judgment import (
     bind_attempt as bind_m1_judgment_attempt,
     build_input as build_m1_judgment_input,
 )
+from .m2_judgment import build_input as build_m2_judgment_input
 from .multimodal_adapter import (
     CONTRACT as MULTIMODAL_INPUT_CONTRACT,
     RESULT_CONTRACT as MULTIMODAL_RESULT_CONTRACT,
@@ -947,6 +948,10 @@ def _call_stage(
         assert_m1_blind(packet)
         if stage == "m1_judgment" and ("m1_judgment_spec" in packet or "evidence_snapshot" in packet):
             build_m1_judgment_input(packet)
+    if stage == "m2":
+        # The provider boundary must never be reachable with a missing H0,
+        # stale M1, or mutable portfolio fact view.
+        build_m2_judgment_input(packet)
     if search:
         packet = attach_agent_contract(packet, capability=f"research:{stage}")
         packet = attach_role_inputs(packet, stage=stage)
@@ -1412,6 +1417,11 @@ def _call_stage(
                 }
         if stage == "m1_judgment" and verifier.get("passed") and isinstance(verifier.get("m1_judgment"), dict):
             verifier["m1_judgment"] = bind_m1_judgment_attempt(verifier["m1_judgment"], attempt["attempt_id"])
+        if stage == "m2" and verifier.get("passed") and isinstance(verifier.get("m2_synthesis"), dict):
+            from .m2_judgment import bind_attempt as bind_m2_synthesis_attempt
+            verifier["m2_synthesis"] = bind_m2_synthesis_attempt(
+                verifier["m2_synthesis"], attempt["attempt_id"],
+            )
         status = "succeeded" if verifier.get("passed") else "rejected"
         output_text = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         store.finish_attempt(

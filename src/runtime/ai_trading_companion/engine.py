@@ -28,6 +28,7 @@ from .decision_cycle import DECISION_CYCLE_CONTRACT
 from .mandate_spec import resolve_cycle_mandates
 from .evidence_snapshot import descriptor as evidence_snapshot_descriptor
 from .m1_judgment import build_input as build_m1_judgment_input, build_output as build_m1_judgment_output
+from .m2_judgment import build_input as build_m2_judgment_input, build_output as build_m2_judgment_output
 from .research_isolation import coerce_quant_research_port
 from .audit_contract import build_output as build_audit_output, expected_writer_identity
 from .m0_observation import (
@@ -1577,6 +1578,55 @@ class CompanionEngine:
         verified_m2 = normalize_stage_output("m2", verified_output if isinstance(verified_output, dict) else {}).text
         if verified_m2 != m2:
             raise ValueError("M2 body does not match the verified synthesis attempt")
+        raw_packet = json.loads(verified_attempt.get("input_packet_json") or "null")
+        verifier = json.loads(verified_attempt.get("verifier_json") or "{}")
+        m2_receipt = verifier.get("m2_synthesis") if isinstance(verifier, dict) else None
+        formal_receipt = isinstance(raw_packet, dict) and (
+            "m2_synthesis_spec" in raw_packet
+            or isinstance(verified_output, dict) and verified_output.get("result_version") == 4
+        )
+        if formal_receipt:
+            if not isinstance(m2_receipt, dict):
+                raise ValueError("M2 synthesis attempt lacks its versioned receipt")
+            try:
+                expected_input = build_m2_judgment_input(raw_packet)
+                if raw_packet["cycle_id"] != cycle_id or raw_packet["sha256"] != packet_hash:
+                    raise ValueError("M2 receipt packet identity mismatch")
+                frozen_m0 = raw_packet["frozen_m0"]
+                stored_m0 = self.store.latest_artifact_before(cycle_id, "m0", raw_packet["as_of"])
+                if not isinstance(stored_m0, dict) or frozen_m0 != {
+                    "artifact_id": stored_m0["artifact_id"], "sha256": stored_m0["body_sha256"],
+                    "as_of": stored_m0["as_of"], "known_at": stored_m0.get("known_at"),
+                }:
+                    raise ValueError("M2 receipt M0 is not Runtime-owned")
+                frozen_h0 = raw_packet["frozen_h0"]
+                stored_h0 = self.store.latest_artifact_before(cycle_id, "h0", raw_packet["as_of"])
+                if not isinstance(stored_h0, dict) or frozen_h0.get("artifact_id") != stored_h0["artifact_id"] or frozen_h0.get("sha256") != stored_h0["body_sha256"] or frozen_h0.get("source_text") != stored_h0.get("body_markdown"):
+                    raise ValueError("M2 receipt H0 is not Runtime-owned")
+                frozen_m1 = raw_packet["frozen_m1"]
+                stored_m1 = self.store.latest_artifact_before(cycle_id, "m1", raw_packet["as_of"])
+                m1_snapshot_row = next((row for row in self.store.judgment_snapshots(cycle_id) if isinstance(stored_m1, dict) and row.get("artifact_id") == stored_m1["artifact_id"]), None)
+                if not isinstance(stored_m1, dict) or not isinstance(m1_snapshot_row, dict):
+                    raise ValueError("M2 receipt M1 is not Runtime-owned")
+                stored_m1_snapshot = json.loads(m1_snapshot_row["snapshot_json"])
+                expected_m1 = {
+                    "artifact_id": stored_m1["artifact_id"], "sha256": stored_m1["body_sha256"],
+                    "as_of": stored_m1["as_of"], "known_at": stored_m1.get("known_at"),
+                    "original_judgment_text": stored_m1["body_markdown"], "snapshot": stored_m1_snapshot,
+                    "snapshot_sha256": hashlib.sha256(json.dumps(stored_m1_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                }
+                if frozen_m1 != expected_m1:
+                    raise ValueError("M2 receipt M1 is not Runtime-owned")
+                fact_view = self.store.m2_portfolio_fact_view(cycle_id)
+                if not isinstance(fact_view, dict) or raw_packet.get("current_position_facts") != fact_view:
+                    raise ValueError("M2 receipt position facts are not Runtime-owned")
+                expected_receipt = build_m2_judgment_output(
+                    expected_input, verified_output, attempt_id=attempt_id,
+                )
+                if m2_receipt != expected_receipt:
+                    raise ValueError("M2 receipt does not match its frozen input, output and attempt")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("M2 synthesis receipt is not qualified") from exc
         if not cycle.get("has_h0"):
             raise ValueError("M2 requires H0")
         m1_snapshots = [row for row in self.store.judgment_snapshots(cycle_id) if row.get("kind") == "m1"]
@@ -1601,6 +1651,13 @@ class CompanionEngine:
             )
             artifact_metadata = {
                 "attempt_id": attempt_id,
+                "m1_source_artifact_id": m1_snapshots[-1].get("artifact_id") if m1_snapshots else None,
+                "append_only": True,
+                "m2_synthesis": {
+                    "contract": m2_receipt.get("contract") if isinstance(m2_receipt, dict) else None,
+                    "version": m2_receipt.get("version") if isinstance(m2_receipt, dict) else None,
+                    "sha256": m2_receipt.get("sha256") if isinstance(m2_receipt, dict) else None,
+                } if isinstance(m2_receipt, dict) else None,
                 "audit": {
                     "record_id": audit_row["record_id"],
                     "sha256": audit_row["content_sha256"],

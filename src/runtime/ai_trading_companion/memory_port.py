@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, field
 import hashlib
 import json
 from typing import Any, Callable, Protocol
@@ -9,9 +10,16 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 import uuid
 
+from .memory_retrieval import MemoryIsolationError, qualify_episode, rank_bundle
+from .temporal_integrity import canonical_time
+
 
 class MemoryUnavailable(RuntimeError):
     pass
+
+
+class MemoryNotVisible(MemoryUnavailable, MemoryIsolationError):
+    """An episode cannot be read within the requested frozen snapshot."""
 
 
 class MemoryPort(Protocol):
@@ -19,7 +27,7 @@ class MemoryPort(Protocol):
     def append_batch(self, episodes: list[dict[str, Any]]) -> list[dict[str, Any]]: ...
     def begin_snapshot(self, request: dict[str, Any]) -> dict[str, Any]: ...
     def search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, Any]]: ...
-    def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20) -> dict[str, Any]: ...
+    def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20, context: dict[str, Any] | None = None) -> dict[str, Any]: ...
     def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]: ...
     def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]: ...
     def timeline(self, memory_space_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]: ...
@@ -34,6 +42,7 @@ class HttpMemoryAdapter:
     base_url: str
     timeout_seconds: float = 10.0
     opener: Callable[..., Any] = urlopen
+    _snapshots: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def append(self, episode: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/v1/episodes", episode)["result"]
@@ -42,19 +51,56 @@ class HttpMemoryAdapter:
         return self._request("POST", "/v1/episodes/batch", {"episodes": episodes})["result"]
 
     def begin_snapshot(self, request: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", "/v1/snapshots", request)["result"]
+        snapshot = self._request("POST", "/v1/snapshots", request)["result"]
+        self._snapshots[snapshot["snapshot_id"]] = copy.deepcopy(snapshot)
+        return snapshot
 
     def search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
-        return self._request("POST", f"/v1/snapshots/{snapshot_id}/search", {"query": query, "limit": limit})["result"]
+        return self.retrieve_bundle(snapshot_id, query, limit=limit)["results"]
 
-    def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20) -> dict[str, Any]:
-        return self._request("POST", f"/v1/snapshots/{snapshot_id}/retrieve", {"query": query, "limit": limit})["result"]
+    def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20,
+                        context: dict[str, Any] | None = None) -> dict[str, Any]:
+        bundle = self._request("POST", f"/v1/snapshots/{snapshot_id}/retrieve", {"query": query, "limit": 100})["result"]
+        self._remember_snapshot(snapshot_id, bundle["snapshot"])
+        originals: dict[str, dict[str, Any]] = {}
 
-    def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
+        def resolve(episode_id: str) -> dict[str, Any]:
+            if episode_id not in originals:
+                originals[episode_id] = self._expand_original(snapshot_id, episode_id)
+            return originals[episode_id]
+
+        return rank_bundle(bundle, resolve, limit=max(1, min(limit, 100)), context=context)
+
+    def _remember_snapshot(self, snapshot_id: str, snapshot: dict[str, Any]) -> None:
+        if snapshot.get("snapshot_id") != snapshot_id or (
+            snapshot_id in self._snapshots and self._snapshots[snapshot_id] != snapshot
+        ):
+            raise MemoryUnavailable("MemoryHub snapshot identity changed")
+        self._snapshots[snapshot_id] = copy.deepcopy(snapshot)
+
+    def _snapshot(self, snapshot_id: str) -> dict[str, Any]:
+        if snapshot_id not in self._snapshots:
+            bundle = self._request("POST", f"/v1/snapshots/{snapshot_id}/retrieve", {"query": "", "limit": 1})["result"]
+            self._remember_snapshot(snapshot_id, bundle["snapshot"])
+        return self._snapshots[snapshot_id]
+
+    def _expand_original(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/snapshots/{snapshot_id}/expand", {"episode_id": episode_id})["result"]
 
+    def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
+        original = self._expand_original(snapshot_id, episode_id)
+        qualify_episode(original, self._snapshot(snapshot_id), lambda parent: self._expand_original(snapshot_id, parent))
+        return original
+
     def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
-        return self._request("POST", f"/v1/snapshots/{snapshot_id}/related", {"episode_id": episode_id, "limit": limit})["result"]
+        self.expand(snapshot_id, episode_id)
+        cards = self._request("POST", f"/v1/snapshots/{snapshot_id}/related", {"episode_id": episode_id, "limit": 100})["result"]
+        bundle = {
+            "snapshot": self._snapshot(snapshot_id), "query": "", "results": cards,
+            "bundle_id": f"related:{snapshot_id}:{episode_id}", "audit_id": None,
+            "versions": {"protocol": "memoryhub/v1"},
+        }
+        return rank_bundle(bundle, lambda parent: self._expand_original(snapshot_id, parent), limit=max(1, min(limit, 100)))["results"]
 
     def timeline(self, memory_space_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]:
         return self._request(
@@ -92,7 +138,8 @@ class HttpMemoryAdapter:
                 return json.loads(response.read())
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
-            raise MemoryUnavailable(f"MemoryHub rejected {path}: HTTP {error.code}: {detail}") from error
+            error_type = MemoryNotVisible if error.code == 400 and "episode is not visible in snapshot" in detail else MemoryUnavailable
+            raise error_type(f"MemoryHub rejected {path}: HTTP {error.code}: {detail}") from error
         except (URLError, TimeoutError, OSError) as error:
             raise MemoryUnavailable(f"MemoryHub unavailable at {self.base_url}: {error}") from error
 
@@ -140,31 +187,51 @@ class InMemoryMemoryAdapter:
 
     def search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
         snapshot = self._snapshots[snapshot_id]
-        return [
-            {"episode_id": item["episode_id"], "summary": item.get("body", ""), "known_at": item["known_at"]}
-            for item in self._episodes[: snapshot["watermark"]]
-            if item["memory_space_id"] == snapshot["memory_space_id"]
-            and item["known_at"] <= snapshot["as_of"]
-            and query.casefold() in item.get("body", "").casefold()
-        ][:limit]
+        cards = []
+        for item in self._episodes[:snapshot["watermark"]]:
+            if item["memory_space_id"] != snapshot["memory_space_id"] or canonical_time(item["known_at"]) > canonical_time(snapshot["as_of"]):
+                continue
+            if query and not any(term in item.get("body", "").casefold() for term in query.casefold().split()):
+                continue
+            if snapshot["stage"] in {"m1_research", "m1_judgment"}:
+                try:
+                    qualify_episode(item, snapshot, lambda parent: self._expand_original(snapshot_id, parent))
+                except (ValueError, KeyError, TypeError):
+                    continue
+            cards.append({**copy.deepcopy(item), "summary": item.get("body", "")[:500]})
+        return cards[:limit]
 
-    def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20) -> dict[str, Any]:
-        snapshot = dict(self._snapshots[snapshot_id])
-        return {
-            "bundle_id": f"test-bundle-{len(self._snapshots)}", "audit_id": f"test-audit-{len(self._snapshots)}",
+    def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20,
+                        context: dict[str, Any] | None = None) -> dict[str, Any]:
+        snapshot = copy.deepcopy(self._snapshots[snapshot_id])
+        bundle = {
+            "bundle_id": f"test-bundle-{snapshot_id}", "audit_id": f"test-audit-{snapshot_id}",
             "snapshot": snapshot,
             "versions": {"policy": snapshot["policy_version"], "retriever": "test/v1", "index": "test/v1", "extractor": "test/v1", "protocol": snapshot["protocol_version"]},
-            "query": query, "results": self.search(snapshot_id, query, limit=limit),
+            "query": query, "results": self.search(snapshot_id, query, limit=100),
         }
+        return rank_bundle(bundle, lambda parent: self._expand_original(snapshot_id, parent), limit=max(1, min(limit, 100)), context=context)
+
+    def _expand_original(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
+        snapshot = self._snapshots[snapshot_id]
+        for item in self._episodes[:snapshot["watermark"]]:
+            if item["episode_id"] == episode_id and item["memory_space_id"] == snapshot["memory_space_id"] and canonical_time(item["known_at"]) <= canonical_time(snapshot["as_of"]):
+                return copy.deepcopy(item)
+        raise MemoryNotVisible("episode is not visible in snapshot")
 
     def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
-        visible = {item["episode_id"] for item in self.search(snapshot_id, "", limit=100)}
-        if episode_id not in visible:
-            raise MemoryUnavailable("episode is not visible in snapshot")
-        return dict(next(item for item in self._episodes if item["episode_id"] == episode_id))
+        original = self._expand_original(snapshot_id, episode_id)
+        qualify_episode(original, self._snapshots[snapshot_id], lambda parent: self._expand_original(snapshot_id, parent))
+        return original
 
     def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
-        return [item for item in self.search(snapshot_id, "", limit=100) if item.get("corrects_episode_id") == episode_id][:limit]
+        target = self._expand_original(snapshot_id, episode_id)
+        qualify_episode(target, self._snapshots[snapshot_id], lambda parent: self._expand_original(snapshot_id, parent))
+        target_links = target.get("metadata", {}).get("related_episode_ids", [])
+        return [item for item in self.retrieve_bundle(snapshot_id, "", limit=100)["results"] if (
+            item.get("corrects_episode_id") == episode_id or target.get("corrects_episode_id") == item["episode_id"]
+            or item["episode_id"] in target_links or episode_id in item.get("metadata", {}).get("related_episode_ids", [])
+        )][:limit]
 
     def timeline(self, memory_space_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]:
         return [

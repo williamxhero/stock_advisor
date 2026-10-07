@@ -1,9 +1,13 @@
 """Offline qualification replays; these are not live dependency acceptance."""
 from __future__ import annotations
 
+import copy
 import json
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +16,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from ai_trading_companion.__main__ import flush, run_scheduled_cycle
+from ai_trading_companion.builtin_tools import ensure_builtin_tools
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.evidence_gate import EvidenceInsufficient
@@ -116,6 +121,149 @@ def native_bar_output():
             "market_status": "trading", "provider": "controlled-native", "source_semantics": "native",
         } for code in HOLDINGS],
     }}
+
+
+@pytest.mark.parametrize("field,value,error", [
+    ("exchange", "SZSE", "tool_current_bar_identity_invalid"),
+    ("volume", float("nan"), "tool_current_bar_values_invalid"),
+    ("amount", float("inf"), "tool_current_bar_values_invalid"),
+    ("close", True, "tool_current_bar_values_invalid"),
+    ("low", 11, "tool_current_bar_values_invalid"),
+    ("is_st", None, "tool_current_bar_status_invalid"),
+    ("is_suspended", "false", "tool_current_bar_status_invalid"),
+    ("market_status", "", "tool_current_bar_status_invalid"),
+    ("interval_start", "2026-09-02T14:29:00+08:00", "tool_current_bar_time_invalid"),
+    ("interval_end", "2026-09-03T14:31:00+08:00", "tool_current_bar_time_invalid"),
+    ("observed_at", "2026-09-03T14:31:00+08:00", "tool_current_bar_after_required_at"),
+    ("freshness_ms", True, "tool_current_bar_stale"),
+])
+def test_current_bar_rejects_invalid_values_identity_time_and_metadata(tmp_path, field, value, error):
+    output = native_bar_output()
+    output["data"]["bars"][0][field] = value
+    code = "import sys\nsys.stdout.write(" + repr(json.dumps(output)) + ")"
+    runner = ToolRunner(route_catalog(tmp_path / "tools", {"markethub": code}))
+    result = runner.resolve_with_fallback(request())
+    assert not result.succeeded and result.adapter_receipts[0]["error_code"] == error
+    assert result.adapter_receipts[0]["exit_code"] == 0
+    assert len(result.attempts) == 1
+
+
+@pytest.mark.parametrize("case", ["missing", "duplicate", "wrong_symbol", "stale", "fact_time", "finality"])
+def test_current_bar_requires_exact_frozen_coverage_and_truthful_cutoff(tmp_path, case):
+    output = native_bar_output()
+    bars = output["data"]["bars"]
+    if case == "missing":
+        bars.pop()
+    elif case == "duplicate":
+        bars.append(copy.deepcopy(bars[0]))
+    elif case == "wrong_symbol":
+        bars[0]["symbol"] = "600000"
+    elif case == "stale":
+        for bar in bars:
+            bar.update(interval_start="2026-09-03T14:23:00+08:00", interval_end="2026-09-03T14:24:00+08:00",
+                       observed_at="2026-09-03T14:24:00+08:00", last_trade_at="2026-09-03T14:23:00+08:00",
+                       freshness_ms=0)
+        output["fact_as_of"] = "2026-09-03T06:24:00Z"
+    elif case == "fact_time":
+        output["fact_as_of"] = "2026-09-03T06:29:00Z"
+    else:
+        output["data"]["finality"] = "official_close"
+    code = "import sys\nsys.stdout.write(" + repr(json.dumps(output)) + ")"
+    result = ToolRunner(route_catalog(tmp_path / "tools", {"markethub": code})).resolve_with_fallback(request())
+    expected = ("tool_current_bar_stale" if case == "stale" else "tool_current_bar_time_invalid" if case == "fact_time"
+                else "tool_current_bar_finality_invalid" if case == "finality" else "tool_current_bar_symbol_mismatch")
+    assert result.adapter_receipts[0]["error_code"] == expected and not result.succeeded
+
+
+@pytest.mark.parametrize("case,error", [
+    ("sampled_only", "tool_current_bar_source_invalid"),
+    ("missing_symbol", "tool_current_bar_symbol_mismatch"),
+    ("wrong_symbol", "tool_current_bar_symbol_mismatch"),
+    ("duplicate_key", "tool_current_bar_result_invalid"),
+    ("missing_date", "tool_current_bar_time_invalid"),
+    ("wrong_date", "tool_current_bar_time_invalid"),
+    ("future", "tool_current_bar_time_invalid"),
+    ("stale", "tool_current_bar_stale"),
+    ("nan", "tool_current_bar_values_invalid"),
+    ("negative", "tool_current_bar_values_invalid"),
+    ("no_amount", "tool_current_bar_values_invalid"),
+    ("decreasing_volume", "tool_current_bar_values_invalid"),
+    ("decreasing_amount", "tool_current_bar_values_invalid"),
+    ("duplicate_minute", "tool_current_bar_values_invalid"),
+    ("nonconsecutive", "tool_current_bar_result_invalid"),
+    ("incomplete", "tool_current_bar_result_invalid"),
+])
+def test_generated_tencent_adapter_never_promotes_unproven_minute_facts(tmp_path, case, error):
+    calls = []
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            calls.append(self.path)
+            if self.path.startswith("/stocks/quotes"):
+                self.send_error(503)
+                return
+            vendor = parse_qs(urlsplit(self.path).query)["code"][0]
+            minute = {"date": "20260903", "data": ["1428 10.00 100 1000", "1429 10.20 120 1224"]}
+            if case == "missing_date":
+                minute.pop("date")
+            elif case == "wrong_date":
+                minute["date"] = "20260902"
+            elif case == "future":
+                minute["data"].append("1431 10.30 125 1275")
+            elif case == "stale":
+                minute["data"] = ["1422 10.00 100 1000", "1423 10.20 120 1224"]
+            elif case == "nan":
+                minute["data"][1] = "1429 10.20 nan 1224"
+            elif case == "negative":
+                minute["data"][1] = "1429 10.20 120 -1"
+            elif case == "no_amount":
+                minute["data"][1] = "1429 10.20 120"
+            elif case == "decreasing_volume":
+                minute["data"][1] = "1429 10.20 90 1224"
+            elif case == "decreasing_amount":
+                minute["data"][1] = "1429 10.20 120 900"
+            elif case == "duplicate_minute":
+                minute["data"][1] = "1428 10.20 120 1224"
+            elif case == "nonconsecutive":
+                minute["data"][0] = "1427 10.00 100 1000"
+            elif case == "incomplete":
+                minute["data"].pop()
+            by_symbol = {vendor: {"data": minute}}
+            if case == "missing_symbol":
+                by_symbol = {}
+            elif case == "wrong_symbol":
+                by_symbol = {"sh600000": {"data": minute}}
+            body = json.dumps({"data": by_symbol})
+            if case == "duplicate_key":
+                body = '{"data":' + json.dumps(by_symbol) + ',"data":' + json.dumps(by_symbol) + '}'
+            raw = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *_args):
+            pass
+
+    ensure_builtin_tools(tmp_path / "tools")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        result = ToolRunner(ToolCatalog(tmp_path / "tools")).resolve_with_fallback(FactRequest(
+            1, "cn_equity_current_bar", AS_OF, 8, {"symbols": HOLDINGS, "freq": "1m",
+                "markethub_url": base + "/stocks/quotes", "tencent_minute_url": base + "/minute?code="},
+            context={"cycle_id": "tencent-contract"}, finality="intraday",
+        ))
+        assert not result.succeeded and result.data is None
+        assert result.attempts == ("markethub:tool_http_server_error", f"tencent:{error}")
+        assert result.adapter_receipts[-1]["error_code"] == error
+        assert result.adapter_receipts[-1]["diagnostic_artifact_ref"]
+        if case == "sampled_only":
+            assert [parse_qs(urlsplit(path).query)["code"][0] for path in calls[1:]] == ["sh600487", "sz002371", "sh605296"]
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_transient_retry_recovers_with_truthful_history_and_cache(tmp_path):

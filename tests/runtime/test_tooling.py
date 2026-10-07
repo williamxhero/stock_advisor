@@ -57,11 +57,11 @@ class ToolRunnerTests(unittest.TestCase):
                 ensure_builtin_tools(root)
 
             capability_manifest = json.loads((
-                root / "cn_market_breadth" / "versions" / "1.1.22" / "manifest.json"
+                root / "cn_market_breadth" / "versions" / "1.1.23" / "manifest.json"
             ).read_text(encoding="utf-8"))
             adapter_manifest = json.loads((
                 root / "cn_market_breadth" / "adapters" / "markethub"
-                / "versions" / "1.1.22" / "manifest.json"
+                / "versions" / "1.1.23" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual(new_python, capability_manifest["command"][0])
             self.assertEqual(new_python, adapter_manifest["command"][0])
@@ -91,7 +91,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.22", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.23", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
             routing = json.loads(turnover_routing.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -100,7 +100,7 @@ class ToolRunnerTests(unittest.TestCase):
             )
             official_manifest = json.loads((
                 root / "cn_market_turnover_compare" / "adapters" / "official_exchanges"
-                / "versions" / "1.1.22" / "manifest.json"
+                / "versions" / "1.1.23" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual({
                 "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
@@ -123,7 +123,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             selected = json.loads(routing.read_text(encoding="utf-8"))
             self.assertEqual(["tencent", "sina", "eastmoney"], [row["adapter"] for row in selected["candidates"]])
-            self.assertTrue(all(row["version"] == "1.1.22" for row in selected["candidates"]))
+            self.assertTrue(all(row["version"] == "1.1.23" for row in selected["candidates"]))
 
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
         version_root = root / capability / "versions" / "1.0.0"

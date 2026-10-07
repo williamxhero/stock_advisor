@@ -2,7 +2,7 @@
 param(
     [switch]$Release,
     [switch]$ProjectRegression,
-    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryWrite', 'Reflection', 'AnalysisSkill', 'SkillRegistry', 'AdapterContract', 'FinRobotAdapter', 'FinGPTAdapter', 'MultimodalAdapter', 'MandateSpec', 'AuditSpec', 'ObservabilitySpec', 'M0Observation', 'M1Judgment', 'M2Synthesis', 'PositionSafety', 'ResearchIsolation', 'RegressionSpec')]
+    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryRetrieval', 'MemoryWrite', 'Reflection', 'AnalysisSkill', 'SkillRegistry', 'AdapterContract', 'FinRobotAdapter', 'FinGPTAdapter', 'MultimodalAdapter', 'MandateSpec', 'AuditSpec', 'ObservabilitySpec', 'M0Observation', 'M1Judgment', 'M2Synthesis', 'PositionSafety', 'ResearchIsolation', 'RegressionSpec')]
     [string]$Select = 'all'
 )
 
@@ -23,6 +23,7 @@ if ($ProjectRegression) {
         "$root\tests\runtime\test_cycle_replay.py",
         "$root\tests\runtime\test_evidence_spec.py",
         "$root\tests\runtime\test_memory_type.py",
+        "$root\tests\runtime\test_memory_retrieval.py",
         "$root\memoryhub\tests\test_memory_types.py",
         "$root\tests\runtime\test_memory_write.py",
         "$root\memoryhub\tests\test_append_only_ledger.py",
@@ -74,6 +75,10 @@ elseif ($Select -eq 'EvidenceSpec') {
 elseif ($Select -eq 'MemoryType') {
     py -m pytest "$root\tests\runtime\test_memory_type.py" "$root\memoryhub\tests\test_memory_types.py" -q
     if ($LASTEXITCODE -ne 0) { throw "MemoryType regression tests failed with exit code $LASTEXITCODE." }
+}
+elseif ($Select -eq 'MemoryRetrieval') {
+    py -m pytest "$root\tests\runtime\test_memory_retrieval.py" "$root\tests\runtime\test_memory_port.py" "$root\tests\runtime\test_adaptive_memory.py" -q
+    if ($LASTEXITCODE -ne 0) { throw "MemoryRetrieval regression tests failed with exit code $LASTEXITCODE." }
 }
 elseif ($Select -eq 'Reflection') {
     py -m pytest "$root\tests\runtime\test_reflection.py" -q

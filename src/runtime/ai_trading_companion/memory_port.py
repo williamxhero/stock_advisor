@@ -10,8 +10,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 import uuid
 
-from .memory_retrieval import MemoryIsolationError, freeze_retrieval, qualify_episode, rank_bundle
-from .temporal_integrity import canonical_time, timestamp
+from .memory_retrieval import MemoryIsolationError, freeze_retrieval, memory_timestamp, qualify_episode, rank_bundle
 
 
 class MemoryUnavailable(RuntimeError):
@@ -178,12 +177,8 @@ class InMemoryMemoryAdapter:
             "content_hash": episode["content_hash"],
             "protocol_version": "memoryhub/v1",
         }
-        stored = copy.deepcopy({**episode, **receipt})
-        for field_name in ("occurred_at", "known_at", "submitted_at"):
-            value = str(stored[field_name])
-            stored[field_name] = canonical_time(value + "T00:00:00Z" if len(value) == 10 else value)
         self._receipts[key] = receipt
-        self._episodes.append(stored)
+        self._episodes.append(copy.deepcopy({**episode, **receipt}))
         return dict(receipt)
 
     def append_batch(self, episodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -205,7 +200,7 @@ class InMemoryMemoryAdapter:
         snapshot = self._snapshots[snapshot_id]
         cards = []
         for item in self._episodes[:snapshot["watermark"]]:
-            if item["memory_space_id"] != snapshot["memory_space_id"] or timestamp(item["known_at"]) > timestamp(snapshot["as_of"]):
+            if item["memory_space_id"] != snapshot["memory_space_id"] or memory_timestamp(item["known_at"]) > memory_timestamp(snapshot["as_of"]):
                 continue
             if query and not any(term in item.get("body", "").casefold() for term in query.casefold().split()):
                 continue
@@ -241,7 +236,7 @@ class InMemoryMemoryAdapter:
     def _expand_original(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
         snapshot = self._snapshots[snapshot_id]
         for item in self._episodes[:snapshot["watermark"]]:
-            if item["episode_id"] == episode_id and item["memory_space_id"] == snapshot["memory_space_id"] and timestamp(item["known_at"]) <= timestamp(snapshot["as_of"]):
+            if item["episode_id"] == episode_id and item["memory_space_id"] == snapshot["memory_space_id"] and memory_timestamp(item["known_at"]) <= memory_timestamp(snapshot["as_of"]):
                 return copy.deepcopy(item)
         raise MemoryNotVisible("episode is not visible in snapshot")
 

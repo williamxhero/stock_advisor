@@ -6,11 +6,12 @@ ranking projection; a high score never grants visibility or promotes a lesson.
 from __future__ import annotations
 
 import copy
+from datetime import datetime
 import re
 from typing import Any, Callable
 
 from .memory_type import build_envelope, sha256, validate as validate_type
-from .temporal_integrity import canonical_time, timestamp
+from .temporal_integrity import timestamp
 
 CONTRACT = "MemoryRetrievalSpec/v1"
 VERSION = 1
@@ -26,6 +27,12 @@ HALF_LIFE_DAYS = {
 
 class MemoryIsolationError(ValueError):
     pass
+
+
+def memory_timestamp(value: Any) -> datetime:
+    """Interpret MemoryHub date-only times without rewriting their source form."""
+    text = str(value)
+    return timestamp(text + "T00:00:00Z" if len(text) == 10 else text)
 
 
 def build_input(snapshot: dict[str, Any], query: str, *, limit: int = 20,
@@ -59,7 +66,7 @@ def validate_input(value: dict[str, Any]) -> None:
     for field in ("snapshot_id", "memory_space_id", "stage", "as_of", "policy_version", "protocol_version"):
         if not isinstance(snapshot.get(field), str) or not snapshot[field].strip():
             raise ValueError(f"memory retrieval requires snapshot {field}")
-    canonical_time(snapshot["as_of"])
+    memory_timestamp(snapshot["as_of"])
     if type(snapshot.get("watermark")) is not int or snapshot["watermark"] < 0:
         raise ValueError("memory retrieval requires a frozen watermark")
     if snapshot["stage"] in BLIND_STAGES and not snapshot.get("cycle_id"):
@@ -128,7 +135,7 @@ def qualify_episode(episode: dict[str, Any], snapshot: dict[str, Any],
     if episode.get("memory_space_id", snapshot["memory_space_id"]) != snapshot["memory_space_id"]:
         raise MemoryIsolationError("cross_space_lineage")
     if episode["sequence"] > snapshot["watermark"] or any(
-        timestamp(episode[field]) > timestamp(snapshot["as_of"])
+        memory_timestamp(episode[field]) > memory_timestamp(snapshot["as_of"])
         for field in ("occurred_at", "known_at", "submitted_at")
     ):
         raise MemoryIsolationError("future_knowledge")
@@ -204,7 +211,7 @@ def rank_bundle(bundle: dict[str, Any], resolve: Callable[[str], dict[str, Any]]
         half_life = HALF_LIFE_DAYS[semantic_type]
         if semantic_type == "lesson":
             half_life = {"candidate": 30.0, "verified": 365.0, "error": 7.0}[profile["lesson_state"]]
-        age = max(0.0, (timestamp(snapshot["as_of"]) - timestamp(episode["occurred_at"])).total_seconds() / 86400)
+        age = max(0.0, (memory_timestamp(snapshot["as_of"]) - memory_timestamp(episode["occurred_at"])).total_seconds() / 86400)
         decay = 2 ** (-age / half_life)
         support = {"unknown": 0.5, "supported": 1.0, "contradicted": 0.2}[profile["outcome_support"]]
         if semantic_type == "lesson" and profile["lesson_state"] == "error":

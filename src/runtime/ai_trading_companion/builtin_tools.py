@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.21"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15", "1.1.16", "1.1.17", "1.1.18", "1.1.19", "1.1.20"}
+_VERSION = "1.1.22"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15", "1.1.16", "1.1.17", "1.1.18", "1.1.19", "1.1.20", "1.1.21"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -175,6 +175,7 @@ import html
 import json
 import os
 import re
+import socket
 import shutil
 import subprocess
 import sys
@@ -189,8 +190,32 @@ sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
 
-def fail(code: int, message: str) -> None:
-    print(message, file=sys.stderr)
+def current_bar_mode() -> bool:
+    return len(sys.argv) == 2 and sys.argv[1] in {"cn_equity_current_bar", "cn_equity_current_bar_tencent"}
+
+
+def fail(code: int, message: str, error_code: str | None = None) -> None:
+    if not current_bar_mode():
+        print(message, file=sys.stderr)
+        raise SystemExit(code)
+    if error_code is None:
+        error_code = "tool_process_configuration" if code == 64 else "tool_response_contract_invalid"
+        if "access-controlled" in message:
+            error_code = "tool_access_restricted"
+        elif "current Bar" in message or "minute tape" in message or "minute row" in message:
+            error_code = "tool_current_bar_result_invalid"
+            for marker, typed in (
+                ("symbol", "symbol_mismatch"), ("timestamp", "time_invalid"),
+                ("stale", "stale"), ("freshness", "stale"),
+                ("OHLC", "values_invalid"), ("values", "values_invalid"),
+                ("non-monotonic", "values_invalid"), ("finality", "finality_invalid"),
+                ("status", "status_invalid"), ("source", "source_invalid"),
+            ):
+                if marker in message:
+                    error_code = "tool_current_bar_" + typed
+                    break
+    print(json.dumps({"contract": "ai-trading-tool-failure/v1", "error_code": error_code,
+                      "message": message}), file=sys.stderr)
     raise SystemExit(code)
 
 
@@ -219,7 +244,7 @@ def fetch(
     if referer:
         headers["Referer"] = referer
     last_error: Exception | None = None
-    for _attempt in range(2):
+    for _attempt in range(1 if current_bar_mode() else 2):
         request = Request(url, headers=headers)
         try:
             with urlopen(request, timeout=12) as response:
@@ -227,7 +252,7 @@ def fetch(
                 if status in {401, 402, 403}:
                     fail(64, "access-controlled response")
                 if status >= 400:
-                    fail(75, f"upstream HTTP {status}")
+                    fail(75, f"upstream HTTP {status}", "tool_http_server_error" if status >= 500 else "tool_http_client_error")
                 raw = response.read(1_000_001)
                 if len(raw) > 1_000_000:
                     fail(75, "response too large")
@@ -235,6 +260,13 @@ def fetch(
                 return response.geturl(), raw.decode(charset, errors="replace")
         except SystemExit:
             raise
+        except HTTPError as exc:
+            if current_bar_mode():
+                fail(75, f"upstream HTTP {exc.code}", (
+                    "tool_access_restricted" if exc.code in {401, 402, 403}
+                    else "tool_http_server_error" if exc.code >= 500 else "tool_http_client_error"
+                ))
+            last_error = exc
         except Exception as exc:
             last_error = exc
     curl = (shutil.which("curl") or shutil.which("curl.exe")) if curl_fallback else None
@@ -262,7 +294,14 @@ def fetch(
                 ):
                     return url, decoded
             last_error = RuntimeError(f"curl_exit_{completed.returncode}")
-    fail(75, f"network read failed after retry: {type(last_error).__name__}")
+    reason = last_error.reason if isinstance(last_error, URLError) else last_error
+    error_code = (
+        "tool_network_timeout" if isinstance(reason, (TimeoutError, socket.timeout))
+        else "tool_network_connection_reset" if isinstance(reason, ConnectionResetError)
+        else "tool_network_dns_temporary" if isinstance(reason, socket.gaierror) and reason.errno == socket.EAI_AGAIN
+        else "tool_network_unavailable"
+    )
+    fail(75, f"network read failed: {type(reason).__name__}", error_code)
 
 
 def strip_html(value: str) -> str:

@@ -12,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -21,6 +22,7 @@ from urllib.parse import urlsplit
 
 from .adapter_contract import CONTRACT as ADAPTER_CONTRACT, VERSION as ADAPTER_VERSION
 from .secret_guard import find_secrets
+from .tool_failures import RETRY_POLICY, TRANSIENT_ERRORS, process_error
 
 
 _MANIFEST_CONTRACT = "ai-trading-tool-manifest/v1"
@@ -316,6 +318,8 @@ class ToolRunner:
             "diagnostic_artifact_ref": result.diagnostic_artifact_ref,
             "output_sha256": (result.raw_artifact_ref or "").rsplit(":", 1)[-1] or None,
             "exit_code": result.exit_code,
+            "retry_policy": RETRY_POLICY,
+            "retryable": result.error_code in TRANSIENT_ERRORS,
             "technical_validation": list(result.technical_validation),
             "health": {"state": "degraded" if health.get("degraded") else "ready", **health},
             "evidence_gate": {"state": "not_evaluated", "owner": "EvidenceGate"},
@@ -368,6 +372,7 @@ class ToolRunner:
                 return EvidenceResolution.failed(
                     request.capability, "tool_timeout", tool_version=tool.version,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                    exit_code=process.returncode,
                 )
             if _contains_secret(stdout) or _contains_secret(stderr):
                 return EvidenceResolution.failed(request.capability, "tool_secret_rejected", tool_version=tool.version)
@@ -377,21 +382,19 @@ class ToolRunner:
             except ArtifactCapacityError:
                 return EvidenceResolution.failed(request.capability, "tool_archive_capacity_exceeded", tool_version=tool.version)
             if process.returncode != 0:
-                error_code = (
-                    "tool_access_restricted" if process.returncode == 64
-                    else "tool_browser_unavailable" if process.returncode == 69
-                    else "tool_process_failed"
-                )
+                error_code = process_error(stderr, process.returncode)
                 return EvidenceResolution.failed(
                     request.capability,
                     error_code,
-                    tool_version=tool.version, exit_code=process.returncode,
+                    tool_version=tool.version,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                    exit_code=process.returncode,
                 )
             if len(stdout) > self.max_stdout_bytes:
                 return EvidenceResolution.failed(
                     request.capability, "tool_stdout_too_large", tool_version=tool.version,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                    exit_code=process.returncode,
                 )
             try:
                 output = json.loads(stdout.decode("utf-8"))
@@ -399,27 +402,32 @@ class ToolRunner:
                 return EvidenceResolution.failed(
                     request.capability, "tool_stdout_invalid_json", tool_version=tool.version,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                    exit_code=process.returncode,
                 )
             if not isinstance(output, dict):
                 return EvidenceResolution.failed(
                     request.capability, "tool_result_invalid", tool_version=tool.version,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                    exit_code=process.returncode,
                 )
             if set(output) != {"contract", "fact_as_of", "data"} or output.get("contract") != _RESULT_CONTRACT:
                 return EvidenceResolution.failed(
                     request.capability, "tool_result_invalid", tool_version=tool.version,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                    exit_code=process.returncode,
                 )
             if not isinstance(output.get("data"), dict):
                 return EvidenceResolution.failed(
                     request.capability, "tool_result_invalid", tool_version=tool.version,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                    exit_code=process.returncode,
                 )
             protected_error = _validate_tool_output_bounds(output["data"])
             if protected_error:
                 return EvidenceResolution.failed(
                     request.capability, protected_error, tool_version=tool.version,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                    exit_code=process.returncode,
                 )
             try:
                 _parse_timestamp(str(output.get("fact_as_of") or ""))
@@ -427,12 +435,14 @@ class ToolRunner:
                 return EvidenceResolution.failed(
                     request.capability, "tool_fact_as_of_invalid", tool_version=tool.version,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                    exit_code=process.returncode,
                 )
             validation_error = _validate_capability_result(request, output)
             if validation_error:
                 return EvidenceResolution.failed(
                     request.capability, validation_error, tool_version=tool.version,
                     raw_artifact_ref=raw_artifact_ref, diagnostic_artifact_ref=diagnostic_artifact_ref,
+                    exit_code=process.returncode,
                 )
             return EvidenceResolution(
                 succeeded=True,
@@ -485,6 +495,8 @@ class ToolRunner:
 
     def resolve_with_fallback(self, request: FactRequest) -> EvidenceResolution:
         cache_key = json.dumps(request.to_wire(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if find_secrets(cache_key):
+            return EvidenceResolution.failed(request.capability, "tool_secret_rejected")
         cached = self._cache.get(cache_key)
         if cached is not None and request.freshness_seconds > 0:
             age = datetime.now(timezone.utc) - _parse_timestamp(cached.acquired_at)
@@ -500,26 +512,38 @@ class ToolRunner:
         failures: list[EvidenceResolution] = []
         receipts: list[dict[str, Any]] = []
         last: EvidenceResolution | None = None
-        deadline = datetime.now(timezone.utc).timestamp() + request.deadline_seconds
-        for tool in candidates:
+        deadline = time.monotonic() + request.deadline_seconds
+        for index, tool in enumerate(candidates):
             circuit_key = self._circuit_key(request, tool)
             if circuit_key is not None and circuit_key in self._open_circuits:
                 attempts.append(f"{tool.adapter}:circuit_open")
                 continue
-            remaining = deadline - datetime.now(timezone.utc).timestamp()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            attempt_request = replace(request, deadline_seconds=remaining)
-            result = self.resolve(attempt_request, _tool=tool)
-            if result.route_adapter is None:
-                result = replace(result, route_adapter=tool.adapter)
-            attempts.append(f"{tool.adapter}:{'succeeded' if result.succeeded else result.error_code}")
-            last = result
-            receipts.extend(copy.deepcopy(result.adapter_receipts))
+            # Reserve an equal share for every independent remaining route.
+            route_deadline = time.monotonic() + remaining / (len(candidates) - index)
+            result = None
+            for retry in range(2):
+                remaining = route_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                attempt_request = replace(request, deadline_seconds=remaining)
+                result = self.resolve(attempt_request, _tool=tool)
+                if result.route_adapter is None:
+                    result = replace(result, route_adapter=tool.adapter)
+                attempts.append(f"{tool.adapter}:{'succeeded' if result.succeeded else result.error_code}")
+                last = result
+                receipts.extend(copy.deepcopy(result.adapter_receipts))
+                self._record_health(tool, result)
+                if result.succeeded or result.error_code not in TRANSIENT_ERRORS or retry == 1:
+                    break
+            if result is None:
+                continue
             if not result.succeeded:
                 failures.append(result)
-            self._record_health(tool, result)
-            if not result.succeeded and self._is_deterministic_failure(result):
+                # Exhausting the one permitted transient retry also closes the
+                # route for this cycle; repair cannot start a new retry budget.
                 if circuit_key is not None:
                     self._open_circuits.add(circuit_key)
             if result.succeeded:
@@ -537,8 +561,13 @@ class ToolRunner:
             ),
             attempts=tuple(attempts), adapter_receipts=tuple(receipts),
         )
-        if (request.context.get("cycle_id") or request.context.get("attempt_id")) and failures and len(failures) == len(candidates) and all(self._is_deterministic_failure(item) for item in failures):
-            failed = replace(failed, error_code="tool_routes_exhausted_deterministic")
+        if (request.context.get("cycle_id") or request.context.get("attempt_id")) and failures and all(
+            self._circuit_key(request, tool) in self._open_circuits for tool in candidates
+        ):
+            failed = replace(failed, error_code=(
+                "tool_routes_exhausted_deterministic" if all(self._is_deterministic_failure(item) for item in failures)
+                else "tool_routes_exhausted"
+            ))
         self._append_audit(request, failed)
         self._report_capability_need(request, failed)
         return failed
@@ -560,7 +589,10 @@ class ToolRunner:
                               "exit_code": result.exit_code,
                               "diagnostic_artifact_ref": result.diagnostic_artifact_ref,
                               "route": {"adapter": result.route_adapter, "version": result.tool_version},
-                              "raw_artifact_ref": result.raw_artifact_ref},
+                              "raw_artifact_ref": result.raw_artifact_ref,
+                              "acquired_at": result.acquired_at, "required_at": request.required_at,
+                              "retry_policy": RETRY_POLICY,
+                              "adapter_receipts": copy.deepcopy(list(result.adapter_receipts))},
             "source_hints": source_hints,
         }
         try:
@@ -626,25 +658,7 @@ class ToolRunner:
         return (cycle_id, request.capability, tool.adapter, tool.version) if cycle_id else None
 
     def _is_deterministic_failure(self, result: EvidenceResolution) -> bool:
-        code = result.error_code or ""
-        # Exit 75 is the built-in provider contract for a bounded upstream
-        # failure or a source that has not published the requested observation
-        # yet.  It must not poison the candidate's health or open a circuit for
-        # the rest of the current cycle: a later retry or an independent route
-        # can still satisfy the same frozen request.
-        if code in {"tool_timeout", "tool_network_transient"} or result.exit_code == 75:
-            return False
-        if code == "tool_process_failed" and result.diagnostic_artifact_ref:
-            try:
-                diagnostic = self.read_artifact(result.diagnostic_artifact_ref).decode("utf-8", errors="replace").lower()
-            except Exception:
-                diagnostic = ""
-            if any(marker in diagnostic for marker in (
-                "network read failed", "upstream http 5", "no quote for required trading date",
-                "no previous close", "no quote at or before required_at", "does not meet close finality",
-            )):
-                return False
-        return True
+        return result.error_code not in TRANSIENT_ERRORS
 
 
 def _validate_tool_output_bounds(data: dict[str, Any]) -> str | None:

@@ -189,6 +189,10 @@ def _m0_failure_is_retryable(exc: Exception) -> bool:
             "broker_secret_rejected", "broker_output_invalid", "broker_protocol",
         }
     verifier = getattr(exc, "verifier", None)
+    # Exhaustion has already consumed the frozen routes' typed retry budgets.
+    # Covered requirement names elsewhere in the verifier cannot reopen them.
+    if isinstance(verifier, dict) and verifier.get("stop_reason") == "current_bar_routes_exhausted":
+        return False
     haystack = " ".join(
         str(value) for value in (str(exc), verifier) if value is not None
     ).lower()

@@ -1,41 +1,77 @@
-# Current-Bar reliability: incomplete delivery
+# Current-Bar reliability: offline contract and delivery
 
-Scope: #127 / #358, followed by #128 / #359. These changes are offline defensive fixes, not live dependency acceptance or a release qualification.
+Scope: #127 / #358 and #128 / #359. These are offline reliability fixes, not live dependency acceptance or a release qualification.
 
-## Retry and evidence contract
+## Retry and terminal delivery
 
 - `ai-trading-tool-failure/v1` carries an allowlisted `error_code` on stderr. Neither exit 75 nor diagnostic prose authorizes a retry.
 - `tool-retry-policy/v1` permits at most one same-route retry for typed timeout, connection reset, or temporary DNS failure, within the route's share of the original monotonic deadline.
 - Exhausted routes are circuit-broken by cycle, capability, adapter and immutable version. Research repair cannot grant a new route budget.
 - Resolution audit and capability needs carry the same per-attempt receipts: route/version, acquired timestamp, exit code, typed error, diagnostic/raw artifact references, and retry policy. Secret-bearing requests and diagnostics are rejected before persistence.
+- `stop_reason=current_bar_routes_exhausted` is terminal before generic availability heuristics. A covered requirement name elsewhere in the verifier cannot reopen the exhausted routes. The scheduled pipeline records one failed attempt and one system fault, publishes `research.failed` exactly once through Exchange, and emits neither M0 nor M1. The original scheduled exhaustion regression remains unchanged.
+- Research packet finalization includes the derived agent and role contracts before checkpoint lookup and persistence. Re-finalization rebuilds those contracts from the same base rather than recursively hashing their own references. Qualified evidence therefore retains the same frozen packet identity at the acquisition and delivery boundaries.
 
-## Unresolved #127 ownership blocker
+## Tencent minute-Bar input contract
 
-`__main__._m0_failure_is_retryable` searches the entire verifier for prose markers, including `portfolio_market_state`. That key also occurs in successfully covered gap states. Consequently the actual scheduled all-source-failure replay returns `m0_retry_wait` instead of publishing the required terminal fault, despite `stop_reason=current_bar_routes_exhausted`.
+The generated Tencent adapter supports **`tencent-minute-bar/v1`**, an explicit normalized adapter input contract. This is **not a claim that Tencent's public sampled-price API already exposes this schema**. The response must bind exactly the requested vendor symbol:
 
-The owner of `__main__.py` must consume the terminal exhaustion/typed retry state before generic availability heuristics. This branch deliberately does not edit that exclusive file or falsify verifier content. `engine.py`, `store.py`, `packet_builder.py`, qualification/publish/install scripts, schedules and historical judgments are also unchanged.
+```json
+{
+  "data": {
+    "sh600000": {
+      "data": {
+        "contract": "tencent-minute-bar/v1",
+        "date": "20260901",
+        "units": {"price": "CNY/share", "volume": "shares", "amount": "CNY"},
+        "volume_mode": "cumulative",
+        "interval_semantics": "start_labelled_1m",
+        "security_status": {
+          "is_st": false,
+          "is_suspended": false,
+          "market_status": "trading",
+          "as_of": "2026-09-01T14:30:00+08:00",
+          "source_url": "https://provider.example/security-status/sh600000"
+        },
+        "data": [
+          {"time": "1428", "open": 10, "high": 10.1, "low": 9.9, "close": 10,
+           "cumulative_volume": 100, "cumulative_amount": 1000, "is_final": true,
+           "observed_at": "2026-09-01T14:29:00+08:00", "last_trade_at": "2026-09-01T14:28:50+08:00"},
+          {"time": "1429", "open": 10.1, "high": 10.6, "low": 9.8, "close": 10.2,
+           "cumulative_volume": 120, "cumulative_amount": 1204, "is_final": true,
+           "observed_at": "2026-09-01T14:30:00+08:00", "last_trade_at": "2026-09-01T14:29:50+08:00"}
+        ]
+      }
+    }
+  }
+}
+```
 
-The retained scheduled regression is intentionally not skipped, xfailed, or weakened. #127 / #358 are **not complete** until it passes through the actual scheduled pipeline and Exchange publication.
+This example and the test fixtures are synthetic, not captured provider evidence.
 
-## Verification of the #127 pass
+- The response date must match the frozen Shanghai trading date. Duplicate keys, wrong/missing vendor symbols, duplicate/non-monotonic minutes, decreasing cumulative totals, non-finite/boolean numbers, incomplete OHLC and invalid extrema fail closed.
+- `time` explicitly labels the start of a one-minute interval in the A-share trading session. Only completed consecutive minutes at or before the cutoff may be selected; a still-forming current minute cannot displace the completed preceding interval. Missing, premature or insufficient close finality is rejected.
+- OHLC comes from the selected interval's explicit fields, never two sampled prices. Volume and amount are differences of consecutive cumulative totals. Volume accepts only `shares` or `lots_100` and is normalized to shares; amount accepts only CNY. The resulting trade amount must be consistent with the interval extrema and the converted volume. A zero-trade interval must carry forward the previous close, but zero volume never proves suspension.
+- Observation and last-trade timestamps must be timezone-aware, dated, consistent with the interval and frozen cutoff, and fresh. Security status must include actual boolean ST/suspension fields, a supported market status, a contemporaneous timestamp and a source URL. Status is not guessed from a name, volume or requested finality.
+- All frozen holdings must validate before any Bar is returned. Successful Bars carry `provider=tencent_minute`, `source_semantics=derived`, `degraded=true`, normalized units, cumulative derivation operands and status provenance. Source evidence retains the original normalized minute contract in the archived raw tool result, outside the bounded qualification excerpt so a long tape cannot truncate the Bar JSON.
+- The existing sampled-price shape remains rejected with typed failure receipts. Its date alone, or an unproven `contract` label without OHLC/units/status evidence, does not make it qualifying data.
 
-- `env -u PYTHONPATH py -3.13 -m pytest tests/runtime/test_tooling.py tests/runtime/test_local_research.py tests/runtime/test_current_bar_reliability.py -q`: **165 passed, 1 failed**. The only failure is the scheduled terminal-fault acceptance above.
-- `env -u PYTHONPATH py -3.13 -m pytest tests/runtime/test_current_bar_reliability.py::test_current_bar_public_fault_names_only_attempted_routes -q`: **1 passed** (added after the broader run).
+The shared technical validator also rejects mismatched symbol/exchange identities, non-finite/boolean OHLCVA, wrong interval duration/date, completed future intervals, stale observations despite a claimed zero freshness, missing boolean status metadata, false close finality, incomplete/duplicate frozen coverage and an inconsistent top-level fact timestamp. MarketHub must supply actual boolean ST/suspension metadata rather than relying on coercion.
 
-## #128 fail-closed guard, not a qualified Tencent fallback
+## Offline acceptance and remaining external evidence
 
-The previous Tencent converter recursively collected rows from arbitrary symbols, assigned the requested date to undated rows, derived interval extrema from only two sampled prices, assumed ST was false, inferred suspension from zero volume, and inferred finality from the requested mode. Those claims are not proven by a cumulative minute tape.
+Offline regression coverage includes restoration of the existing MarketHub-failure/Tencent-success capability test with an explicit contract-valid input, rejection of undated or sampled-only tapes, all three frozen holdings, both supported volume units, ST and suspension provenance, zero-volume non-suspension, typed invalid-contract receipts, and a successful formal 14:30 scheduled qualification through the real EvidenceContract and Exchange seams. The positive scheduled replay uses controlled non-Bar observations and a synthetic compose response; it is not a live model/provider acceptance.
 
-The current converter binds the exact requested vendor symbol and the response's trading date, rejects duplicate JSON keys and malformed/non-finite/non-monotonic rows, checks consecutive completed minutes and the frozen cutoff, and validates every requested holding before rejecting the tape's missing provenance. It **does not produce a qualifying Bar** from the currently supported sampled-price shape. The independent route is still attempted immediately after MarketHub failure; a well-formed tape reports typed `tool_current_bar_source_invalid` rather than synthesizing facts. This intentionally removes the unsafe apparent success path.
+The following remain user-owned and are not claimed complete:
 
-The shared technical validator additionally rejects mismatched symbol/exchange identities, non-finite and boolean OHLCVA values, wrong interval duration/date, completed future intervals, stale observations despite a claimed zero freshness, missing boolean status metadata, false close finality, incomplete/duplicate frozen coverage, and an inconsistent top-level fact timestamp. MarketHub must supply actual boolean ST/suspension metadata rather than relying on coercion.
+1. Captured Tencent trading-window responses and provider documentation establishing the actual date, interval OHLC, interval-label semantics, cumulative volume/amount units, completion timestamps, and contemporaneous ST/suspension/status source. The public sampled-price endpoint is not automatically promoted to this normalized schema; a verified provider-to-contract mapping still requires those captures.
+2. Captured same-symbol, same-minute MarketHub/Tencent differential evidence, including the three frozen holdings and trading-status edge cases. Synthetic fixtures do not establish provider parity.
+3. Live formal 14:30 qualification and Exchange delivery using the verified provider mapping, plus release/install/activation and rollback acceptance. No live requests, real credentials or production service changes were performed.
 
-#128 / #359 remain **not complete**. Required follow-up is captured provider evidence establishing interval OHLC, cumulative volume/amount units and security-status provenance; then a deterministic converter, captured same-minute MarketHub/Tencent differential tests, and the successful formal 14:30 scheduled qualification/Exchange replay. The existing successful Tencent test currently supplies an undated sampled-price fixture, not a captured OHLCVA contract; it is retained to expose the unresolved positive fallback, not rewritten to claim success. No captured-provider parity or successful Tencent scheduled delivery is claimed.
+## Verification
 
-## Verification of the #128 safety pass
+- `env -u PYTHONPATH py -3.13 -m pytest tests/runtime/test_tooling.py tests/runtime/test_local_research.py tests/runtime/test_current_bar_reliability.py -q`: **230 passed** on the final implementation.
+- `env -u PYTHONPATH py -3.13 -m pytest tests/runtime/test_companion_exchange.py -q`: **15 passed**, run after the acceptance suite.
+- Both operator-reported failures were reproduced before editing (**2 failed**) and pass in the final acceptance run. An intermediate broader run exposed an incorrect holding-order assumption in the new positive fixture (**1 failed, 229 passed**); the assertion now checks the actual frozen contract order, not the portfolio input order.
+- Pytest emits the existing unset `asyncio_default_fixture_loop_scope` deprecation warning; no tests were skipped, disabled or xfailed.
 
-- `env -u PYTHONPATH py -3.13 -m pytest tests/runtime/test_tooling.py tests/runtime/test_local_research.py tests/runtime/test_current_bar_reliability.py -q`: **198 passed, 3 failed**. Failures were stale-error precedence, the unresolved positive Tencent fallback fixture, and the scheduled terminal-fault acceptance.
-- The stale-error precedence regression was then fixed without changing its test: stale evidence remains classified as stale before checking missing status metadata.
-- `env -u PYTHONPATH py -3.13 -m pytest tests/runtime/test_tooling.py::ToolRunnerTests::test_current_equity_bar_rejects_a_stale_observation tests/runtime/test_current_bar_reliability.py::test_current_bar_rejects_invalid_values_identity_time_and_metadata -q`: **13 passed** after that fix. The broader set was not rerun after this localized correction; the two acceptance gaps remain unresolved.
-
-No Trading-window observations, real credentials, installation, activation, rollback, or production service changes were performed.
+`engine.py`, `store.py`, `packet_builder.py`, schedules and historical judgments are unchanged.

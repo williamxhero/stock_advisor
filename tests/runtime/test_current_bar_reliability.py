@@ -8,6 +8,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ import pytest
 
 from ai_trading_companion.__main__ import flush, run_scheduled_cycle
 from ai_trading_companion.builtin_tools import ensure_builtin_tools
+from ai_trading_companion.broker_client import BrokerResponse
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.evidence_contract import EvidenceContractFactory
 from ai_trading_companion.evidence_gate import EvidenceInsufficient
@@ -25,6 +27,7 @@ from ai_trading_companion.local_research import ToolCatalogMarketBackend, _publi
 from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.portfolio import PortfolioService
 from ai_trading_companion.store import CompanionStore
+from ai_trading_companion.stage_expression import safe_stage_output
 from ai_trading_companion.tooling import FactRequest, ToolCatalog, ToolRunner
 from ai_trading_companion.tool_failures import RETRY_POLICY, TRANSIENT_ERRORS
 
@@ -175,6 +178,28 @@ def test_current_bar_requires_exact_frozen_coverage_and_truthful_cutoff(tmp_path
     assert result.adapter_receipts[0]["error_code"] == expected and not result.succeeded
 
 
+def proven_minute_contract():
+    """Synthetic input for the explicit contract, not live provider evidence."""
+    return {
+        "contract": "tencent-minute-bar/v1", "date": "20260903",
+        "units": {"price": "CNY/share", "volume": "lots_100", "amount": "CNY"},
+        "volume_mode": "cumulative", "interval_semantics": "start_labelled_1m",
+        "security_status": {"is_st": False, "is_suspended": False, "market_status": "trading",
+                            "as_of": AS_OF, "source_url": "https://fixture.example/security-status"},
+        "data": [
+            {"time": "1428", "open": 10, "high": 10.1, "low": 9.9, "close": 10,
+             "cumulative_volume": 100, "cumulative_amount": 100000, "is_final": True,
+             "observed_at": "2026-09-03T14:29:00+08:00", "last_trade_at": "2026-09-03T14:28:50+08:00"},
+            {"time": "1429", "open": 10.1, "high": 10.6, "low": 9.8, "close": 10.2,
+             "cumulative_volume": 120, "cumulative_amount": 120200, "is_final": True,
+             "observed_at": AS_OF, "last_trade_at": "2026-09-03T14:29:50+08:00"},
+            {"time": "1430", "open": 10.2, "high": 10.3, "low": 10.2, "close": 10.3,
+             "cumulative_volume": 125, "cumulative_amount": 125300, "is_final": False,
+             "observed_at": AS_OF, "last_trade_at": "2026-09-03T14:30:00+08:00"},
+        ],
+    }
+
+
 @pytest.mark.parametrize("case,error", [
     ("sampled_only", "tool_current_bar_source_invalid"),
     ("missing_symbol", "tool_current_bar_symbol_mismatch"),
@@ -261,6 +286,144 @@ def test_generated_tencent_adapter_never_promotes_unproven_minute_facts(tmp_path
         assert result.adapter_receipts[-1]["diagnostic_artifact_ref"]
         if case == "sampled_only":
             assert [parse_qs(urlsplit(path).query)["code"][0] for path in calls[1:]] == ["sh600487", "sz002371", "sh605296"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize("case,error", [
+    ("valid_lots", None), ("valid_shares", None), ("valid_st", None), ("valid_suspension", None), ("valid_no_trade", None),
+    ("missing_contract", "tool_current_bar_source_invalid"),
+    ("missing_units", "tool_current_bar_source_invalid"),
+    ("unknown_units", "tool_current_bar_source_invalid"),
+    ("wrong_amount_units", "tool_current_bar_source_invalid"),
+    ("not_cumulative", "tool_current_bar_source_invalid"),
+    ("unknown_labels", "tool_current_bar_source_invalid"),
+    ("missing_ohlc", "tool_current_bar_values_invalid"),
+    ("wrong_extrema", "tool_current_bar_values_invalid"),
+    ("boolean_ohlc", "tool_current_bar_values_invalid"),
+    ("infinite_ohlc", "tool_current_bar_values_invalid"),
+    ("boolean_volume", "tool_current_bar_values_invalid"),
+    ("units_contradict_amount", "tool_current_bar_values_invalid"),
+    ("wrong_last_trade", "tool_current_bar_values_invalid"),
+    ("future_observed", "tool_current_bar_time_invalid"),
+    ("naive_observed", "tool_current_bar_time_invalid"),
+    ("missing_status", "tool_current_bar_status_invalid"),
+    ("non_boolean_status", "tool_current_bar_status_invalid"),
+    ("suspension_contradiction", "tool_current_bar_status_invalid"),
+    ("stale_status", "tool_current_bar_time_invalid"),
+    ("missing_status_source", "tool_current_bar_source_invalid"),
+    ("non_final", "tool_current_bar_finality_invalid"),
+    ("premature_final", "tool_current_bar_time_invalid"),
+    ("false_official_close", "tool_current_bar_finality_invalid"),
+])
+def test_generated_tencent_adapter_requires_proven_bar_contract(tmp_path, case, error):
+    minute = proven_minute_contract()
+    selected = minute["data"][1]
+    if case == "valid_shares":
+        minute["units"]["volume"] = "shares"
+        for row in minute["data"]:
+            row["cumulative_volume"] *= 100
+    elif case == "valid_st":
+        minute["security_status"]["is_st"] = True
+    elif case in {"valid_suspension", "valid_no_trade"}:
+        if case == "valid_suspension":
+            minute["security_status"].update(is_suspended=True, market_status="suspended")
+        for row in minute["data"]:
+            row.update(cumulative_volume=100, cumulative_amount=100000, open=10, high=10, low=10, close=10,
+                       last_trade_at="2026-09-03T14:28:50+08:00")
+    elif case == "missing_contract":
+        minute.pop("contract")
+    elif case == "missing_units":
+        minute.pop("units")
+    elif case == "unknown_units":
+        minute["units"]["volume"] = "lots"
+    elif case == "wrong_amount_units":
+        minute["units"]["amount"] = "wan_CNY"
+    elif case == "not_cumulative":
+        minute["volume_mode"] = "interval"
+    elif case == "unknown_labels":
+        minute["interval_semantics"] = "end_labelled_1m"
+    elif case == "missing_ohlc":
+        selected.pop("high")
+    elif case == "wrong_extrema":
+        selected["high"] = 10
+    elif case == "boolean_ohlc":
+        selected["open"] = True
+    elif case == "infinite_ohlc":
+        selected["high"] = float("inf")
+    elif case == "boolean_volume":
+        selected["cumulative_volume"] = True
+    elif case == "units_contradict_amount":
+        minute["units"]["volume"] = "shares"
+    elif case == "wrong_last_trade":
+        selected["last_trade_at"] = "2026-09-03T14:28:50+08:00"
+    elif case == "future_observed":
+        selected["observed_at"] = "2026-09-03T14:31:00+08:00"
+    elif case == "naive_observed":
+        selected["observed_at"] = "2026-09-03T14:30:00"
+    elif case == "missing_status":
+        minute.pop("security_status")
+    elif case == "non_boolean_status":
+        minute["security_status"]["is_st"] = "false"
+    elif case == "suspension_contradiction":
+        minute["security_status"].update(is_suspended=True, market_status="suspended")
+    elif case == "stale_status":
+        minute["security_status"]["as_of"] = "2026-09-03T14:29:00+08:00"
+    elif case == "missing_status_source":
+        minute["security_status"].pop("source_url")
+    elif case == "non_final":
+        selected["is_final"] = False
+    elif case == "premature_final":
+        minute["data"][2]["is_final"] = True
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/stocks/quotes"):
+                self.send_error(503)
+                return
+            vendor = parse_qs(urlsplit(self.path).query)["code"][0]
+            raw = json.dumps({"data": {vendor: {"data": minute}}}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *_args):
+            pass
+
+    ensure_builtin_tools(tmp_path / "tools")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        runner = ToolRunner(ToolCatalog(tmp_path / "tools"))
+        result = runner.resolve_with_fallback(FactRequest(
+            1, "cn_equity_current_bar", AS_OF, 8, {"symbols": HOLDINGS, "freq": "1m",
+                "markethub_url": base + "/stocks/quotes", "tencent_minute_url": base + "/minute?code="},
+            finality="official_close" if case == "false_official_close" else "intraday",
+        ))
+        if error:
+            assert not result.succeeded and result.data is None
+            assert result.attempts == ("markethub:tool_http_server_error", f"tencent:{error}")
+            assert result.adapter_receipts[-1]["error_code"] == error
+            return
+        assert result.succeeded, result.error_code
+        assert result.attempts == ("markethub:tool_http_server_error", "tencent:succeeded")
+        assert {bar["symbol"] for bar in result.data["bars"]} == set(HOLDINGS)
+        assert result.fact_as_of == AS_OF
+        for bar in result.data["bars"]:
+            no_trade = case in {"valid_suspension", "valid_no_trade"}
+            assert (bar["open"], bar["high"], bar["low"], bar["close"]) == ((10, 10, 10, 10) if no_trade else (10.1, 10.6, 9.8, 10.2))
+            assert (bar["volume"], bar["amount"]) == ((0, 0) if no_trade else (2000, 20200))
+            assert bar["is_st"] == (case == "valid_st")
+            assert bar["is_suspended"] == (case == "valid_suspension")
+            assert bar["is_final"] and bar["degraded"] and bar["source_semantics"] == "derived"
+            assert bar["interval_end"] == "2026-09-03T14:30:00+08:00"
+        assert len(result.data["source_evidence"]) == len(HOLDINGS)
+        archived = json.loads(runner.read_artifact(result.raw_artifact_ref))
+        assert archived["data"]["source_evidence"][0]["raw_minute_contract"] == minute
     finally:
         server.shutdown()
         server.server_close()
@@ -365,6 +528,113 @@ def controlled_non_bar_result(operation, contract):
 class Weekdays:
     def is_trading_day(self, day):
         return day.weekday() < 5
+
+
+def test_scheduled_proven_tencent_fallback_qualifies_and_reaches_exchange(tmp_path):
+    calls = []
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            calls.append(self.path)
+            if self.path.startswith("/stocks/quotes"):
+                self.send_error(503)
+                return
+            vendor = parse_qs(urlsplit(self.path).query)["code"][0]
+            minute = proven_minute_contract()
+            # A longer tape must remain archived without truncating the
+            # qualification excerpt into invalid JSON at the 8KB boundary.
+            minute["data"] = [{**minute["data"][0], "time": f"09{value:02d}",
+                "cumulative_volume": value - 29, "cumulative_amount": (value - 29) * 1000,
+                "observed_at": f"2026-09-03T{'10:00' if value == 59 else f'09:{value + 1:02d}'}:00+08:00",
+                "last_trade_at": f"2026-09-03T09:{value:02d}:50+08:00",
+            } for value in range(30, 60)] + minute["data"]
+            raw = json.dumps({"data": {vendor: {"data": minute}}}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *_args):
+            pass
+
+    ensure_builtin_tools(tmp_path / "tools")
+    store = CompanionStore(tmp_path / "runtime.sqlite3")
+    engine = CompanionEngine(store, memory=InMemoryMemoryAdapter(),
+                             evidence_contract_factory=EvidenceContractFactory(Weekdays()))
+    portfolio = seed_portfolio(store)
+    exchange = LocalExchange(tmp_path / "exchange")
+    cycle = engine.start_cycle("daily.execution.1430", "2026-09-03T14:30:00+08:00", AS_OF)
+    paths = SimpleNamespace(home=tmp_path, tools=tmp_path / "tools", runtime=tmp_path / "runtime",
+                            resources=RESOURCES, exchange=exchange.root)
+    settings = SimpleNamespace(research={}, broker={"url": "http://broker.test:8817"})
+    runner = ToolRunner(ToolCatalog(paths.tools), need_reporter=store.submit_capability_need)
+    resolve = runner.resolve_with_fallback
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    def local_resolve(request):
+        return resolve(replace(request, inputs={**request.inputs, "markethub_url": base + "/stocks/quotes",
+                                               "tencent_minute_url": base + "/minute?code="}))
+    runner.resolve_with_fallback = local_resolve
+    original_backend = ToolCatalogMarketBackend.__call__
+    def backend(self, operation, arguments):
+        if operation != "current_bar":
+            result = controlled_non_bar_result(operation, self.contract)
+            if operation == "announcement_snapshot":
+                source = result["results"][0]
+                data = json.loads(source["excerpt_text"])
+                result["results"] = [{**source, "url": f"https://www.cninfo.com.cn/{row['symbol']}/notice",
+                    "excerpt_text": json.dumps({**data, "checked_symbol": row["symbol"], "announcements": [row]}, ensure_ascii=False)
+                } for row in data["announcements"]]
+            return result
+        return original_backend(self, operation, arguments)
+    planner = Mock()
+    planner.outcomes = []
+    planner.side_effect = AssertionError("qualified deterministic evidence needs no model repair")
+    broker = Mock()
+    def compose(request):
+        assert request.stage == "m0_compose"
+        output = safe_stage_output(request.stage, packet=request.packet)
+        return BrokerResponse(json.dumps(output), output, "offline-fixture", "fixture", request.intellect,
+                              request.intellect, "offline-fixture", request.effort)
+    broker.invoke.side_effect = compose
+    try:
+        with patch("ai_trading_companion.engine.utc_now", return_value=datetime.fromisoformat(AS_OF)), \
+             patch("ai_trading_companion.__main__.PATHS", paths), \
+             patch("ai_trading_companion.__main__.load_settings", return_value=settings), \
+             patch("ai_trading_companion.__main__.broker_client", return_value=broker), \
+             patch("ai_trading_companion.__main__.BrokerResearchPlanner", return_value=planner), \
+             patch("ai_trading_companion.__main__.ToolRunner", return_value=runner), \
+             patch.object(ToolCatalogMarketBackend, "__call__", backend):
+            result = run_scheduled_cycle(engine, store, exchange, portfolio, cycle["cycle_id"], True,
+                                         at=datetime(2026, 9, 3, 6, 30, tzinfo=timezone.utc))
+            flush(store, exchange)
+            flush(store, exchange)
+        assert result["state"] == "awaiting_h0"
+        attempts = store.attempts(cycle["cycle_id"])
+        assert [row["status"] for row in attempts] == ["succeeded", "succeeded"]
+        verifier = json.loads(attempts[0]["verifier_json"])
+        assert verifier["passed"] and "portfolio_current_bar" not in verifier.get("missing_requirements", [])
+        assert len(calls) == 4
+        frozen_contract = json.loads(attempts[0]["input_packet_json"])["evidence_contract"]
+        frozen = next(row for row in frozen_contract["requirements"] if row["key"] == "portfolio_current_bar")
+        assert set(frozen["required_entities"]) == set(HOLDINGS)
+        assert [parse_qs(urlsplit(path).query)["code"][0] for path in calls[1:]] == [
+            ("sz" if code.startswith("0") else "sh") + code for code in frozen["required_entities"]
+        ]
+        events = [json.loads(path.read_text(encoding="utf-8")) for path in (exchange.root / "to-client/pending").glob("*.json")]
+        assert sum((event.get("type") or event.get("event_type")) == "m0.ready" for event in events) == 1
+        assert not any((event.get("type") or event.get("event_type")) in {"research.failed", "m1.ready"} for event in events)
+        audit = json.loads((paths.tools / ".audit/resolutions.ndjson").read_text())
+        assert audit["attempts"] == ["markethub:tool_http_server_error", "tencent:succeeded"]
+        assert len(audit["adapter_receipts"]) == 2
+        archived = json.loads(runner.read_artifact(audit["raw_artifact_ref"]))
+        for source in archived["data"]["source_evidence"]:
+            assert len(source["raw_minute_contract"]["data"]) == 33
+            assert len(json.dumps(source["data"], sort_keys=True)) < 8000
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_scheduled_all_routes_failed_reaches_exchange_once_without_a_judgment(tmp_path):

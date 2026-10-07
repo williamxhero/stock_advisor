@@ -1187,11 +1187,6 @@ def _validate_current_equity_bars(request: FactRequest, data: dict[str, Any], fa
         if symbol not in expected_symbols or symbol in seen:
             return "tool_current_bar_symbol_mismatch"
         seen.add(symbol)
-        exchange = ("SSE" if symbol.startswith(("6", "9")) else "SZSE" if symbol.startswith(("0", "2", "3"))
-                    else "BSE" if symbol.startswith(("4", "8")) else None)
-        if (not re.fullmatch(r"\d{6}", symbol) or exchange is None or bar.get("exchange") != exchange
-                or bar.get("freq") != freq or bar.get("market") != "CN-A"):
-            return "tool_current_bar_identity_invalid"
         try:
             interval_start = _parse_timestamp(str(bar.get("interval_start") or ""))
             interval_end = _parse_timestamp(str(bar.get("interval_end") or ""))
@@ -1205,6 +1200,18 @@ def _validate_current_equity_bars(request: FactRequest, data: dict[str, Any], fa
             return "tool_current_bar_result_invalid"
         if observed_at > required_at:
             return "tool_current_bar_after_required_at"
+        # A closed interval is not necessarily the official session close.
+        if (request.finality in {"close", "official_close"} and bar.get("is_final") is False
+                or request.finality == "official_close" and interval_end.astimezone(_SHANGHAI).hour < 15):
+            return "tool_current_bar_finality_invalid"
+        # Numeric symbols are exchange-scoped: SSE indices also use 0xxxxx.
+        exchange = bar.get("exchange")
+        if (not re.fullmatch(r"\d{6}", symbol) or not (
+                exchange == "SSE" and symbol.startswith(("0", "6", "9"))
+                or exchange == "SZSE" and symbol.startswith(("0", "2", "3"))
+                or exchange == "BSE" and symbol.startswith(("4", "8")))
+                or bar.get("freq") != freq or bar.get("market") != "CN-A"):
+            return "tool_current_bar_identity_invalid"
         if (interval_end - interval_start != timedelta(minutes=1 if freq == "1m" else 30)
                 or interval_start.second or interval_start.microsecond
                 or interval_start > observed_at or last_trade_at > observed_at
@@ -1223,12 +1230,10 @@ def _validate_current_equity_bars(request: FactRequest, data: dict[str, Any], fa
             return "tool_current_bar_stale"
         if any(not isinstance(bar.get(field), bool) for field in ("is_final", "degraded", "is_st", "is_suspended")):
             return "tool_current_bar_status_invalid"
-        if not isinstance(bar.get("market_status"), str) or not bar["market_status"].strip():
-            return "tool_current_bar_status_invalid"
-        if request.finality in {"close", "official_close"} and (
-            not bar["is_final"] or interval_end.astimezone(_SHANGHAI).hour < 15
+        if "market_status" in bar and (
+            not isinstance(bar["market_status"], str) or not bar["market_status"].strip()
         ):
-            return "tool_current_bar_finality_invalid"
+            return "tool_current_bar_status_invalid"
         if bar.get("source_semantics") not in {"native", "derived"} or not str(bar.get("provider") or "").strip():
             return "tool_current_bar_source_invalid"
         observed_times.append(observed_at)

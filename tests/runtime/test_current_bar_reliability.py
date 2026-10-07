@@ -28,7 +28,7 @@ from ai_trading_companion.memory_port import InMemoryMemoryAdapter
 from ai_trading_companion.portfolio import PortfolioService
 from ai_trading_companion.store import CompanionStore
 from ai_trading_companion.stage_expression import safe_stage_output
-from ai_trading_companion.tooling import FactRequest, ToolCatalog, ToolRunner
+from ai_trading_companion.tooling import FactRequest, ToolCatalog, ToolRunner, validate_capability_data
 from ai_trading_companion.tool_failures import RETRY_POLICY, TRANSIENT_ERRORS
 
 AS_OF = "2026-09-03T06:30:00Z"
@@ -124,6 +124,39 @@ def native_bar_output():
             "market_status": "trading", "provider": "controlled-native", "source_semantics": "native",
         } for code in HOLDINGS],
     }}
+
+
+@pytest.mark.parametrize("case,error", [
+    ("valid", None),
+    ("non_final", "tool_current_bar_finality_invalid"),
+    ("future", "tool_current_bar_after_required_at"),
+    ("non_final_bad_identity", "tool_current_bar_finality_invalid"),
+    ("future_bad_identity", "tool_current_bar_after_required_at"),
+    ("missing_exchange", "tool_current_bar_identity_invalid"),
+    ("wrong_market", "tool_current_bar_identity_invalid"),
+    ("official_close", "tool_current_bar_finality_invalid"),
+])
+def test_current_bar_preserves_canonical_markethub_contract(case, error):
+    from ai_trading_companion.regression_probes import AS_OF as cutoff, _market_data
+
+    data = _market_data()
+    bar = data["bars"][0]
+    finality = "close"
+    if case.startswith("non_final"):
+        bar["is_final"] = False
+    elif case.startswith("future"):
+        bar["observed_at"] = "2026-09-30T02:00:00Z"
+    if case.endswith("bad_identity"):
+        bar["exchange"] = "invalid"
+    elif case == "missing_exchange":
+        bar.pop("exchange")
+    elif case == "wrong_market":
+        bar["market"] = "US"
+    elif case == "official_close":
+        finality = data["finality"] = "official_close"
+    fact_request = FactRequest(1, "cn_equity_current_bar", cutoff, 1.0,
+                               {"symbols": ["000001"], "freq": "1m"}, finality=finality)
+    assert validate_capability_data(fact_request, cutoff, data) == error
 
 
 @pytest.mark.parametrize("field,value,error", [

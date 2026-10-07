@@ -966,6 +966,15 @@ class LocalResearchChain:
             checkpoint("complete")
             bundle_bytes, bundle_hash = freeze_evidence_bundle(normalized)
             return FrozenResearchResult(True, normalized, verifier, observations, bundle_bytes, bundle_hash, 0)
+        if any(
+            item.get("status") == "failed"
+            and (item.get("arguments") or {}).get("requirement_key") == "portfolio_current_bar"
+            and item.get("tool_error_code") in {
+                "tool_circuit_open", "tool_routes_exhausted_deterministic", "tool_routes_exhausted",
+            }
+            for item in observations
+        ):
+            forced_stop_reason = "current_bar_routes_exhausted"
         round_number = 0
         no_gain_rounds = 0
         while not forced_stop_reason and (
@@ -2317,6 +2326,11 @@ def _build_gap_states(
             "blocking": bool(requirement.get("blocking", True)),
             "fact_window": dict(requirement.get("window") or {}),
             "attempted_source_categories": attempted_categories,
+            "attempted_routes": sorted({
+                str(attempt).split(":", 1)[0] for item in related
+                for attempt in item.get("tool_attempts") or []
+                if not str(attempt).endswith(":circuit_open")
+            }),
             "rejection_reasons": list(dict.fromkeys(rejection_reasons)),
             "stop_reason": stop_reason if research_state in {"routes_exhausted", "permission_required"} else None,
             "transitions": [
@@ -2342,6 +2356,17 @@ def _public_failure_message(as_of: str, gap_states: list[dict[str, Any]]) -> str
         f"（当前覆盖：{row.get('coverage_state') or 'missing'}）"
         for row in blocking
     ) or "关键事实覆盖仍未达到发布标准"
+    bar_gaps = [row for row in blocking if row.get("requirement_key") == "portfolio_current_bar"]
+    if bar_gaps:
+        routes = {route for row in bar_gaps for route in row.get("attempted_routes") or []}
+        labels = {"markethub": "主行情服务", "tencent": "独立分钟数据回退"}
+        checked_routes = "、".join(labels.get(route, "其他行情来源") for route in sorted(routes)) or "当前可用行情来源"
+        return (
+            f"截至 {as_of}，实有持仓当前行情未能取得合格的一分钟价格、成交量与成交额证据。"
+            f"本轮已尝试的{checked_routes}未提供满足本轮冻结时点和持仓范围的事实，"
+            "本轮盘中观察无法合格发布，也不能据此形成后续独立研判或交易动作。"
+            "其他已核验事实保持有效。"
+        )
     return (
         f"截至 {as_of}，已检查{checked}；{gaps}，因此不能支持依赖这些事实的方向判断。"
         "其他已核验事实保持有效。"
@@ -2563,7 +2588,7 @@ def _merge_mandatory_operations(
                 item.get("status") == "failed"
                 and str((item.get("arguments") or {}).get("requirement_key") or "") == key
                 and item.get("operation") == identity[1]
-                and item.get("tool_error_code") in {"tool_circuit_open", "tool_routes_exhausted_deterministic"}
+                and item.get("tool_error_code") in {"tool_circuit_open", "tool_routes_exhausted_deterministic", "tool_routes_exhausted"}
                 for item in observations or []
             ):
                 return False

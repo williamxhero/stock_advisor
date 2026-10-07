@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 
 
-_VERSION = "1.1.21"
-_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15", "1.1.16", "1.1.17", "1.1.18", "1.1.19", "1.1.20"}
+_VERSION = "1.1.24"
+_PREVIOUS_BUILTIN_VERSIONS = {"1.1.0", "1.1.1", "1.1.2", "1.1.3", "1.1.4", "1.1.5", "1.1.6", "1.1.7", "1.1.8", "1.1.9", "1.1.10", "1.1.11", "1.1.12", "1.1.13", "1.1.14", "1.1.15", "1.1.16", "1.1.17", "1.1.18", "1.1.19", "1.1.20", "1.1.21", "1.1.22", "1.1.23"}
 _CAPABILITIES = {
     "generic_http_json": "http_json",
     "generic_web_read": "web_read",
@@ -173,8 +173,10 @@ import datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 import html
 import json
+import math
 import os
 import re
+import socket
 import shutil
 import subprocess
 import sys
@@ -189,8 +191,32 @@ sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
 
-def fail(code: int, message: str) -> None:
-    print(message, file=sys.stderr)
+def current_bar_mode() -> bool:
+    return len(sys.argv) == 2 and sys.argv[1] in {"cn_equity_current_bar", "cn_equity_current_bar_tencent"}
+
+
+def fail(code: int, message: str, error_code: str | None = None) -> None:
+    if not current_bar_mode():
+        print(message, file=sys.stderr)
+        raise SystemExit(code)
+    if error_code is None:
+        error_code = "tool_process_configuration" if code == 64 else "tool_response_contract_invalid"
+        if "access-controlled" in message:
+            error_code = "tool_access_restricted"
+        elif "current Bar" in message or "minute tape" in message or "minute row" in message:
+            error_code = "tool_current_bar_result_invalid"
+            for marker, typed in (
+                ("symbol", "symbol_mismatch"), ("timestamp", "time_invalid"),
+                ("stale", "stale"), ("freshness", "stale"),
+                ("OHLC", "values_invalid"), ("values", "values_invalid"),
+                ("non-monotonic", "values_invalid"), ("finality", "finality_invalid"),
+                ("status", "status_invalid"), ("source", "source_invalid"),
+            ):
+                if marker in message:
+                    error_code = "tool_current_bar_" + typed
+                    break
+    print(json.dumps({"contract": "ai-trading-tool-failure/v1", "error_code": error_code,
+                      "message": message}), file=sys.stderr)
     raise SystemExit(code)
 
 
@@ -219,7 +245,7 @@ def fetch(
     if referer:
         headers["Referer"] = referer
     last_error: Exception | None = None
-    for _attempt in range(2):
+    for _attempt in range(1 if current_bar_mode() else 2):
         request = Request(url, headers=headers)
         try:
             with urlopen(request, timeout=12) as response:
@@ -227,7 +253,7 @@ def fetch(
                 if status in {401, 402, 403}:
                     fail(64, "access-controlled response")
                 if status >= 400:
-                    fail(75, f"upstream HTTP {status}")
+                    fail(75, f"upstream HTTP {status}", "tool_http_server_error" if status >= 500 else "tool_http_client_error")
                 raw = response.read(1_000_001)
                 if len(raw) > 1_000_000:
                     fail(75, "response too large")
@@ -235,6 +261,13 @@ def fetch(
                 return response.geturl(), raw.decode(charset, errors="replace")
         except SystemExit:
             raise
+        except HTTPError as exc:
+            if current_bar_mode():
+                fail(75, f"upstream HTTP {exc.code}", (
+                    "tool_access_restricted" if exc.code in {401, 402, 403}
+                    else "tool_http_server_error" if exc.code >= 500 else "tool_http_client_error"
+                ))
+            last_error = exc
         except Exception as exc:
             last_error = exc
     curl = (shutil.which("curl") or shutil.which("curl.exe")) if curl_fallback else None
@@ -262,7 +295,14 @@ def fetch(
                 ):
                     return url, decoded
             last_error = RuntimeError(f"curl_exit_{completed.returncode}")
-    fail(75, f"network read failed after retry: {type(last_error).__name__}")
+    reason = last_error.reason if isinstance(last_error, URLError) else last_error
+    error_code = (
+        "tool_network_timeout" if isinstance(reason, (TimeoutError, socket.timeout))
+        else "tool_network_connection_reset" if isinstance(reason, ConnectionResetError)
+        else "tool_network_dns_temporary" if isinstance(reason, socket.gaierror) and reason.errno == socket.EAI_AGAIN
+        else "tool_network_unavailable"
+    )
+    fail(75, f"network read failed: {type(reason).__name__}", error_code)
 
 
 def strip_html(value: str) -> str:
@@ -448,8 +488,8 @@ def current_bar_payload(body: str, symbols: list[dict[str, str]], freq: str, fin
             fail(75, "MarketHub current Bar freshness or volume is invalid")
         is_final = row.get("is_final")
         degraded = row.get("degraded")
-        if not isinstance(is_final, bool) or not isinstance(degraded, bool):
-            fail(75, "MarketHub current Bar status is invalid")
+        if any(not isinstance(row.get(field), bool) for field in ("is_final", "degraded", "is_suspended", "is_st")):
+            fail(75, "MarketHub current Bar status is invalid", "tool_current_bar_status_invalid")
         if finality in {"close", "official_close"} and not is_final:
             fail(75, "MarketHub current Bar does not meet finality")
         source_semantics = str(row.get("source_semantics") or "")
@@ -576,81 +616,190 @@ def minute_rows(value: object) -> list[str]:
 def tencent_current_bar_payload(
     symbols: list[dict[str, str]], required_at: str, freq: str, finality: str, minute_endpoint: object = None,
 ) -> tuple[dict[str, object], str]:
-    """Convert Tencent's cumulative minute tape into a truthful derived 1m Bar.
+    """Derive volume/amount only from a dated, explicit minute-Bar contract.
 
-    Tencent does not provide native OHLCVA bars at this endpoint.  The minute
-    tape is therefore only accepted when it contains consecutive cumulative
-    volume and amount values; the interval's close is the reported minute
-    price and its open is the preceding minute price.  This is deliberately a
-    narrow, independently validated fallback rather than a webpage-text path.
+    The raw sampled-price endpoint is not this contract: it cannot establish
+    interval extrema, units or security status and remains fail-closed.
     """
     if freq != "1m":
         fail(64, "Tencent current Bar supports only 1m")
     try:
-        cutoff = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00")).astimezone(
-            dt.timezone(dt.timedelta(hours=8)))
+        cutoff = dt.datetime.fromisoformat(required_at.replace("Z", "+00:00"))
+        if cutoff.tzinfo is None:
+            raise ValueError("naive cutoff")
+        cutoff = cutoff.astimezone(dt.timezone(dt.timedelta(hours=8)))
     except ValueError:
         fail(64, "required_at must be an ISO timestamp")
     base = str(minute_endpoint or "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                fail(75, "Tencent minute response has duplicate fields", "tool_current_bar_result_invalid")
+            result[key] = value
+        return result
+
     bars: list[dict[str, object]] = []
+    source_urls: list[str] = []
     source_evidence: list[dict[str, object]] = []
     latest: dt.datetime | None = None
+    unproven = False
+
+    def proven_time(value: object) -> dt.datetime:
+        try:
+            moment = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if moment.tzinfo is None or moment.astimezone(cutoff.tzinfo).date() != cutoff.date() or moment > cutoff:
+                raise ValueError("unbound timestamp")
+            return moment.astimezone(cutoff.tzinfo)
+        except ValueError:
+            fail(75, "Tencent minute provenance timestamp is invalid", "tool_current_bar_time_invalid")
+
     for symbol in symbols:
         source_url, body = fetch(base.replace("{symbol}", symbol["vendor_symbol"]) if "{symbol}" in base else base + symbol["vendor_symbol"])
         try:
-            rows = minute_rows(json.loads(body))
-        except json.JSONDecodeError:
-            fail(75, "Tencent minute response is not JSON")
+            response = json.loads(body, object_pairs_hook=unique_object)
+            by_symbol = response["data"]
+            if not isinstance(by_symbol, dict) or set(by_symbol) != {symbol["vendor_symbol"]}:
+                fail(75, "Tencent minute symbol coverage is invalid", "tool_current_bar_symbol_mismatch")
+            block = by_symbol[symbol["vendor_symbol"]]
+            minute = block["data"]
+            date_text = minute.get("date") if isinstance(minute, dict) else block.get("date")
+            rows = minute.get("data") if isinstance(minute, dict) else minute
+        except (KeyError, TypeError, json.JSONDecodeError):
+            fail(75, "Tencent minute response is incomplete", "tool_current_bar_result_invalid")
+        try:
+            trading_date = dt.datetime.strptime(str(date_text), "%Y%m%d" if re.fullmatch(r"\d{8}", str(date_text)) else "%Y-%m-%d").date()
+        except ValueError:
+            fail(75, "Tencent minute trading date is missing", "tool_current_bar_time_invalid")
+        if trading_date != cutoff.date():
+            fail(75, "Tencent minute trading date is mismatched", "tool_current_bar_time_invalid")
+        if not isinstance(rows, list) or not rows:
+            fail(75, "Tencent minute tape is incomplete", "tool_current_bar_result_invalid")
         tape: list[tuple[dt.datetime, float, float, float]] = []
         for row in rows:
-            fields = row.strip().split()
-            if len(fields) < 4 or not re.fullmatch(r"\d{4}", fields[0]):
-                continue
+            if isinstance(row, dict):
+                fields = [row.get(field) for field in ("time", "close", "cumulative_volume", "cumulative_amount")]
+            else:
+                fields = row.strip().split() if isinstance(row, str) else []
+            if len(fields) != 4 or not isinstance(fields[0], str) or not re.fullmatch(r"\d{4}", fields[0]):
+                fail(75, "Tencent minute row lacks price or cumulative volume/amount", "tool_current_bar_values_invalid")
             try:
-                moment = dt.datetime.combine(cutoff.date(), dt.time(int(fields[0][:2]), int(fields[0][2:])), cutoff.tzinfo)
-                price, cumulative_volume, cumulative_amount = float(fields[1]), float(fields[2]), float(fields[3])
-            except ValueError:
-                continue
-            if price <= 0 or cumulative_volume < 0 or cumulative_amount < 0:
-                fail(75, "Tencent minute row has invalid values")
-            if tape and (moment <= tape[-1][0] or cumulative_volume < tape[-1][2] or cumulative_amount < tape[-1][3]):
-                fail(75, "Tencent minute tape is non-monotonic")
-            # The endpoint also exposes the currently forming minute.  A row
-            # labelled HH:MM is only usable after its one-minute interval has
-            # ended; otherwise it is future evidence relative to required_at.
-            if moment + dt.timedelta(minutes=1) <= cutoff:
-                tape.append((moment, price, cumulative_volume, cumulative_amount))
-        if len(tape) < 2:
-            fail(75, "Tencent minute tape lacks a complete interval")
-        moment, close, volume_total, amount_total = tape[-1]
-        prior_moment, open_price, prior_volume, prior_amount = tape[-2]
-        interval_end = moment + dt.timedelta(minutes=1)
-        if cutoff - interval_end > dt.timedelta(minutes=5):
-            fail(75, "Tencent minute tape is stale")
-        volume, amount = volume_total - prior_volume, amount_total - prior_amount
-        if volume < 0 or amount < 0:
-            fail(75, "Tencent minute tape is non-monotonic")
-        observed_at = interval_end
-        freshness_ms = int((cutoff - observed_at).total_seconds() * 1000)
+                moment = dt.datetime.combine(trading_date, dt.time(int(fields[0][:2]), int(fields[0][2:])), cutoff.tzinfo)
+                if any(isinstance(field, bool) for field in fields[1:]):
+                    raise ValueError("boolean value")
+                price, volume, amount = (float(field) for field in fields[1:])
+            except (TypeError, ValueError, OverflowError):
+                fail(75, "Tencent minute row values are invalid", "tool_current_bar_values_invalid")
+            if not all(math.isfinite(value) for value in (price, volume, amount)) or price <= 0 or volume < 0 or amount < 0:
+                fail(75, "Tencent minute row values are invalid", "tool_current_bar_values_invalid")
+            if moment > cutoff:
+                fail(75, "Tencent minute timestamp is future evidence", "tool_current_bar_time_invalid")
+            if tape and (moment <= tape[-1][0] or volume < tape[-1][2] or amount < tape[-1][3]):
+                fail(75, "Tencent minute tape is non-monotonic", "tool_current_bar_values_invalid")
+            tape.append((moment, price, volume, amount))
+        completed = [row for row in tape if row[0] + dt.timedelta(minutes=1) <= cutoff]
+        if len(completed) < 2 or completed[-1][0] - completed[-2][0] != dt.timedelta(minutes=1):
+            fail(75, "Tencent minute tape lacks consecutive completed rows", "tool_current_bar_result_invalid")
+        if cutoff - (completed[-1][0] + dt.timedelta(minutes=1)) > dt.timedelta(minutes=5):
+            fail(75, "Tencent minute tape is stale", "tool_current_bar_stale")
+        if not isinstance(minute, dict) or minute.get("contract") != "tencent-minute-bar/v1":
+            unproven = True
+            continue
+        units = minute.get("units")
+        if (not isinstance(units, dict) or units.get("price") != "CNY/share"
+                or units.get("amount") != "CNY" or units.get("volume") not in ("shares", "lots_100")
+                or minute.get("volume_mode") != "cumulative"
+                or minute.get("interval_semantics") != "start_labelled_1m"):
+            fail(75, "Tencent minute units or interval semantics are unproven", "tool_current_bar_source_invalid")
+        if any(not isinstance(row, dict) for row in rows):
+            fail(75, "Tencent minute interval OHLC is unproven", "tool_current_bar_source_invalid")
+        proven_rows: dict[dt.datetime, dict[str, object]] = {}
+        for raw, sample in zip(rows, tape):
+            start, _, _, _ = sample
+            end = start + dt.timedelta(minutes=1)
+            if not (dt.time(9, 30) <= start.time() < dt.time(11, 30) or dt.time(13, 0) <= start.time() < dt.time(15, 0)):
+                fail(75, "Tencent minute interval is outside the trading session", "tool_current_bar_time_invalid")
+            try:
+                values = [raw[field] for field in ("open", "high", "low", "close")]
+                if any(isinstance(value, bool) for value in values):
+                    raise ValueError("boolean OHLC")
+                open_price, high, low, close = map(float, values)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                fail(75, "Tencent minute interval OHLC is invalid", "tool_current_bar_values_invalid")
+            if (not all(math.isfinite(value) and value > 0 for value in (open_price, high, low, close))
+                    or not (low <= open_price <= high and low <= close <= high)):
+                fail(75, "Tencent minute interval OHLC is invalid", "tool_current_bar_values_invalid")
+            observed = proven_time(raw.get("observed_at"))
+            last_trade = proven_time(raw.get("last_trade_at"))
+            if observed < start or last_trade > observed:
+                fail(75, "Tencent minute observation is inconsistent", "tool_current_bar_time_invalid")
+            if not isinstance(raw.get("is_final"), bool):
+                fail(75, "Tencent minute finality is missing", "tool_current_bar_finality_invalid")
+            if raw["is_final"] and end > observed:
+                fail(75, "Tencent minute completion is future evidence", "tool_current_bar_time_invalid")
+            proven_rows[start] = {
+                "open": open_price, "high": high, "low": low, "close": close,
+                "observed_at": observed, "last_trade_at": last_trade, "is_final": raw["is_final"],
+            }
+        previous, selected = completed[-2:]
+        start, _, cumulative_volume, cumulative_amount = selected
+        end = start + dt.timedelta(minutes=1)
+        proof = proven_rows[start]
+        observed, last_trade = proof["observed_at"], proof["last_trade_at"]
+        if not proof["is_final"]:
+            fail(75, "Tencent minute Bar is not complete", "tool_current_bar_finality_invalid")
+        freshness_ms = int((cutoff - observed).total_seconds() * 1000)
+        if freshness_ms > 300_000:
+            fail(75, "Tencent minute observation is stale", "tool_current_bar_stale")
+        status = minute.get("security_status")
+        if (not isinstance(status, dict)
+                or any(not isinstance(status.get(field), bool) for field in ("is_st", "is_suspended"))
+                or status.get("market_status") not in ("trading", "closed", "suspended")):
+            fail(75, "Tencent minute security status is unproven", "tool_current_bar_status_invalid")
+        if proven_time(status.get("as_of")) != observed:
+            fail(75, "Tencent minute security status is not contemporaneous", "tool_current_bar_time_invalid")
+        status_url = status.get("source_url")
+        if not isinstance(status_url, str) or not status_url.strip():
+            fail(75, "Tencent minute security status source is missing", "tool_current_bar_source_invalid")
+        status_url = safe_url(status_url)
+        volume = (cumulative_volume - previous[2]) * (100 if units["volume"] == "lots_100" else 1)
+        amount = cumulative_amount - previous[3]
+        if ((status["market_status"] == "suspended") != status["is_suspended"]
+                or (status["is_suspended"] and (volume or amount))):
+            fail(75, "Tencent minute security status contradicts trading", "tool_current_bar_status_invalid")
+        if (not math.isfinite(volume) or not math.isfinite(amount)
+                or bool(volume) != bool(amount)
+                or (volume == 0 and (last_trade >= start or any(proof[field] != previous[1] for field in ("open", "high", "low", "close"))))
+                or (volume > 0 and not (start <= last_trade < end))
+                or (volume > 0 and not proof["low"] * volume - 0.01 <= amount <= proof["high"] * volume + 0.01)):
+            fail(75, "Tencent minute cumulative units or trade values are inconsistent", "tool_current_bar_values_invalid")
+        if finality in {"close", "official_close"} and (end.time() < dt.time(15, 0) or status["market_status"] != "closed"):
+            fail(75, "Tencent minute Bar does not meet close finality", "tool_current_bar_finality_invalid")
         bar = {
-            "symbol": symbol["symbol"], "exchange": symbol["exchange"], "market": symbol["market"],
-            "freq": "1m", "trade_time": moment.isoformat(),
-            "interval_start": moment.isoformat(), "interval_end": interval_end.isoformat(),
-            "open": open_price, "high": max(open_price, close), "low": min(open_price, close), "close": close,
-            "volume": volume, "amount": amount, "is_suspended": volume == 0,
-            "is_st": False, "is_final": finality in {"close", "official_close"},
-            "observed_at": observed_at.isoformat(), "last_trade_at": moment.isoformat(),
-            "freshness_ms": freshness_ms, "degraded": True, "market_status": "trading",
-            "provider": "tencent_minute", "source_semantics": "derived", "source": "tencent_minute_current_bar",
+            "symbol": symbol["symbol"], "exchange": symbol["exchange"], "market": symbol["market"], "freq": freq,
+            "interval_start": start.isoformat(), "interval_end": end.isoformat(), "trade_time": last_trade.isoformat(),
+            **{field: proof[field] for field in ("open", "high", "low", "close", "is_final")},
+            "volume": volume, "amount": amount, "volume_unit": "shares", "amount_unit": "CNY",
+            "observed_at": observed.isoformat(), "last_trade_at": last_trade.isoformat(), "freshness_ms": freshness_ms,
+            **{field: status[field] for field in ("is_st", "is_suspended", "market_status")},
+            "provider": "tencent_minute", "source_semantics": "derived", "degraded": True, "source": "tencent_minute",
+            "derivation": {"contract": minute["contract"], "units": units, "previous_minute": previous[0].isoformat(),
+                           "cumulative_volume": [previous[2], cumulative_volume],
+                           "cumulative_amount": [previous[3], cumulative_amount], "security_status": status},
         }
         bars.append(bar)
-        latest = max(latest, observed_at) if latest else observed_at
-        source_evidence.append({"url": source_url, "fact_as_of": observed_at.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"), "data": {"bars": [bar], "finality": finality}})
-    if latest is None:
-        fail(75, "Tencent minute response is empty")
-    fact_as_of = latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-    evidence = {"bars": bars, "finality": finality, "source": "tencent_minute_current_bar"}
-    return {**evidence, "source_urls": [str(row["url"]) for row in source_evidence], "source_evidence": source_evidence}, fact_as_of
+        latest = max(latest, observed) if latest else observed
+        source_urls.extend(url for url in (source_url, status_url) if url not in source_urls)
+        # Keep the full tape in the archive, not the bounded qualification
+        # excerpt: a full trading session must not truncate its Bar JSON.
+        source_evidence.append({"url": source_url, "fact_as_of": observed.isoformat(), "raw_minute_contract": minute,
+                                "data": {"bars": [bar], "finality": finality}})
+    if unproven or not bars or latest is None:
+        fail(75, "Tencent minute tape lacks interval OHLC, verified units and security status provenance",
+             "tool_current_bar_source_invalid")
+    return {"bars": bars, "finality": finality, "source": "tencent_minute", "source_urls": source_urls,
+            "source_evidence": source_evidence}, latest.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def frozen_minute(symbol: dict[str, str], required_at: str, minute_endpoint: object = None) -> tuple[float, str, str]:

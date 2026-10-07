@@ -57,11 +57,11 @@ class ToolRunnerTests(unittest.TestCase):
                 ensure_builtin_tools(root)
 
             capability_manifest = json.loads((
-                root / "cn_market_breadth" / "versions" / "1.1.21" / "manifest.json"
+                root / "cn_market_breadth" / "versions" / "1.1.24" / "manifest.json"
             ).read_text(encoding="utf-8"))
             adapter_manifest = json.loads((
                 root / "cn_market_breadth" / "adapters" / "markethub"
-                / "versions" / "1.1.21" / "manifest.json"
+                / "versions" / "1.1.24" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual(new_python, capability_manifest["command"][0])
             self.assertEqual(new_python, adapter_manifest["command"][0])
@@ -91,7 +91,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             ensure_builtin_tools(root)
 
-            self.assertEqual("1.1.21", json.loads(previous.read_text(encoding="utf-8"))["version"])
+            self.assertEqual("1.1.24", json.loads(previous.read_text(encoding="utf-8"))["version"])
             self.assertEqual("custom-1", json.loads(custom.read_text(encoding="utf-8"))["version"])
             routing = json.loads(turnover_routing.read_text(encoding="utf-8"))
             self.assertEqual(
@@ -100,7 +100,7 @@ class ToolRunnerTests(unittest.TestCase):
             )
             official_manifest = json.loads((
                 root / "cn_market_turnover_compare" / "adapters" / "official_exchanges"
-                / "versions" / "1.1.21" / "manifest.json"
+                / "versions" / "1.1.24" / "manifest.json"
             ).read_text(encoding="utf-8"))
             self.assertEqual({
                 "allowed_domains": ["query.sse.com.cn", "www.szse.cn"],
@@ -123,7 +123,7 @@ class ToolRunnerTests(unittest.TestCase):
 
             selected = json.loads(routing.read_text(encoding="utf-8"))
             self.assertEqual(["tencent", "sina", "eastmoney"], [row["adapter"] for row in selected["candidates"]])
-            self.assertTrue(all(row["version"] == "1.1.21" for row in selected["candidates"]))
+            self.assertTrue(all(row["version"] == "1.1.24" for row in selected["candidates"]))
 
     def publish_tool(self, root: Path, capability: str, script: str, *, state: str = "promoted") -> Path:
         version_root = root / capability / "versions" / "1.0.0"
@@ -1170,12 +1170,28 @@ class ToolRunnerTests(unittest.TestCase):
                     self.send_error(503, "MarketHub unavailable")
                     return
                 if self.path.startswith("/minute?code=sh600000"):
-                    body = json.dumps({"data": {"sh600000": {"data": [
-                        "1428 10.00 100 1000", "1429 10.20 120 1224",
-                        # Tencent exposes the still-forming current minute too.
-                        # A 14:30:13 cutoff must keep the completed 14:29 bar.
-                        "1430 10.30 125 1275",
-                    ]}}}).encode("utf-8")
+                    # Synthetic contract fixture, not a captured Tencent response.
+                    # Explicit extrema differ from the sampled closes; the current
+                    # minute is still forming and must not displace 14:29.
+                    body = json.dumps({"data": {"sh600000": {"data": {
+                        "contract": "tencent-minute-bar/v1", "date": "20260901",
+                        "units": {"price": "CNY/share", "volume": "shares", "amount": "CNY"},
+                        "volume_mode": "cumulative", "interval_semantics": "start_labelled_1m",
+                        "security_status": {"is_st": True, "is_suspended": False, "market_status": "trading",
+                            "as_of": "2026-09-01T14:30:00+08:00",
+                            "source_url": f"http://127.0.0.1:{self.server.server_port}/status/sh600000"},
+                        "data": [
+                            {"time": "1428", "open": 10, "high": 10.1, "low": 9.9, "close": 10,
+                             "cumulative_volume": 100, "cumulative_amount": 1000, "is_final": True,
+                             "observed_at": "2026-09-01T14:29:00+08:00", "last_trade_at": "2026-09-01T14:28:50+08:00"},
+                            {"time": "1429", "open": 10.1, "high": 10.6, "low": 9.8, "close": 10.2,
+                             "cumulative_volume": 120, "cumulative_amount": 1204, "is_final": True,
+                             "observed_at": "2026-09-01T14:30:00+08:00", "last_trade_at": "2026-09-01T14:29:50+08:00"},
+                            {"time": "1430", "open": 10.2, "high": 10.3, "low": 10.2, "close": 10.3,
+                             "cumulative_volume": 125, "cumulative_amount": 1255, "is_final": False,
+                             "observed_at": "2026-09-01T14:30:00+08:00", "last_trade_at": "2026-09-01T14:30:00+08:00"},
+                        ],
+                    }}}}).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
@@ -1202,12 +1218,24 @@ class ToolRunnerTests(unittest.TestCase):
                 ))
 
                 self.assertTrue(result.succeeded, result.error_code)
-                self.assertEqual(("markethub:tool_process_failed", "tencent:succeeded"), result.attempts)
+                self.assertEqual(("markethub:tool_http_server_error", "tencent:succeeded"), result.attempts)
                 bar = result.data["bars"][0]
                 self.assertEqual("derived", bar["source_semantics"])
                 self.assertEqual("tencent_minute", bar["provider"])
                 self.assertEqual(10.2, bar["close"])
+                self.assertEqual((10.1, 10.6, 9.8), (bar["open"], bar["high"], bar["low"]))
+                self.assertEqual((20, 204), (bar["volume"], bar["amount"]))
+                self.assertEqual(("shares", "CNY"), (bar["volume_unit"], bar["amount_unit"]))
+                self.assertTrue(bar["is_st"])
+                self.assertFalse(bar["is_suspended"])
+                self.assertTrue(bar["is_final"])
+                self.assertTrue(bar["degraded"])
+                self.assertEqual("2026-09-01T14:29:50+08:00", bar["last_trade_at"])
                 self.assertEqual("2026-09-01T14:30:00+08:00", bar["interval_end"])
+                self.assertEqual("2026-09-01T06:30:00Z", result.fact_as_of)
+                proof = result.data["source_evidence"][0]["raw_minute_contract"]
+                self.assertEqual("tencent-minute-bar/v1", proof["contract"])
+                self.assertTrue(result.raw_artifact_ref)
             finally:
                 server.shutdown()
                 server.server_close()

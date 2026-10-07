@@ -189,6 +189,10 @@ def _m0_failure_is_retryable(exc: Exception) -> bool:
             "broker_secret_rejected", "broker_output_invalid", "broker_protocol",
         }
     verifier = getattr(exc, "verifier", None)
+    # Exhaustion has already consumed the frozen routes' typed retry budgets.
+    # Covered requirement names elsewhere in the verifier cannot reopen them.
+    if isinstance(verifier, dict) and verifier.get("stop_reason") == "current_bar_routes_exhausted":
+        return False
     haystack = " ".join(
         str(value) for value in (str(exc), verifier) if value is not None
     ).lower()
@@ -348,7 +352,9 @@ def resolve_stage_controls(
     return runtime_strategy.controls(stage, timeout_seconds=timeout, search=search, task_key=task_key)
 
 
-def finalize_stage_packet(packet: dict[str, Any], controls: RuntimeStrategyControls) -> dict[str, Any]:
+def finalize_stage_packet(
+    packet: dict[str, Any], controls: RuntimeStrategyControls, *, research_stage: str | None = None,
+) -> dict[str, Any]:
     """Bind runtime controls before deriving the sole hash for a stage invocation.
 
     The returned packet is a new immutable candidate.  Its ``sha256`` covers
@@ -359,6 +365,11 @@ def finalize_stage_packet(packet: dict[str, Any], controls: RuntimeStrategyContr
         key: value for key, value in packet.items()
         if key not in {"sha256", "runtime_strategy_controls", "allowed_research_backends"}
     }
+    if research_stage is not None:
+        # Rebuild derived contracts from the same base on replay; role inputs
+        # refer to the base hash and must not recursively hash themselves.
+        final_packet.pop("agent_contract", None)
+        final_packet.pop("agent_role_inputs", None)
     if controls.market_understanding_enabled and isinstance(final_packet.get("evidence_contract"), dict):
         final_packet["evidence_contract"] = EvidenceContractFactory.with_market_understanding(
             final_packet["evidence_contract"],
@@ -377,6 +388,9 @@ def finalize_stage_packet(packet: dict[str, Any], controls: RuntimeStrategyContr
             coordinator_sha256(baseline) if baseline is not None else None
         )
     final_packet["sha256"] = canonical_packet_hash(final_packet)
+    if research_stage is not None:
+        final_packet = attach_agent_contract(final_packet, capability=f"research:{research_stage}")
+        final_packet = attach_role_inputs(final_packet, stage=research_stage)
     return final_packet
 
 
@@ -947,7 +961,7 @@ def _call_stage(
     )
     timeout = controls.timeout_seconds
     search = bool(search and controls.max_operations > 0 and controls.enabled_backends)
-    packet = finalize_stage_packet(packet, controls)
+    packet = finalize_stage_packet(packet, controls, research_stage=stage if search else None)
     if stage in {"m1_research", "m1_judgment"}:
         from .decision_cycle import assert_m1_blind
         assert_m1_blind(packet)
@@ -957,9 +971,6 @@ def _call_stage(
         # The provider boundary must never be reachable with a missing H0,
         # stale M1, or mutable portfolio fact view.
         build_m2_judgment_input(packet)
-    if search:
-        packet = attach_agent_contract(packet, capability=f"research:{stage}")
-        packet = attach_role_inputs(packet, stage=stage)
     router = CognitiveRouter(effort_policy=CognitiveEffortPolicy.load(store))
     preliminary = router.plan(stage, packet, timeout, search)
     cell = store.router_policy_cell(
@@ -2231,7 +2242,10 @@ def run_research(
     # extracted from provider prose.  Artifacts are therefore frozen into M0
     # before the packet is handed to any probabilistic stage.
     _run_finrobot_calculations(engine, store, cycle, finrobot_inputs)
-    public_packet = finalize_stage_packet(builder.build(cycle, "m0_research", context=memory_research), research_controls)
+    public_packet = finalize_stage_packet(
+        builder.build(cycle, "m0_research", context=memory_research), research_controls,
+        research_stage="m0_research" if research_controls.max_operations > 0 and research_controls.enabled_backends else None,
+    )
     compose_timeout = int(policy.m1_timeout.total_seconds())
     compose_controls = resolve_stage_controls(
         store, "m0_compose", timeout=compose_timeout, search=False,

@@ -10,8 +10,8 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 import uuid
 
-from .memory_retrieval import MemoryIsolationError, qualify_episode, rank_bundle
-from .temporal_integrity import canonical_time
+from .memory_retrieval import MemoryIsolationError, freeze_retrieval, qualify_episode, rank_bundle
+from .temporal_integrity import canonical_time, timestamp
 
 
 class MemoryUnavailable(RuntimeError):
@@ -60,8 +60,7 @@ class HttpMemoryAdapter:
 
     def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20,
                         context: dict[str, Any] | None = None) -> dict[str, Any]:
-        bundle = self._request("POST", f"/v1/snapshots/{snapshot_id}/retrieve", {"query": query, "limit": 100})["result"]
-        self._remember_snapshot(snapshot_id, bundle["snapshot"])
+        bundle = self._retrieval_bundle(snapshot_id, query)
         originals: dict[str, dict[str, Any]] = {}
 
         def resolve(episode_id: str) -> dict[str, Any]:
@@ -70,6 +69,19 @@ class HttpMemoryAdapter:
             return originals[episode_id]
 
         return rank_bundle(bundle, resolve, limit=max(1, min(limit, 100)), context=context)
+
+    def _retrieval_bundle(self, snapshot_id: str, query: str) -> dict[str, Any]:
+        bundle = self._request("POST", f"/v1/snapshots/{snapshot_id}/retrieve", {"query": query, "limit": 100})["result"]
+        self._remember_snapshot(snapshot_id, bundle["snapshot"])
+        if bundle.get("query") != query:
+            raise MemoryUnavailable("MemoryHub retrieval query changed")
+        return bundle
+
+    def freeze_retrieval(self, snapshot_id: str, query: str, *, limit: int = 20,
+                         context: dict[str, Any] | None = None) -> dict[str, Any]:
+        return freeze_retrieval(self._retrieval_bundle(snapshot_id, query),
+                                lambda parent: self._expand_original(snapshot_id, parent),
+                                limit=max(1, min(limit, 100)), context=context)
 
     def _remember_snapshot(self, snapshot_id: str, snapshot: dict[str, Any]) -> None:
         if snapshot.get("snapshot_id") != snapshot_id or (
@@ -166,8 +178,12 @@ class InMemoryMemoryAdapter:
             "content_hash": episode["content_hash"],
             "protocol_version": "memoryhub/v1",
         }
+        stored = copy.deepcopy({**episode, **receipt})
+        for field_name in ("occurred_at", "known_at", "submitted_at"):
+            value = str(stored[field_name])
+            stored[field_name] = canonical_time(value + "T00:00:00Z" if len(value) == 10 else value)
         self._receipts[key] = receipt
-        self._episodes.append({**episode, **receipt})
+        self._episodes.append(stored)
         return dict(receipt)
 
     def append_batch(self, episodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -182,14 +198,14 @@ class InMemoryMemoryAdapter:
     def begin_snapshot(self, request: dict[str, Any]) -> dict[str, Any]:
         snapshot_id = f"test-snapshot-{len(self._snapshots) + 1}"
         value = {**request, "snapshot_id": snapshot_id, "watermark": len(self._episodes), "policy_version": "memory-policy/v1", "protocol_version": "memoryhub/v1"}
-        self._snapshots[snapshot_id] = value
-        return dict(value)
+        self._snapshots[snapshot_id] = copy.deepcopy(value)
+        return copy.deepcopy(value)
 
     def search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
         snapshot = self._snapshots[snapshot_id]
         cards = []
         for item in self._episodes[:snapshot["watermark"]]:
-            if item["memory_space_id"] != snapshot["memory_space_id"] or canonical_time(item["known_at"]) > canonical_time(snapshot["as_of"]):
+            if item["memory_space_id"] != snapshot["memory_space_id"] or timestamp(item["known_at"]) > timestamp(snapshot["as_of"]):
                 continue
             if query and not any(term in item.get("body", "").casefold() for term in query.casefold().split()):
                 continue
@@ -201,21 +217,31 @@ class InMemoryMemoryAdapter:
             cards.append({**copy.deepcopy(item), "summary": item.get("body", "")[:500]})
         return cards[:limit]
 
-    def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20,
-                        context: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _retrieval_bundle(self, snapshot_id: str, query: str) -> dict[str, Any]:
         snapshot = copy.deepcopy(self._snapshots[snapshot_id])
-        bundle = {
+        return {
             "bundle_id": f"test-bundle-{snapshot_id}", "audit_id": f"test-audit-{snapshot_id}",
             "snapshot": snapshot,
             "versions": {"policy": snapshot["policy_version"], "retriever": "test/v1", "index": "test/v1", "extractor": "test/v1", "protocol": snapshot["protocol_version"]},
             "query": query, "results": self.search(snapshot_id, query, limit=100),
         }
-        return rank_bundle(bundle, lambda parent: self._expand_original(snapshot_id, parent), limit=max(1, min(limit, 100)), context=context)
+
+    def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20,
+                        context: dict[str, Any] | None = None) -> dict[str, Any]:
+        return rank_bundle(self._retrieval_bundle(snapshot_id, query),
+                           lambda parent: self._expand_original(snapshot_id, parent),
+                           limit=max(1, min(limit, 100)), context=context)
+
+    def freeze_retrieval(self, snapshot_id: str, query: str, *, limit: int = 20,
+                         context: dict[str, Any] | None = None) -> dict[str, Any]:
+        return freeze_retrieval(self._retrieval_bundle(snapshot_id, query),
+                                lambda parent: self._expand_original(snapshot_id, parent),
+                                limit=max(1, min(limit, 100)), context=context)
 
     def _expand_original(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
         snapshot = self._snapshots[snapshot_id]
         for item in self._episodes[:snapshot["watermark"]]:
-            if item["episode_id"] == episode_id and item["memory_space_id"] == snapshot["memory_space_id"] and canonical_time(item["known_at"]) <= canonical_time(snapshot["as_of"]):
+            if item["episode_id"] == episode_id and item["memory_space_id"] == snapshot["memory_space_id"] and timestamp(item["known_at"]) <= timestamp(snapshot["as_of"]):
                 return copy.deepcopy(item)
         raise MemoryNotVisible("episode is not visible in snapshot")
 

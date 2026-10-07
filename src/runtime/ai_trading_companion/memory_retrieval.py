@@ -6,12 +6,11 @@ ranking projection; a high score never grants visibility or promotes a lesson.
 from __future__ import annotations
 
 import copy
-from datetime import datetime
 import re
 from typing import Any, Callable
 
 from .memory_type import build_envelope, sha256, validate as validate_type
-from .temporal_integrity import canonical_time
+from .temporal_integrity import canonical_time, timestamp
 
 CONTRACT = "MemoryRetrievalSpec/v1"
 VERSION = 1
@@ -129,8 +128,8 @@ def qualify_episode(episode: dict[str, Any], snapshot: dict[str, Any],
     if episode.get("memory_space_id", snapshot["memory_space_id"]) != snapshot["memory_space_id"]:
         raise MemoryIsolationError("cross_space_lineage")
     if episode["sequence"] > snapshot["watermark"] or any(
-        canonical_time(episode[field]) > canonical_time(snapshot["as_of"])
-        for field in ("known_at", "submitted_at")
+        timestamp(episode[field]) > timestamp(snapshot["as_of"])
+        for field in ("occurred_at", "known_at", "submitted_at")
     ):
         raise MemoryIsolationError("future_knowledge")
     metadata = episode.get("metadata") or {}
@@ -138,12 +137,19 @@ def qualify_episode(episode: dict[str, Any], snapshot: dict[str, Any],
     profile = metadata.get("memory_retrieval")
     if profile is not None:
         validate_profile(profile)
+        if profile["reliability"] == "rejected":
+            raise MemoryIsolationError("rejected_reliability_lineage")
     if snapshot["stage"] in BLIND_STAGES:
         if (episode.get("episode_type") in {"h0", "h0_proposition", "h0_action", "user_message"}
             or metadata.get("stage") in {"h0", "premarket", "m2", "m2_synthesis", "chat", "conversation"}
             or metadata.get("origin_stage") == "h0" or metadata.get("h0_derived") is True
+            or metadata.get("h0_artifact_id") or metadata.get("h0_message_id")
             or (metadata.get("actor") == "human" and semantic_type not in {"user_fact", "preference"})):
             raise MemoryIsolationError("h0_or_conversation_lineage")
+        if metadata.get("source_message_id"):
+            # Legacy cognition records name a message, not a snapshot-resolvable
+            # episode. Never infer that an H0-derived personal fact is blind-safe.
+            raise MemoryIsolationError("unresolved_message_lineage")
         if profile is None and semantic_type not in {"user_fact", "preference", "evidence"} and metadata.get("stage") not in {"m0", "m0_research", "m1_research", "m1_judgment"}:
             raise MemoryIsolationError("unproven_blind_lineage")
     parents = set()
@@ -198,7 +204,7 @@ def rank_bundle(bundle: dict[str, Any], resolve: Callable[[str], dict[str, Any]]
         half_life = HALF_LIFE_DAYS[semantic_type]
         if semantic_type == "lesson":
             half_life = {"candidate": 30.0, "verified": 365.0, "error": 7.0}[profile["lesson_state"]]
-        age = max(0.0, (datetime.fromisoformat(canonical_time(snapshot["as_of"])) - datetime.fromisoformat(canonical_time(episode["occurred_at"]))).total_seconds() / 86400)
+        age = max(0.0, (timestamp(snapshot["as_of"]) - timestamp(episode["occurred_at"])).total_seconds() / 86400)
         decay = 2 ** (-age / half_life)
         support = {"unknown": 0.5, "supported": 1.0, "contradicted": 0.2}[profile["outcome_support"]]
         if semantic_type == "lesson" and profile["lesson_state"] == "error":
@@ -222,11 +228,76 @@ def rank_bundle(bundle: dict[str, Any], resolve: Callable[[str], dict[str, Any]]
         result.pop("derived_summary", None)
         scored.append(result)
     scored.sort(key=lambda item: (-item["retrieval"]["score"], item["episode_id"]))
+    blind = snapshot["stage"] in BLIND_STAGES
+    # Query-dependent rejected IDs/counts can themselves reveal H0 direction.
+    # Keep them only in the separate offline archive, never a blind read receipt.
+    visible_exclusions = [] if blind else excluded
     receipt = {
-        **request, "status": "degraded" if excluded else "qualified" if scored else "empty",
-        "input_sha256": sha256(request), "candidate_episode_ids": [card["episode_id"] for card in candidates],
-        "candidate_window_limit": 100, "candidate_window_saturated": len(candidates) >= 100,
-        "accepted_inputs": inputs, "excluded": excluded,
+        **request, "status": "degraded" if visible_exclusions else "qualified" if scored else "empty",
+        "input_sha256": sha256(request),
+        "candidate_episode_ids": [item["episode_id"] for item in inputs] if blind else [card["episode_id"] for card in candidates],
+        "candidate_window_limit": 100, "candidate_window_saturated": None if blind else len(candidates) >= 100,
+        "accepted_inputs": inputs, "excluded": visible_exclusions,
         "provenance": {"bundle_id": bundle["bundle_id"], "audit_id": bundle["audit_id"], "versions": copy.deepcopy(bundle["versions"])},
     }
     return {**bundle, "results": scored[:limit], "retrieval": receipt}
+
+
+def freeze_retrieval(bundle: dict[str, Any], resolve: Callable[[str], dict[str, Any]], *,
+                     limit: int = 20, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Capture actual read inputs for offline replay, never for model context.
+
+    The archive may contain rejected originals. It must stay separate from the
+    safe ranked bundle and cannot be used to bypass a live snapshot policy.
+    """
+    originals: dict[str, dict[str, Any]] = {}
+    unavailable: dict[str, str] = {}
+
+    def capture(episode_id: str) -> dict[str, Any]:
+        if episode_id in unavailable:
+            raise MemoryIsolationError(unavailable[episode_id])
+        if episode_id not in originals:
+            try:
+                originals[episode_id] = copy.deepcopy(resolve(episode_id))
+            except MemoryIsolationError as error:
+                unavailable[episode_id] = str(error)
+                raise
+        return originals[episode_id]
+
+    output = rank_bundle(bundle, capture, limit=limit, context=context)
+    payload = {
+        "bundle": copy.deepcopy(bundle), "originals": originals, "unavailable": unavailable,
+        "limit": limit, "context": copy.deepcopy(context), "original_output": output,
+    }
+    return {"contract": "MemoryRetrievalReplay/v1", "version": VERSION,
+            "source_sha256": sha256(payload), "payload": payload}
+
+
+def frozen_replay(archive: dict[str, Any]) -> dict[str, Any]:
+    if set(archive) != {"contract", "version", "source_sha256", "payload"} or archive["contract"] != "MemoryRetrievalReplay/v1" or archive["version"] != VERSION:
+        raise ValueError("unsupported MemoryRetrieval replay")
+    payload = archive["payload"]
+    if sha256(payload) != archive["source_sha256"]:
+        raise ValueError("memory retrieval replay integrity conflict")
+
+    def resolve(episode_id: str) -> dict[str, Any]:
+        if episode_id in payload["unavailable"]:
+            raise MemoryIsolationError(payload["unavailable"][episode_id])
+        if episode_id not in payload["originals"]:
+            raise ValueError("memory retrieval replay is missing an original")
+        return payload["originals"][episode_id]
+
+    output = rank_bundle(payload["bundle"], resolve, limit=payload["limit"], context=payload["context"])
+    if output != payload["original_output"]:
+        raise ValueError("memory retrieval replay qualification conflict")
+    return {
+        "contract": "MemoryRetrievalReplayResult/v1", "version": VERSION,
+        "source_sha256": archive["source_sha256"], "output": output,
+        "evaluation_vector": {
+            "delivery_speed": {"state": "not_measured_in_frozen_replay"},
+            "qualification_probability": {"state": "not_estimated_in_frozen_replay"},
+            "research_quality": {"state": "deterministic_retrieval_only", "dimensions": ["relevance", "reliability", "decay", "outcome_support", "market_state_match", "instrument_match"]},
+            "judgment_outcome": {"state": "not_measured_in_frozen_replay"},
+            "safety_reliability": {"qualification_reproduced": True, "snapshot_bound": True, "write_permissions": []},
+        },
+    }

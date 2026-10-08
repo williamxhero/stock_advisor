@@ -250,6 +250,29 @@ def test_every_candidate_revision_can_be_rolled_back_without_rewriting(revision,
         service.rollback("withdraw", target["episode_id"], reason="different reason", as_of=AT)
 
 
+def test_dynamic_maturity_remains_fail_closed_on_a_late_ledger_sequence() -> None:
+    class LateLedger(InMemoryMemoryAdapter):
+        def append(self, episode):
+            receipt = super().append(episode)
+            return {**receipt, "sequence": receipt["sequence"] + 1_000_000_000}
+
+        def begin_snapshot(self, request):
+            snapshot = super().begin_snapshot(request)
+            return {**snapshot, "watermark": snapshot["watermark"] + 1_000_000_000}
+
+        def export_space(self, memory_space_id):
+            exported = super().export_space(memory_space_id)
+            return {**exported, "episodes": [{**row, "sequence": row["sequence"] + 1_000_000_000} for row in exported["episodes"]]}
+    memory = LateLedger()
+    service, created = candidate(memory)
+    good = append_observation(memory, "good")
+    baseline = append_observation(memory, "baseline", status="incorrect")
+    service.observe("late", created["episode_id"], good, baseline, subject="600519", market_state="range", as_of=AT)
+    assessed = service.assess(created["episode_id"], as_of=AT)
+    assert assessed["state"] == "inconclusive"
+    assert 0 < assessed["maturity"]["strata"]["range"]["support_interval"][1] <= 1
+
+
 def lessons(bundle):
     return [row["episode_id"] for row in bundle["results"] if row["retrieval"]["semantic_type"] == "lesson"]
 
@@ -269,9 +292,8 @@ def test_repeated_model_hits_remain_blocked_in_all_states() -> None:
             assert promoted["decision"]["state"] == "inconclusive"
     assert promoted["decision"]["state"] == "inconclusive"
     assert service.assess(created["episode_id"], as_of=AT)["maturity"]["independent_cycles"] == 512
-    assert promoted["decision"]["payload"]["blockers"] == [
-        "authoritative_outcome_verification_unavailable", "prospective_pair_registration_unavailable",
-    ]
+    assert "frozen_factual_window_required" in promoted["decision"]["payload"]["blockers"]
+    assert "prospective_pair_registration_unavailable" not in promoted["decision"]["payload"]["blockers"]
     after = memory.begin_snapshot({"memory_space_id": SPACE, "stage": "m1_judgment", "cycle_id": "next-cycle", "as_of": AT})
     assert lessons(memory.retrieve_bundle(after["snapshot_id"], "600519 risk", context={"market_state": "range"})) == []
 
@@ -340,7 +362,7 @@ def test_memoryhub_storage_does_not_authorize_model_metrics_and_repeated_cycle_i
     assert trial["state"] == "inconclusive"
     assert trial["support"] == trial["baseline_support"] == 0
     assert trial["quality_passed"] is False
-    assert "authoritative_outcome_verification_unavailable" in trial["reasons"]
+    assert "frozen_factual_window_required" in trial["reasons"]
     service.observe("alias", created["episode_id"], good, baseline, subject="600519", market_state="range", as_of=AT)
     assert service.assess(created["episode_id"], as_of=AT)["maturity"]["independent_cycles"] == 1
     with pytest.raises(MemoryUnavailable, match="immutable lesson request conflict"):

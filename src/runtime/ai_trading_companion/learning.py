@@ -96,7 +96,7 @@ def normalize_snapshot(value: dict[str, Any] | None, text: str, *, reference_at:
     base = heuristic_snapshot(text, reference_at=reference_at, qualified=qualified)
     if not isinstance(value, dict):
         return base
-    for key in ("subjects", "direction", "horizon", "reference_at", "triggers", "invalidations", "confidence", "benchmark", "qualified", "original_claims", "claims"):
+    for key in ("subjects", "direction", "horizon", "reference_at", "window_end", "triggers", "invalidations", "confidence", "benchmark", "qualified", "original_claims", "claims"):
         if key in value:
             base[key] = value[key]
     if base["direction"] not in {"bullish", "bearish", "neutral", "avoid", "unqualified", "unknown"}:

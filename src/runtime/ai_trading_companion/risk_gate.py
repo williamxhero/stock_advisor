@@ -34,9 +34,9 @@ _ADD_RISK = re.compile(r"(?:建议|可以|应当|应该|我会|认可|推荐).{0
 _DIRECTION = re.compile(r"(?:我|建议|可以|应该).{0,8}(?:看多|看空|买入|卖出|加仓)|\b(?:bullish|bearish)\b", re.I)
 # Bare imperatives are actionable even without an explicit recommendation verb.
 _IMPERATIVE = re.compile(
-    r"^\s*(?:(?:现在|立即|立刻|马上|直接|请)\s*)?(?:(?:使用|用)杠杆|融资|配资)?"
+    r"^\s*(?:(?:现在|立即|立刻|马上|直接|请)\s*)*(?:(?:使用|用)杠杆|融资|配资)?"
     r"(?:买入|加仓|扩大敞口|新增风险)(?:\s|\d|吧|$)|"
-    r"\b(?:now|immediately)\s+(?:buy|add\s+risk)\b|^\s*(?:buy|add\s+risk)\b", re.I,
+    r"\b(?:now|immediately)\s+(?:buy|add\s+risk)\b|^\s*(?:(?:please|now|immediately)\s+)*(?:buy|add\s+risk)\b", re.I,
 )
 # Selling/reducing is directional advice, but does not by itself add risk.
 _DIRECTIONAL_IMPERATIVE = re.compile(

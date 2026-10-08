@@ -488,6 +488,8 @@ def test_negated_attributed_or_analytical_leverage_is_not_advice(text):
 @pytest.mark.parametrize("text", [
     "现在买入300421。", "立即加仓300421。", "买入300421吧。",
     "Buy 300421 now.", "Add risk now.",
+    "Please buy 603179.", "Please now buy 603179.", "Please immediately add risk.",
+    "请现在买入603179。", "请立即买入603179。",
     "不建议观望而是现在买入300421。",
 ])
 @pytest.mark.parametrize("restricted", ["drawdown", "conflict"])

@@ -257,6 +257,22 @@ def test_schema_accepts_registry_verdict_replay_and_install_outputs():
         assert list(validator.iter_errors(value)) == [], value
 
 
+def delayed_probe_success(data):
+    import time
+    # Recovery qualification must tolerate startup contention within the
+    # production budget; dedicated adapter timeout tests still own latency.
+    time.sleep(1.1)
+    return {"value": int(data["value"]) + 1}
+
+
+def test_adapter_recovery_probe_tolerates_fixture_startup_contention(monkeypatch):
+    from ai_trading_companion import regression_probes
+
+    monkeypatch.setattr(regression_probes, "_probe_execute_success", delayed_probe_success)
+    result = regression_probes.run_probes(get_case("adapter_failure_recovery"))
+    assert all(result["axes"][axis]["passed"] for axis in ("safety", "quality", "recovery")), result
+
+
 def test_compatibility_spec_module_exposes_gate_contract():
     assert regression_spec.CONTRACT == CONTRACT
     assert regression_spec.run_regression_gate() == run_regression_gate()

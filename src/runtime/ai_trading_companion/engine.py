@@ -2086,6 +2086,7 @@ class CompanionEngine:
             return
         semantic_type = {
             "judgment": "judgment", "judgment_revision": "judgment",
+            "m1": "judgment", "m2": "judgment", "h0": "judgment",
             "outcome": "outcome", "reflection": "lesson",
         }.get(presented.kind, "message")
         write_memory(self.memory, "ai_message", {
@@ -2098,6 +2099,7 @@ class CompanionEngine:
             "metadata": {
                 "message_id": presented.message_id, "cycle_id": cycle["cycle_id"],
                 "kind": presented.kind, "state": "published", "actor": "ai",
+                "stage": {"m1": "m1_judgment", "m2": "m2_synthesis", "h0": "h0", "m0": "m0"}.get(presented.kind, presented.kind),
                 "published_message": presented.message(),
             },
         }, semantic_type=semantic_type)

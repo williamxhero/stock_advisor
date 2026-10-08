@@ -460,7 +460,10 @@ class UnifiedCognition:
             proposal = action.get("workflow_proposal")
             if not proposal:
                 return {"action_id": action_id, "action_type": action_type, "state": "rejected", "reason": "缺少改进提案"}
-            created = WorkflowEvolution(self.store).propose(cycle["cycle_id"], proposal, source_artifact_id=source_artifact["artifact_id"])
+            created = WorkflowEvolution(
+                self.store, memory=getattr(self.engine, "memory", None),
+                memory_space_id=getattr(self.engine, "memory_space_id", "ai-trading-companion"),
+            ).propose(cycle["cycle_id"], proposal, source_artifact_id=source_artifact["artifact_id"])
             return {"action_id": action_id, "action_type": action_type, "state": "proposed", "proposal_id": created["proposal_id"]}
         return {"action_id": action_id, "action_type": action_type, "state": "rejected", "reason": "动作不在允许范围内"}
 

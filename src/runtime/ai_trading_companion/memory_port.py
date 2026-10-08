@@ -10,7 +10,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 import uuid
 
-from .memory_retrieval import MemoryIsolationError, freeze_retrieval, memory_timestamp, qualify_episode, rank_bundle
+from .memory_retrieval import MemoryIsolationError, freeze_retrieval, lesson_bundle, memory_timestamp, qualify_episode, rank_bundle
 
 
 class MemoryUnavailable(RuntimeError):
@@ -74,7 +74,8 @@ class HttpMemoryAdapter:
         self._remember_snapshot(snapshot_id, bundle["snapshot"])
         if bundle.get("query") != query:
             raise MemoryUnavailable("MemoryHub retrieval query changed")
-        return bundle
+        exported = self.export_space(bundle["snapshot"]["memory_space_id"])
+        return lesson_bundle(bundle, exported["episodes"], export_space_id=exported["memory_space_id"])
 
     def freeze_retrieval(self, snapshot_id: str, query: str, *, limit: int = 20,
                          context: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -99,18 +100,26 @@ class HttpMemoryAdapter:
         return self._request("POST", f"/v1/snapshots/{snapshot_id}/expand", {"episode_id": episode_id})["result"]
 
     def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
+        return self._qualified_original(snapshot_id, episode_id)
+
+    def _qualified_original(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
         original = self._expand_original(snapshot_id, episode_id)
-        qualify_episode(original, self._snapshot(snapshot_id), lambda parent: self._expand_original(snapshot_id, parent))
+        snapshot = self._snapshot(snapshot_id)
+        exported = self.export_space(snapshot["memory_space_id"])
+        heads = lesson_bundle({"snapshot": snapshot, "results": []}, exported["episodes"], export_space_id=exported["memory_space_id"])["_lesson_heads"]
+        qualify_episode(original, snapshot, lambda parent: self._expand_original(snapshot_id, parent), lesson_heads=heads)
         return original
 
     def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
-        self.expand(snapshot_id, episode_id)
+        self._qualified_original(snapshot_id, episode_id)
         cards = self._request("POST", f"/v1/snapshots/{snapshot_id}/related", {"episode_id": episode_id, "limit": 100})["result"]
         bundle = {
             "snapshot": self._snapshot(snapshot_id), "query": "", "results": cards,
             "bundle_id": f"related:{snapshot_id}:{episode_id}", "audit_id": None,
             "versions": {"protocol": "memoryhub/v1"},
         }
+        exported = self.export_space(bundle["snapshot"]["memory_space_id"])
+        bundle = lesson_bundle(bundle, exported["episodes"], add_results=False, export_space_id=exported["memory_space_id"])
         return rank_bundle(bundle, lambda parent: self._expand_original(snapshot_id, parent), limit=max(1, min(limit, 100)))["results"]
 
     def timeline(self, memory_space_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]:
@@ -197,6 +206,9 @@ class InMemoryMemoryAdapter:
         return copy.deepcopy(value)
 
     def search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        return self.retrieve_bundle(snapshot_id, query, limit=limit)["results"]
+
+    def _search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
         snapshot = self._snapshots[snapshot_id]
         cards = []
         for item in self._episodes[:snapshot["watermark"]]:
@@ -214,12 +226,14 @@ class InMemoryMemoryAdapter:
 
     def _retrieval_bundle(self, snapshot_id: str, query: str) -> dict[str, Any]:
         snapshot = copy.deepcopy(self._snapshots[snapshot_id])
-        return {
+        bundle = {
             "bundle_id": f"test-bundle-{snapshot_id}", "audit_id": f"test-audit-{snapshot_id}",
             "snapshot": snapshot,
             "versions": {"policy": snapshot["policy_version"], "retriever": "test/v1", "index": "test/v1", "extractor": "test/v1", "protocol": snapshot["protocol_version"]},
-            "query": query, "results": self.search(snapshot_id, query, limit=100),
+            "query": query, "results": self._search(snapshot_id, query, limit=100),
         }
+        exported = self.export_space(snapshot["memory_space_id"])
+        return lesson_bundle(bundle, exported["episodes"], export_space_id=exported["memory_space_id"])
 
     def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20,
                         context: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -241,13 +255,18 @@ class InMemoryMemoryAdapter:
         raise MemoryNotVisible("episode is not visible in snapshot")
 
     def expand(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
+        return self._qualified_original(snapshot_id, episode_id)
+
+    def _qualified_original(self, snapshot_id: str, episode_id: str) -> dict[str, Any]:
         original = self._expand_original(snapshot_id, episode_id)
-        qualify_episode(original, self._snapshots[snapshot_id], lambda parent: self._expand_original(snapshot_id, parent))
+        snapshot = self._snapshots[snapshot_id]
+        exported = self.export_space(snapshot["memory_space_id"])
+        heads = lesson_bundle({"snapshot": snapshot, "results": []}, exported["episodes"], export_space_id=exported["memory_space_id"])["_lesson_heads"]
+        qualify_episode(original, snapshot, lambda parent: self._expand_original(snapshot_id, parent), lesson_heads=heads)
         return original
 
     def related(self, snapshot_id: str, episode_id: str, *, limit: int = 20) -> list[dict[str, Any]]:
-        target = self._expand_original(snapshot_id, episode_id)
-        qualify_episode(target, self._snapshots[snapshot_id], lambda parent: self._expand_original(snapshot_id, parent))
+        target = self._qualified_original(snapshot_id, episode_id)
         target_links = target.get("metadata", {}).get("related_episode_ids", [])
         return [item for item in self.retrieve_bundle(snapshot_id, "", limit=100)["results"] if (
             item.get("corrects_episode_id") == episode_id or target.get("corrects_episode_id") == item["episode_id"]

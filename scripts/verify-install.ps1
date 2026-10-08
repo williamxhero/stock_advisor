@@ -26,6 +26,10 @@ foreach ($required in @(
     'resources\contracts\debate-input-v1.schema.json',
     'resources\contracts\memory-type-spec-v1.schema.json',
     'resources\contracts\memory-write-spec-v1.schema.json',
+    'resources\contracts\lesson-promotion-spec-v1.schema.json',
+    'resources\contracts\lesson-frozen-pair-v1.schema.json',
+    'resources\contracts\lesson-frozen-window-v1.schema.json',
+    'resources\contracts\companion-outcome-result-v2.schema.json',
     'resources\contracts\reflection-spec-v1.schema.json',
     'resources\contracts\analysis-skill-spec-v1.schema.json',
     'resources\contracts\skill-registry-spec-v1.schema.json',
@@ -58,6 +62,8 @@ foreach ($required in @(
     'runtime\ai_trading_companion\debate.py',
     'runtime\ai_trading_companion\memory_type.py',
     'runtime\ai_trading_companion\memory_write.py',
+    'runtime\ai_trading_companion\lesson_promotion.py',
+    'runtime\ai_trading_companion\lesson_promotion_replay.py',
     'runtime\ai_trading_companion\reflection.py',
     'runtime\ai_trading_companion\analysis_skill.py',
     'runtime\ai_trading_companion\skill_registry.py',
@@ -433,6 +439,43 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
         }
         foreach ($check in $memoryWriteQualification.checks.PSObject.Properties) {
             if ($check.Value -ne $true) { throw "Installed MemoryWrite check failed: $($check.Name)" }
+        }
+        # Lesson replay reconstructs qualification from original MemoryHub
+        # episodes in an isolated evaluator, never appending to canonical memory.
+        $lessonReplayOne = ((& $python -m ai_trading_companion.lesson_promotion_replay) -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0) { throw "Installed LessonPromotion replay 1 failed with exit code $LASTEXITCODE." }
+        $lessonReplayTwo = ((& $python -m ai_trading_companion.lesson_promotion_replay) -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0) { throw "Installed LessonPromotion replay 2 failed with exit code $LASTEXITCODE." }
+        if ($lessonReplayOne -ne $lessonReplayTwo) { throw 'Installed LessonPromotion frozen replays were not deterministic.' }
+        if ($lessonReplayOne -match '"(aggregate|aggregate_score|overall_score|score|scores|weighted_score|weighted_average)"\s*:') {
+            throw 'Installed LessonPromotion exposed a forbidden aggregate score.'
+        }
+        $lessonQualification = $lessonReplayOne | ConvertFrom-Json
+        if ($lessonQualification.contract -ne 'LessonPromotionInstallQualification/v1' -or $lessonQualification.qualified -ne $true) {
+            throw 'Installed LessonPromotion qualification did not pass.'
+        }
+        if ($lessonQualification.scope -ne 'offline_frozen_replay_only' -or $lessonQualification.production_strategy_approved -ne $false) {
+            throw 'Installed LessonPromotion qualification exceeded offline replay authority.'
+        }
+        foreach ($check in @('frozen_replay', 'source_unchanged', 'canonical_memory_unchanged', 'earlier_snapshot_unchanged', 'model_metrics_not_facts', 'factual_pair_reconstructed', 'rollback_reconstructed', 'episode_integrity_rejected')) {
+            if ($lessonQualification.checks.$check -ne $true) { throw "Installed LessonPromotion check failed: $check" }
+        }
+        foreach ($axis in @('delivery_speed', 'qualification_probability', 'research_quality', 'judgment_outcome', 'safety_reliability')) {
+            if ($lessonQualification.evaluation_vector.PSObject.Properties.Name -notcontains $axis) {
+                throw "Installed LessonPromotion qualification is missing evaluation axis: $axis"
+            }
+            $evaluation = $lessonQualification.evaluation_vector.$axis
+            if ($evaluation.status -notin @('pass', 'fail', 'not_measured') -or $evaluation.measurements.measured -isnot [bool]) {
+                throw "Installed LessonPromotion evaluation axis lacks explicit measurements: $axis"
+            }
+            if ($evaluation.status -ne 'pass' -and [string]::IsNullOrWhiteSpace([string]$evaluation.reason)) {
+                throw "Installed LessonPromotion non-passing evaluation axis lacks a reason: $axis"
+            }
+        }
+        if ($lessonQualification.evaluation_vector.safety_reliability.status -ne 'pass' -or
+            $lessonQualification.evaluation_vector.safety_reliability.measurements.read_only -ne $true -or
+            $lessonQualification.evaluation_vector.judgment_outcome.status -ne 'not_measured') {
+            throw 'Installed LessonPromotion must preserve read-only safety and unmeasured live profitability.'
         }
         $reflectionReplayOne = ((& $python -m ai_trading_companion.reflection) -join "`n")
         if ($LASTEXITCODE -ne 0) { throw "Installed Reflection replay 1 failed with exit code $LASTEXITCODE." }

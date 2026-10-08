@@ -8,6 +8,9 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .reflection import from_outcome
+from .memory_write import canonical_json, write_memory
+from .memory_type import sha256
+from .memory_port import MemoryPort, MemoryUnavailable
 from .store import now
 
 
@@ -94,7 +97,7 @@ def normalize_snapshot(value: dict[str, Any] | None, text: str, *, reference_at:
     base = heuristic_snapshot(text, reference_at=reference_at, qualified=qualified)
     if not isinstance(value, dict):
         return base
-    for key in ("subjects", "direction", "horizon", "reference_at", "triggers", "invalidations", "confidence", "benchmark", "qualified", "original_claims", "claims"):
+    for key in ("subjects", "direction", "horizon", "reference_at", "window_end", "lesson_candidate_id", "triggers", "invalidations", "confidence", "benchmark", "qualified", "original_claims", "claims"):
         if key in value:
             base[key] = value[key]
     if base["direction"] not in {"bullish", "bearish", "neutral", "avoid", "unqualified", "unknown"}:
@@ -111,8 +114,11 @@ def normalize_snapshot(value: dict[str, Any] | None, text: str, *, reference_at:
 class JudgmentLifecycle:
     """Deep module for immutable judgment snapshots and their future checkpoints."""
 
-    def __init__(self, store: Any) -> None:
+    def __init__(self, store: Any, *, memory: MemoryPort | None = None,
+                 memory_space_id: str = "ai-trading-companion") -> None:
         self.store = store
+        self.memory = memory
+        self.memory_space_id = memory_space_id
 
     def capture(
         self,
@@ -164,7 +170,7 @@ class JudgmentLifecycle:
         as_of = str(result.get("as_of") or now())
         summary = str(result.get("summary") or "本次结果数据不足，暂不结案。")
         reflection_checkpoint = dict(checkpoint)
-        if not reflection_checkpoint.get("snapshot_json"):
+        if not reflection_checkpoint.get("snapshot_json") or not reflection_checkpoint.get("artifact_id"):
             snapshot = next((item for item in self.store.judgment_snapshots()
                              if item.get("snapshot_id") == checkpoint.get("snapshot_id")), None)
             if snapshot:
@@ -182,8 +188,82 @@ class JudgmentLifecycle:
             "memory_tags": ["outcome", str(result.get("verification_status", "unverified"))],
             "reflection": reflection,
         }
+        if self.memory is not None:
+            from .governance import classify_regime
+            from .lesson_promotion import LessonPromotion
+            source_artifact = next((row for row in self.store.artifacts(cycle_id)
+                                    if row.get("artifact_id") == reflection_checkpoint.get("artifact_id")), None)
+            source_metadata = json.loads((source_artifact or {}).get("metadata_json") or "{}")
+            message_id = (source_metadata.get("published_message") or {}).get("message_id")
+            original = next((row for row in self.memory.timeline(self.memory_space_id)
+                             if row.get("source_event_id") == message_id), None) if message_id else None
+            lineage = [original["episode_id"]] if original else []
+            frozen = reflection_checkpoint.get("snapshot_json") or {}
+            if isinstance(frozen, str):
+                frozen = json.loads(frozen)
+            stage = {"m1": "m1_judgment", "h0": "h0", "m2": "m2_synthesis"}.get(reflection_checkpoint.get("kind")) if original else "outcome"
+            market_state = classify_regime(result.get("market_regime") or {})
+            # Structured canonical content binds metadata too: MemoryHub's
+            # idempotency hash covers the body, not arbitrary metadata.
+            receipt = write_memory(self.memory, "learning", {
+                "memory_space_id": self.memory_space_id, "source_system": "stock-advisor",
+                "source_event_id": f"outcome:{checkpoint['checkpoint_id']}", "content_hash": "auto",
+                "episode_type": "outcome", "body": canonical_json({"result": result, "reflection": reflection, "judgment_snapshot": frozen, "parent_episode_ids": lineage}),
+                "occurred_at": as_of, "known_at": as_of, "submitted_at": as_of,
+                "authority": "runtime_learning", "protocol_version": "memoryhub/v1",
+                "metadata": {**metadata, "outcome_result": result, "cycle_id": cycle_id,
+                             "stage": stage, "judgment_kind": reflection_checkpoint.get("kind", "unknown"),
+                             "judgment_snapshot": frozen, "parent_episode_ids": lineage, "market_state": market_state},
+            }, semantic_type="outcome")
+            metadata["memory_episode_id"] = receipt["episode_id"]
+            # Recheck canonical immutability above, but never reinterpret an
+            # optional rejection when later ledger writes make a reference valid.
+            for existing in self.store.artifacts(cycle_id):
+                previous = json.loads(existing.get("metadata_json") or "{}")
+                if existing["kind"] == "outcome" and previous.get("checkpoint_id") == checkpoint["checkpoint_id"]:
+                    if previous.get("reflection") != reflection:
+                        raise MemoryUnavailable("immutable outcome conflict")
+                    self.store.complete_outcome(checkpoint["checkpoint_id"], as_of, result, existing["artifact_id"])
+                    return existing
+            lessons = LessonPromotion(self.memory, self.memory_space_id)
+
+            def optional_action(request: dict[str, Any], action: Any, reason: str) -> dict[str, Any]:
+                try:
+                    return action()
+                except MemoryUnavailable:
+                    # Outages and immutable conflicts are retriable failures,
+                    # not invalid optional propositions.
+                    raise
+                except (KeyError, ValueError, TypeError):
+                    return {"contract": "LessonActionRejection/v1", "version": 1,
+                            "state": "rejected", "reason": reason, "request": request,
+                            "request_sha256": sha256(request), "outcome_episode_id": receipt["episode_id"]}
+
+            candidate = reflection.get("lesson_candidate")
+            if candidate:
+                request = {"request_id": checkpoint["checkpoint_id"], "hypothesis": candidate["hypothesis"],
+                           "market_states": result.get("lesson_market_states") or [],
+                           "evidence_episode_ids": candidate["evidence_refs"],
+                           "counterevidence_episode_ids": result.get("lesson_counterevidence_refs") or [],
+                           "parent_episode_ids": [receipt["episode_id"]], "as_of": as_of}
+                metadata["lesson_candidate_receipt"] = optional_action(
+                    request, lambda: lessons.propose(**request), "invalid_evidence_reference")
+            metadata["lesson_trial_receipts"] = [optional_action(
+                {"trial": trial, "request_id": f"{checkpoint['checkpoint_id']}:{index}",
+                 "outcome_episode_id": receipt["episode_id"], "market_state": market_state, "as_of": as_of},
+                lambda: lessons.consume_trial(trial, receipt["episode_id"],
+                    request_id=f"{checkpoint['checkpoint_id']}:{index}", market_state=market_state, as_of=as_of),
+                "invalid_trial_reference",
+            ) for index, trial in enumerate(result.get("lesson_trials") or [])]
         if isinstance(result.get("presentation"), dict):
             metadata["presentation"] = result["presentation"]
+        for existing in self.store.artifacts(cycle_id):
+            previous = json.loads(existing.get("metadata_json") or "{}")
+            if existing["kind"] == "outcome" and previous.get("checkpoint_id") == checkpoint["checkpoint_id"]:
+                if previous.get("reflection") != reflection:
+                    raise MemoryUnavailable("immutable outcome conflict")
+                self.store.complete_outcome(checkpoint["checkpoint_id"], as_of, result, existing["artifact_id"])
+                return existing
         artifact = self.store.append_artifact(
             cycle_id,
             "outcome",
@@ -227,8 +307,11 @@ class WorkflowEvolution:
     ALLOWED_CATEGORIES = {"workflow_efficiency", "search_coverage", "investment_method"}
     PATCH_KEYS = {"add_categories", "add_standing_questions", "add_counterevidence_questions", "add_method_hypotheses"}
 
-    def __init__(self, store: Any) -> None:
+    def __init__(self, store: Any, *, memory: MemoryPort | None = None,
+                 memory_space_id: str = "ai-trading-companion") -> None:
         self.store = store
+        self.memory = memory
+        self.memory_space_id = memory_space_id
 
     def active_policy(self) -> dict[str, Any]:
         stored = self.store.workflow_policy("research")
@@ -242,6 +325,19 @@ class WorkflowEvolution:
         if not isinstance(patch, dict) or set(patch) - self.PATCH_KEYS:
             raise ValueError("workflow proposal contains unsupported policy fields")
         clean_patch = {key: [str(item).strip() for item in patch.get(key) or [] if str(item).strip()][:12] for key in self.PATCH_KEYS}
+        if category == "investment_method" and self.memory is not None:
+            from .lesson_promotion import LessonPromotion
+            from .memory_type import sha256
+            source = self.store.latest_artifact(cycle_id, "reflection") if source_artifact_id is None else next(
+                (row for row in self.store.artifacts(cycle_id) if row["artifact_id"] == source_artifact_id), None,
+            )
+            as_of = (source or {}).get("known_at") or now()
+            receipt = LessonPromotion(self.memory, self.memory_space_id).propose(
+                f"workflow:{source_artifact_id or cycle_id}:{sha256(proposal)}", str(proposal.get("change") or proposal.get("title") or ""),
+                market_states=[], evidence_episode_ids=list(proposal.get("evidence") or []),
+                counterevidence_episode_ids=[], as_of=as_of,
+            )
+            return {"proposal_id": receipt["episode_id"], "state": "pending_validation", "lesson_promotion": receipt}
         proposal_id = str(uuid.uuid4())
         payload = {
             "title": str(proposal.get("title") or "工作流改进提案"),
@@ -266,17 +362,17 @@ class WorkflowEvolution:
                     current_payload["policy_patch"][key] = list(dict.fromkeys([
                         *(current_payload["policy_patch"].get(key) or []), *(payload["policy_patch"].get(key) or []),
                     ]))[:12]
-                state = "awaiting_approval" if category != "investment_method" or len(combined) >= 3 else "pending_validation"
+                state = "pending_validation" if category == "investment_method" else "awaiting_approval"
                 with self.store.connection() as c:
                     c.execute(
                         """UPDATE knowledge_change_proposal SET changeset_json=?,evidence_json=?,state=?,validation_json=?
                            WHERE proposal_id=?""",
                         (json.dumps(current_payload, ensure_ascii=False, sort_keys=True), json.dumps(combined, ensure_ascii=False), state,
-                         json.dumps({"independent_evidence_count": len(combined), "minimum_independent_evidence": 3 if category == "investment_method" else 1}, ensure_ascii=False),
+                         json.dumps({"lesson_promotion_required": category == "investment_method"}, ensure_ascii=False),
                          existing["proposal_id"]),
                     )
                 return self.get(existing["proposal_id"])
-        state = "pending_validation" if category == "investment_method" and len(set(evidence)) < 3 else "awaiting_approval"
+        state = "pending_validation" if category == "investment_method" else "awaiting_approval"
         at = now()
         with self.store.connection() as c:
             c.execute(
@@ -286,7 +382,7 @@ class WorkflowEvolution:
                    VALUES(?,?,?,?,?,?,NULL,NULL,?,?,?,1,NULL,NULL)""",
                 (proposal_id, cycle_id, "research", json.dumps(payload, ensure_ascii=False, sort_keys=True),
                  state, at, category, json.dumps(evidence, ensure_ascii=False),
-                 json.dumps({"minimum_independent_evidence": 3 if category == "investment_method" else 1}, ensure_ascii=False)),
+                 json.dumps({"lesson_promotion_required": category == "investment_method"}, ensure_ascii=False)),
             )
         return self.get(proposal_id)
 
@@ -314,8 +410,8 @@ class WorkflowEvolution:
             with self.store.connection() as c:
                 c.execute("UPDATE knowledge_change_proposal SET state='rejected',decision_note=? WHERE proposal_id=?", (note, proposal_id))
             return self.get(proposal_id)
-        if proposal["state"] == "pending_validation":
-            raise ValueError("investment-method proposal lacks repeated historical evidence")
+        if proposal["category"] == "investment_method" or proposal["state"] == "pending_validation":
+            raise ValueError("investment-method proposal lacks repeated historical evidence qualified by MemoryHub lesson promotion")
         payload = json.loads(proposal["changeset_json"])
         current = self.active_policy()
         if self.store.workflow_policy("research") is None:

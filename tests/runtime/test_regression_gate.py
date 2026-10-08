@@ -259,11 +259,13 @@ def test_schema_accepts_registry_verdict_replay_and_install_outputs():
 
 def delayed_probe_success(data):
     import time
-    # Simulate fixture/startup contention, not production latency qualification.
+    # Recovery qualification must tolerate startup contention within the
+    # production budget; dedicated adapter timeout tests still own latency.
     time.sleep(1.1)
     return {"value": int(data["value"]) + 1}
 
 
+@pytest.mark.slow
 def test_adapter_recovery_probe_tolerates_fixture_startup_contention(monkeypatch):
     from ai_trading_companion import regression_probes
 

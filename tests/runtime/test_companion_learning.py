@@ -239,10 +239,10 @@ class CompanionLearningTests(unittest.TestCase):
                     "add_method_hypotheses": ["传言真实性与传播价格影响分别评价"],
                 },
             })
-        self.assertEqual("awaiting_approval", proposal["state"])
-        applied = evolution.decide(proposal["proposal_id"], True)
-        self.assertEqual("applied", applied["state"])
-        self.assertIn("传言真实性与传播价格影响分别评价", evolution.active_policy()["method_hypotheses"])
+        self.assertEqual("pending_validation", proposal["state"])
+        with self.assertRaisesRegex(ValueError, "lacks repeated historical evidence"):
+            evolution.decide(proposal["proposal_id"], True)
+        self.assertEqual([], evolution.active_policy()["method_hypotheses"])
 
     def test_cognitive_router_keeps_official_judgments_on_expert_and_shadows_effort(self):
         router = CognitiveRouter()
@@ -1070,7 +1070,7 @@ class CompanionLearningTests(unittest.TestCase):
             "companion-m1-result-v1.schema.json", "companion-m2-result-v1.schema.json",
             "companion-chat-result-v2.schema.json", "companion-reflection-result-v2.schema.json",
             "companion-cognition-result-v2.schema.json",
-            "companion-outcome-result-v1.schema.json", "portfolio-interpretation-result-v1.schema.json",
+            "companion-outcome-result-v1.schema.json", "companion-outcome-result-v2.schema.json", "portfolio-interpretation-result-v1.schema.json",
         )
 
         def check(node: object, path: str) -> None:

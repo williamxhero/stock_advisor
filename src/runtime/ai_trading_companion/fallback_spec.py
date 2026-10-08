@@ -103,3 +103,75 @@ def replacement_allowed(requested: dict[str, Any], candidate: dict[str, Any]) ->
         return False
     return all(set(candidate["permissions"][key]).issubset(requested["permissions"][key])
                for key in ("network_permissions", "state_permissions", "write_permissions"))
+
+
+def install_qualification() -> dict[str, Any]:
+    """Measure deterministic fallback boundaries; do not imply live quality."""
+    def fixture(component: str, operation: str, status: str, **kwargs: Any) -> dict[str, Any]:
+        return build_receipt(
+            component, operation, status=status, as_of="2026-09-21T01:45:00Z",
+            source_contract="FallbackInstallFixture/v1", source_version="1",
+            input_sha256="a" * 64, **kwargs,
+        )
+
+    failed = fixture("Adapter", "financial_calculation", "failed", deterministic=True)
+    unavailable = fixture("MemoryHub", "read_episode", "unavailable")
+    retried = fixture("Skill", "market_analysis", "succeeded", attempts=("attempt-1", "attempt-2"))
+    recovered = fixture("MemoryHub", "read_episode", "succeeded", attempts=("recovery-1",))
+    requested = {
+        "adapter_id": "primary", "mode": "read", "input_contract": "Input/v1",
+        "output_contract": "Output/v1", "capabilities": ["market.read"],
+        "permissions": {"network_permissions": ["market.read"],
+                        "state_permissions": ["cycle.read"], "write_permissions": []},
+    }
+    reduced = {**requested, "adapter_id": "replacement", "permissions": {
+        "network_permissions": [], "state_permissions": ["cycle.read"], "write_permissions": [],
+    }}
+    expanded = {**reduced, "permissions": {
+        **reduced["permissions"], "write_permissions": ["runtime.write"],
+    }}
+    checks = {
+        "deterministic_failure_not_computable": (
+            failed["state"] == "NOT_COMPUTABLE" and failed["substitute_value"] is None
+            and failed["continuation"] == "blocked"
+        ),
+        "memory_unavailable_without_local_fallback": (
+            unavailable["state"] == "unavailable" and not unavailable["boundaries"]["local_memory_fallback"]
+        ),
+        "retry_degraded_and_recovery_available": retried["state"] == "degraded" and recovered["state"] == "available",
+        "replacement_cannot_expand_permissions": (
+            replacement_allowed(requested, reduced) and not replacement_allowed(requested, expanded)
+        ),
+        "ownership_and_qualification_boundaries_preserved": (
+            failed["boundaries"]["rollback_committed_facts"] is False
+            and failed["boundaries"]["blind_m1"] is True
+            and failed["boundaries"]["fact_ownership_preserved"] is True
+            and failed["boundaries"]["quantresearch_access"] == "read_only"
+            and failed["qualification"]["state"] == "not_evaluated"
+        ),
+    }
+    unmeasured_reasons = {
+        "delivery_speed": "offline_fixtures_have_no_live_latency_baseline",
+        "qualification_probability": "fixed_fallback_fixtures_are_not_a_population",
+        "research_quality": "fallback_smoke_does_not_measure_research_quality",
+        "judgment_outcome": "no_realized_judgment_outcome_is_available_offline",
+    }
+    evaluation_vector = {
+        axis: {"status": "not_measured", "reason": reason}
+        for axis, reason in unmeasured_reasons.items()
+    }
+    evaluation_vector["safety_reliability"] = {
+        "status": "pass" if all(checks.values()) else "fail",
+        "scope": "deterministic_fallback_fixtures", "measurements": checks,
+    }
+    return {
+        "contract": "FallbackSpecInstallQualification/v1",
+        "qualified": evaluation_vector["safety_reliability"]["status"] == "pass",
+        "evaluation_vector": evaluation_vector,
+        "receipts": {"deterministic_failure": failed, "memory_unavailable": unavailable,
+                     "retried_skill": retried, "recovered_memory": recovered},
+    }
+
+
+if __name__ == "__main__":
+    print(json.dumps(install_qualification(), ensure_ascii=False, sort_keys=True, separators=(",", ":")))

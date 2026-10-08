@@ -49,6 +49,11 @@ WRITE_POLICY: dict[str, dict[str, frozenset[str]]] = {
         "authorities": frozenset({"user_private_fact", "published_ai_message", "recorded_observation"}),
         "semantic_types": frozenset({"correction"}),
     },
+    "learning": {
+        "episode_types": frozenset({"outcome", "lesson"}),
+        "authorities": frozenset({"runtime_learning"}),
+        "semantic_types": frozenset({"outcome", "lesson"}),
+    },
     "migrated": {
         "episode_types": frozenset(),  # any legacy episode type
         "authorities": frozenset({"migrated_legacy_record"}),

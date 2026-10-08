@@ -2819,7 +2819,7 @@ def run_reflection(
     )
     proposal = None
     if data.get("workflow_proposal") and artifact:
-        proposal = WorkflowEvolution(store).propose(
+        proposal = WorkflowEvolution(store, memory=engine.memory, memory_space_id=engine.memory_space_id).propose(
             cycle_id, data["workflow_proposal"], source_artifact_id=artifact["artifact_id"],
         )
     return artifact
@@ -2833,7 +2833,14 @@ def run_outcome(
 ) -> dict[str, Any]:
     cycle = store.get_cycle(checkpoint["cycle_id"])
     outcome_stage: VerifiedStageResult | None = None
-    if not execute:
+    if execute and engine.memory is None:
+        raise MemoryUnavailable("MemoryHub is required for formal outcome processing")
+    recorded = next((episode for episode in engine.memory.export_space(engine.memory_space_id)["episodes"]
+                     if episode["source_system"] == "stock-advisor"
+                     and episode["source_event_id"] == f"outcome:{checkpoint['checkpoint_id']}"), None) if engine.memory else None
+    if recorded:
+        result = recorded["metadata"]["outcome_result"]
+    elif not execute:
         result = {
             "as_of": iso(datetime.now(timezone.utc)),
             "checkpoint_ready": False, "target_session_date": None,
@@ -2859,7 +2866,7 @@ def run_outcome(
             as_of=iso(datetime.now(timezone.utc)),
         )
         outcome_result = _call_stage(
-            store, cycle, "outcome_research", packet, "companion-outcome-result-v1.schema.json",
+            store, cycle, "outcome_research", packet, "companion-outcome-result-v2.schema.json",
             search=True, timeout=300,
         )
         result, outcome_stage = _stage_output(outcome_result)
@@ -2869,10 +2876,16 @@ def run_outcome(
         return result
     presented = engine.present_for_publication(
         str(result["summary"]), str(result.get("as_of") or cycle["as_of"]), "outcome",
+        message_id=f"outcome:{checkpoint['checkpoint_id']}", sealed_at=str(result.get("as_of") or cycle["as_of"]),
         **_stage_resolved(outcome_stage),
     )
-    result = {**result, "summary": presented.markdown, "presentation": presented.metadata()["presentation"], "published_message": presented.message()}
-    artifact = JudgmentLifecycle(store).record_outcome(checkpoint, result)
+    if not recorded:
+        result = {**result, "summary": presented.markdown, "presentation": presented.metadata()["presentation"], "published_message": presented.message()}
+    if engine.memory is None:
+        raise MemoryUnavailable("MemoryHub is required for formal outcomes and lesson promotion")
+    artifact = JudgmentLifecycle(
+        store, memory=engine.memory, memory_space_id=engine.memory_space_id,
+    ).record_outcome(checkpoint, result)
     regime_metrics = result.get("market_regime") if isinstance(result.get("market_regime"), dict) else {}
     regime = classify_regime(regime_metrics)
     store.save_market_regime(cycle["cycle_id"], str(result.get("as_of") or cycle["as_of"]), regime, regime_metrics, str(regime_metrics.get("data_quality") or "unknown"))
@@ -2911,8 +2924,8 @@ def run_outcome(
             )
     engine.emit(cycle, "outcome.ready", {
         "cycle": cycle, "text": result["summary"], "horizon": checkpoint["horizon"],
-        "presentation": presented.metadata()["presentation"],
-        "message": presented.message(),
+        "presentation": result["presentation"],
+        "message": result["published_message"],
         "verification_status": result["verification_status"],
         "source_artifact_id": artifact["artifact_id"],
     })
@@ -3077,7 +3090,7 @@ def run_pending_workflow_feedback(
         )
         proposal = None
         if data.get("workflow_proposal") and artifact:
-            proposal = WorkflowEvolution(store).propose(
+            proposal = WorkflowEvolution(store, memory=engine.memory, memory_space_id=engine.memory_space_id).propose(
                 cycle["cycle_id"], data["workflow_proposal"], source_artifact_id=artifact["artifact_id"],
             )
         return {"cycle_id": cycle["cycle_id"], "artifact_id": artifact["artifact_id"]} if artifact else {"cycle_id": cycle["cycle_id"], "action": "silent"}

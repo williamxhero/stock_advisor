@@ -58,6 +58,7 @@ def test_policy_matrix_accepts_each_formal_kind_and_rejects_unknown_or_projectio
         "user_fact": (episode(episode_type="personal_fact"), "user_fact"),
         "evidence": (episode(episode_type="external_evidence", authority="mutable_source_snapshot"), "evidence"),
         "migrated": (episode(episode_type="legacy_workspace_document", authority="migrated_legacy_record"), "operational"),
+        "learning": (episode(episode_type="outcome", authority="runtime_learning"), "outcome"),
     }
     assert set(samples) | {"correction"} == set(WRITE_POLICY)
     for kind, (value, semantic_type) in samples.items():

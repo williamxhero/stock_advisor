@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LessonPromotionSpec/v1 immutable Runtime decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "version", "policy_version", "kind", "candidate_id", "hypothesis", "market_states", "as_of", "state", "provenance", "payload"],
+  "properties": {
+    "contract": {"const": "LessonPromotionSpec/v1"},
+    "version": {"const": 1},
+    "policy_version": {"const": "lesson-maturity/v1"},
+    "kind": {"enum": ["candidate", "attempt", "rollback", "supersede"]},
+    "candidate_id": {"type": "string", "minLength": 1},
+    "hypothesis": {"type": "string", "minLength": 1},
+    "market_states": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "as_of": {"type": "string", "minLength": 1},
+    "state": {"enum": ["candidate", "promoted", "failed", "inconclusive", "superseded", "rolled_back"]},
+    "provenance": {"type": "object", "minProperties": 1},
+    "payload": {"type": "object"}
+  }
+}

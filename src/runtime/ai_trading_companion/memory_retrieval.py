@@ -126,8 +126,40 @@ def _semantic_type(episode: dict[str, Any]) -> str:
     }.get(episode.get("episode_type"), "observation")
 
 
+def lesson_bundle(bundle: dict[str, Any], episodes: list[dict[str, Any]], *, add_results: bool = True) -> dict[str, Any]:
+    """Resolve effective lesson revisions from the frozen ledger, not search rank."""
+    heads: dict[str, dict[str, Any]] = {}
+    snapshot = bundle["snapshot"]
+    for episode in episodes:
+        event = episode.get("metadata", {}).get("lesson_promotion")
+        if not event or episode["sequence"] > snapshot["watermark"] or any(
+            memory_timestamp(episode[field]) > memory_timestamp(snapshot["as_of"])
+            for field in ("occurred_at", "known_at", "submitted_at")
+        ):
+            continue
+        if episode.get("memory_space_id") != snapshot["memory_space_id"]:
+            continue
+        from .lesson_promotion import validate
+        from .memory_write import canonical_json
+        validate(event)
+        if episode.get("authority") != "runtime_learning" or episode.get("body") != canonical_json(event):
+            raise MemoryIsolationError("lesson_contract_integrity_conflict")
+        if event["state"] in {"promoted", "rolled_back", "superseded"}:
+            previous = heads.get(event["candidate_id"])
+            if previous is None or episode["sequence"] > previous["sequence"]:
+                heads[event["candidate_id"]] = episode
+    results = [card for card in bundle["results"] if not card.get("metadata", {}).get("lesson_promotion")]
+    if add_results:
+        results.extend({**copy.deepcopy(episode), "summary": episode["metadata"]["lesson_promotion"]["hypothesis"]}
+                       for episode in heads.values() if episode["metadata"]["lesson_promotion"]["state"] == "promoted")
+    else:
+        results = bundle["results"]
+    return {**bundle, "results": results, "_lesson_heads": {key: episode["episode_id"] for key, episode in heads.items()}}
+
+
 def qualify_episode(episode: dict[str, Any], snapshot: dict[str, Any],
-                    resolve: Callable[[str], dict[str, Any]], *, ancestors: frozenset[str] = frozenset()) -> None:
+                    resolve: Callable[[str], dict[str, Any]], *, ancestors: frozenset[str] = frozenset(),
+                    lesson_heads: dict[str, str] | None = None) -> None:
     """Fail closed on missing/cyclic lineage, including across cycles and spaces."""
     episode_id = episode["episode_id"]
     if episode_id in ancestors or len(ancestors) >= 64:
@@ -142,6 +174,15 @@ def qualify_episode(episode: dict[str, Any], snapshot: dict[str, Any],
     metadata = episode.get("metadata") or {}
     semantic_type = _semantic_type(episode)
     profile = metadata.get("memory_retrieval")
+    lesson = metadata.get("lesson_promotion")
+    if lesson is not None:
+        from .lesson_promotion import validate
+        from .memory_write import canonical_json
+        validate(lesson)
+        if episode.get("authority") != "runtime_learning" or episode.get("body") != canonical_json(lesson):
+            raise MemoryIsolationError("lesson_contract_integrity_conflict")
+        if not ancestors and (lesson["state"] != "promoted" or not lesson_heads or lesson_heads.get(lesson["candidate_id"]) != episode_id):
+            raise MemoryIsolationError("lesson_not_effective")
     if profile is not None:
         validate_profile(profile)
         if profile["reliability"] == "rejected":
@@ -157,7 +198,7 @@ def qualify_episode(episode: dict[str, Any], snapshot: dict[str, Any],
             # Legacy cognition records name a message, not a snapshot-resolvable
             # episode. Never infer that an H0-derived personal fact is blind-safe.
             raise MemoryIsolationError("unresolved_message_lineage")
-        if profile is None and semantic_type not in {"user_fact", "preference", "evidence"} and metadata.get("stage") not in {"m0", "m0_research", "m1_research", "m1_judgment"}:
+        if profile is None and lesson is None and semantic_type not in {"user_fact", "preference", "evidence"} and metadata.get("stage") not in {"m0", "m0_research", "m1_research", "m1_judgment"}:
             raise MemoryIsolationError("unproven_blind_lineage")
     parents = set()
     for key in ("parent_episode_ids", "derived_from_episode_ids", "related_episode_ids"):
@@ -171,7 +212,7 @@ def qualify_episode(episode: dict[str, Any], snapshot: dict[str, Any],
         source = resolve(parent)
         if source.get("episode_id") != parent:
             raise MemoryIsolationError("lineage_identity_conflict")
-        qualify_episode(source, snapshot, resolve, ancestors=ancestors | {episode_id})
+        qualify_episode(source, snapshot, resolve, ancestors=ancestors | {episode_id}, lesson_heads=lesson_heads)
         if profile and parent in profile["outcome_episode_ids"] and _semantic_type(source) != "outcome":
             raise MemoryIsolationError("outcome_reference_type_conflict")
         if profile and parent in profile["evidence_episode_ids"] and _semantic_type(source) not in {"evidence", "observation"}:
@@ -190,7 +231,10 @@ def rank_bundle(bundle: dict[str, Any], resolve: Callable[[str], dict[str, Any]]
             episode = resolve(episode_id)
             if episode.get("episode_id") != episode_id:
                 raise MemoryIsolationError("candidate_identity_conflict")
-            qualify_episode(episode, snapshot, resolve)
+            qualify_episode(episode, snapshot, resolve, lesson_heads=bundle.get("_lesson_heads"))
+            lesson = episode.get("metadata", {}).get("lesson_promotion")
+            if lesson is not None and request["market_state"] is not None and request["market_state"] not in lesson["market_states"]:
+                raise MemoryIsolationError("lesson_market_state_unqualified")
         except (ValueError, KeyError, TypeError) as error:
             excluded.append({"episode_id": episode_id, "reason": str(error)})
             continue
@@ -203,7 +247,9 @@ def rank_bundle(bundle: dict[str, Any], resolve: Callable[[str], dict[str, Any]]
             excluded.append({"episode_id": episode_id, "reason": "rejected_reliability"})
             continue
         terms = sorted(set(request["query"].casefold().split()))
-        text = str(episode.get("body") or card.get("summary") or "").casefold()
+        lesson = episode.get("metadata", {}).get("lesson_promotion")
+        body = lesson["hypothesis"] if lesson else str(episode.get("body") or card.get("summary") or "")
+        text = body.casefold()
         relevance = sum(term in text for term in terms) / len(terms) if terms else 1.0
         instruments = profile["instruments"] or sorted(set(re.findall(r"(?<!\d)\d{6}(?!\d)", text)))
         instrument_match = (1.0 if set(request["instruments"]) & set(instruments) else 0.25 if instruments else 0.5) if request["instruments"] else 1.0
@@ -227,7 +273,7 @@ def rank_bundle(bundle: dict[str, Any], resolve: Callable[[str], dict[str, Any]]
         source = {key: episode[key] for key in ("episode_id", "content_hash", "source_system", "source_event_id", "known_at")}
         inputs.append({"episode_id": episode_id, "sha256": sha256(episode)})
         # Use the original ledger text, not a potentially contaminated derived summary.
-        result = {**card, "summary": str(episode.get("body") or card.get("summary") or "")[:500],
+        result = {**card, "summary": body[:500],
                   "metadata": copy.deepcopy(episode.get("metadata", {})),
                   "retrieval": {"contract": CONTRACT, "version": VERSION, "policy_version": POLICY_VERSION,
                                 "semantic_type": semantic_type, "half_life_days": half_life,
@@ -247,7 +293,9 @@ def rank_bundle(bundle: dict[str, Any], resolve: Callable[[str], dict[str, Any]]
         "accepted_inputs": inputs, "excluded": visible_exclusions,
         "provenance": {"bundle_id": bundle["bundle_id"], "audit_id": bundle["audit_id"], "versions": copy.deepcopy(bundle["versions"])},
     }
-    return {**bundle, "results": scored[:limit], "retrieval": receipt}
+    output = {**bundle, "results": scored[:limit], "retrieval": receipt}
+    output.pop("_lesson_heads", None)
+    return output
 
 
 def freeze_retrieval(bundle: dict[str, Any], resolve: Callable[[str], dict[str, Any]], *,

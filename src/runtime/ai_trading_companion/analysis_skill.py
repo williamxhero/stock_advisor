@@ -12,6 +12,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .fallback_spec import build_receipt, validate_receipt
+
 CONTRACT = "AnalysisSkillSpec/v1"
 VERSION = 1
 RESULT_CONTRACT = "AnalysisSkillResult/v1"
@@ -82,6 +84,12 @@ def validate_output(value: dict[str, Any]) -> None:
         raise ValueError("AnalysisSkill data must be an object")
     if not isinstance(value["provenance"], dict) or not value["provenance"].get("input_sha256"):
         raise ValueError("AnalysisSkill output provenance is required")
+    if "fallback" in value["provenance"]:
+        receipt = validate_receipt(value["provenance"]["fallback"])
+        if receipt["input"]["source"]["input_sha256"] != value["provenance"]["input_sha256"]:
+            raise ValueError("AnalysisSkill fallback provenance mismatch")
+        if (receipt["continuation"] == "qualification_required") != (value["status"] in {"succeeded", "partial"} and value["data"].get("state") != "NOT_COMPUTABLE"):
+            raise ValueError("AnalysisSkill fallback status mismatch")
     if value["permissions"] != {"write_permissions": []}:
         raise ValueError("AnalysisSkill output is read-only")
     _walk_forbidden(value)
@@ -142,7 +150,7 @@ class SkillRegistry:
         if not isinstance(inputs, dict):
             raise ValueError("analysis skill inputs must be an object")
         missing = [name for name in skill.required_inputs if name not in inputs]
-        if missing:
+        if missing and skill.mode != "deterministic":
             raise ValueError("analysis skill inputs missing: " + ", ".join(missing))
         request = {
             "contract": CONTRACT, "version": VERSION, "skill_id": skill.skill_id,
@@ -152,20 +160,31 @@ class SkillRegistry:
             "permissions": {"write_permissions": []},
         }
         validate_input(request)
-        if skill.validate is not None:
+        if skill.validate is not None and skill.mode == "probabilistic":
             skill.validate(copy.deepcopy(inputs))
         try:
+            if missing:
+                raise ValueError("missing_required_inputs")
+            if skill.validate is not None and skill.mode == "deterministic":
+                skill.validate(copy.deepcopy(inputs))
             data = skill.execute(copy.deepcopy(inputs))
             status = "succeeded"
         except Exception as exc:
-            data, status = {"error": type(exc).__name__}, "failed"
+            data, status = {"error": "missing_required_inputs" if missing else type(exc).__name__}, "failed"
         if not isinstance(data, dict):
             data, status = {"error": "skill_result_must_be_object"}, "failed"
+        receipt = build_receipt(
+            "Skill", skill.skill_id, status="failed" if data.get("state") == "NOT_COMPUTABLE" else status, as_of=as_of,
+            source_contract=RESULT_CONTRACT, source_version=skill.skill_version,
+            input_sha256=sha256(request), deterministic=skill.mode == "deterministic", cycle_id=cycle_id,
+        )
+        if receipt["state"] == "NOT_COMPUTABLE":
+            data = {**data, "state": "NOT_COMPUTABLE", "value": None}
         result = {
             "contract": RESULT_CONTRACT, "version": VERSION,
             "skill_id": skill.skill_id, "skill_version": skill.skill_version,
             "mode": skill.mode, "status": status, "data": data,
-            "provenance": {"input_sha256": sha256(request), "as_of": as_of, "cycle_id": cycle_id},
+            "provenance": {"input_sha256": sha256(request), "as_of": as_of, "cycle_id": cycle_id, "fallback": receipt},
             "permissions": {"write_permissions": []},
         }
         validate_output(result)

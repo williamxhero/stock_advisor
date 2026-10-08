@@ -32,6 +32,12 @@ def test_one_batch_keeps_one_fault_episode_until_a_complete_reply_resolves_it(tm
         *_event_payloads(store, "chat.stream.failed"),
         *_event_payloads(store, "chat_research.failed"),
     ]
+    for payload in failures:
+        receipt = payload["fallback"]
+        assert receipt["state"] == "terminated"
+        assert receipt["continuation"] == "blocked"
+        assert receipt["boundaries"]["rollback_committed_facts"] is False
+        assert receipt["qualification"]["state"] == "not_evaluated"
     episode_ids = {
         episode["episode_id"]
         for payload in failures

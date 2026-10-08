@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FallbackSpec/v1 Runtime degradation receipt",
+  "type": "object", "additionalProperties": false,
+  "required": ["contract", "version", "input", "state", "substitute_value", "continuation", "boundaries", "qualification", "provenance", "sha256"],
+  "properties": {
+    "contract": {"const": "FallbackSpec/v1"}, "version": {"const": 1},
+    "input": {"$ref": "#/$defs/input"},
+    "state": {"enum": ["available", "degraded", "NOT_COMPUTABLE", "unavailable", "terminated"]},
+    "substitute_value": {"const": null},
+    "continuation": {"enum": ["qualification_required", "blocked"]},
+    "boundaries": {"const": {
+      "local_memory_fallback": false, "llm_numeric_substitution": false,
+      "rollback_committed_facts": false, "blind_m1": true,
+      "fact_ownership_preserved": true, "quantresearch_access": "read_only", "write_permissions": []
+    }},
+    "qualification": {"const": {"state": "not_evaluated", "required_gates": ["EvidenceGate", "RiskGate"]}},
+    "provenance": {"const": {"source": "runtime", "spec_refs": ["github:issue:316", "github:issue:106", "github:issue:82"]}},
+    "sha256": {"$ref": "#/$defs/digest"}
+  },
+  "allOf": [{
+    "if": {"properties": {"state": {"enum": ["available", "degraded"]}}},
+    "then": {"properties": {"continuation": {"const": "qualification_required"}}},
+    "else": {"properties": {"continuation": {"const": "blocked"}}}
+  }],
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "input": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "component", "operation", "status", "deterministic", "as_of", "cycle_id", "attempts", "source"],
+      "properties": {
+        "contract": {"const": "FallbackInput/v1"}, "version": {"const": 1},
+        "component": {"enum": ["Adapter", "Skill", "Orchestration", "MarketHub", "MemoryHub", "QuantResearch"]},
+        "operation": {"type": "string", "minLength": 1},
+        "status": {"enum": ["succeeded", "degraded", "failed", "unavailable", "terminated"]},
+        "deterministic": {"type": "boolean"}, "as_of": {"type": "string", "minLength": 1},
+        "cycle_id": {"type": ["string", "null"]},
+        "attempts": {"type": "array", "items": {"type": "string"}},
+        "source": {
+          "type": "object", "additionalProperties": false,
+          "required": ["contract", "version", "input_sha256"],
+          "properties": {
+            "contract": {"type": "string", "minLength": 1}, "version": {"type": "string", "minLength": 1},
+            "input_sha256": {"$ref": "#/$defs/digest"}
+          }
+        }
+      }
+    }
+  }
+}

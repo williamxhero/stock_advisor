@@ -2,7 +2,7 @@
 param(
     [switch]$Release,
     [switch]$ProjectRegression,
-    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryRetrieval', 'MemoryWrite', 'Reflection', 'AnalysisSkill', 'SkillRegistry', 'AdapterContract', 'FinRobotAdapter', 'FinGPTAdapter', 'MultimodalAdapter', 'MandateSpec', 'AuditSpec', 'ObservabilitySpec', 'M0Observation', 'M1Judgment', 'M2Synthesis', 'PositionSafety', 'RiskGateSpec', 'ResearchIsolation', 'RegressionSpec')]
+    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryRetrieval', 'MemoryWrite', 'Reflection', 'AnalysisSkill', 'SkillRegistry', 'AdapterContract', 'FinRobotAdapter', 'FinGPTAdapter', 'MultimodalAdapter', 'MandateSpec', 'AuditSpec', 'ObservabilitySpec', 'M0Observation', 'M1Judgment', 'M2Synthesis', 'PositionSafety', 'RiskGateSpec', 'ResearchIsolation', 'RegressionSpec', 'FallbackSpec')]
     [string]$Select = 'all'
 )
 
@@ -21,6 +21,7 @@ if ($ProjectRegression) {
     $regressionTests = @(
         "$root\tests\runtime\test_cycle_contract.py",
         "$root\tests\runtime\test_cycle_replay.py",
+        "$root\tests\runtime\test_fallback_spec.py",
         "$root\tests\runtime\test_evidence_spec.py",
         "$root\tests\runtime\test_memory_type.py",
         "$root\tests\runtime\test_memory_retrieval.py",
@@ -148,6 +149,10 @@ elseif ($Select -eq 'ResearchIsolation') {
 elseif ($Select -eq 'RegressionSpec') {
     py -m pytest "$root\tests\runtime\test_regression_gate.py" -q
     if ($LASTEXITCODE -ne 0) { throw "RegressionSpec regression tests failed with exit code $LASTEXITCODE." }
+}
+elseif ($Select -eq 'FallbackSpec') {
+    py -m pytest "$root\tests\runtime\test_fallback_spec.py" -q
+    if ($LASTEXITCODE -ne 0) { throw "FallbackSpec regression tests failed with exit code $LASTEXITCODE." }
 }
 else {
     py -m pytest "$root\tests\runtime\test_memory_write.py" "$root\memoryhub\tests\test_append_only_ledger.py" -q

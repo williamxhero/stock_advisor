@@ -41,10 +41,12 @@ foreach ($required in @(
     'resources\contracts\observability-evaluation-v1.schema.json',
     'resources\contracts\observability-replay-v1.schema.json',
     'resources\contracts\companion-published-message-v2.schema.json',
+    'resources\contracts\fallback-spec-v1.schema.json',
     'runtime\ai_trading_companion\__main__.py',
     'runtime\ai_trading_companion\regression_gate.py',
     'runtime\ai_trading_companion\regression_probes.py',
     'runtime\ai_trading_companion\regression_spec.py',
+    'runtime\ai_trading_companion\fallback_spec.py',
     'runtime\ai_trading_companion\observability_contract.py',
     'runtime\ai_trading_companion\cycle_replay.py',
     'runtime\ai_trading_companion\evidence_snapshot.py',
@@ -80,6 +82,15 @@ if ($buildInfo.dirty -ne $false) { throw 'Installed build-info must record dirty
 if ([string]$buildInfo.source_revision -notmatch '^[0-9a-f]{40}$') { throw 'Installed build-info must contain the full Git SHA.' }
 if ($ExpectedRevision -and $buildInfo.source_revision -ne $ExpectedRevision) {
     throw "Installed revision $($buildInfo.source_revision) does not match expected revision $ExpectedRevision."
+}
+$fallbackSchema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\fallback-spec-v1.schema.json') -Raw | ConvertFrom-Json
+if ($fallbackSchema.title -ne 'FallbackSpec/v1 Runtime degradation receipt' -or $fallbackSchema.'$schema' -ne 'https://json-schema.org/draft/2020-12/schema') {
+    throw 'Installed FallbackSpec schema has an unexpected contract or schema dialect.'
+}
+foreach ($required in @('contract', 'version', 'input', 'state', 'substitute_value', 'continuation', 'boundaries', 'qualification', 'provenance', 'sha256')) {
+    if ($fallbackSchema.required -notcontains $required) {
+        throw "Installed FallbackSpec schema is missing required field: $required."
+    }
 }
 $coordinatorSchemaPath = Join-Path $InstallRoot 'resources\contracts\coordinator-spec-v1.schema.json'
 $coordinatorSchema = Get-Content -LiteralPath $coordinatorSchemaPath -Raw | ConvertFrom-Json
@@ -207,6 +218,38 @@ try {
             }
             if ($regressionQualification.evaluation_vector.$axis.passed -ne $true) {
                 throw "Installed RegressionSpec evaluation axis did not qualify: $axis"
+            }
+        }
+        # FallbackSpec must report deterministic honest degradation from the installed tree.
+        $fallbackFirst = ((& $python -m ai_trading_companion.fallback_spec) -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0) { throw "Installed FallbackSpec qualification failed with exit code $LASTEXITCODE." }
+        $fallbackSecond = ((& $python -m ai_trading_companion.fallback_spec) -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0) { throw "Installed FallbackSpec replay qualification failed with exit code $LASTEXITCODE." }
+        if ($fallbackFirst -ne $fallbackSecond) { throw 'Installed FallbackSpec qualification was not deterministic.' }
+        $fallbackQualification = $fallbackFirst | ConvertFrom-Json
+        if ($fallbackQualification.contract -ne 'FallbackSpecInstallQualification/v1' -or $fallbackQualification.qualified -ne $true) {
+            throw 'Installed FallbackSpec did not produce a qualified installation result.'
+        }
+        foreach ($axis in @('delivery_speed', 'qualification_probability', 'research_quality', 'judgment_outcome', 'safety_reliability')) {
+            if ($fallbackQualification.evaluation_vector.PSObject.Properties.Name -notcontains $axis) {
+                throw "Installed FallbackSpec is missing evaluation axis: $axis"
+            }
+            if ($fallbackQualification.evaluation_vector.$axis.status -notin @('pass', 'fail', 'not_measured')) {
+                throw "Installed FallbackSpec has an invalid evaluation status: $axis"
+            }
+            if ($fallbackQualification.evaluation_vector.$axis.status -eq 'not_measured' -and
+                [string]::IsNullOrWhiteSpace([string]$fallbackQualification.evaluation_vector.$axis.reason)) {
+                throw "Installed FallbackSpec did not explain unmeasured evaluation axis: $axis"
+            }
+        }
+        if ($fallbackQualification.evaluation_vector.safety_reliability.status -ne 'pass') {
+            throw 'Installed FallbackSpec safety qualification did not pass.'
+        }
+        foreach ($receiptName in @('deterministic_failure', 'memory_unavailable', 'retried_skill', 'recovered_memory')) {
+            $receipt = $fallbackQualification.receipts.$receiptName
+            if ($receipt.contract -ne 'FallbackSpec/v1' -or $receipt.version -ne 1 -or
+                [string]$receipt.sha256 -notmatch '^[a-f0-9]{64}$' -or $null -ne $receipt.substitute_value) {
+                throw "Installed FallbackSpec receipt is invalid: $receiptName"
             }
         }
         # Validate the ObservabilitySpec event, independent evaluation vector, and

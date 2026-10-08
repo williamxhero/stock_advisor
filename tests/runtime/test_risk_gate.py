@@ -500,6 +500,38 @@ def test_imperative_advice_obeys_drawdown_and_direction_restrictions(text, restr
     assert ("drawdown_requires_review" if restricted == "drawdown" else "critical_market_conflict") in receipt["problems"]
 
 
+@pytest.mark.parametrize("text", [
+    "现在卖出603179。", "立即减仓603179。", "请卖出603179。", "请立即减仓603179。",
+    "Sell 603179 now.", "Please sell 603179.", "Now sell 603179.",
+    "Immediately reduce exposure.", "Please now reduce exposure.",
+])
+@pytest.mark.parametrize("restricted", ["conflict", "drawdown"])
+def test_sell_or_reduce_imperatives_require_direction_but_do_not_add_risk(text, restricted):
+    from ai_trading_companion.risk_gate import install_qualification, publication_receipt
+    if restricted == "conflict":
+        value = copy.deepcopy(install_qualification()["replay"]["frozen"]["source_packet"])
+        value["evidence"]["conflicts"] = [{"materiality": "critical", "resolution": "unresolved"}]
+    else:
+        value = packet()
+    receipt = publication_receipt(value, {"text": text})
+    if restricted == "conflict":
+        assert "NO_DIRECTION" in receipt["restrictions"]
+        assert receipt["state"] == "refused"
+        assert "critical_market_conflict" in receipt["problems"]
+    else:
+        assert "NO_NEW_RISK" in receipt["restrictions"]
+        assert receipt["permissions"]["direction"] is True
+        assert receipt["state"] == "qualified"
+        assert receipt["problems"] == []
+
+
+@pytest.mark.parametrize("text", ["不要卖出603179。", "Do not reduce exposure."])
+def test_negated_sell_or_reduce_is_not_directional_advice(text):
+    from ai_trading_companion.risk_gate import publication_receipt
+    value = packet(conflicts=[{"materiality": "critical", "resolution": "unresolved"}])
+    assert publication_receipt(value, {"text": text})["state"] == "qualified"
+
+
 def test_formal_m1_action_reason_cannot_hide_imperative_advice_in_observe_core():
     from ai_trading_companion.mandate_spec import sha256
     value = packet()

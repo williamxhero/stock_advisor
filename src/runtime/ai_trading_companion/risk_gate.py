@@ -38,6 +38,11 @@ _IMPERATIVE = re.compile(
     r"(?:买入|加仓|扩大敞口|新增风险)(?:\s|\d|吧|$)|"
     r"\b(?:now|immediately)\s+(?:buy|add\s+risk)\b|^\s*(?:buy|add\s+risk)\b", re.I,
 )
+# Selling/reducing is directional advice, but does not by itself add risk.
+_DIRECTIONAL_IMPERATIVE = re.compile(
+    r"^\s*(?:(?:现在|立即|立刻|马上|直接|请)\s*)*(?:卖出|减仓)(?:\s|\d|吧|$)|"
+    r"^\s*(?:(?:please|now|immediately)\s+)*(?:sell|reduce\s+(?:risk|exposure|position))\b", re.I,
+)
 
 
 def build_input(packet: dict[str, Any]) -> dict[str, Any]:
@@ -270,7 +275,8 @@ def build_output(value: dict[str, Any], output: dict[str, Any]) -> dict[str, Any
         problems.extend(directional)
     if reduced and any(row.get("confidence") in {"medium", "high"} for row in nodes):
         problems.extend(reduced)
-    if directional and any((_DIRECTION.search(clause) or _ADD_RISK.search(clause) or _IMPERATIVE.search(clause))
+    if directional and any((_DIRECTION.search(clause) or _ADD_RISK.search(clause) or _IMPERATIVE.search(clause)
+                            or _DIRECTIONAL_IMPERATIVE.search(clause))
                            and not negated_advice(clause) for clause in clauses):
         problems.extend(directional)
     sizing = output.get("sizing_proposal")

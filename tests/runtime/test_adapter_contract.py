@@ -247,6 +247,25 @@ def test_engine_adapter_seam_is_read_only(tmp_path: Path) -> None:
     assert result["permissions"]["write_permissions"] == []
 
 
+def test_engine_exposes_terminal_computation_without_replacing_failed_transport(tmp_path: Path) -> None:
+    engine = CompanionEngine(CompanionStore(tmp_path / "companion.sqlite3"))
+    engine.register_adapter(adapter(execute_fail_crash))
+    result = engine.execute_adapter("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z", retries=1)
+    assert result["status"] == "failed" and result["data"] == {}
+    assert result["attempts"] == ["fixture:failed", "fixture:failed"]
+    assert result["provenance"]["computation"] == {"state": "NOT_COMPUTABLE", "value": None}
+    validate_output(result)
+    altered = copy.deepcopy(result)
+    altered["status"] = "succeeded"
+    altered["error_code"] = None
+    altered["qualification"] = {"passed": True}
+    altered["data"] = {"state": "NOT_COMPUTABLE", "value": None}
+    from ai_trading_companion.adapter_contract import sha256
+    altered["provenance"]["data_sha256"] = sha256(altered["data"])
+    with pytest.raises(ValueError, match="computation"):
+        validate_output(altered)
+
+
 def test_retry_fallback_and_idempotency() -> None:
     registry = AdapterRegistry()
     registry.register(adapter(execute_fail_crash))
@@ -282,7 +301,13 @@ def test_deterministic_failure_cannot_fall_back_to_a_model_estimate() -> None:
         "fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z", fallbacks=("estimate",),
     )
     assert result["status"] == "failed"
-    assert result["data"] == {}
+    assert result["data"] == {}  # Legacy transport payload remains compatible.
+    assert result["provenance"]["computation"] == {"state": "NOT_COMPUTABLE", "value": None}
+    validate_output(result)
+    tampered = copy.deepcopy(result)
+    tampered["provenance"]["computation"]["value"] = 2
+    with pytest.raises(ValueError, match="computation"):
+        validate_output(tampered)
     receipt = result["provenance"]["fallback"]
     assert receipt["contract"] == "FallbackSpec/v1"
     assert receipt["state"] == "NOT_COMPUTABLE"

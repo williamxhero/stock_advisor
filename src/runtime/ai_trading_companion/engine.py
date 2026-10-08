@@ -13,7 +13,7 @@ from .learning import JudgmentLifecycle
 from .evidence_contract import EvidenceContractFactory
 from .message_presentation import MessageQualificationError, PresentedMessage, present_message, repair_message_draft
 from .memory_write import write_memory
-from .fallback_spec import build_receipt
+from .fallback_spec import build_receipt, validate_receipt
 from .publication_registry import published_event_types
 from .stage_expression import normalize_stage_output
 from .models import TASK_POLICIES
@@ -640,7 +640,8 @@ class CompanionEngine:
         self.store.fail_stage(cycle_id, "m0", reason, retryable=False, details=details)
         self._emit_failure(
             cycle, "research.failed", message, reason,
-            {"diagnostic_code": self._diagnostic_code(reason)},
+            {"diagnostic_code": self._diagnostic_code(reason),
+             **({"fallback": details["fallback"]} if details and "fallback" in details else {})},
         )
         return cycle
 
@@ -1557,7 +1558,10 @@ class CompanionEngine:
             })
             return cycle
         message = self._stage_failure_message("M1", str(reason), details)
-        self._emit_failure(cycle, "m1.failed", message, reason, {"diagnostic_code": diagnostic_code, "retryable": False})
+        self._emit_failure(cycle, "m1.failed", message, reason, {
+            "diagnostic_code": diagnostic_code, "retryable": False,
+            **({"fallback": details["fallback"]} if details and "fallback" in details else {}),
+        })
         return cycle
 
     @classmethod
@@ -2093,13 +2097,19 @@ class CompanionEngine:
         reason_category = str(extra.get("diagnostic_code") or self._diagnostic_code(reason))
         # Operational failure is not a judgment or an undo of committed facts.
         # Only bounded Runtime identity enters this receipt, never H0 or provider text.
-        extra["fallback"] = build_receipt(
-            "Orchestration", event_type, status="terminated", as_of=occurred_at,
-            source_contract="companion-fault-episode/v1", source_version="v1",
-            input_sha256=sha256({"cycle_id": cycle["cycle_id"], "event_type": event_type,
-                                 "reason_category": reason_category, "as_of": cycle.get("as_of")}),
-            cycle_id=cycle["cycle_id"],
-        )
+        if "fallback" in extra:
+            receipt = validate_receipt(extra["fallback"])
+            if receipt["input"]["cycle_id"] != cycle["cycle_id"] or receipt["continuation"] != "blocked":
+                raise ValueError("fault fallback receipt does not match terminated cycle operation")
+            assert_safe(json.dumps(receipt, ensure_ascii=False), boundary="fault fallback receipt")
+        else:
+            extra["fallback"] = build_receipt(
+                "Orchestration", event_type, status="terminated", as_of=occurred_at,
+                source_contract="companion-fault-episode/v1", source_version="v1",
+                input_sha256=sha256({"cycle_id": cycle["cycle_id"], "event_type": event_type,
+                                     "reason_category": reason_category, "as_of": cycle.get("as_of")}),
+                cycle_id=cycle["cycle_id"],
+            )
         targets = self._fault_targets(cycle, event_type, extra)
         episode_ids = [
             self.store.fault_episode_id(

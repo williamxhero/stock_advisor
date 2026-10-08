@@ -23,7 +23,7 @@ def sha256(value: Any) -> str:
                                      separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def _output(request: dict[str, Any]) -> dict[str, Any]:
+def _build_receipt(request: dict[str, Any]) -> dict[str, Any]:
     status = request["status"]
     if status == "succeeded":
         state = "degraded" if len(request["attempts"]) > 1 else "available"
@@ -55,7 +55,7 @@ def build_receipt(component: str, operation: str, *, status: str, as_of: str,
         "as_of": as_of, "cycle_id": cycle_id, "attempts": list(attempts),
         "source": {"contract": source_contract, "version": source_version, "input_sha256": input_sha256},
     }
-    value = _output(request)
+    value = _build_receipt(request)
     validate_receipt(value)
     return value
 
@@ -85,7 +85,7 @@ def validate_receipt(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("FallbackInput requires versioned source")
     if len(source["input_sha256"]) != 64 or any(char not in "0123456789abcdef" for char in source["input_sha256"]):
         raise ValueError("invalid FallbackInput source digest")
-    if value != _output(request):
+    if value != _build_receipt(request):
         raise ValueError("FallbackSpec receipt differs from deterministic policy")
     return value
 

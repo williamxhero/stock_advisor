@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from .learning import WorkflowEvolution
 from .memory_port import MemoryPort, MemoryUnavailable
-from .fallback_spec import build_receipt
+from .fallback_spec import build_receipt, sha256
 from .secret_guard import assert_safe
 from .evidence_contract import EvidenceContractFactory
 from .models import TASK_POLICIES
@@ -321,15 +321,25 @@ class RuntimePacketBuilder:
                         strategy_package={"contract": "CompanionResearchSubject/v1", "task_key": cycle["task_key"]},
                     )
                     packet["research_request"] = research_request
-                    if research_evidence is _RESEARCH_EVIDENCE_UNSET:
-                        research_evidence = self.quant_research_port.read(research_request)
+                    try:
+                        if research_evidence is _RESEARCH_EVIDENCE_UNSET:
+                            research_evidence = self.quant_research_port.read(research_request)
+                        if research_evidence is not None:
+                            research_evidence = validate_research_evidence(research_evidence)
+                    except Exception as exc:
+                        exc.fallback = build_receipt(
+                            "QuantResearch", "read_evidence", status="failed",
+                            as_of=packet_as_of, source_contract=research_request["contract"], source_version="v1",
+                            input_sha256=research_request["sha256"], cycle_id=cycle["cycle_id"],
+                        )
+                        raise
                     packet["research_fallback"] = build_receipt(
                         "QuantResearch", "read_evidence", status="unavailable" if research_evidence is None else "succeeded",
                         as_of=packet_as_of, source_contract=research_request["contract"], source_version="v1",
                         input_sha256=research_request["sha256"], cycle_id=cycle["cycle_id"],
                     )
                     if packet["research_fallback"]["continuation"] != "blocked":
-                        packet["research_evidence"] = validate_research_evidence(research_evidence)
+                        packet["research_evidence"] = research_evidence
             if stage in {"m1_judgment", "m2"} and cycle["task_key"] in {
                 "daily.execution.0945", "daily.execution.1030", "daily.execution.1430", "daily.review.1520",
             }:
@@ -414,21 +424,37 @@ class RuntimePacketBuilder:
         self, cycle: dict[str, Any], stage: str, packet_as_of: str,
         evidence: dict[str, Any] | None, mandate: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        if self.memory is None:
-            raise MemoryUnavailable("MemoryHub is required; local long-term memory fallback is disabled")
         scope = mandate["memory_scope"]
         if stage not in scope["allowed_stages"]:
             raise ValueError("frozen mandate does not permit memory access for this stage")
         access_stage = {"m2": "m2_synthesis", "outcome_research": "reflection"}.get(stage, stage)
         memory_cycle_id, memory_as_of = memory_boundary(cycle, stage, packet_as_of)
-        snapshot = self.memory.begin_snapshot({
+        request = {
             "memory_space_id": scope["memory_space_id"], "as_of": memory_as_of,
             "stage": access_stage, "cycle_id": memory_cycle_id,
-        })
-        bundle = self.memory.retrieve_bundle(
-            str(snapshot["snapshot_id"]), self._memory_query_text(evidence),
-            limit=scope["max_results"],
-        )
+        }
+        operation = "begin_snapshot"
+        try:
+            if self.memory is None:
+                raise MemoryUnavailable("MemoryHub is required; local long-term memory fallback is disabled")
+            snapshot = self.memory.begin_snapshot(request)
+            operation = "retrieve_bundle"
+            request = {
+                **request, "snapshot_id": str(snapshot["snapshot_id"]),
+                "query_sha256": hashlib.sha256(self._memory_query_text(evidence).encode("utf-8")).hexdigest(),
+                "limit": scope["max_results"],
+            }
+            bundle = self.memory.retrieve_bundle(
+                request["snapshot_id"], self._memory_query_text(evidence), limit=scope["max_results"],
+            )
+        except Exception as exc:
+            exc.fallback = build_receipt(
+                "MemoryHub", operation, status="unavailable", as_of=memory_as_of,
+                source_contract="memoryhub/v1", source_version="v1",
+                input_sha256=sha256(request),
+                cycle_id=cycle["cycle_id"],
+            )
+            raise
         results = list(bundle.get("results") or [])
         allowed_kinds = set(scope["allowed_kinds"])
         if allowed_kinds and "*" not in allowed_kinds:

@@ -131,6 +131,14 @@ def validate_output(value: dict[str, Any]) -> None:
             raise ValueError("AdapterContract fallback provenance mismatch")
         if (receipt["continuation"] == "qualification_required") != (value["status"] == "succeeded" and value["data"].get("state") != "NOT_COMPUTABLE"):
             raise ValueError("AdapterContract fallback status mismatch")
+    if "computation" in value["provenance"]:
+        computation = value["provenance"]["computation"]
+        if (computation != {"state": "NOT_COMPUTABLE", "value": None}
+                or value["provenance"].get("computation_sha256") != sha256(computation)
+                or value["provenance"].get("fallback", {}).get("state") != "NOT_COMPUTABLE"
+                or value["provenance"].get("fallback", {}).get("input", {}).get("status") != "failed"
+                or value["status"] == "succeeded"):
+            raise ValueError("AdapterContract computation provenance mismatch")
     for field, payload in (("output_sha256", value["raw_output"]), ("data_sha256", value["data"])):
         expected = value["provenance"].get(field)
         if expected is not None and expected != sha256(payload):
@@ -280,6 +288,13 @@ class AdapterRegistry:
         assert final is not None
         final["attempts"] = list(attempts)
         self._bind_fallback(final, requested.mode)
+        if final["provenance"]["fallback"]["state"] == "NOT_COMPUTABLE":
+            # Keep the legacy failed transport payload; expose semantics only
+            # after every permitted retry/provider has been exhausted.
+            computation = {"state": "NOT_COMPUTABLE", "value": None}
+            final["provenance"]["computation"] = computation
+            final["provenance"]["computation_sha256"] = sha256(computation)
+            validate_output(final)
         return final
 
     @staticmethod

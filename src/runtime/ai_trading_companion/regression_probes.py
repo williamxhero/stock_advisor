@@ -390,8 +390,9 @@ def _probe_adapter(case: Any) -> dict[str, Any]:
     registry = AdapterRegistry()
     registry.register(AdapterDefinition("probe-failing", "v1", "ProbeInput/v1", "ProbeOutput/v1", "deterministic", _probe_execute_fail, _probe_validate_value, _probe_validate_value, _probe_qualify_value))
     registry.register(AdapterDefinition("probe-fallback", "v1", "ProbeInput/v1", "ProbeOutput/v1", "deterministic", _probe_execute_success, _probe_validate_value, _probe_validate_value, _probe_qualify_value))
-    output = registry.execute("probe-failing", {"value": 1}, as_of=AS_OF, timeout_seconds=1.0, retries=0, fallbacks=("probe-fallback",), request_id="probe-request")
-    repeat = registry.execute("probe-failing", {"value": 1}, as_of=AS_OF, timeout_seconds=1.0, retries=0, fallbacks=("probe-fallback",), request_id="probe-request")
+    # This qualifies recovery, not latency; allow the production startup budget.
+    output = registry.execute("probe-failing", {"value": 1}, as_of=AS_OF, timeout_seconds=10.0, retries=0, fallbacks=("probe-fallback",), request_id="probe-request")
+    repeat = registry.execute("probe-failing", {"value": 1}, as_of=AS_OF, timeout_seconds=10.0, retries=0, fallbacks=("probe-fallback",), request_id="probe-request")
     checks = {
         "adapter_has_no_write_permissions": output["permissions"] == {"write_permissions": []},
         "failed_adapter_does_not_publish": output["attempts"][0].startswith("probe-failing:") and output["attempts"][0].endswith("failed"),

@@ -107,21 +107,43 @@ def test_persisted_cycle_replay_preserves_retry_evidence_and_original_artifacts(
         "daily.execution.0945", "2026-09-21T09:45:00+08:00", "2026-09-21T01:45:00Z",
         schedule_revision=7,
     )
-    packet = {"frozen_public_evidence": [], "business_context": {"positions": []}}
+    from ai_trading_companion.analysis_skill import AnalysisSkill, SkillRegistry, frozen_replay
+
+    registry = SkillRegistry()
+    registry.register(AnalysisSkill("growth", "fixture/v1", ("growth",), ("series",),
+                                   "deterministic", lambda data: {"value": data["series"][-1] - data["series"][0]}))
+    packets, outputs = [], []
+    for inputs in ({}, {"series": [1, 2, 4]}):
+        request = {
+            "contract": "AnalysisSkillSpec/v1", "version": 1, "skill_id": "growth",
+            "skill_version": "fixture/v1", "capabilities": ["growth"], "required_inputs": ["series"],
+            "mode": "deterministic", "inputs": inputs,
+            "provenance": {"as_of": cycle["as_of"], "cycle_id": cycle["cycle_id"]},
+            "permissions": {"write_permissions": []},
+        }
+        output = registry.execute("growth", inputs, as_of=cycle["as_of"], cycle_id=cycle["cycle_id"])
+        assert frozen_replay(request, output)["qualification"]["valid"] is True
+        packets.append({"frozen_public_evidence": [], "analysis_skill_input": request})
+        outputs.append(output)
+    assert outputs[0]["provenance"]["fallback"]["state"] == "NOT_COMPUTABLE"
+    assert outputs[1]["data"] == {"value": 3}
     snapshot = store.create_evidence_snapshot(cycle["cycle_id"], {
         "schema_version": 3, "as_of": cycle["as_of"], "spoken_summary": "Observed facts",
         "sources": [{"evidence_ref": "ev-1", "excerpt": "Frozen evidence"}],
         "coverage": [], "critical_gaps": [], "conflicts": [], "high_impact_events": [],
     }, as_of=cycle["as_of"], source_watermarks={"market": "revision-7"})
-    failed = store.begin_attempt(cycle["cycle_id"], "m1_judgment", cycle["as_of"],
-                                 input_sha256=canonical_packet_hash(packet), input_packet=packet,
-                                 model="frozen-model", runner_fingerprint="prompt-v7")
-    store.finish_attempt(failed["attempt_id"], "failed", verifier={"passed": False})
-    retried = store.begin_attempt(cycle["cycle_id"], "m1_judgment", cycle["as_of"],
-                                  input_sha256=canonical_packet_hash(packet), input_packet=packet,
-                                  model="frozen-model", runner_fingerprint="prompt-v7")
-    store.finish_attempt(retried["attempt_id"], "succeeded", output={"direction": "wait"},
-                         verifier={"passed": True})
+    for packet, output in zip(packets, outputs):
+        attempt = store.begin_attempt(
+            cycle["cycle_id"], "m1_research", cycle["as_of"],
+            input_sha256=canonical_packet_hash(packet), input_packet=packet,
+            runner_fingerprint="growth:fixture/v1",
+        )
+        receipt = fallback_spec.validate_receipt(output["provenance"]["fallback"])
+        store.finish_attempt(
+            attempt["attempt_id"], output["status"], output=output,
+            output_sha256=fallback_spec.sha256(output),
+            verifier={"passed": receipt["continuation"] == "qualification_required", "fallback": receipt},
+        )
     original_artifact = store.append_artifact(
         cycle["cycle_id"], "m1", "model", "Original judgment", cycle["as_of"]
     )
@@ -133,11 +155,18 @@ def test_persisted_cycle_replay_preserves_retry_evidence_and_original_artifacts(
 
     assert first == second
     assert frozen == untouched == freeze_cycle(store, cycle["cycle_id"])
-    assert json.loads(frozen["source"]["attempts"][0]["input_packet_json"]) == packet
+    assert json.loads(frozen["source"]["attempts"][0]["input_packet_json"]) == packets[0]
+    for recorded, packet, output in zip(first["source"]["attempts"], packets, outputs):
+        assert json.loads(recorded["output_json"]) == output
+        receipt = fallback_spec.validate_receipt(json.loads(recorded["verifier_json"])["fallback"])
+        assert receipt == output["provenance"]["fallback"]
+        assert receipt["input"]["source"]["input_sha256"] == fallback_spec.sha256(packet["analysis_skill_input"])
+        assert receipt["input"]["source"]["version"] == "fixture/v1"
+        assert receipt["input"]["cycle_id"] == cycle["cycle_id"]
     assert [attempt["status"] for attempt in first["source"]["attempts"]] == ["failed", "succeeded"]
     assert first["source"]["evidence_snapshots"] == [snapshot]
     assert first["source"]["cycle"]["schedule"]["revision"] == 7
-    assert first["source"]["attempts"][0]["runner_fingerprint"] == "prompt-v7"
+    assert first["source"]["attempts"][0]["runner_fingerprint"] == "growth:fixture/v1"
     assert [attempt["qualified"] for attempt in first["qualification"]["attempts"]] == [False, True]
     assert first["source"]["artifacts"][0]["artifact_id"] == original_artifact["artifact_id"]
     assert first["source"]["artifacts"][0]["body_markdown"] == "Original judgment"

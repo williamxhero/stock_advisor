@@ -241,6 +241,119 @@ def test_unavailable_quantresearch_is_versioned_and_cannot_supply_m1_evidence(tm
         build_m1_input(packet)
 
 
+@pytest.mark.parametrize("failure", [RuntimeError("H0 private opinion"), ValueError("H0 private opinion")])
+def test_quantresearch_fault_retains_type_and_safe_component_receipt(tmp_path, failure):
+    from test_m1_judgment import _runtime_builder_fixture
+    from ai_trading_companion.fallback_spec import validate_receipt
+
+    store, engine, cycle, raw_packet = _runtime_builder_fixture(tmp_path)
+    mandate = build_mandate(cycle["task_key"], "m1_judgment", as_of=AS_OF,
+                            memory_space_id=engine.memory_space_id, quantresearch_enabled=True)
+
+    seen = {}
+
+    def reader(_request):
+        seen.update(_request)
+        if isinstance(failure, ValueError):
+            return {"invalid": "H0 private opinion"}
+        raise failure
+
+    with patch("ai_trading_companion.packet_builder.mandate_for_stage", return_value=mandate):
+        with pytest.raises(type(failure)) as caught:
+            RuntimePacketBuilder(
+                PROJECT_ROOT / "resources", store, memory=InMemoryMemoryAdapter(),
+                quant_research_port=QuantResearchPort(reader),
+            ).build(cycle, "m1_judgment", evidence=raw_packet["evidence"])
+    receipt = validate_receipt(caught.value.fallback)
+    assert receipt["input"]["component"] == "QuantResearch"
+    assert receipt["input"]["status"] == "failed"
+    assert receipt["continuation"] == "blocked"
+    assert receipt["input"]["cycle_id"] == cycle["cycle_id"]
+    assert receipt["input"]["source"]["contract"] == "ResearchEvidenceRequest/v1"
+    assert receipt["input"]["source"]["input_sha256"] == seen["sha256"]
+    assert "H0 private opinion" not in json.dumps(receipt)
+    engine.m1_failed(cycle["cycle_id"], str(caught.value), retryable=False,
+                     details={"fallback": receipt})
+    metadata = json.loads(store.latest_artifact(cycle["cycle_id"], "system_fault")["metadata_json"])
+    assert metadata["fallback"] == receipt
+
+
+@pytest.mark.parametrize("operation", ["begin_snapshot", "retrieve_bundle", "missing"])
+def test_memory_fault_blocks_without_local_fallback_and_binds_safe_request(tmp_path, operation):
+    from test_m1_judgment import _runtime_builder_fixture
+    from ai_trading_companion.memory_port import MemoryUnavailable
+    from ai_trading_companion.fallback_spec import validate_receipt
+    from ai_trading_companion.cycle_contract import memory_boundary
+
+    store, engine, cycle, raw_packet = _runtime_builder_fixture(tmp_path)
+
+    seen = {}
+
+    class UnavailableMemory(InMemoryMemoryAdapter):
+        def begin_snapshot(self, request):
+            seen.update(request)
+            if operation == "begin_snapshot":
+                raise MemoryUnavailable("H0 private opinion")
+            return super().begin_snapshot(request)
+
+        def retrieve_bundle(self, snapshot_id, query, *, limit=20):
+            import hashlib
+            seen.update(snapshot_id=snapshot_id, query_sha256=hashlib.sha256(query.encode("utf-8")).hexdigest(), limit=limit)
+            raise MemoryUnavailable("H0 private opinion")
+
+    with pytest.raises(MemoryUnavailable) as caught:
+        RuntimePacketBuilder(
+            PROJECT_ROOT / "resources", store,
+            memory=None if operation == "missing" else UnavailableMemory(),
+        ).build(cycle, "m1_judgment", evidence=raw_packet["evidence"])
+    receipt = validate_receipt(caught.value.fallback)
+    assert receipt["input"]["component"] == "MemoryHub"
+    assert receipt["state"] == "unavailable"
+    assert receipt["boundaries"]["local_memory_fallback"] is False
+    assert receipt["input"]["operation"] == ("begin_snapshot" if operation == "missing" else operation)
+    assert receipt["input"]["as_of"] == memory_boundary(cycle, "m1_judgment", cycle["as_of"])[1]
+    if operation == "missing":
+        memory_cycle, memory_as_of = memory_boundary(cycle, "m1_judgment", cycle["as_of"])
+        seen = {"memory_space_id": engine.memory_space_id, "as_of": memory_as_of,
+                "stage": "m1_judgment", "cycle_id": memory_cycle}
+    assert receipt["input"]["source"]["input_sha256"] == sha256(seen)
+    assert "H0 private opinion" not in json.dumps(receipt)
+    engine.m1_failed(cycle["cycle_id"], str(caught.value), retryable=False,
+                     details={"fallback": receipt})
+    assert json.loads(store.latest_artifact(cycle["cycle_id"], "system_fault")["metadata_json"])["fallback"] == receipt
+
+
+def test_cli_m1_preflight_persists_the_actual_memory_component_receipt(tmp_path):
+    from test_m1_judgment import _runtime_builder_fixture
+    from ai_trading_companion.__main__ import run_m1
+    from ai_trading_companion.memory_port import MemoryUnavailable
+
+    store, engine, cycle, packet = _runtime_builder_fixture(tmp_path)
+    store.append_artifact(
+        cycle["cycle_id"], "evidence", "runtime", json.dumps(packet["evidence"]), cycle["as_of"],
+        {"public_only": True},
+    )
+
+    class UnavailableMemory(InMemoryMemoryAdapter):
+        def begin_snapshot(self, request):
+            raise MemoryUnavailable("H0 private opinion")
+
+    engine.memory = UnavailableMemory()
+    # Reuse the CLI preflight fixture seam: adaptive research has already finished;
+    # the real packet builder must still refuse this unavailable MemoryHub read.
+    with patch("ai_trading_companion.__main__._formal_adaptive_research", return_value={}):
+        with pytest.raises(MemoryUnavailable) as caught:
+            run_m1(engine, store, None, cycle["cycle_id"], execute=True)
+    receipt = caught.value.fallback
+    assert receipt["input"]["component"] == "MemoryHub"
+    assert receipt["input"]["operation"] == "begin_snapshot"
+    assert receipt["continuation"] == "blocked"
+    metadata = json.loads(store.latest_artifact(cycle["cycle_id"], "system_fault")["metadata_json"])
+    assert metadata["fallback"] == receipt
+    assert "H0 private opinion" not in json.dumps(receipt)
+    assert store.get_cycle(cycle["cycle_id"])["state"] == "waiting_for_repair"
+
+
 def test_frozen_replay_and_install_qualification_are_deterministic():
     first = frozen_replay(evidence())
     second = frozen_replay(copy.deepcopy(evidence()))

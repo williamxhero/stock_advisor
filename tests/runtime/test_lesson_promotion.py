@@ -39,6 +39,80 @@ def test_runtime_outcome_is_owned_by_memoryhub_before_checkpoint_completion(tmp_
     assert len(memory.export_space(SPACE)["episodes"]) == 1
 
 
+@pytest.fixture
+def ready_outcome_recovery(tmp_path):
+    class GuardedMemory(InMemoryMemoryAdapter):
+        exports = 0
+        offline = False
+
+        def export_space(self, memory_space_id):
+            self.exports += 1
+            if self.offline:
+                raise MemoryUnavailable("MemoryHub is offline")
+            return super().export_space(memory_space_id)
+
+    store = CompanionStore(tmp_path / "runtime.sqlite3")
+    memory = GuardedMemory()
+    engine = CompanionEngine(store, memory=memory, memory_space_id=SPACE)
+    cycle = engine.start_cycle("daily.execution.0945", "2026-09-20T09:45:00+08:00", "2026-09-20T01:45:00Z")
+    artifact = store.append_artifact(cycle["cycle_id"], "m1", "model", "条件尚未成立。", "2026-09-20T01:45:00Z")
+    snapshot = JudgmentLifecycle(store).capture(artifact, "m1", "条件尚未成立。")
+    store.schedule_outcome(snapshot["snapshot_id"], "T+1", AT)
+    checkpoint = next(row for row in store.due_outcomes(AT) if row["snapshot_id"] == snapshot["snapshot_id"])
+    presented = engine.present_for_publication("结果偏离，不能据此认定推理错误。", AT, "outcome",
+                                               message_id=f"outcome:{checkpoint['checkpoint_id']}", sealed_at=AT)
+    result = {"as_of": AT, "checkpoint_ready": True, "verification_status": "incorrect",
+              "summary": presented.markdown, "observations": [], "data_gaps": [],
+              "presentation": presented.metadata()["presentation"], "published_message": presented.message()}
+    JudgmentLifecycle(store, memory=memory, memory_space_id=SPACE).record_outcome(checkpoint, result)
+    # Re-enter the public recovery path with a canonical ready outcome retained.
+    store.fail_outcome(checkpoint["checkpoint_id"], "recovered pending checkpoint", retry_at=AT)
+    store.append_artifact(cycle["cycle_id"], "reflection", "model", "复盘已经保留。", AT,
+                          {"checkpoint_id": checkpoint["checkpoint_id"]})
+    memory.exports = 0
+    return engine, store, memory, checkpoint, result
+
+
+@pytest.mark.parametrize("offline", [False, True])
+def test_outcome_preview_never_recovers_a_ready_canonical_outcome(ready_outcome_recovery, offline) -> None:
+    from ai_trading_companion.__main__ import run_outcome
+    engine, store, memory, checkpoint, canonical = ready_outcome_recovery
+    artifacts = store.artifacts(checkpoint["cycle_id"])
+    events = store.pending_events()
+    memory.offline = offline
+
+    preview = run_outcome(engine, store, checkpoint, execute=False)
+
+    assert preview["checkpoint_ready"] is False
+    assert preview["verification_status"] == "unverified"
+    assert preview["data_gaps"] == ["fixture mode"]
+    assert memory.exports == 0
+    assert store.artifacts(checkpoint["cycle_id"]) == artifacts
+    assert store.pending_events() == events
+    pending = next(row for row in store.due_outcomes("2099-01-01T00:00:00Z", limit=100)
+                   if row["checkpoint_id"] == checkpoint["checkpoint_id"])
+    assert pending["status"] == "retry"
+    memory.offline = False
+    assert memory.export_space(SPACE)["episodes"][0]["metadata"]["outcome_result"] == canonical
+
+
+def test_executed_outcome_recovers_canonical_result_idempotently(ready_outcome_recovery) -> None:
+    from ai_trading_companion.__main__ import run_outcome
+    engine, store, memory, checkpoint, canonical = ready_outcome_recovery
+    artifacts = store.artifacts(checkpoint["cycle_id"])
+    episodes = memory.export_space(SPACE)["episodes"]
+
+    assert run_outcome(engine, store, checkpoint, execute=True) == canonical
+    assert run_outcome(engine, store, checkpoint, execute=True) == canonical
+
+    assert store.artifacts(checkpoint["cycle_id"]) == artifacts
+    assert memory.export_space(SPACE)["episodes"] == episodes
+    assert checkpoint["checkpoint_id"] not in {row["checkpoint_id"] for row in store.due_outcomes("2099-01-01T00:00:00Z", limit=100)}
+    published = [row for row in store.pending_events() if row["event_type"] == "outcome.ready"]
+    assert published
+    assert store.judgment_snapshots(checkpoint["cycle_id"])[0]["verification_status"] == "incorrect"
+
+
 def append_observation(memory, event, *, cycle="cycle-1", status="correct", quality="verified", mae=0.01, market_state="range", excess_return=None, parents=None):
     from ai_trading_companion.memory_write import canonical_json, write_memory
     result = {"verification_status": status, "data_gaps": [], "observations": [

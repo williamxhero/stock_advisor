@@ -2837,7 +2837,7 @@ def run_outcome(
         raise MemoryUnavailable("MemoryHub is required for formal outcome processing")
     recorded = next((episode for episode in engine.memory.export_space(engine.memory_space_id)["episodes"]
                      if episode["source_system"] == "stock-advisor"
-                     and episode["source_event_id"] == f"outcome:{checkpoint['checkpoint_id']}"), None) if engine.memory else None
+                     and episode["source_event_id"] == f"outcome:{checkpoint['checkpoint_id']}"), None) if execute and engine.memory else None
     if recorded:
         result = recorded["metadata"]["outcome_result"]
     elif not execute:

@@ -15,6 +15,113 @@ from test_judgment_publication import core
 AT = "2026-10-05T01:45:00Z"
 
 
+def test_frozen_replay_preserves_actual_runtime_packet_output_and_publication(tmp_path):
+    from ai_trading_companion.m1_judgment import bind_attempt, build_input, build_output
+    from ai_trading_companion.mandate_spec import sha256
+    from ai_trading_companion.risk_gate import freeze, frozen_replay
+    from test_m1_judgment import _runtime_builder_fixture
+
+    store, engine, cycle, raw = _runtime_builder_fixture(tmp_path)
+    decision = core()
+    decision["position_focus"] = []
+    output = m1_output(raw, decision)
+    verifier = CognitiveRouter().verify("m1_judgment", raw, output)
+    assert verifier["passed"] is True
+    research = store.begin_attempt(cycle["cycle_id"], "m1_research", AT, "research-hash")
+    store.finish_attempt(research["attempt_id"], "succeeded", output={}, output_sha256=sha256({}), verifier={"passed": True})
+    attempt = store.begin_attempt(cycle["cycle_id"], "m1_judgment", AT, raw["sha256"], input_packet=raw,
+                                 model="recorded-model", runner_fingerprint="recorded-runner/v1")
+    verifier["m1_judgment"] = bind_attempt(build_output(build_input(raw), output), attempt["attempt_id"])
+    store.finish_attempt(attempt["attempt_id"], "succeeded", output=output, output_sha256=sha256(output), verifier=verifier)
+    engine.m1_ready(cycle["cycle_id"], output["narrative"], research_attempt_id=research["attempt_id"],
+                    judgment_attempt_id=attempt["attempt_id"], research_packet_hash="research-hash", judgment_packet_hash=raw["sha256"])
+    artifact = store.latest_artifact(cycle["cycle_id"], "m1")
+    receipt = json.loads(artifact["metadata_json"])["risk_gate"]
+    provenance = {"attempt_id": attempt["attempt_id"], "model": "recorded-model", "runner_fingerprint": "recorded-runner/v1"}
+    frozen = freeze(raw, output, original_receipt=receipt, original_artifact=artifact, provenance=provenance)
+    original = copy.deepcopy(frozen)
+    first = frozen_replay(frozen)
+    assert first == frozen_replay(copy.deepcopy(frozen))
+    assert first["frozen"] == original == frozen
+    assert first["requalification"] == receipt
+    assert first["historical_receipt_matches"] is True
+    assert frozen["source_packet"] == raw and frozen["source_output"] == output
+    assert frozen["provenance"] == provenance
+    assert store.latest_artifact(cycle["cycle_id"], "m1") == artifact
+
+
+def test_install_cli_records_independent_unmeasured_axes_and_fails_closed():
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    from ai_trading_companion.risk_gate import install_qualification
+
+    value = install_qualification()
+    assert value["contract"] == "RiskGateInstallQualification/v1"
+    assert value["qualified"] is True
+    assert all(value["checks"].values())
+    assert set(value["evaluation_vector"]) == {
+        "delivery_speed", "qualification_probability", "research_quality", "judgment_outcome", "safety_reliability",
+    }
+    for axis in ("delivery_speed", "qualification_probability", "research_quality", "judgment_outcome"):
+        assert value["evaluation_vector"][axis]["status"] == "not_measured"
+        assert value["evaluation_vector"][axis]["measurements"]["measured"] is False
+        assert value["evaluation_vector"][axis]["reason"]
+    assert value["evaluation_vector"]["safety_reliability"]["status"] == "pass"
+    assert value["source_unavailable_smoke"]["requalification"]["state"] == "refused"
+    root = Path(__file__).resolve().parents[2]
+    environment = {**os.environ, "PYTHONPATH": str(root / "src/runtime")}
+    command = [sys.executable, "-m", "ai_trading_companion.risk_gate"]
+    first = subprocess.run(command, env=environment, cwd=root, check=True, capture_output=True).stdout
+    second = subprocess.run(command, env=environment, cwd=root, check=True, capture_output=True).stdout
+    assert first == second
+    assert json.loads(first) == value
+
+
+def test_versioned_schema_validates_real_envelopes_and_rejects_permission_and_shape_forgery():
+    from pathlib import Path
+    from jsonschema import Draft202012Validator, FormatChecker
+    from ai_trading_companion.risk_gate import install_qualification
+
+    schema_path = Path(__file__).resolve().parents[2] / "resources/contracts/risk-gate-spec-v1.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    Draft202012Validator.check_schema(schema)
+    validator = Draft202012Validator(schema, format_checker=FormatChecker())
+    installation = install_qualification()
+    replay = installation["replay"]
+    frozen = replay["frozen"]
+    receipt = replay["requalification"]
+    for value in (receipt["input"], receipt, frozen, replay, installation["source_unavailable_smoke"]):
+        validator.validate(value)
+    negatives = []
+    for field, bad in (("version", True), ("policy", {"contract": "CanonicalRiskPolicy/v2"}), ("as_of", "not-a-time")):
+        value = copy.deepcopy(receipt["input"])
+        value[field] = bad
+        negatives.append(value)
+    for field in ("provenance", "permissions", "reasons", "source_output"):
+        value = copy.deepcopy(receipt)
+        value.pop(field)
+        negatives.append(value)
+    for field, bad in (("write_permissions", ["place_order"]), ("precision", "yes"), ("confidence_ceiling", "unlimited")):
+        value = copy.deepcopy(receipt)
+        value["permissions"][field] = bad
+        negatives.append(value)
+    value = copy.deepcopy(receipt)
+    value["restrictions"] = ["BYPASS"]
+    negatives.append(value)
+    for bad in negatives:
+        assert list(validator.iter_errors(bad))
+
+
+@pytest.mark.parametrize("value", [None, {}, {"contract": "RiskGateResult/v1", "version": 1},
+                                   {"version": 1, "input": {}, "source_output": []}])
+def test_receipt_validator_rejects_incomplete_contract_as_value_error(value):
+    from ai_trading_companion.risk_gate import validate_output
+    with pytest.raises(ValueError):
+        validate_output(value)
+
+
 def packet(**evidence_changes):
     value = m1_packet()
     value["evidence"].update(evidence_changes)
@@ -27,6 +134,104 @@ def packet(**evidence_changes):
     # The runtime packet builder declares this boundary; provider output cannot remove it.
     value["risk_gate_spec"] = {"contract": "RiskGateSpec/v1", "version": 1}
     return value
+
+
+def test_replay_preserves_absent_or_disagreeing_historical_receipts_without_backfill():
+    from ai_trading_companion.risk_gate import freeze, frozen_replay, publication_receipt
+    value = packet()
+    output = {"text": "建议融资加仓"}
+    historical = {"contract": "HistoricalReview/v1", "qualified": True, "model": "original-model"}
+    frozen = freeze(value, output, original_receipt=historical, original_artifact={"text": "original published text"})
+    replay = frozen_replay(frozen)
+    assert replay["requalification"]["state"] == "refused"
+    assert replay["historical_receipt_matches"] is False
+    assert replay["frozen"]["original_receipt"] == historical
+    assert replay["frozen"]["original_artifact"] == {"text": "original published text"}
+    assert frozen["original_receipt"] == historical
+    value.pop("risk_gate_spec")
+    legacy = frozen_replay(freeze(value, output, original_receipt=None))
+    assert legacy["requalification"] is None
+    assert legacy["frozen"]["original_receipt"] is None
+    assert "risk_gate_spec" not in legacy["frozen"]["source_packet"]
+    assert publication_receipt(value, output) is None
+
+
+@pytest.mark.parametrize("field", ["source_packet", "source_output", "original_receipt", "original_artifact", "provenance"])
+def test_frozen_replay_rejects_tampering_with_any_original_material(field):
+    from ai_trading_companion.risk_gate import freeze, frozen_replay
+    frozen = freeze(packet(), {"text": "我先核对事实。"}, original_receipt={}, original_artifact={})
+    frozen[field]["tampered"] = True
+    with pytest.raises(ValueError, match="digest"):
+        frozen_replay(frozen)
+
+
+def test_semantic_validators_reject_rehashed_qualifications_and_unsupported_versions():
+    from ai_trading_companion.evidence_spec import fingerprint
+    from ai_trading_companion.risk_gate import (build_input, freeze, frozen_replay, publication_receipt,
+                                               validate_input, validate_output, validate_replay)
+    value = packet()
+    input_value = build_input(value)
+    input_value["policy"]["leverage_allowed"] = True
+    input_value["sha256"] = fingerprint({k: v for k, v in input_value.items() if k != "sha256"})
+    with pytest.raises(ValueError, match="policy"):
+        validate_input(input_value)
+    receipt = publication_receipt(value, {"text": "建议融资加仓"})
+    receipt["state"] = "qualified"
+    receipt["sha256"] = fingerprint({k: v for k, v in receipt.items() if k != "sha256"})
+    with pytest.raises(ValueError, match="receipt"):
+        validate_output(receipt)
+    replay = frozen_replay(freeze(value, {"text": "我先核对事实。"}, original_receipt=None))
+    replay["permissions"]["write_permissions"] = ["place_order"]
+    replay["sha256"] = fingerprint({k: v for k, v in replay.items() if k != "sha256"})
+    with pytest.raises(ValueError, match="replay"):
+        validate_replay(replay)
+    value["risk_gate_spec"]["version"] = 2
+    with pytest.raises(ValueError, match="unsupported"):
+        frozen_replay(freeze(value, {}, original_receipt=None))
+
+
+def test_restart_and_retry_preserve_published_prefix_and_risk_permission_boundary(tmp_path):
+    from ai_trading_companion.engine import CompanionEngine
+    from ai_trading_companion.memory_port import InMemoryMemoryAdapter
+    from ai_trading_companion.store import CompanionStore
+    database = tmp_path / "risk-recovery.sqlite3"
+    memory = InMemoryMemoryAdapter()
+    engine = CompanionEngine(CompanionStore(database), memory=memory)
+    cycle = engine.ensure_daily_conversation()
+    stream = engine.chat_stream_started(cycle["cycle_id"], [], "ai_chat")
+    engine.chat_stream_delta(cycle["cycle_id"], stream["stream_id"], "我先核对事实。")
+    with pytest.raises(ValueError, match="risk gate.*refused"):
+        engine.chat_stream_delta(cycle["cycle_id"], stream["stream_id"], "建议融资加仓。")
+    restarted_store = CompanionStore(database)
+    recovered = CompanionEngine(restarted_store, memory=memory)
+    with pytest.raises(ValueError, match="risk gate.*refused"):
+        recovered.chat_stream_delta(cycle["cycle_id"], stream["stream_id"], "建议融资加仓。")
+    assert restarted_store.stream_message(stream["stream_id"])["text"] == "我先核对事实。"
+    recovered.chat_ready(cycle["cycle_id"], "我不认可杠杆；先核对当前资产。")
+    artifact = restarted_store.latest_artifact(cycle["cycle_id"], "ai_chat")
+    receipt = json.loads(artifact["metadata_json"])["risk_gate"]
+    assert receipt["state"] == "qualified"
+    assert receipt["permissions"]["precision"] is False
+    assert receipt["permissions"]["write_permissions"] == []
+    assert restarted_store.stream_message(stream["stream_id"])["text"] == "我先核对事实。"
+
+
+def test_regression_gate_cannot_compensate_a_risk_qualification_failure_with_other_axes():
+    from ai_trading_companion.regression_gate import case_registry, run_regression_gate
+    from ai_trading_companion.risk_gate import publication_receipt
+    baseline = {case["case_id"]: {"safety": True, "quality": True, "recovery": True} for case in case_registry()}
+    candidate = copy.deepcopy(baseline)
+    receipt = publication_receipt(packet(conflicts=[{"materiality": "critical", "resolution": "unresolved"}]),
+                                  {"direction": "bullish", "expected_return": 999999, "latency_ms": 0})
+    candidate["missing_conflicting_data"]["safety"] = receipt["state"] == "qualified"
+    candidate["missing_conflicting_data"]["evaluation"] = {
+        axis: True for axis in ("delivery_speed", "qualification_probability", "research_quality", "judgment_outcome", "safety_reliability")
+    }
+    verdict = run_regression_gate(candidate, baseline=baseline)
+    assert verdict["passed"] is False
+    assert verdict["failure_cases"] == ["missing_conflicting_data"]
+    assert verdict["protection_vector"]["safety"]["passed"] is False
+    assert verdict["evaluation_vector"]["delivery_speed"]["passed"] is True
 
 
 def test_selected_opportunity_cannot_bypass_drawdown_gate_with_positive_review_or_fallback():

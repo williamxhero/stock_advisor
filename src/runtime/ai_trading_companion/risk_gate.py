@@ -13,6 +13,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Any
 
+from .evidence_spec import fingerprint
 from .mandate_spec import sha256, validate_mandate
 from .position_safety import (
     CANONICAL_RISK, assert_no_execution, build_input as position_input, build_output as position_output,
@@ -267,9 +268,58 @@ def build_output(value: dict[str, Any], output: dict[str, Any]) -> dict[str, Any
     return receipt
 
 
+def freeze(packet: dict[str, Any], output: dict[str, Any], *, original_receipt: dict[str, Any] | None,
+           original_artifact: dict[str, Any] | None = None,
+           provenance: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Capture an actual attempt; never synthesize or replace its historical receipt."""
+    value = {"contract": "RiskGateFrozen/v1", "version": 1,
+             "source_packet": copy.deepcopy(packet), "source_output": copy.deepcopy(output),
+             "original_receipt": copy.deepcopy(original_receipt),
+             "original_artifact": copy.deepcopy(original_artifact),
+             "provenance": copy.deepcopy(provenance or {})}
+    value["sha256"] = fingerprint(value)
+    return validate_frozen(value)
+
+
+def validate_frozen(value: dict[str, Any]) -> dict[str, Any]:
+    fields = {"contract", "version", "source_packet", "source_output", "original_receipt",
+              "original_artifact", "provenance", "sha256"}
+    if (not isinstance(value, dict) or set(value) != fields or value["contract"] != "RiskGateFrozen/v1"
+            or type(value["version"]) is not int or value["version"] != 1):
+        raise ValueError("unsupported risk gate frozen contract")
+    if (any(not isinstance(value[key], dict) for key in ("source_packet", "source_output", "provenance"))
+            or any(value[key] is not None and not isinstance(value[key], dict)
+                   for key in ("original_receipt", "original_artifact"))):
+        raise ValueError("risk gate frozen fields must be objects")
+    if value["sha256"] != fingerprint({key: child for key, child in value.items() if key != "sha256"}):
+        raise ValueError("risk gate frozen digest mismatch")
+    return value
+
+
+def frozen_replay(value: dict[str, Any]) -> dict[str, Any]:
+    """Requalify separately from immutable history; old packets are not upgraded."""
+    frozen = copy.deepcopy(validate_frozen(value))
+    receipt = publication_receipt(frozen["source_packet"], frozen["source_output"])
+    replay = {"contract": "RiskGateReplay/v1", "version": 1, "frozen": frozen,
+              "requalification": receipt,
+              "historical_receipt_matches": (receipt == frozen["original_receipt"]
+                                             if frozen["original_receipt"] is not None else None),
+              "permissions": {"write_permissions": []}}
+    replay["sha256"] = fingerprint(replay)
+    return replay
+
+
+def validate_replay(value: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, dict) or value != frozen_replay(value.get("frozen")):
+        raise ValueError("risk gate replay qualification/digest mismatch")
+    return value
+
+
 def validate_output(value: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(value, dict) or type(value.get("version")) is not int or value.get("version") != 1:
-        raise ValueError("unsupported risk gate receipt version")
+    if (not isinstance(value, dict) or value.get("contract") != RESULT_CONTRACT
+            or type(value.get("version")) is not int or value.get("version") != 1
+            or not isinstance(value.get("input"), dict) or not isinstance(value.get("source_output"), dict)):
+        raise ValueError("unsupported risk gate receipt contract or fields")
     if value != build_output(value["input"], value["source_output"]):
         raise ValueError("risk gate receipt qualification/digest mismatch")
     return value
@@ -293,3 +343,94 @@ def assert_publication(packet: dict[str, Any] | None, output: dict[str, Any], ve
         if verifier.get("risk_gate") is not None and verifier["risk_gate"] != receipt:
             raise ValueError("risk gate publication receipt mismatch")
     return receipt
+
+
+def install_qualification() -> dict[str, Any]:
+    """Provider-free installation fixtures, not live performance or promotion evidence."""
+    from .evidence_spec import from_observation, install_qualification as evidence_install
+    from .evidence_qualification import qualify_record
+    from .evidence_snapshot import build_snapshot, descriptor
+    from .mandate_spec import build_mandate
+
+    at = "2026-09-21T01:45:00Z"
+    quote = json.dumps({"quotes": [{"symbol": "603179", "price": 10, "quote_at": at, "status": "trading"}]})
+    record = from_observation({
+        "evidence_kind": "market_fact", "url": "https://example.test/install-risk-quote",
+        "excerpt_text": quote, "fact_as_of": at, "factual_status": "verified", "evidence_ref": "install-risk-quote",
+    }, {"attempt_id": "install-risk-attempt", "observation_id": "install-risk-observation",
+        "backend": "market", "operation": "install_smoke", "known_at": at})
+    evidence = {"sources": [{"evidence_ref": "install-risk-quote", "excerpt": quote,
+                             "evidence_spec": record, "evidence_qualification": qualify_record(record, as_of=at)}],
+                "coverage": [], "conflicts": [], "critical_gaps": []}
+    packet = {"cycle_id": "install-risk-cycle", "stage": "m1_judgment", "as_of": at,
+              "risk_gate_spec": SPEC, "mandate": build_mandate("daily.execution.0945", "m1_judgment", as_of=at),
+              "evidence": evidence,
+              "evidence_snapshot": descriptor(build_snapshot(cycle_id="install-risk-cycle", as_of=at,
+                                                              evidence=evidence, source_watermarks={})),
+              "position_safety": position_input({
+                  "positions": [{"code": "603179", "shares": 100, "last_price": 10, "updated_at": at}],
+                  "total_assets": 100000, "holdings_as_of": at, "assets_as_of": at,
+                  "risk_state": {"theme_by_code": {"603179": "auto"}, "synchronized": True, "peak_assets": 100000},
+              }, stage="m1_judgment", as_of=at, source_ref="install-runtime", latest_session="2026-09-21")}
+    output = {"direction": "bullish", "confidence": "low", "sizing_proposal": {
+        "code": "603179", "target_shares": 1000, "stop_price": 9, "leverage": False}}
+    frozen = freeze(packet, output, original_receipt=publication_receipt(packet, output),
+                    original_artifact={"artifact_id": "install-risk-artifact", "text": "条件确认后再考虑；交易由用户决定。"},
+                    provenance={"source": "install_fixture", "model": "not_invoked", "runner_fingerprint": "RiskGateInstall/v1"})
+    replay = validate_replay(frozen_replay(frozen))
+    # Reuse the real read-only acquisition failure smoke, not a declared failure.
+    acquisition = evidence_install()["source_unavailable_smoke"]
+    unavailable_packet = copy.deepcopy(packet)
+    unavailable_packet["evidence"] = {"sources": acquisition["evidence_items"], "acquisition": acquisition}
+    unavailable_packet["evidence_snapshot"] = descriptor(build_snapshot(
+        cycle_id=packet["cycle_id"], as_of=at, evidence=unavailable_packet["evidence"], source_watermarks={}))
+    unavailable = frozen_replay(freeze(unavailable_packet, output,
+                                      original_receipt=publication_receipt(unavailable_packet, output)))
+    conflicted = copy.deepcopy(packet)
+    conflicted["evidence"]["conflicts"] = [{"materiality": "critical", "resolution": "unresolved"}]
+    conflicted["evidence_snapshot"] = descriptor(build_snapshot(
+        cycle_id=packet["cycle_id"], as_of=at, evidence=conflicted["evidence"], source_watermarks={}))
+    stale = copy.deepcopy(packet)
+    stale_truth = copy.deepcopy(packet["position_safety"]["truth"])
+    stale_truth["assets_as_of"] = "2026-09-17T01:45:00Z"
+    stale["position_safety"] = position_input(stale_truth, stage="m1_judgment", as_of=at,
+                                             source_ref="install-stale", latest_session="2026-09-21")
+    historical = copy.deepcopy(packet)
+    historical.pop("risk_gate_spec")
+    historical_replay = frozen_replay(freeze(historical, output, original_receipt=None))
+    checks = {
+        "frozen_replay": replay == frozen_replay(copy.deepcopy(frozen)),
+        "history_preserved": replay["frozen"] == frozen and replay["historical_receipt_matches"] is True,
+        "precise_qualified": replay["requalification"]["state"] == "qualified"
+                             and replay["requalification"]["permissions"]["precision"] is True,
+        "source_unavailable_refused": (acquisition["status"] == "failed" and acquisition["qualified"] is False
+                                       and all(acquisition["measurements"].values())
+                                       and unavailable["requalification"]["state"] == "refused"
+                                       and "market_evidence_missing" in unavailable["requalification"]["problems"]),
+        "critical_conflict_refused": "critical_market_conflict" in publication_receipt(conflicted, output)["problems"],
+        "stale_assets_refused": publication_receipt(stale, output)["state"] == "refused",
+        "leverage_refused": "leverage_not_approved" in publication_receipt(packet, {"text": "建议融资加仓"})["problems"],
+        "write_refused": "ownership_or_execution_violation" in publication_receipt(packet, {"operation": "memoryhub_write"})["problems"],
+        "historical_not_upgraded": historical_replay["requalification"] is None,
+        "read_only": replay["permissions"]["write_permissions"] == []
+                     and replay["requalification"]["permissions"]["write_permissions"] == [],
+    }
+    vector = {
+        "delivery_speed": {"status": "not_measured", "reason": "no_live_latency_baseline",
+                           "measurements": {"measured": False, "sample_count": 0, "baseline_available": False}},
+        "qualification_probability": {"status": "not_measured", "reason": "fixed_fixtures_are_not_a_population",
+                                      "measurements": {"measured": False, "qualified_fixtures": int(checks["precise_qualified"]),
+                                                       "unavailable_fixture_refused": checks["source_unavailable_refused"]}},
+        "research_quality": {"status": "not_measured", "reason": "no_research_quality_baseline",
+                             "measurements": {"measured": False, "evidence_record_qualified": evidence["sources"][0]["evidence_qualification"]["state"] == "qualified"}},
+        "judgment_outcome": {"status": "not_measured", "reason": "no_observed_trade_outcome",
+                             "measurements": {"measured": False, "outcome_observed": False}},
+        "safety_reliability": {"status": "pass" if all(checks.values()) else "fail", "scope": "deterministic_install_fixtures",
+                               "measurements": {"measured": True, **checks}},
+    }
+    return {"contract": "RiskGateInstallQualification/v1", "version": 1, "qualified": all(checks.values()),
+            "checks": checks, "replay": replay, "source_unavailable_smoke": unavailable, "evaluation_vector": vector}
+
+
+if __name__ == "__main__":
+    print(json.dumps(install_qualification(), ensure_ascii=False, sort_keys=True, separators=(",", ":")))

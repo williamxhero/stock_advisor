@@ -239,7 +239,9 @@ class LessonPromotion:
         # Absolute catastrophic excursion remains a hard safety boundary.
         # Ordinary paired harm is governed by the conservative interval above,
         # not an irreversible veto from one adverse observation.
-        catastrophic = any(trial["quality_passed"] and
+        # Frozen metrics are recomputed only after complete raw validation;
+        # an inconclusive direction does not erase independently measured risk.
+        catastrophic = any(trial.get("evaluation_kind") == "frozen_facts" and
                            trial.get("metrics", {}).get("adverse_excursion", 0) > 0.15 for trial in trials)
         safety = bool(units) and not catastrophic
         quality = bool(units) and all(row["market_state"] != "conflicted" for row in units.values())

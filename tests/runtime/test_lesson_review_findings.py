@@ -164,6 +164,27 @@ def test_ordinary_adverse_facts_enter_harm_interval_without_permanent_veto():
     assert later["maturity"]["strata"]["trend_expansion"]["harm_interval"][0] > 0
 
 
+def test_validated_catastrophic_excursion_survives_inconclusive_direction():
+    memory = InMemoryMemoryAdapter()
+    service, created = proposal(memory)
+    pair = frozen_pair(memory, close=100, low=70)
+    observed = service.observe_frozen_pair("flat-catastrophic", created["episode_id"], pair, as_of=END)
+    trial = observed["decision"]["payload"]["trial"]
+    assert trial["state"] == "inconclusive"
+    assert trial["quality_passed"] is False
+    assert trial["support"] == trial["baseline_support"] == 0
+    assert trial["reasons"] == ["directional_outcome_inconclusive"]
+    assert trial["metrics"]["adverse_excursion"] == pytest.approx(0.3)
+    later_pair = frozen_pair(memory, "later-safe", index=1)
+    service.observe_frozen_pair("later-safe", created["episode_id"], later_pair, as_of="2026-10-01T00:00:00Z")
+    assessment = service.assess(created["episode_id"], as_of="2026-10-01T00:00:00Z")
+    assert assessment["state"] == "failed"
+    assert assessment["maturity"]["safety_passed"] is False
+    trace = service.trace(created["episode_id"], as_of="2026-10-01T00:00:00Z")
+    assert trace["effective_state"] == "failed"
+    assert observed["episode_id"] in [row["episode_id"] for row in trace["revisions"]]
+
+
 @pytest.mark.parametrize("close,benchmark_close,expected_state,expected_support,quality", [
     (100, 101, "inconclusive", 0, False),
     (101, 102, "supported", 1, True),

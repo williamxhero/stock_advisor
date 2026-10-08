@@ -23,6 +23,7 @@ from .mandate_spec import mandate_for_stage
 from .m1_judgment import build_input as build_m1_judgment_input
 from .m2_judgment import build_input as build_m2_judgment_input
 from .position_safety import build_input as build_position_safety_input
+from .risk_gate import SPEC as RISK_GATE_SPEC, STAGES as RISK_GATE_STAGES
 from .research_isolation import (
     access_descriptor as research_access_descriptor,
     build_request as build_research_request,
@@ -239,7 +240,7 @@ class RuntimePacketBuilder:
                         "total_assets": fact_view.get("total_assets") if isinstance(fact_view, dict) else None,
                         "holdings_as_of": fact_view.get("updated_at") if isinstance(fact_view, dict) else None,
                         "assets_as_of": fact_view.get("assets_as_of") if isinstance(fact_view, dict) else None,
-                        "risk_state": {},
+                        "risk_state": fact_view.get("risk_state") or {},
                     },
                     stage=stage, as_of=packet_as_of,
                     source_ref=str(fact_view.get("fact_view_sha256") or cycle["cycle_id"]),
@@ -276,7 +277,7 @@ class RuntimePacketBuilder:
                         "total_assets": private_assets,
                         "holdings_as_of": max(position_times, default=None),
                         "assets_as_of": private.get("assets_as_of") if isinstance(private, dict) else None,
-                        "risk_state": {},
+                        "risk_state": private.get("risk_state") or {},
                     },
                     stage=stage, as_of=packet_as_of,
                     source_ref=str(cycle.get("private_context_sha256") or cycle["cycle_id"]),
@@ -361,6 +362,14 @@ class RuntimePacketBuilder:
                 ]
             if context:
                 packet["context"] = context
+        if stage in RISK_GATE_STAGES:
+            packet["risk_gate_spec"] = copy.deepcopy(RISK_GATE_SPEC)
+            if "position_safety" not in packet:
+                portfolio = (packet.get("business_context") or {}).get("portfolio") or {}
+                packet["position_safety"] = build_position_safety_input(
+                    {**portfolio, "risk_state": self.store.portfolio_risk_state(packet_as_of)},
+                    stage=stage, as_of=packet_as_of, source_ref=cycle["cycle_id"] + ":runtime-portfolio",
+                )
         packet["sha256"] = hashlib.sha256(
             json.dumps(packet, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()

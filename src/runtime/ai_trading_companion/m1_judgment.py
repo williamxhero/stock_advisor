@@ -42,7 +42,7 @@ _FORBIDDEN_KINDS = frozenset({"h0", "m1", "m2", "chat_human", "ai_chat", "pre_m0
                               "premarket", "premarket_chat", "premarket_submission"})
 _PACKET_FIELDS = frozenset({
     "schema_version", "cycle_id", "task_key", "stage", "as_of", "scheduled_for", "calendar_context",
-    "mandate", "mandate_reference", "m1_judgment_spec", "position_safety", "cycle_reference", "task_profile",
+    "mandate", "mandate_reference", "m1_judgment_spec", "position_safety", "risk_gate_spec", "cycle_reference", "task_profile",
     "prior_opportunity_plans", "prior_opportunity_followups", "protocol", "risk_doctrine",
     "business_context", "frozen_m0", "frozen_public_evidence", "evidence_snapshot", "evidence",
     "research_isolation", "research_request", "research_evidence", "prior_market_understanding", "artifacts", "memories", "active_workflow_policy", "context",

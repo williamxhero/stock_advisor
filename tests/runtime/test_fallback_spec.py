@@ -21,6 +21,46 @@ _AXES = (
 )
 
 
+def test_install_verifier_round_trips_chinese_python_json_on_windows_powershell():
+    import base64
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell 5.1 is required for this native capture regression")
+    verifier = (Path(__file__).resolve().parents[2] / "scripts" / "verify-install.ps1").read_text(encoding="utf-8-sig")
+    # Exercise the shipped verifier's capture setup in the actual PS5.1 host,
+    # without creating an installation or running unrelated qualification probes.
+    setup_start = verifier.index("try {", verifier.index("$previousHome =")) + len("try {")
+    setup_end = verifier.index("$env:AI_TRADING_COMPANION_HOME = $healthHome", setup_start)
+    environment = dict(os.environ, VERIFY_FIXTURE_PYTHON=sys.executable)
+    text = "市场宽度仍待持续确认"
+    environment["VERIFY_FIXTURE_SOURCE"] = (
+        "import json; print(json.dumps({'text': " + ascii(text) + "}, ensure_ascii=False))"
+    )
+    command = """
+$ErrorActionPreference = 'Stop'
+if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Expected Windows PowerShell 5.1' }
+[Console]::OutputEncoding = [Text.Encoding]::GetEncoding(936)
+$env:PYTHONIOENCODING = 'utf-8'
+""" + verifier[setup_start:setup_end] + """
+$raw = ((& $env:VERIFY_FIXTURE_PYTHON -c $env:VERIFY_FIXTURE_SOURCE) -join "`n").Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Python fixture failed' }
+$parsed = $raw | ConvertFrom-Json
+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($parsed.text))
+"""
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-EncodedCommand",
+         base64.b64encode(command.encode("utf-16-le")).decode("ascii")],
+        env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    assert base64.b64decode(result.stdout.strip()).decode("utf-8") == text
+
+
 def test_install_qualification_reports_deterministic_independent_axes():
     first = fallback_spec.install_qualification()
     second = fallback_spec.install_qualification()

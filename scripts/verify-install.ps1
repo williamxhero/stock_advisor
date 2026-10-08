@@ -160,11 +160,17 @@ $runtimePython = Join-Path $CompanionHome 'runtime\python\Scripts\python.exe'
 $python = if (Test-Path -LiteralPath $runtimePython) { $runtimePython } else { 'py' }
 $healthHome = Join-Path $CompanionHome ("verification\install-health-" + [guid]::NewGuid().ToString('N'))
 $previousHome = $env:AI_TRADING_COMPANION_HOME
+$previousPythonIOEncoding = $env:PYTHONIOENCODING
+$previousConsoleOutputEncoding = [Console]::OutputEncoding
 New-Item -ItemType Directory -Path $healthHome -Force | Out-Null
 try {
     # Runtime status performs schema/schedule initialization. Keep that health
     # smoke isolated from the user's formal database and workspace while still
     # exercising the exact installed Runtime and resources.
+    # PS5.1 decodes native stdout using Console.OutputEncoding, independently
+    # of Python's encoder. Both must agree for non-ASCII JSON qualification.
+    $env:PYTHONIOENCODING = 'utf-8'
+    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     $env:AI_TRADING_COMPANION_HOME = $healthHome
     Push-Location $healthHome
     try {
@@ -545,6 +551,13 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
     }
 }
 finally {
+    [Console]::OutputEncoding = $previousConsoleOutputEncoding
+    if ($null -eq $previousPythonIOEncoding) {
+        Remove-Item Env:PYTHONIOENCODING -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:PYTHONIOENCODING = $previousPythonIOEncoding
+    }
     if ($null -eq $previousHome) {
         Remove-Item Env:AI_TRADING_COMPANION_HOME -ErrorAction SilentlyContinue
     }

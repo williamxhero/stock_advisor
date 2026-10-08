@@ -265,6 +265,47 @@ def test_selected_opportunity_cannot_bypass_drawdown_gate_with_positive_review_o
     assert result["risk_gate"]["input"]["position_safety"]["provenance"]["source_ref"] == "pre-h0-frozen"
 
 
+@pytest.mark.parametrize("stage", ["m0_compose", "m1_judgment", "m2"])
+@pytest.mark.parametrize("source_state", [None, "rejected", "expired"])
+def test_unusable_evidence_allows_only_m0_observation_not_advice_or_writes(stage, source_state):
+    from ai_trading_companion.risk_gate import publication_receipt, validate_output
+
+    value = {
+        "cycle_id": "cycle-risk-observation", "stage": stage, "as_of": AT,
+        "mandate": build_mandate("daily.execution.0945", stage, as_of=AT),
+        "risk_gate_spec": {"contract": "RiskGateSpec/v1", "version": 1},
+        "evidence": {"sources": [] if source_state is None else [{
+            "evidence_qualification": {"state": source_state, "permitted_use": "none"},
+        }]},
+    }
+    result = publication_receipt(value, {"text": "我先核对市场事实。"})
+    assert validate_output(result) == result
+    assert result["permissions"]["direction"] is False
+    assert result["permissions"]["precision"] is False
+    assert result["permissions"]["new_risk"] is False
+    assert result["permissions"]["write_permissions"] == []
+    if stage == "m0_compose":
+        assert result["state"] == "qualified"
+        assert result["problems"] == []
+        assert result["permissions"]["continue"] is True
+        assert "NO_DIRECTION" in result["restrictions"]
+        assert "m0_cannot_advise" in result["reasons"]["no_direction"]
+        for output in ({"text": "建议买入核心股。"}, {"direction": "bullish"}):
+            refused = publication_receipt(value, output)
+            assert refused["state"] == "refused"
+            assert "m0_cannot_advise" in refused["problems"]
+        for output in ({"operation": "memoryhub_write"}, {"operation": "place_order"}):
+            refused = publication_receipt(value, output)
+            assert refused["state"] == "refused"
+            assert "ownership_or_execution_violation" in refused["problems"]
+    else:
+        assert result["state"] == "refused"
+        assert result["permissions"]["continue"] is False
+        assert "STOP" in result["restrictions"]
+        reason = "market_evidence_missing" if source_state is None else "usable_market_evidence_missing"
+        assert reason in result["problems"]
+
+
 def test_rejected_only_evidence_cannot_qualify_even_a_low_confidence_direction():
     from ai_trading_companion.risk_gate import publication_receipt
     value = packet()

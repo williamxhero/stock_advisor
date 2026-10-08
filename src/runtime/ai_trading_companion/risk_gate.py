@@ -201,7 +201,9 @@ def build_output(value: dict[str, Any], output: dict[str, Any]) -> dict[str, Any
     evidence = value["evidence"]
     sources = evidence.get("sources") or []
     stops, directional, reduced, precision, new_risk = [], [], [], [], []
-    if value["stage"] in {"m0_compose", "m1_judgment", "m2"}:
+    # Missing market evidence stops judgments, not M0's read-only observation.
+    # M0 can never gain advice eligibility, even when its evidence is qualified.
+    if value["stage"] in {"m1_judgment", "m2"}:
         if not sources:
             stops.append("market_evidence_missing")
         elif all((row.get("evidence_qualification") or {}).get("state") in {"rejected", "expired"} for row in sources):

@@ -100,7 +100,7 @@ def test_frozen_prices_not_model_scores_determine_an_offline_attempt():
 @pytest.mark.parametrize("options,missing,expected,reason", [
     ({"gaps": True}, False, "inconclusive", "incomplete_frozen_window"),
     ({"private": True}, False, "inconclusive", "h0_or_conversation_lineage"),
-    ({"close": 101}, False, "inconclusive", "directional_outcome_inconclusive"),
+    ({"close": 100}, False, "inconclusive", "directional_outcome_inconclusive"),
     ({"low": 70}, False, "failed", None),
     ({}, True, "inconclusive", "missing_frozen_input"),
     ({"snapshot_benchmark": "000001"}, False, "inconclusive", "frozen_benchmark_conflict"),

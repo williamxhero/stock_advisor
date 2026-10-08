@@ -435,14 +435,17 @@ class LessonPromotion:
                 cursor = memory_timestamp(bar["end_at"])
             if cursor != end:
                 raise ValueError("incomplete_frozen_window")
-            excess = bars[-1]["close"] / window["reference_price"] - bars[-1]["benchmark_close"] / window["reference_benchmark_price"]
+            stock_return = bars[-1]["close"] / window["reference_price"] - 1
+            excess = stock_return - (bars[-1]["benchmark_close"] / window["reference_benchmark_price"] - 1)
             adverse = [max(0.0, 1 - min(bar["low"] for bar in bars) / window["reference_price"]) if direction == 1 else
                        max(0.0, max(bar["high"] for bar in bars) / window["reference_price"] - 1) for direction in directions]
-            trial.update({"support": int(directions[0] * excess > 0), "baseline_support": int(directions[1] * excess > 0),
+            # Plain rise/fall claims are absolute, not unstated outperformance.
+            trial.update({"support": int(directions[0] * stock_return > 0), "baseline_support": int(directions[1] * stock_return > 0),
                           "quality_passed": True, "safety_passed": adverse[0] <= 0.15 and adverse[0] <= adverse[1],
                           "window": {"reference_at": window["reference_at"], "window_end": window["window_end"]},
-                          "metrics": {"excess_return": excess, "adverse_excursion": adverse[0], "baseline_adverse_excursion": adverse[1]}})
-            if excess == 0:
+                          "metrics": {"stock_return": stock_return, "excess_return": excess,
+                                      "adverse_excursion": adverse[0], "baseline_adverse_excursion": adverse[1]}})
+            if stock_return == 0:
                 raise ValueError("directional_outcome_inconclusive")
             trial["state"] = "supported" if trial["support"] and trial["safety_passed"] else "failed"
             trial["window_episode_id"] = pair["window_episode_id"]

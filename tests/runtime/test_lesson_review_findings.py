@@ -164,6 +164,37 @@ def test_ordinary_adverse_facts_enter_harm_interval_without_permanent_veto():
     assert later["maturity"]["strata"]["trend_expansion"]["harm_interval"][0] > 0
 
 
+@pytest.mark.parametrize("close,benchmark_close,expected_state,expected_support,quality", [
+    (100, 101, "inconclusive", 0, False),
+    (101, 102, "supported", 1, True),
+])
+def test_absolute_original_claim_is_not_reinterpreted_as_benchmark_outperformance(
+    close, benchmark_close, expected_state, expected_support, quality,
+):
+    memory = InMemoryMemoryAdapter()
+    service, created = proposal(memory)
+    pair = frozen_pair(memory, close=close)
+    source = next(row for row in memory.export_space("frozen-lessons")["episodes"]
+                  if row["episode_id"] == pair["window_episode_id"])
+    window = json.loads(source["body"])
+    window["bars"][-1]["benchmark_close"] = benchmark_close
+    window_id = evidence(memory, "explicit-benchmark-window", window, at=END)
+    receipt = service.observe_frozen_pair("absolute-direction", created["episode_id"],
+                                         {**pair, "window_episode_id": window_id}, as_of=END)
+    trial = receipt["decision"]["payload"]["trial"]
+    assert trial["state"] == expected_state
+    assert trial["support"] == expected_support
+    assert trial["baseline_support"] == 0
+    assert trial["quality_passed"] is quality
+    assert trial["metrics"]["stock_return"] == pytest.approx(0 if close == 100 else 0.01)
+    assert trial["metrics"]["excess_return"] == pytest.approx(-0.01)
+    assert receipt["decision"]["state"] != "promoted"
+    if close == 100:
+        assert trial["reasons"] == ["directional_outcome_inconclusive"]
+    else:
+        assert trial["reasons"] == []
+
+
 @pytest.mark.parametrize("text", ["600519不会上涨", "如果600519上涨，则再考虑买入", "600519可能上涨", "600519上涨但也可能下跌"])
 def test_negated_and_conditional_judgments_do_not_create_directional_support(text):
     memory = InMemoryMemoryAdapter()

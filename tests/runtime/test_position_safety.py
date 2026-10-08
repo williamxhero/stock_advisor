@@ -162,6 +162,25 @@ def test_drawdown_and_leverage_boundaries_refuse_added_risk():
     assert "leverage_not_approved" in leveraged["problems"]
 
 
+@pytest.mark.parametrize("text", [
+    "拿90%的总资产买入300421。", "100股300421现在买入。",
+    "用总资产的三成配置300421。", "200 shares of 300421: buy now.",
+])
+def test_free_form_precision_requires_structured_sizing_in_either_word_order(text):
+    result = build_output(contract(), {"text": text})
+    assert result["state"] == "refused"
+    assert "structured_sizing_required" in result["problems"]
+
+
+@pytest.mark.parametrize("text", [
+    "成交放大15.50%但下跌家数占优，我把反弹视为轮动，暂不加仓。",
+    "我不建议买入100股，而是先观察。",
+    "不要拿90%的总资产买入300421。",
+])
+def test_factual_percentage_and_negated_sizing_are_not_execution_advice(text):
+    assert build_output(contract(), {"text": text})["state"] == "directional_only"
+
+
 def test_m0_exact_sizing_is_never_qualified():
     value = build_input(snapshot(), stage="m0_compose", as_of=AS_OF,
                         source_ref="m0", latest_session=SESSION)

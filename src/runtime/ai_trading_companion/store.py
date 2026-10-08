@@ -2786,6 +2786,35 @@ class CompanionStore:
         result["_created"] = created
         return result
 
+    def portfolio_risk_state(self, as_of: str, *, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
+        """Conservative observed peak from verified Runtime asset events, never estimates.
+
+        No review clearance is inferred from a model's favorable opinion. Missing
+        theme attribution remains unknown and prevents precise theme sizing.
+        Source known-at allows delayed processing of genuine pre-cutoff user
+        facts; otherwise creation is the only proven knowledge clock. Reversals
+        affect only cutoffs at which they were known, not earlier observed peaks.
+        """
+        if connection is None:
+            with self.connection() as c:
+                return self.portfolio_risk_state(as_of, connection=c)
+        rows = connection.execute(
+            "SELECT t.price FROM portfolio_transaction t "
+            "LEFT JOIN narrative_artifact source ON source.artifact_id=t.source_artifact_id "
+            "LEFT JOIN portfolio_transaction reversal ON reversal.transaction_id=t.reverted_by "
+            "LEFT JOIN narrative_artifact reversal_source ON reversal_source.artifact_id=reversal.source_artifact_id "
+            "WHERE t.action='asset_correction' "
+            "AND julianday(t.occurred_at)<=julianday(?) "
+            "AND julianday(COALESCE(source.known_at,t.created_at))<=julianday(?) "
+            "AND (t.reverted_by IS NULL OR "
+            "julianday(COALESCE(reversal_source.known_at,reversal.created_at))>julianday(?))",
+            (as_of, as_of, as_of),
+        ).fetchall()
+        values = [float(row[0]) for row in rows if row[0] is not None and float(row[0]) > 0]
+        if not values:
+            return {}
+        return {"peak_assets": max(values), "synchronized": True, "review_completed": False}
+
     def freeze_private_context(self, cycle_id: str) -> dict[str, Any]:
         """Freeze pre-H0 private facts so M1 cannot observe H0-derived updates."""
         at = now()
@@ -2806,6 +2835,7 @@ class CompanionStore:
                 "positions": positions,
                 "total_assets": float(meta["total_assets"]) if meta.get("total_assets") else None,
                 "assets_as_of": assets_as_of[0] if assets_as_of else None,
+                "risk_state": self.portfolio_risk_state(at, connection=c),
                 "frozen_at": at,
             }
             raw = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -2944,6 +2974,7 @@ class CompanionStore:
                 "assets_as_of": assets_as_of[0] if assets_as_of else None,
                 "positions": positions,
                 "total_assets": float(total_assets[0]) if total_assets else None,
+                "risk_state": self.portfolio_risk_state(known_at, connection=c),
             }
             canonical = json.dumps(view, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             view["fact_view_sha256"] = digest(canonical)

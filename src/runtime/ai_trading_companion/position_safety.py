@@ -40,8 +40,25 @@ _FORBIDDEN = {
 _EXACT_ADVICE = re.compile(
     r"(?:买入|卖出|加仓|减仓|持有|配置|买|卖).{0,24}?(?:\d[\d,.]*|[一二三四五六七八九十百千]+)\s*(?:股|手|万元|元)|"
     r"(?:仓位|配置|敞口).{0,16}?(?:\d+(?:\.\d+)?\s*[%％成]|[一二三四五六七八九十]+成)|"
-    r"(?:buy|sell|hold|allocate).{0,30}?\d[\d,.]*\s*(?:shares|lots|%|percent)", re.I,
+    r"(?:buy|sell|hold|allocate).{0,30}?\d[\d,.]*\s*(?:shares|lots|%|percent)|"
+    r"(?:\d[\d,.]*|[一二三四五六七八九十百千]+)\s*(?:股|手|万元|元|[%％成]).{0,24}?(?:买入|卖出|加仓|减仓|持有|配置|买|卖)|"
+    r"\d[\d,.]*\s*(?:shares|lots|%|percent).{0,30}?\b(?:buy|sell|hold|allocate)\b", re.I,
 )
+
+
+def advice_clauses(text: str) -> list[str]:
+    """Bound action/negation checks to a proposition, not adjacent market facts."""
+    return re.split(r"[。；;，\n!?！？]|(?<!\d),(?!\d)|但是|但|然而|而是|并且|而且|然后|"
+                    r"也(?=不)|\b(?:but|however|instead|whereas|and|then)\b", text, flags=re.I)
+
+
+def negated_advice(clause: str) -> bool:
+    negative = re.search(r"不(?:认可|建议|应|能|要|使用|因|代表|等于|加仓|买入|卖出)|禁止|拒绝|避免|不得|不能|不可|"
+                         r"\b(?:no|not|avoid(?:ing)?)\b", clause, re.I)
+    action = re.search(r"买入|卖出|加仓|减仓|持有|配置|杠杆|融资|"
+                       r"\b(?:buy(?:ing)?|sell(?:ing)?|hold|allocate|margin|leverage)\b", clause, re.I)
+    # A later 'do not chase' cannot negate an earlier affirmative recommendation.
+    return bool(negative and (action is None or negative.start() <= action.start()))
 
 
 def _time(value: Any) -> datetime:
@@ -208,7 +225,7 @@ def freshness_problems(value: dict[str, Any]) -> list[str]:
     return problems
 
 
-def _drawdown_blocked(truth: dict[str, Any]) -> bool:
+def drawdown_blocked(truth: dict[str, Any]) -> bool:
     state = truth["risk_state"]
     return bool(state.get("synchronized") is True and state.get("peak_assets") and truth["total_assets"]
                 and truth["total_assets"] <= state["peak_assets"] * (1 - CANONICAL_RISK["drawdown_review_threshold"])
@@ -255,7 +272,7 @@ def sizing_problems(value: dict[str, Any], proposal: dict[str, Any]) -> list[str
     if shares > row["shares"]:
         if state.get("synchronized") is not True or not state.get("peak_assets"):
             problems.append("portfolio_drawdown_unknown")
-        elif _drawdown_blocked(truth):
+        elif drawdown_blocked(truth):
             problems.append("drawdown_requires_review")
     if value["stage"] == "m0_compose":
         problems.append("m0_cannot_advise")
@@ -282,14 +299,15 @@ def build_output(value: dict[str, Any], output: dict[str, Any], *, sizing: dict[
             elif isinstance(item, list):
                 for child in item:
                     walk(child)
-            elif isinstance(item, str) and _EXACT_ADVICE.search(item):
+            elif isinstance(item, str) and any(_EXACT_ADVICE.search(clause) and not negated_advice(clause)
+                                               for clause in advice_clauses(item)):
                 problems.extend([*freshness_problems(value), "structured_sizing_required"])
         walk(output)
     def adds_risk(item: Any) -> bool:
         if isinstance(item, dict):
             return item.get("current_action") == "allow_add_risk" or item.get("action") == "allow_add_risk" or any(adds_risk(child) for child in item.values())
         return isinstance(item, list) and any(adds_risk(child) for child in item)
-    if adds_risk(output) and _drawdown_blocked(value["truth"]):
+    if adds_risk(output) and drawdown_blocked(value["truth"]):
         problems.append("drawdown_requires_review")
     receipt = {
         "contract": RESULT_CONTRACT, "version": VERSION, "spec_contract": CONTRACT,

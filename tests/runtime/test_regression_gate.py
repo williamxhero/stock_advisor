@@ -272,6 +272,74 @@ def test_adapter_recovery_probe_tolerates_fixture_startup_contention(monkeypatch
     assert all(result["axes"][axis]["passed"] for axis in ("safety", "quality", "recovery")), result
 
 
+@pytest.mark.parametrize("previous_encoding", [None, "ascii"])
+@pytest.mark.parametrize("fail_after_capture", [False, True], ids=["success", "failure"])
+def test_install_verifier_round_trips_chinese_json_and_restores_encoding(
+    tmp_path, previous_encoding, fail_after_capture,
+):
+    import base64
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell 5.1 is required for this native capture regression")
+    verifier = (ROOT / "scripts/verify-install.ps1").read_text(encoding="utf-8-sig")
+    # Run the shipped health wrapper in PS5.1, substituting only the expensive
+    # qualification body with a native JSON fixture (no installation required).
+    setup_start = verifier.index("$previousHome =")
+    setup_end = verifier.index("    Push-Location $healthHome", setup_start)
+    cleanup_start = verifier.rindex("\nfinally {")
+    cleanup_end = verifier.index('\nWrite-Output "AITradingCompanion installation verified:', cleanup_start)
+    text = "市场宽度仍待持续确认"
+    environment = dict(os.environ, VERIFY_FIXTURE_PYTHON=sys.executable,
+        VERIFY_FIXTURE_HOME=str(tmp_path), VERIFY_FIXTURE_ENCODING=previous_encoding or "",
+        VERIFY_FIXTURE_FAIL="1" if fail_after_capture else "0",
+        VERIFY_FIXTURE_SOURCE="import json; print(json.dumps({'text': " + ascii(text) + "}, ensure_ascii=False))")
+    command = """
+$ErrorActionPreference = 'Stop'
+if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
+    throw 'Expected Windows PowerShell 5.1'
+}
+[Console]::OutputEncoding = [Text.Encoding]::GetEncoding(936)
+if ($env:VERIFY_FIXTURE_ENCODING) { $env:PYTHONIOENCODING = $env:VERIFY_FIXTURE_ENCODING }
+else { Remove-Item Env:PYTHONIOENCODING -ErrorAction SilentlyContinue }
+$env:AI_TRADING_COMPANION_HOME = 'before-health'
+$CompanionHome = $env:VERIFY_FIXTURE_HOME
+$healthHome = Join-Path $CompanionHome 'health'
+$payload = $null
+$failure = $null
+try {
+""" + verifier[setup_start:setup_end] + """
+$raw = ((& $env:VERIFY_FIXTURE_PYTHON -c $env:VERIFY_FIXTURE_SOURCE) -join "`n").Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Python fixture failed' }
+$parsed = $raw | ConvertFrom-Json
+$payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($parsed.text))
+if ($env:VERIFY_FIXTURE_FAIL -eq '1') { throw 'fixture failure after native capture' }
+}
+""" + verifier[cleanup_start:cleanup_end] + """
+}
+catch { $failure = $_.Exception.Message }
+@{ text = $payload; failure = $failure; encoding = $env:PYTHONIOENCODING;
+   codepage = [Console]::OutputEncoding.CodePage; home = $env:AI_TRADING_COMPANION_HOME } |
+    ConvertTo-Json -Compress
+"""
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-EncodedCommand",
+         base64.b64encode(command.encode("utf-16-le")).decode("ascii")],
+        env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    captured = json.loads(result.stdout)
+    assert captured["failure"] == ("fixture failure after native capture" if fail_after_capture else None), captured
+    assert base64.b64decode(captured["text"]).decode("utf-8") == text
+    assert captured["encoding"] == previous_encoding
+    assert captured["codepage"] == 936
+    assert captured["home"] == "before-health"
+
+
 def test_compatibility_spec_module_exposes_gate_contract():
     assert regression_spec.CONTRACT == CONTRACT
     assert regression_spec.run_regression_gate() == run_regression_gate()

@@ -34,6 +34,7 @@ foreach ($required in @(
     'resources\contracts\m0-observation-spec-v1.schema.json',
     'resources\contracts\m1-judgment-spec-v1.schema.json',
     'resources\contracts\position-safety-spec-v1.schema.json',
+    'resources\contracts\risk-gate-spec-v1.schema.json',
     'resources\contracts\research-isolation-spec-v1.schema.json',
     'resources\contracts\regression-spec-v1.schema.json',
     'resources\contracts\observability-spec-v1.schema.json',
@@ -65,6 +66,10 @@ foreach ($required in @(
     'runtime\ai_trading_companion\m0_observation.py',
     'runtime\ai_trading_companion\m1_judgment.py',
     'runtime\ai_trading_companion\position_safety.py',
+    'runtime\ai_trading_companion\risk_gate.py',
+    'runtime\ai_trading_companion\evidence_spec.py',
+    'runtime\ai_trading_companion\evidence_qualification.py',
+    'runtime\ai_trading_companion\local_research.py',
     'runtime\ai_trading_companion\research_isolation.py',
     'build-info.json',
     'scripts\run_companion_service.ps1'
@@ -130,6 +135,13 @@ if ($positionSafetySchema.title -ne 'PositionSafetySpec/v1' -or $positionSafetyS
 }
 foreach ($required in @('oneOf', '$defs')) {
     if ($null -eq $positionSafetySchema.$required) { throw "Installed PositionSafety schema is missing required section: $required." }
+}
+$riskGateSchema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\risk-gate-spec-v1.schema.json') -Raw | ConvertFrom-Json
+if ($riskGateSchema.title -ne 'RiskGateSpec/v1' -or $riskGateSchema.'$schema' -ne 'https://json-schema.org/draft/2020-12/schema') {
+    throw 'Installed RiskGate schema has an unexpected contract or schema dialect.'
+}
+foreach ($definition in @('input', 'result', 'frozen', 'replay', 'policy', 'permissions')) {
+    if ($null -eq $riskGateSchema.'$defs'.$definition) { throw "Installed RiskGate schema is missing definition: $definition." }
 }
 $researchIsolationSchema = Get-Content -LiteralPath (Join-Path $InstallRoot 'resources\contracts\research-isolation-spec-v1.schema.json') -Raw | ConvertFrom-Json
 if ($researchIsolationSchema.title -ne 'ResearchIsolationSpec/v1' -or $researchIsolationSchema.'$schema' -ne 'https://json-schema.org/draft/2020-12/schema') {
@@ -511,6 +523,42 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
         }
         foreach ($check in @('frozen_replay', 'precise_qualified', 'stale_assets_refused', 'llm_order_refused', 'llm_write_refused', 'quantresearch_read_only', 'quantresearch_write_refused')) {
             if ($positionSafetyQualification.checks.$check -ne $true) { throw "Installed PositionSafety check failed: $check" }
+        }
+        # RiskGate requalification is read-only and preserves the original packet,
+        # evidence, model output and receipt. Fixed fixtures do not measure live axes.
+        $riskGateReplayOne = ((& $python -m ai_trading_companion.risk_gate) -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0) { throw "Installed RiskGate replay 1 failed with exit code $LASTEXITCODE." }
+        $riskGateReplayTwo = ((& $python -m ai_trading_companion.risk_gate) -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0) { throw "Installed RiskGate replay 2 failed with exit code $LASTEXITCODE." }
+        if ($riskGateReplayOne -ne $riskGateReplayTwo) { throw 'Installed RiskGate frozen replays were not deterministic.' }
+        $riskGateQualification = $riskGateReplayOne | ConvertFrom-Json
+        if ($riskGateQualification.contract -ne 'RiskGateInstallQualification/v1' -or $riskGateQualification.qualified -ne $true) {
+            throw 'Installed RiskGate qualification did not pass.'
+        }
+        foreach ($check in @('frozen_replay', 'history_preserved', 'precise_qualified', 'source_unavailable_refused', 'critical_conflict_refused', 'stale_assets_refused', 'leverage_refused', 'write_refused', 'historical_not_upgraded', 'read_only')) {
+            if ($riskGateQualification.checks.$check -ne $true) { throw "Installed RiskGate check failed: $check" }
+        }
+        foreach ($axis in @('delivery_speed', 'qualification_probability', 'research_quality', 'judgment_outcome', 'safety_reliability')) {
+            $evaluation = $riskGateQualification.evaluation_vector.$axis
+            if ($null -eq $evaluation -or $null -eq $evaluation.measurements -or $evaluation.measurements.measured -isnot [bool]) {
+                throw "Installed RiskGate axis lacks structured measurements: $axis"
+            }
+            if ($axis -eq 'safety_reliability') {
+                if ($evaluation.status -ne 'pass' -or $evaluation.measurements.measured -ne $true) {
+                    throw 'Installed RiskGate measured safety checks failed.'
+                }
+            }
+            elseif ($evaluation.status -ne 'not_measured' -or $evaluation.measurements.measured -ne $false -or
+                    [string]::IsNullOrWhiteSpace([string]$evaluation.reason)) {
+                throw "Installed RiskGate must not claim a live measurement from fixed fixtures: $axis"
+            }
+        }
+        if ($riskGateReplayOne -match '"(aggregate|aggregate_score|composite_score|overall_score|score|scores|total_score|weighted_score|weighted_average)"\s*:') {
+            throw 'Installed RiskGate exposed a forbidden aggregate score.'
+        }
+        if ($riskGateQualification.source_unavailable_smoke.requalification.state -ne 'refused' -or
+            $riskGateQualification.source_unavailable_smoke.requalification.problems -notcontains 'market_evidence_missing') {
+            throw 'Installed RiskGate accepted source-unavailable advice.'
         }
         $researchIsolationReplayOne = ((& $python -m ai_trading_companion.research_isolation) -join "`n")
         if ($LASTEXITCODE -ne 0) { throw "Installed ResearchIsolation replay 1 failed with exit code $LASTEXITCODE." }

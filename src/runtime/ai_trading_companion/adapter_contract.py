@@ -439,7 +439,16 @@ def install_qualification() -> dict[str, Any]:
     request = {"contract": CONTRACT, "version": VERSION, "adapter_id": "fixture", "adapter_version": "v1", "input_contract": "Input/v1", "output_contract": "Output/v1", "mode": "deterministic", "inputs": {"value": 1}, "permissions": {"write_permissions": []}, "provenance": {"as_of": "2026-01-01T00:00:00Z", "cycle_id": None, "timeout_seconds": 1, "request_id": None, "attempt": 0}}
     output = registry.execute("fixture", {"value": 1}, as_of="2026-01-01T00:00:00Z", timeout_seconds=1)
     replay = frozen_replay(request, output)
-    return {"contract": "AdapterContractInstallQualification/v1", "qualified": replay["qualification"]["valid"], "replay_sha256": sha256(replay), "evaluation_vector": replay["evaluation_vector"]}
+    qualification = replay["qualification"]
+    record = qualification["record"]
+    # A faithful replay can describe failure; validity is not execution eligibility.
+    qualified = (
+        qualification["valid"] is True
+        and qualification["status"] == "succeeded"
+        and isinstance(record, dict)
+        and record.get("passed") is True
+    )
+    return {"contract": "AdapterContractInstallQualification/v1", "qualified": qualified, "qualification": qualification, "replay_sha256": sha256(replay), "evaluation_vector": replay["evaluation_vector"]}
 
 
 if __name__ == "__main__":

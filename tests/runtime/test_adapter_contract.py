@@ -318,6 +318,22 @@ def test_deterministic_failure_cannot_fall_back_to_a_model_estimate() -> None:
     assert not list(Draft202012Validator(schema).iter_errors(receipt))
 
 
+def test_install_qualification_rejects_structurally_valid_failed_replay(monkeypatch) -> None:
+    registry = AdapterRegistry()
+    registry.register(adapter(execute_fail_crash))
+    failed = registry.execute(
+        "fixture", {"value": 1}, as_of="2026-01-01T00:00:00Z", timeout_seconds=1,
+    )
+    assert failed["status"] == "failed"
+    assert failed["qualification"] is None
+    monkeypatch.setattr(AdapterRegistry, "execute", lambda *args, **kwargs: copy.deepcopy(failed))
+
+    report = install_qualification()
+
+    assert report["evaluation_vector"]["research_quality"]["status"] == "failed"
+    assert report["qualified"] is False
+
+
 def test_adapter_replay_preserves_inputs_output_qualification_and_schema() -> None:
     registry = AdapterRegistry()
     registry.register(adapter())

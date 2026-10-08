@@ -203,19 +203,21 @@ def test_unknown_market_state_keeps_an_inconclusive_attempt() -> None:
 
 
 def test_distinct_hypotheses_spend_separate_immutable_alpha_allocations() -> None:
+    from test_lesson_frozen_evidence import START, frozen_pair, proposal
     memory = InMemoryMemoryAdapter()
-    service, first = candidate(memory)
-    good = append_observation(memory, "good")
-    baseline = append_observation(memory, "baseline", status="incorrect")
-    service.observe("first", first["episode_id"], good, baseline,
-                    subject="600519", market_state="range", as_of=AT)
+    service, first = proposal(memory)
+    pair = frozen_pair(memory, close=95, low=95)
+    service.observe_frozen_pair("first", first["episode_id"], pair, as_of=AT)
     before = service.assess(first["episode_id"], as_of=AT)
-    _, second = candidate(memory, "candidate-2")
-    service.observe("second", second["episode_id"], good, baseline,
-                    subject="600519", market_state="range", as_of=AT)
+    second = service.propose("candidate-2", first["decision"]["hypothesis"],
+                             market_states=first["decision"]["market_states"],
+                             evidence_episode_ids=first["decision"]["provenance"]["evidence_episode_ids"],
+                             counterevidence_episode_ids=first["decision"]["provenance"]["counterevidence_episode_ids"], as_of=START)
+    pair = frozen_pair(memory, "second", close=95, low=95, lesson_candidate_id="candidate-2")
+    service.observe_frozen_pair("second", second["episode_id"], pair, as_of=AT)
     after = service.assess(second["episode_id"], as_of=AT)
     assert before["maturity"]["hypothesis_alpha"] > after["maturity"]["hypothesis_alpha"]
-    assert before["maturity"]["strata"]["range"]["support_interval"][1] < after["maturity"]["strata"]["range"]["support_interval"][1]
+    assert before["maturity"]["strata"]["trend_expansion"]["support_interval"][1] < after["maturity"]["strata"]["trend_expansion"]["support_interval"][1]
     assert service.assess(first["episode_id"], as_of=AT) == before
 
 

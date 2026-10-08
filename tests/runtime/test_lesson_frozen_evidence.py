@@ -185,6 +185,13 @@ def test_frozen_maturity_requires_independent_windows_and_every_market_state():
     memory = InMemoryMemoryAdapter()
     service, created = proposal(memory)
     as_of = "2031-01-01T00:00:00Z"
+    adverse_pair = frozen_pair(memory, "ordinary-prelude", low=88)
+    missing = service.observe_frozen_pair("missing-prelude", created["episode_id"],
+                                         {**adverse_pair, "window_episode_id": "unavailable-window"}, as_of=as_of)
+    assert missing["decision"]["payload"]["trial"]["state"] == "inconclusive"
+    adverse = service.observe_frozen_pair("ordinary-prelude", created["episode_id"], adverse_pair, as_of=as_of)
+    assert adverse["decision"]["payload"]["trial"]["safety_passed"] is False
+    assert adverse["decision"]["state"] == "inconclusive"
     for index in range(256):
         pair = frozen_pair(memory, f"trend-{index}", index=index)
         receipt = service.observe_frozen_pair(f"trend-{index}", created["episode_id"], pair, as_of=as_of)
@@ -195,6 +202,10 @@ def test_frozen_maturity_requires_independent_windows_and_every_market_state():
         receipt = service.observe_frozen_pair(f"divergence-{index}", created["episode_id"], pair, as_of=as_of)
     assert receipt["decision"]["state"] == "promoted"
     assert receipt["decision"]["payload"]["blockers"] == []
+    assert receipt["decision"]["payload"]["maturity"]["adverse_cycles"] == 1
+    revisions = service.trace(created["episode_id"], as_of=as_of)["revisions"]
+    assert missing["episode_id"] in [row["episode_id"] for row in revisions]
+    assert adverse["episode_id"] in [row["episode_id"] for row in revisions]
     assert service.assess(created["episode_id"], as_of=as_of)["state"] == "promoted"
     snapshot = memory.begin_snapshot({"memory_space_id": SPACE, "stage": "m1_judgment", "cycle_id": "next", "as_of": as_of})
     bundle = memory.retrieve_bundle(snapshot["snapshot_id"], "600519 risk", context={"market_state": "trend_expansion"})

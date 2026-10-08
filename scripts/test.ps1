@@ -29,6 +29,7 @@ if ($ProjectRegression) {
         "$root\tests\runtime\test_lesson_promotion.py",
         "$root\tests\runtime\test_lesson_frozen_evidence.py",
         "$root\tests\runtime\test_lesson_promotion_replay.py",
+        "$root\tests\runtime\test_lesson_review_findings.py",
         "$root\memoryhub\tests\test_append_only_ledger.py",
         "$root\tests\runtime\test_reflection.py",
         "$root\tests\runtime\test_analysis_skill.py",
@@ -84,7 +85,7 @@ elseif ($Select -eq 'MemoryRetrieval') {
     if ($LASTEXITCODE -ne 0) { throw "MemoryRetrieval regression tests failed with exit code $LASTEXITCODE." }
 }
 elseif ($Select -eq 'LessonPromotion') {
-    py -m pytest "$root\tests\runtime\test_lesson_promotion.py" "$root\tests\runtime\test_lesson_frozen_evidence.py" "$root\tests\runtime\test_lesson_promotion_replay.py" -q
+    py -m pytest "$root\tests\runtime\test_lesson_promotion.py" "$root\tests\runtime\test_lesson_frozen_evidence.py" "$root\tests\runtime\test_lesson_promotion_replay.py" "$root\tests\runtime\test_lesson_review_findings.py" -q
     if ($LASTEXITCODE -ne 0) { throw "LessonPromotion regression tests failed with exit code $LASTEXITCODE." }
 }
 elseif ($Select -eq 'Reflection') {

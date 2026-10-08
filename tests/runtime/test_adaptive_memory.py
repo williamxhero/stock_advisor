@@ -32,9 +32,10 @@ class _RecordingMemory(InMemoryMemoryAdapter):
         super().__init__()
         self.operations: list[tuple[str, str]] = []
 
-    def search(self, snapshot_id: str, query: str, *, limit: int = 20) -> list[dict[str, object]]:
+    def retrieve_bundle(self, snapshot_id: str, query: str, *, limit: int = 20,
+                        context: dict[str, object] | None = None) -> dict[str, object]:
         self.operations.append(("search", query))
-        return super().search(snapshot_id, query, limit=limit)
+        return super().retrieve_bundle(snapshot_id, query, limit=limit, context=context)
 
     def expand(self, snapshot_id: str, episode_id: str) -> dict[str, object]:
         self.operations.append(("expand", episode_id))

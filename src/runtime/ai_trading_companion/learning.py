@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from .reflection import from_outcome
 from .memory_write import canonical_json, write_memory
+from .memory_type import sha256
 from .memory_port import MemoryPort, MemoryUnavailable
 from .store import now
 
@@ -215,19 +216,44 @@ class JudgmentLifecycle:
                              "judgment_snapshot": frozen, "parent_episode_ids": lineage, "market_state": market_state},
             }, semantic_type="outcome")
             metadata["memory_episode_id"] = receipt["episode_id"]
+            # Recheck canonical immutability above, but never reinterpret an
+            # optional rejection when later ledger writes make a reference valid.
+            for existing in self.store.artifacts(cycle_id):
+                previous = json.loads(existing.get("metadata_json") or "{}")
+                if existing["kind"] == "outcome" and previous.get("checkpoint_id") == checkpoint["checkpoint_id"]:
+                    if previous.get("reflection") != reflection:
+                        raise MemoryUnavailable("immutable outcome conflict")
+                    self.store.complete_outcome(checkpoint["checkpoint_id"], as_of, result, existing["artifact_id"])
+                    return existing
             lessons = LessonPromotion(self.memory, self.memory_space_id)
+
+            def optional_action(request: dict[str, Any], action: Any, reason: str) -> dict[str, Any]:
+                try:
+                    return action()
+                except MemoryUnavailable:
+                    # Outages and immutable conflicts are retriable failures,
+                    # not invalid optional propositions.
+                    raise
+                except (KeyError, ValueError, TypeError):
+                    return {"contract": "LessonActionRejection/v1", "version": 1,
+                            "state": "rejected", "reason": reason, "request": request,
+                            "request_sha256": sha256(request), "outcome_episode_id": receipt["episode_id"]}
+
             candidate = reflection.get("lesson_candidate")
             if candidate:
-                metadata["lesson_candidate_receipt"] = lessons.propose(
-                    checkpoint["checkpoint_id"], candidate["hypothesis"],
-                    market_states=result.get("lesson_market_states") or [],
-                    evidence_episode_ids=candidate["evidence_refs"],
-                    counterevidence_episode_ids=result.get("lesson_counterevidence_refs") or [],
-                    parent_episode_ids=[receipt["episode_id"]], as_of=as_of,
-                )
-            metadata["lesson_trial_receipts"] = [lessons.consume_trial(
-                trial, receipt["episode_id"], request_id=f"{checkpoint['checkpoint_id']}:{index}",
-                market_state=market_state, as_of=as_of,
+                request = {"request_id": checkpoint["checkpoint_id"], "hypothesis": candidate["hypothesis"],
+                           "market_states": result.get("lesson_market_states") or [],
+                           "evidence_episode_ids": candidate["evidence_refs"],
+                           "counterevidence_episode_ids": result.get("lesson_counterevidence_refs") or [],
+                           "parent_episode_ids": [receipt["episode_id"]], "as_of": as_of}
+                metadata["lesson_candidate_receipt"] = optional_action(
+                    request, lambda: lessons.propose(**request), "invalid_evidence_reference")
+            metadata["lesson_trial_receipts"] = [optional_action(
+                {"trial": trial, "request_id": f"{checkpoint['checkpoint_id']}:{index}",
+                 "outcome_episode_id": receipt["episode_id"], "market_state": market_state, "as_of": as_of},
+                lambda: lessons.consume_trial(trial, receipt["episode_id"],
+                    request_id=f"{checkpoint['checkpoint_id']}:{index}", market_state=market_state, as_of=as_of),
+                "invalid_trial_reference",
             ) for index, trial in enumerate(result.get("lesson_trials") or [])]
         if isinstance(result.get("presentation"), dict):
             metadata["presentation"] = result["presentation"]

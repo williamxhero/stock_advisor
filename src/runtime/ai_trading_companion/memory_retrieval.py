@@ -126,10 +126,13 @@ def _semantic_type(episode: dict[str, Any]) -> str:
     }.get(episode.get("episode_type"), "observation")
 
 
-def lesson_bundle(bundle: dict[str, Any], episodes: list[dict[str, Any]], *, add_results: bool = True) -> dict[str, Any]:
+def lesson_bundle(bundle: dict[str, Any], episodes: list[dict[str, Any]], *, add_results: bool = True,
+                  export_space_id: str | None = None) -> dict[str, Any]:
     """Resolve effective lesson revisions from the frozen ledger, not search rank."""
     heads: dict[str, dict[str, Any]] = {}
     snapshot = bundle["snapshot"]
+    if export_space_id is not None and export_space_id != snapshot["memory_space_id"]:
+        raise MemoryIsolationError("cross_space_export")
     for episode in episodes:
         event = episode.get("metadata", {}).get("lesson_promotion")
         if not event or episode["sequence"] > snapshot["watermark"] or any(
@@ -137,7 +140,7 @@ def lesson_bundle(bundle: dict[str, Any], episodes: list[dict[str, Any]], *, add
             for field in ("occurred_at", "known_at", "submitted_at")
         ):
             continue
-        if episode.get("memory_space_id") != snapshot["memory_space_id"]:
+        if episode.get("memory_space_id", export_space_id) != snapshot["memory_space_id"]:
             continue
         from .lesson_promotion import validate
         from .memory_write import canonical_json
@@ -148,7 +151,10 @@ def lesson_bundle(bundle: dict[str, Any], episodes: list[dict[str, Any]], *, add
             previous = heads.get(event["candidate_id"])
             if previous is None or episode["sequence"] > previous["sequence"]:
                 heads[event["candidate_id"]] = episode
-    results = [card for card in bundle["results"] if not card.get("metadata", {}).get("lesson_promotion")]
+    governance_ids = {episode["episode_id"] for episode in episodes
+                      if episode.get("metadata", {}).get("lesson_promotion")}
+    results = [card for card in bundle["results"] if card["episode_id"] not in governance_ids
+               and not card.get("metadata", {}).get("lesson_promotion")]
     if add_results:
         results.extend({**copy.deepcopy(episode), "summary": episode["metadata"]["lesson_promotion"]["hypothesis"]}
                        for episode in heads.values() if episode["metadata"]["lesson_promotion"]["state"] == "promoted")

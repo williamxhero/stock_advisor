@@ -204,8 +204,13 @@ class LessonPromotion:
                 segment_end = max(segment_end, end)
             else:
                 segment_end, segment_cycle = end, cycle
+        attempted_cycles = {root(trial["cycle_id"]) for trial in trials}
         units: dict[str, dict[str, Any]] = {}
         for trial in trials:
+            # Failed factual outcomes are evidence; unresolved requests are not.
+            # Keep both in the ledger, but never turn missing facts into harm.
+            if trial.get("evaluation_kind") != "frozen_facts" or not trial["quality_passed"]:
+                continue
             cycle = root(trial["cycle_id"])
             prior = units.get(cycle)
             if prior is None:
@@ -231,13 +236,18 @@ class LessonPromotion:
             qualified = bool(rows) and support[0] >= POLICY["minimum_support_lower_bound"] and support[0] > baseline[1] and harm[1] <= POLICY["noninferiority_tolerance"]
             mature &= qualified
             strata[state] = {"support_interval": support, "baseline_interval": baseline, "harm_interval": harm, "qualified": qualified}
-        safety = bool(units) and all(row["safety_passed"] for row in units.values())
-        quality = bool(units) and all(row["quality_passed"] for row in units.values())
-        mature &= safety and quality and all(row["market_state"] != "conflicted" for row in units.values())
-        factual = [row for row in units.values() if row.get("evaluation_kind") == "frozen_facts" and row["quality_passed"]]
-        failed = any(not row["safety_passed"] for row in factual) or any(
-            item["support_interval"][1] < item["baseline_interval"][0] for item in strata.values())
-        blockers = sorted({reason for trial in trials for reason in trial.get("reasons", [])})
+        # Absolute catastrophic excursion remains a hard safety boundary.
+        # Ordinary paired harm is governed by the conservative interval above,
+        # not an irreversible veto from one adverse observation.
+        catastrophic = any(trial["quality_passed"] and
+                           trial.get("metrics", {}).get("adverse_excursion", 0) > 0.15 for trial in trials)
+        safety = bool(units) and not catastrophic
+        quality = bool(units) and all(row["market_state"] != "conflicted" for row in units.values())
+        mature &= safety and quality
+        failed = catastrophic or any(
+            item["support_interval"][1] < item["baseline_interval"][0]
+            or item["harm_interval"][0] > POLICY["noninferiority_tolerance"] for item in strata.values())
+        blockers = [] if mature else sorted({reason for trial in trials for reason in trial.get("reasons", [])})
         if not candidate["provenance"].get("counterevidence_episode_ids"):
             blockers.append("counterevidence_required")
         if not candidate["market_states"]:
@@ -246,7 +256,9 @@ class LessonPromotion:
             blockers.append("paired_frozen_evidence_required")
         return {"state": "promoted" if mature else "failed" if failed else "inconclusive",
                 "blockers": blockers,
-                "maturity": {"independent_cycles": len(units), "hypothesis_sequence": hypothesis_sequence,
+                "maturity": {"independent_cycles": len(attempted_cycles), "qualified_cycles": len(units),
+                             "adverse_cycles": sum(not row["safety_passed"] for row in units.values()),
+                             "hypothesis_sequence": hypothesis_sequence,
                              "hypothesis_alpha": POLICY["alpha"] / multiplicity,
                              "strata": strata, "statistically_qualified": bool(mature),
                              "safety_passed": safety, "quality_passed": quality},
@@ -337,7 +349,7 @@ class LessonPromotion:
     def _frozen_trial(self, candidate: dict[str, Any], pair: dict[str, Any], episodes: dict[str, dict[str, Any]],
                       snapshot: dict[str, Any]) -> dict[str, Any]:
         from .governance import classify_regime
-        from .learning import heuristic_snapshot
+        import re
         trial = {"cycle_id": "unresolved:" + sha256(pair), "market_state": "unknown", "subject": pair["subject"],
                  "outcome_episode_id": pair["outcome_episode_id"], "baseline_episode_id": pair["baseline_episode_id"],
                  "reported_verification_status": None, "support": 0, "baseline_support": 0,
@@ -403,10 +415,12 @@ class LessonPromotion:
                 if not any(parent.get("authority") == "published_ai_message" and parent["body"] == text and
                            memory_timestamp(parent["known_at"]) <= start and memory_timestamp(parent["submitted_at"]) <= start for parent in parents):
                     raise ValueError("unbound_frozen_judgment")
-                parsed = heuristic_snapshot(text, reference_at=frozen["reference_at"])
-                direction = parsed["direction"]
-                if (direction not in {"bullish", "bearish"} or direction != frozen["direction"] or
-                    parsed["subjects"] != [pair["subject"]] or frozen.get("triggers") or frozen.get("invalidations")):
+                # Only a complete unconditional claim has a factual direction.
+                # Substring inference would turn negation/conditions into support.
+                claim = re.fullmatch(r"\s*" + re.escape(pair["subject"]) + r"\s*(上涨|下跌)\s*[。.!！]?\s*", text)
+                direction = ("bullish" if claim[1] == "上涨" else "bearish") if claim else None
+                if (direction is None or direction != frozen["direction"] or
+                    frozen["subjects"] != [pair["subject"]] or frozen.get("triggers") or frozen.get("invalidations")):
                     raise ValueError("unsupported_frozen_direction")
                 directions.append(1 if direction == "bullish" else -1)
             cursor = start

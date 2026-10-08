@@ -2391,7 +2391,10 @@ def run_research(
                 if on_progress:
                     on_progress()
                 return current
-            engine.research_failed(cycle["cycle_id"], str(exc))
+            engine.research_failed(
+                cycle["cycle_id"], str(exc),
+                details={"fallback": exc.fallback} if hasattr(exc, "fallback") else None,
+            )
             publish_observatory_evaluation(store, cycle["cycle_id"])
             if on_progress:
                 on_progress()
@@ -2488,6 +2491,8 @@ def run_m1(
             )
     except Exception as exc:
         details = getattr(exc, "verifier", None)
+        if hasattr(exc, "fallback"):
+            details = {**(details if isinstance(details, dict) else {}), "fallback": exc.fallback}
         engine.m1_failed(
             cycle_id, str(exc), retryable=False,
             details=details if isinstance(details, dict) else None,
@@ -2600,6 +2605,7 @@ def run_m1(
                 "failure_stage": "m1_judgment",
                 "boundary_attempt_id": boundary_attempt["attempt_id"],
                 "boundary_exception_type": type(exc).__name__,
+                **({"fallback": exc.fallback} if hasattr(exc, "fallback") else {}),
             }
             if isinstance(details, dict):
                 details = {**details, **safe_boundary_details}

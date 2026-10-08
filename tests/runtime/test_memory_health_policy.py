@@ -16,6 +16,9 @@ def test_ledger_failure_makes_app_unavailable_without_fallback() -> None:
     decision = MemoryCapabilityPolicy.evaluate(value)
     assert decision.app_available is False
     assert decision.allow_local_memory_fallback is False
+    assert decision.fallback["state"] == "unavailable"
+    assert decision.fallback["continuation"] == "blocked"
+    assert decision.fallback["boundaries"]["local_memory_fallback"] is False
 
 
 def test_index_derivation_and_source_failures_degrade_only_owned_capabilities() -> None:

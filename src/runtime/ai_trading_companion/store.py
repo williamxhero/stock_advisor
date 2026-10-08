@@ -2791,13 +2791,24 @@ class CompanionStore:
 
         No review clearance is inferred from a model's favorable opinion. Missing
         theme attribution remains unknown and prevents precise theme sizing.
+        Source known-at allows delayed processing of genuine pre-cutoff user
+        facts; otherwise creation is the only proven knowledge clock. Reversals
+        affect only cutoffs at which they were known, not earlier observed peaks.
         """
         if connection is None:
             with self.connection() as c:
                 return self.portfolio_risk_state(as_of, connection=c)
         rows = connection.execute(
-            "SELECT price FROM portfolio_transaction WHERE action='asset_correction' "
-            "AND reverted_by IS NULL AND julianday(occurred_at)<=julianday(?)", (as_of,),
+            "SELECT t.price FROM portfolio_transaction t "
+            "LEFT JOIN narrative_artifact source ON source.artifact_id=t.source_artifact_id "
+            "LEFT JOIN portfolio_transaction reversal ON reversal.transaction_id=t.reverted_by "
+            "LEFT JOIN narrative_artifact reversal_source ON reversal_source.artifact_id=reversal.source_artifact_id "
+            "WHERE t.action='asset_correction' "
+            "AND julianday(t.occurred_at)<=julianday(?) "
+            "AND julianday(COALESCE(source.known_at,t.created_at))<=julianday(?) "
+            "AND (t.reverted_by IS NULL OR "
+            "julianday(COALESCE(reversal_source.known_at,reversal.created_at))>julianday(?))",
+            (as_of, as_of, as_of),
         ).fetchall()
         values = [float(row[0]) for row in rows if row[0] is not None and float(row[0]) > 0]
         if not values:

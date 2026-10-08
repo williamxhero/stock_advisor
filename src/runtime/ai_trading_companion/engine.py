@@ -1734,8 +1734,8 @@ class CompanionEngine:
         self._emit_failure(cycle, f"{stage}.failed", self._user_fault_message(reason, label), reason)
         return cycle
 
-    def _chat_risk_receipt(self, cycle: dict[str, Any], text: str) -> dict[str, Any]:
-        """The cognition path has no Router packet; qualify before first visibility."""
+    def _chat_risk_receipt(self, cycle: dict[str, Any], text: str, *, stage: str = "chat") -> dict[str, Any]:
+        """Qualify model prose before visibility, including packetless publication."""
         from .mandate_spec import mandate_for_stage
         from .position_safety import build_input as position_input
         from .risk_gate import SPEC, publication_receipt
@@ -1745,14 +1745,14 @@ class CompanionEngine:
             risk_state = self.store.portfolio_risk_state(as_of, connection=c)
         positions = position_input(
             {"positions": [], "total_assets": float(assets[0]) if assets else None, "risk_state": risk_state},
-            stage="chat", as_of=as_of, source_ref=cycle["cycle_id"] + ":runtime-chat-facts",
+            stage=stage, as_of=as_of, source_ref=cycle["cycle_id"] + ":runtime-" + stage + "-facts",
         )
-        packet = {"cycle_id": cycle["cycle_id"], "stage": "chat", "as_of": as_of,
-                  "mandate": mandate_for_stage(cycle, "chat", memory_space_id=self.memory_space_id),
+        packet = {"cycle_id": cycle["cycle_id"], "stage": stage, "as_of": as_of,
+                  "mandate": mandate_for_stage(cycle, stage, memory_space_id=self.memory_space_id),
                   "position_safety": positions, "risk_gate_spec": SPEC}
         receipt = publication_receipt(packet, {"text": text})
         self.store.record_cycle_event(
-            cycle["cycle_id"], "risk_gate.evaluated", stage="chat",
+            cycle["cycle_id"], "risk_gate.evaluated", stage=stage,
             provenance=receipt["provenance"], payload={"risk_gate": receipt},
         )
         if receipt["state"] == "refused":
@@ -1842,10 +1842,13 @@ class CompanionEngine:
         message = text if meaningful else "我已经核对过了，暂时没有需要你据此调整的新信息。"
         event_type = {"outcome": "outcome.ready", "reflection": "reflection.ready"}.get(kind, "chat.ready")
         presented = self.present_for_publication(message, iso(utc_now()), kind, model=model, provider=provider)
+        risk_receipt = self._chat_risk_receipt(
+            cycle, presented.markdown, stage="reflection" if kind == "reflection" else "chat",
+        )
         self._append_published_memory(cycle, presented)
         artifact = self.store.append_artifact(
             cycle_id, kind, "model", presented.markdown, iso(utc_now()),
-            self._presentation_metadata(metadata or {}, presented),
+            self._presentation_metadata({**(metadata or {}), "risk_gate": risk_receipt}, presented),
         )
         if kind == "outcome":
             self._stage_succeeded(cycle_id, "result", output_sha256=artifact["sha256"])

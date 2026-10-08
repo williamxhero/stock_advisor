@@ -17,7 +17,7 @@ from .evidence_spec import fingerprint
 from .mandate_spec import sha256, validate_mandate
 from .position_safety import (
     CANONICAL_RISK, assert_no_execution, build_input as position_input, build_output as position_output,
-    freshness_problems, validate_input as validate_positions,
+    advice_clauses, drawdown_blocked, freshness_problems, negated_advice, validate_input as validate_positions,
 )
 
 CONTRACT = "RiskGateSpec/v1"
@@ -28,11 +28,16 @@ STAGES = frozenset({"m0_compose", "m1_judgment", "m2", "chat", "reflection"})
 _FACT_WRITES = frozenset({"memoryhub_write", "write_memory", "evidence_write", "write_evidence",
                           "production_strategy_write", "write_strategy", "schedule_write", "write_schedule"})
 _LEVERAGE = re.compile(r"杠杆|融资(?:加仓|买入|交易)|配资|借钱(?:炒股|买入)|margin|leverag", re.I)
-_NEGATED = re.compile(r"不(?:认可|建议|应|能|要|使用|因|代表|等于)|禁止|拒绝|避免|不得|不能|不可|no\b|not\b|avoid\b", re.I)
 _ADVICE = re.compile(r"建议|可以|应当|应该|我会|认可|推荐|\b(?:recommend|should|allow|use)\b", re.I)
 _ADD_RISK = re.compile(r"(?:建议|可以|应当|应该|我会|认可|推荐).{0,12}(?:加仓|买入|扩大敞口|新增风险)|"
                        r"(?:加仓|买入)吧|\b(?:recommend|should|allow).{0,20}(?:buy|add risk)\b", re.I)
 _DIRECTION = re.compile(r"(?:我|建议|可以|应该).{0,8}(?:看多|看空|买入|卖出|加仓)|\b(?:bullish|bearish)\b", re.I)
+# Bare imperatives are actionable even without an explicit recommendation verb.
+_IMPERATIVE = re.compile(
+    r"^\s*(?:(?:现在|立即|立刻|马上|直接|请)\s*)?(?:(?:使用|用)杠杆|融资|配资)?"
+    r"(?:买入|加仓|扩大敞口|新增风险)(?:\s|\d|吧|$)|"
+    r"\b(?:now|immediately)\s+(?:buy|add\s+risk)\b|^\s*(?:buy|add\s+risk)\b", re.I,
+)
 
 
 def build_input(packet: dict[str, Any]) -> dict[str, Any]:
@@ -126,15 +131,45 @@ def _current_prices(value: dict[str, Any]) -> dict[str, float]:
     positions = value["position_safety"]
     if positions is None or positions["latest_trading_day"] is None:
         return {}
+    from .evidence_qualification import qualify_record, validate_qualification
+    from .evidence_snapshot import build_snapshot, descriptor
+
     cutoff = datetime.fromisoformat(value["as_of"].replace("Z", "+00:00"))
+    snapshot = value["evidence_snapshot"]
+    try:
+        expected = descriptor(build_snapshot(
+            cycle_id=value["cycle_id"], as_of=snapshot["as_of"], evidence=value["evidence"],
+            source_watermarks=snapshot["source_watermarks"],
+            parent_snapshot_id=snapshot.get("parent_snapshot_id"), version=snapshot["version"],
+        ))
+        if snapshot != expected or datetime.fromisoformat(snapshot["as_of"].replace("Z", "+00:00")) > cutoff:
+            return {}
+    except (KeyError, TypeError, ValueError):
+        return {}
     prices: dict[str, set[float]] = {}
     for source in value["evidence"].get("sources") or []:
         qualification = source.get("evidence_qualification") or {}
         if qualification.get("state") != "qualified" or qualification.get("permitted_use") != "external_fact":
             continue
         try:
-            payload = json.loads(source.get("excerpt") or "{}")
-        except (TypeError, ValueError):
+            validate_qualification(qualification)
+            record = source["evidence_spec"]
+            refs = qualification["input_record_refs"]
+            if (len(refs) != 1 or refs[0]["record_id"] != record["record_id"]
+                    or record["provenance"]["evidence_ref"] != source["evidence_ref"]
+                    or source["evidence_ref"] not in snapshot["included_sources"]):
+                continue
+            inputs = {"source_refs": refs[0]["source_refs"],
+                      "source_conflict_refs": qualification["source_conflict_refs"],
+                      "memory_receipt": refs[0].get("memory_receipt")}
+            if qualification != qualify_record(record, as_of=qualification["as_of"], **inputs):
+                continue
+            current = qualify_record(record, as_of=value["as_of"], **inputs)
+            if current["state"] != "qualified" or current["permitted_use"] != "external_fact":
+                continue
+            # The display excerpt is not a fact source; only validated content is.
+            payload = json.loads(record["content"])
+        except (KeyError, AttributeError, TypeError, ValueError):
             continue
         if not isinstance(payload, dict):
             continue
@@ -192,9 +227,9 @@ def build_output(value: dict[str, Any], output: dict[str, Any]) -> dict[str, Any
     if any(any(key in _FACT_WRITES and child not in (None, [], {}, False) for key, child in row.items())
            or str(row.get("operation", row.get("action_type", row.get("action", "")))) in _FACT_WRITES for row in nodes):
         stops.append("ownership_or_execution_violation")
-    clauses = [clause for text in _texts(advice) for clause in re.split(r"[。；;，,\n]", text)]
-    if any(_LEVERAGE.search(clause) and _ADVICE.search(clause) and not _NEGATED.search(clause)
-           for clause in clauses):
+    clauses = [clause for text in _texts(advice) for clause in advice_clauses(text)]
+    if any(_LEVERAGE.search(clause) and (_ADVICE.search(clause) or _IMPERATIVE.search(clause))
+           and not negated_advice(clause) for clause in clauses):
         stops.append("leverage_not_approved")
     positions = value["position_safety"]
     position_receipt = None
@@ -213,9 +248,7 @@ def build_output(value: dict[str, Any], output: dict[str, Any]) -> dict[str, Any
         themes = state.get("theme_by_code") or {}
         if any(code not in themes for code in required_codes):
             precision.append("theme_exposure_unknown")
-        if (state.get("synchronized") is True and state.get("peak_assets") and truth["total_assets"]
-                and truth["total_assets"] <= state["peak_assets"] * (1 - CANONICAL_RISK["drawdown_review_threshold"])
-                and state.get("review_completed") is not True):
+        if drawdown_blocked(truth):
             new_risk.append("drawdown_requires_review")
         valuation = positions
         if output.get("sizing_proposal") is not None:
@@ -237,7 +270,8 @@ def build_output(value: dict[str, Any], output: dict[str, Any]) -> dict[str, Any
         problems.extend(directional)
     if reduced and any(row.get("confidence") in {"medium", "high"} for row in nodes):
         problems.extend(reduced)
-    if directional and any(_DIRECTION.search(clause) and not _NEGATED.search(clause) for clause in clauses):
+    if directional and any((_DIRECTION.search(clause) or _ADD_RISK.search(clause) or _IMPERATIVE.search(clause))
+                           and not negated_advice(clause) for clause in clauses):
         problems.extend(directional)
     sizing = output.get("sizing_proposal")
     sizing_adds_risk = False
@@ -247,7 +281,8 @@ def build_output(value: dict[str, Any], output: dict[str, Any]) -> dict[str, Any
         sizing_adds_risk = sizing["target_shares"] > current
     adding = (sizing_adds_risk or any(row.get("current_action", row.get("action")) == "allow_add_risk"
                   or row.get("status") == "selected" for row in nodes)
-              or any(_ADD_RISK.search(clause) and not _NEGATED.search(clause) for clause in clauses))
+              or any((_ADD_RISK.search(clause) or _IMPERATIVE.search(clause))
+                     and not negated_advice(clause) for clause in clauses))
     if adding and not permissions["new_risk"]:
         problems.extend([*stops, *directional, *reduced, *new_risk])
     if output.get("sizing_proposal") is not None and not permissions["precision"]:

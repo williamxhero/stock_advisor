@@ -472,7 +472,11 @@ print(json.dumps(first['evaluation_vector'], sort_keys=True))
         if ($LASTEXITCODE -ne 0) { throw "Installed AdapterContract replay 2 failed with exit code $LASTEXITCODE." }
         if ($adapterReplayOne -ne $adapterReplayTwo) { throw 'Installed AdapterContract frozen replays were not deterministic.' }
         $adapterQualification = $adapterReplayOne | ConvertFrom-Json
-        if ($adapterQualification.contract -ne 'AdapterContractInstallQualification/v1' -or $adapterQualification.qualified -ne $true) {
+        if ($adapterQualification.contract -ne 'AdapterContractInstallQualification/v1' -or
+            $adapterQualification.qualified -isnot [bool] -or -not $adapterQualification.qualified -or
+            $adapterQualification.qualification.valid -isnot [bool] -or -not $adapterQualification.qualification.valid -or
+            $adapterQualification.qualification.status -ne 'succeeded' -or
+            $adapterQualification.qualification.record.passed -isnot [bool] -or -not $adapterQualification.qualification.record.passed) {
             throw 'Installed AdapterContract qualification did not pass.'
         }
         $mandateReplayOne = ((& $python -m ai_trading_companion.mandate_spec) -join "`n")

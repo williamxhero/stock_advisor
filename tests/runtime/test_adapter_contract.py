@@ -8,6 +8,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from ai_trading_companion.adapter_contract import AdapterDefinition, AdapterRegistry, frozen_replay, install_qualification, validate_output
+from ai_trading_companion.cycle_replay import freeze_cycle, replay_cycle
 from ai_trading_companion.engine import CompanionEngine
 from ai_trading_companion.store import CompanionStore
 
@@ -67,6 +68,12 @@ def qualify_value(data: dict[str, object]) -> dict[str, object]:
 
 def adapter(execute=execute_increment) -> AdapterDefinition:
     return AdapterDefinition("fixture", "v1", "Input/v1", "Output/v1", "deterministic", execute, validate_input_value, validate_output_value, qualify_value)
+
+
+def execute_recoverable(data: dict[str, object]) -> dict[str, object]:
+    if data["value"] is None:
+        raise RuntimeError("source unavailable")
+    return {"value": str(int(data["value"]) + 1), "source": "fixture"}
 
 
 def execute_raw(data: dict[str, object]) -> dict[str, object]:
@@ -319,6 +326,11 @@ def test_deterministic_failure_cannot_fall_back_to_a_model_estimate() -> None:
 
 
 def test_install_qualification_rejects_structurally_valid_failed_replay(monkeypatch) -> None:
+    import base64
+    import os
+    import subprocess
+
+    successful = install_qualification()
     registry = AdapterRegistry()
     registry.register(adapter(execute_fail_crash))
     failed = registry.execute(
@@ -332,6 +344,122 @@ def test_install_qualification_rejects_structurally_valid_failed_replay(monkeypa
 
     assert report["evaluation_vector"]["research_quality"]["status"] == "failed"
     assert report["qualified"] is False
+    assert report["qualification"] == {"valid": True, "status": "failed", "record": None}
+
+    # Exercise the shipped acceptance block in PS5.1, without touching an installation.
+    verifier = (Path(__file__).parents[2] / "scripts/verify-install.ps1").read_text(encoding="utf-8-sig")
+    start = verifier.index("        $adapterQualification =")
+    end = verifier.index("        $mandateReplayOne =", start)
+    command = "$ErrorActionPreference = 'Stop'\n$adapterReplayOne = $env:ADAPTER_REPORT\n" + verifier[start:end]
+    cases = [(successful, True), (report, False)]
+    forged = copy.deepcopy(report)
+    forged["qualified"] = True
+    cases.append((forged, False))
+    for status in ("failed", "timed_out", "schema_mismatch", "untrusted_output", "unavailable"):
+        forged = copy.deepcopy(successful)
+        forged["qualification"]["status"] = status
+        cases.append((forged, False))
+    for record in (None, {}, {"passed": False}, {"passed": "true"}):
+        forged = copy.deepcopy(successful)
+        forged["qualification"]["record"] = record
+        cases.append((forged, False))
+    for field in ("qualified", "valid"):
+        forged = copy.deepcopy(successful)
+        (forged if field == "qualified" else forged["qualification"])[field] = "true"
+        cases.append((forged, False))
+    forged = copy.deepcopy(successful)
+    del forged["qualification"]
+    cases.append((forged, False))
+    for receipt, accepted in cases:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+             base64.b64encode(command.encode("utf-16-le")).decode("ascii")],
+            env=dict(os.environ, ADAPTER_REPORT=json.dumps(receipt)),
+            capture_output=True, timeout=30,
+        )
+        assert (result.returncode == 0) is accepted, (receipt, result.stderr.decode(errors="replace"))
+
+
+def test_persisted_adapter_failure_recovery_replay_reconstructs_eligibility(tmp_path: Path) -> None:
+    from ai_trading_companion.adapter_contract import sha256
+    from ai_trading_companion.broker_client import canonical_packet_hash
+
+    store = CompanionStore(tmp_path / "adapter-cycle.sqlite3")
+    engine = CompanionEngine(store)
+    cycle = engine.start_cycle(
+        "daily.execution.0945", "2026-09-21T09:45:00+08:00", "2026-09-21T01:45:00Z",
+        schedule_revision=7,
+    )
+    engine.register_adapter(AdapterDefinition(
+        "fixture", "v1", "Input/v1", "Output/v1", "deterministic", execute_recoverable,
+        output_validate=validate_output_value, qualify=qualify_value, normalize=normalize_value,
+    ))
+    snapshot = store.create_evidence_snapshot(cycle["cycle_id"], {
+        "schema_version": 3, "as_of": cycle["as_of"], "spoken_summary": "Observed facts",
+        "sources": [{"evidence_ref": "adapter:fixture", "excerpt": "Frozen fixture evidence"}],
+        "coverage": [], "critical_gaps": [], "conflicts": [], "high_impact_events": [],
+    }, as_of=cycle["as_of"], source_watermarks={"fixture": "v1"})
+    packets, outputs = [], []
+    for inputs in ({"value": None}, {"value": 1}):
+        output = engine.execute_adapter(
+            "fixture", inputs, as_of=cycle["as_of"], cycle_id=cycle["cycle_id"], retries=1,
+        )
+        request = {
+            "contract": "AdapterContractSpec/v1", "version": 1, "adapter_id": "fixture",
+            "adapter_version": "v1", "input_contract": "Input/v1", "output_contract": "Output/v1",
+            "mode": "deterministic", "inputs": inputs, "permissions": {"write_permissions": []},
+            "provenance": {"as_of": cycle["as_of"], "cycle_id": cycle["cycle_id"],
+                           "timeout_seconds": 10, "retry_limit": 1, "request_id": None,
+                           "attempt": output["provenance"]["attempt"]},
+        }
+        replay = frozen_replay(request, output)
+        packet = {"frozen_public_evidence": snapshot["baseline"]["sources"], "adapter_input": replay["source_input"]}
+        attempt = store.begin_attempt(
+            cycle["cycle_id"], "m1_research", cycle["as_of"],
+            input_sha256=canonical_packet_hash(packet), input_packet=packet,
+            runner_fingerprint="fixture:v1",
+        )
+        store.finish_attempt(
+            attempt["attempt_id"], output["status"], output=output, output_sha256=sha256(output),
+            verifier={"passed": output["status"] == "succeeded" and output["qualification"]["passed"] is True,
+                      "adapter_qualification": replay["qualification"], "fallback": output["provenance"]["fallback"]},
+        )
+        packets.append(packet)
+        outputs.append(output)
+    assert outputs[0]["status"] == "failed"
+    assert outputs[0]["attempts"] == ["fixture:failed", "fixture:failed"]
+    assert outputs[0]["qualification"] is None
+    assert outputs[0]["provenance"]["fallback"]["continuation"] == "blocked"
+    assert outputs[1]["raw_output"] == {"value": "2", "source": "fixture"}
+    assert outputs[1]["data"] == {"value": 2, "source": "fixture"}
+    assert outputs[1]["qualification"] == {"passed": True, "evidence_refs": ["adapter:fixture"]}
+    original = store.append_artifact(cycle["cycle_id"], "m1", "model", "Original judgment", cycle["as_of"])
+
+    persisted = CompanionStore(tmp_path / "adapter-cycle.sqlite3")
+    frozen = freeze_cycle(persisted, cycle["cycle_id"])
+    untouched = copy.deepcopy(frozen)
+    first = replay_cycle(frozen)
+    second = replay_cycle(copy.deepcopy(frozen))
+
+    assert first == second
+    assert frozen == untouched == freeze_cycle(persisted, cycle["cycle_id"])
+    assert [attempt["status"] for attempt in first["source"]["attempts"]] == ["failed", "succeeded"]
+    assert [attempt["qualified"] for attempt in first["qualification"]["attempts"]] == [False, True]
+    for recorded, packet, output in zip(first["source"]["attempts"], packets, outputs):
+        assert json.loads(recorded["input_packet_json"]) == packet
+        assert json.loads(recorded["output_json"]) == output
+        assert recorded["output_sha256"] == sha256(output)
+        assert recorded["runner_fingerprint"] == "fixture:v1"
+        rebuilt = frozen_replay(json.loads(recorded["input_packet_json"])["adapter_input"],
+                                json.loads(recorded["output_json"]))
+        assert rebuilt["qualification"] == json.loads(recorded["verifier_json"])["adapter_qualification"]
+        assert rebuilt["source_input_sha256"] == output["provenance"]["input_sha256"]
+        assert rebuilt["source_output"]["provenance"]["fallback"] == json.loads(recorded["verifier_json"])["fallback"]
+    assert first["source"]["evidence_snapshots"] == [snapshot]
+    assert first["source"]["cycle"]["schedule"]["revision"] == 7
+    assert first["source"]["artifacts"][0]["artifact_id"] == original["artifact_id"]
+    assert first["source"]["artifacts"][0]["body_markdown"] == "Original judgment"
+    assert persisted.latest_artifact(cycle["cycle_id"], "m1")["body_markdown"] == "Original judgment"
 
 
 def test_adapter_replay_preserves_inputs_output_qualification_and_schema() -> None:

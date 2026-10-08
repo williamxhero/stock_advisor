@@ -2,7 +2,7 @@
 param(
     [switch]$Release,
     [switch]$ProjectRegression,
-    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryRetrieval', 'MemoryWrite', 'Reflection', 'AnalysisSkill', 'SkillRegistry', 'AdapterContract', 'FinRobotAdapter', 'FinGPTAdapter', 'MultimodalAdapter', 'MandateSpec', 'AuditSpec', 'ObservabilitySpec', 'M0Observation', 'M1Judgment', 'M2Synthesis', 'PositionSafety', 'ResearchIsolation', 'RegressionSpec')]
+    [ValidateSet('all', 'EvidenceSpec', 'MemoryType', 'MemoryRetrieval', 'MemoryWrite', 'LessonPromotion', 'Reflection', 'AnalysisSkill', 'SkillRegistry', 'AdapterContract', 'FinRobotAdapter', 'FinGPTAdapter', 'MultimodalAdapter', 'MandateSpec', 'AuditSpec', 'ObservabilitySpec', 'M0Observation', 'M1Judgment', 'M2Synthesis', 'PositionSafety', 'ResearchIsolation', 'RegressionSpec')]
     [string]$Select = 'all'
 )
 
@@ -26,6 +26,9 @@ if ($ProjectRegression) {
         "$root\tests\runtime\test_memory_retrieval.py",
         "$root\memoryhub\tests\test_memory_types.py",
         "$root\tests\runtime\test_memory_write.py",
+        "$root\tests\runtime\test_lesson_promotion.py",
+        "$root\tests\runtime\test_lesson_frozen_evidence.py",
+        "$root\tests\runtime\test_lesson_promotion_replay.py",
         "$root\memoryhub\tests\test_append_only_ledger.py",
         "$root\tests\runtime\test_reflection.py",
         "$root\tests\runtime\test_analysis_skill.py",
@@ -79,6 +82,10 @@ elseif ($Select -eq 'MemoryType') {
 elseif ($Select -eq 'MemoryRetrieval') {
     py -m pytest "$root\tests\runtime\test_memory_retrieval.py" "$root\tests\runtime\test_memory_port.py" "$root\tests\runtime\test_adaptive_memory.py" -q
     if ($LASTEXITCODE -ne 0) { throw "MemoryRetrieval regression tests failed with exit code $LASTEXITCODE." }
+}
+elseif ($Select -eq 'LessonPromotion') {
+    py -m pytest "$root\tests\runtime\test_lesson_promotion.py" "$root\tests\runtime\test_lesson_frozen_evidence.py" "$root\tests\runtime\test_lesson_promotion_replay.py" -q
+    if ($LASTEXITCODE -ne 0) { throw "LessonPromotion regression tests failed with exit code $LASTEXITCODE." }
 }
 elseif ($Select -eq 'Reflection') {
     py -m pytest "$root\tests\runtime\test_reflection.py" -q

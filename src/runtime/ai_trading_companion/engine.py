@@ -13,6 +13,7 @@ from .learning import JudgmentLifecycle
 from .evidence_contract import EvidenceContractFactory
 from .message_presentation import MessageQualificationError, PresentedMessage, present_message, repair_message_draft
 from .memory_write import write_memory
+from .fallback_spec import build_receipt, validate_receipt
 from .publication_registry import published_event_types
 from .stage_expression import normalize_stage_output
 from .models import TASK_POLICIES
@@ -28,6 +29,7 @@ from .decision_cycle import DECISION_CYCLE_CONTRACT
 from .mandate_spec import resolve_cycle_mandates
 from .evidence_snapshot import descriptor as evidence_snapshot_descriptor
 from .m1_judgment import build_input as build_m1_judgment_input, build_output as build_m1_judgment_output
+from .risk_gate import assert_publication as assert_risk_publication
 from .m2_judgment import build_input as build_m2_judgment_input, build_output as build_m2_judgment_output
 from .research_isolation import coerce_quant_research_port
 from .audit_contract import build_output as build_audit_output, expected_writer_identity
@@ -639,7 +641,8 @@ class CompanionEngine:
         self.store.fail_stage(cycle_id, "m0", reason, retryable=False, details=details)
         self._emit_failure(
             cycle, "research.failed", message, reason,
-            {"diagnostic_code": self._diagnostic_code(reason)},
+            {"diagnostic_code": self._diagnostic_code(reason),
+             **({"fallback": details["fallback"]} if details and "fallback" in details else {})},
         )
         return cycle
 
@@ -723,6 +726,10 @@ class CompanionEngine:
                     raise ValueError("receipt input identity mismatch")
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError("M0 observation receipt is not qualified") from exc
+        risk_receipt = assert_risk_publication(
+            json.loads(compose_attempt.get("input_packet_json") or "null"), compose_output,
+            json.loads(compose_attempt.get("verifier_json") or "{}"),
+        )
         verified_m0 = normalize_stage_output("m0_compose", compose_output if isinstance(compose_output, dict) else {}).text
         if verified_m0 != m0:
             raise ValueError("M0 body does not match the verified compose attempt")
@@ -768,6 +775,7 @@ class CompanionEngine:
             artifact = self.store.append_artifact(
                 cycle_id, "m0", "model", presented.markdown, evidence_as_of or cycle["as_of"],
                 self._presentation_metadata({
+                    "risk_gate": risk_receipt,
                     "direction_free": True, "evidence_attempt_id": evidence_attempt_id,
                     "compose_attempt_id": compose_attempt_id, "m0_observation": observation_metadata,
                     "audit": audit_metadata,
@@ -1252,6 +1260,7 @@ class CompanionEngine:
             raise ValueError("M1 snapshot does not match the verified judgment attempt")
         verifier = json.loads(judgment_attempt.get("verifier_json") or "{}")
         raw_packet = json.loads(judgment_attempt.get("input_packet_json") or "null")
+        risk_receipt = assert_risk_publication(raw_packet, verified_output, verifier)
         m1_receipt = verifier.get("m1_judgment")
         if verified_output.get("result_version") == 5 or (
             isinstance(raw_packet, dict) and "m1_judgment_spec" in raw_packet
@@ -1306,6 +1315,8 @@ class CompanionEngine:
             "research_attempt_id": research_attempt_id,
             "judgment_attempt_id": judgment_attempt_id,
         }
+        if risk_receipt is not None:
+            audit_metadata["risk_gate"] = risk_receipt
         if isinstance(m1_receipt, dict):
             audit_metadata["m1_judgment"] = {
                 "contract": m1_receipt["contract"], "version": m1_receipt["version"],
@@ -1556,7 +1567,10 @@ class CompanionEngine:
             })
             return cycle
         message = self._stage_failure_message("M1", str(reason), details)
-        self._emit_failure(cycle, "m1.failed", message, reason, {"diagnostic_code": diagnostic_code, "retryable": False})
+        self._emit_failure(cycle, "m1.failed", message, reason, {
+            "diagnostic_code": diagnostic_code, "retryable": False,
+            **({"fallback": details["fallback"]} if details and "fallback" in details else {}),
+        })
         return cycle
 
     @classmethod
@@ -1588,6 +1602,7 @@ class CompanionEngine:
             raise ValueError("M2 body does not match the verified synthesis attempt")
         raw_packet = json.loads(verified_attempt.get("input_packet_json") or "null")
         verifier = json.loads(verified_attempt.get("verifier_json") or "{}")
+        risk_receipt = assert_risk_publication(raw_packet, verified_output, verifier)
         m2_receipt = verifier.get("m2_synthesis") if isinstance(verifier, dict) else None
         formal_receipt = isinstance(raw_packet, dict) and (
             "m2_synthesis_spec" in raw_packet
@@ -1658,6 +1673,7 @@ class CompanionEngine:
                 artifact_id="pending", connection=connection,
             )
             artifact_metadata = {
+                "risk_gate": risk_receipt,
                 "attempt_id": attempt_id,
                 "m1_source_artifact_id": m1_snapshots[-1].get("artifact_id") if m1_snapshots else None,
                 "append_only": True,
@@ -1723,6 +1739,31 @@ class CompanionEngine:
         self._emit_failure(cycle, f"{stage}.failed", self._user_fault_message(reason, label), reason)
         return cycle
 
+    def _chat_risk_receipt(self, cycle: dict[str, Any], text: str, *, stage: str = "chat") -> dict[str, Any]:
+        """Qualify model prose before visibility, including packetless publication."""
+        from .mandate_spec import mandate_for_stage
+        from .position_safety import build_input as position_input
+        from .risk_gate import SPEC, publication_receipt
+        as_of = iso(utc_now())
+        with self.store.connection() as c:
+            assets = c.execute("SELECT value FROM portfolio_meta WHERE key='total_assets'").fetchone()
+            risk_state = self.store.portfolio_risk_state(as_of, connection=c)
+        positions = position_input(
+            {"positions": [], "total_assets": float(assets[0]) if assets else None, "risk_state": risk_state},
+            stage=stage, as_of=as_of, source_ref=cycle["cycle_id"] + ":runtime-" + stage + "-facts",
+        )
+        packet = {"cycle_id": cycle["cycle_id"], "stage": stage, "as_of": as_of,
+                  "mandate": mandate_for_stage(cycle, stage, memory_space_id=self.memory_space_id),
+                  "position_safety": positions, "risk_gate_spec": SPEC}
+        receipt = publication_receipt(packet, {"text": text})
+        self.store.record_cycle_event(
+            cycle["cycle_id"], "risk_gate.evaluated", stage=stage,
+            provenance=receipt["provenance"], payload={"risk_gate": receipt},
+        )
+        if receipt["state"] == "refused":
+            raise ValueError("risk gate publication refused: " + ", ".join(receipt["problems"]))
+        return receipt
+
     def chat_ready(
         self, cycle_id: str, text: str, *, reply_to_batch_id: str | None = None,
         reply_to_batch_ids: list[str] | None = None, stream_id: str | None = None, kind: str = "ai_chat",
@@ -1739,6 +1780,7 @@ class CompanionEngine:
             text, iso(utc_now()), kind, allow_structured_format=allow_structured_format,
             model=model, provider=provider,
         )
+        risk_receipt = self._chat_risk_receipt(cycle, presented.markdown)
         published_at = iso(utc_now())
         memory_message_id = stream_id or f"{cycle_id}:{kind}:{reply_to_batch_id or hashlib.sha256(presented.markdown.encode('utf-8')).hexdigest()}"
         memory_receipt = None
@@ -1762,6 +1804,7 @@ class CompanionEngine:
         artifact = self.store.append_artifact(
             cycle_id, kind, "model", presented.markdown, published_at,
             self._presentation_metadata({
+                "risk_gate": risk_receipt,
                 "reply_to_batch_id": reply_to_batch_id, "stream_id": stream_id,
                 "reply_to_batch_ids": batch_ids,
                 "memory_message_id": memory_message_id,
@@ -1804,10 +1847,13 @@ class CompanionEngine:
         message = text if meaningful else "我已经核对过了，暂时没有需要你据此调整的新信息。"
         event_type = {"outcome": "outcome.ready", "reflection": "reflection.ready"}.get(kind, "chat.ready")
         presented = self.present_for_publication(message, iso(utc_now()), kind, model=model, provider=provider)
+        risk_receipt = self._chat_risk_receipt(
+            cycle, presented.markdown, stage="reflection" if kind == "reflection" else "chat",
+        )
         self._append_published_memory(cycle, presented)
         artifact = self.store.append_artifact(
             cycle_id, kind, "model", presented.markdown, iso(utc_now()),
-            self._presentation_metadata(metadata or {}, presented),
+            self._presentation_metadata({**(metadata or {}), "risk_gate": risk_receipt}, presented),
         )
         if kind == "outcome":
             self._stage_succeeded(cycle_id, "result", output_sha256=artifact["sha256"])
@@ -1836,6 +1882,7 @@ class CompanionEngine:
             text, cycle["as_of"], "ai_chat",
             message_id=stream_id, sealed_at=str(current["created_at"]),
         )
+        self._chat_risk_receipt(cycle, str(current["text"]) + presented.markdown)
         stream = self.store.append_stream_chunk(stream_id, presented.markdown)
         self.emit(cycle, "chat.stream.delta", {
             "cycle": cycle, "stream_id": stream_id, "text": presented.markdown,
@@ -2092,6 +2139,21 @@ class CompanionEngine:
         extra = dict(extra or {})
         presented = self.present_for_publication(message, occurred_at, "system_fault")
         reason_category = str(extra.get("diagnostic_code") or self._diagnostic_code(reason))
+        # Operational failure is not a judgment or an undo of committed facts.
+        # Only bounded Runtime identity enters this receipt, never H0 or provider text.
+        if "fallback" in extra:
+            receipt = validate_receipt(extra["fallback"])
+            if receipt["input"]["cycle_id"] != cycle["cycle_id"] or receipt["continuation"] != "blocked":
+                raise ValueError("fault fallback receipt does not match terminated cycle operation")
+            assert_safe(json.dumps(receipt, ensure_ascii=False), boundary="fault fallback receipt")
+        else:
+            extra["fallback"] = build_receipt(
+                "Orchestration", event_type, status="terminated", as_of=occurred_at,
+                source_contract="companion-fault-episode/v1", source_version="v1",
+                input_sha256=sha256({"cycle_id": cycle["cycle_id"], "event_type": event_type,
+                                     "reason_category": reason_category, "as_of": cycle.get("as_of")}),
+                cycle_id=cycle["cycle_id"],
+            )
         targets = self._fault_targets(cycle, event_type, extra)
         episode_ids = [
             self.store.fault_episode_id(

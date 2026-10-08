@@ -23,6 +23,7 @@ from .stage_expression import (
 )
 from .transition_conditions import is_valid_condition
 from .position_safety import publication_receipt
+from .risk_gate import publication_receipt as risk_publication_receipt
 
 
 RESEARCH_STAGES = frozenset({"m0_research", "m1_research", "outcome_research", "chat_research"})
@@ -181,6 +182,14 @@ class CognitiveRouter:
         problems: list[str] = []
         m0_observation_receipt: dict[str, Any] | None = None
         profile = self.profile(stage, packet, 1)
+        risk_receipt = None
+        if "risk_gate_spec" in packet:
+            try:
+                risk_receipt = risk_publication_receipt(packet, output)
+                problems.extend("risk_gate:" + reason for reason in risk_receipt["problems"])
+            except (TypeError, ValueError, KeyError) as exc:
+                problems.append("risk_gate_contract:" + str(exc))
+        risk_problems = list(problems)
         if stage == "m0_candidate_review":
             problems = review_problems(output)
             return {"passed": not problems, "problems": problems, "profile": profile.as_json()}
@@ -188,7 +197,7 @@ class CognitiveRouter:
             stage == "m2" and output.get("result_version") == 4
         ):
             from .judgment_publication import publication_problems
-            problems = publication_problems(output, packet)
+            problems = risk_problems + publication_problems(output, packet)
             if stage == "m1_judgment" and not profile.m1_blind:
                 problems.append("m1_packet_contains_human_input")
             problems.extend(_formal_m1_expression_problems(packet, output.get("narrative", "")))
@@ -228,6 +237,8 @@ class CognitiveRouter:
                 result["m1_judgment" if stage == "m1_judgment" else "m2_synthesis"] = receipt
             if position_receipt is not None:
                 result["position_safety"] = position_receipt
+            if risk_receipt is not None:
+                result["risk_gate"] = risk_receipt
             return result
         normalized = normalize_stage_output(stage, output)
         if stage == "m0_compose":
@@ -409,6 +420,8 @@ class CognitiveRouter:
         result = {"passed": not problems, "problems": list(dict.fromkeys(problems)), "profile": profile.as_json()}
         if m0_observation_receipt is not None and not problems:
             result["m0_observation"] = m0_observation_receipt
+        if risk_receipt is not None:
+            result["risk_gate"] = risk_receipt
         return result
 
 

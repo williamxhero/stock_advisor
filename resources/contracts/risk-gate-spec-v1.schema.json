@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RiskGateSpec/v1",
+  "description": "Runtime qualification only. Digests and deterministic requalification are verified by risk_gate validators; no advice receipt grants fact writes or execution rights.",
+  "oneOf": [
+    {"$ref": "#/$defs/input"},
+    {"$ref": "#/$defs/result"},
+    {"$ref": "#/$defs/frozen"},
+    {"$ref": "#/$defs/replay"}
+  ],
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "reasonsList": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "policy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "leverage_allowed", "single_stock_max", "same_theme_max", "planned_loss_max", "drawdown_review_threshold", "freshness_trading_days"],
+      "properties": {
+        "contract": {"const": "CanonicalRiskPolicy/v1"},
+        "version": {"type": "integer", "const": 1},
+        "leverage_allowed": {"type": "boolean", "const": false},
+        "single_stock_max": {"type": "number", "const": 0.2},
+        "same_theme_max": {"type": "number", "const": 0.4},
+        "planned_loss_max": {"type": "number", "const": 0.01},
+        "drawdown_review_threshold": {"type": "number", "const": 0.15},
+        "freshness_trading_days": {"type": "integer", "const": 1}
+      }
+    },
+    "input": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "cycle_id", "stage", "as_of", "mandate", "evidence", "evidence_snapshot", "position_safety", "policy", "provenance", "sha256"],
+      "properties": {
+        "contract": {"const": "RiskGateSpec/v1"},
+        "version": {"type": "integer", "const": 1},
+        "cycle_id": {"type": ["string", "null"]},
+        "stage": {"enum": ["m0_compose", "m1_judgment", "m2", "chat", "reflection"]},
+        "as_of": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"},
+        "mandate": {"type": "object", "required": ["contract", "version", "stage", "sha256"], "properties": {"contract": {"const": "MandateSpec/v1"}, "version": {"type": "integer", "const": 1}, "sha256": {"$ref": "#/$defs/digest"}}},
+        "evidence": {"type": "object"},
+        "evidence_snapshot": {"type": ["object", "null"]},
+        "position_safety": {"type": ["object", "null"], "required": ["contract", "version", "truth", "sha256"], "properties": {"contract": {"const": "PositionSafetySpec/v1"}, "version": {"type": "integer", "const": 1}, "sha256": {"$ref": "#/$defs/digest"}}},
+        "policy": {"$ref": "#/$defs/policy"},
+        "provenance": {
+          "type": "object", "additionalProperties": false,
+          "required": ["source", "mandate_sha256", "evidence_sha256", "position_sha256"],
+          "properties": {
+            "source": {"const": "runtime"},
+            "mandate_sha256": {"$ref": "#/$defs/digest"},
+            "evidence_sha256": {"$ref": "#/$defs/digest"},
+            "position_sha256": {"anyOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]}
+          }
+        },
+        "sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "permissions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["continue", "direction", "precision", "new_risk", "confidence_ceiling", "write_permissions"],
+      "properties": {
+        "continue": {"type": "boolean"}, "direction": {"type": "boolean"},
+        "precision": {"type": "boolean"}, "new_risk": {"type": "boolean"},
+        "confidence_ceiling": {"enum": ["low", "high"]},
+        "write_permissions": {"type": "array", "const": []}
+      }
+    },
+    "result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "policy", "input", "source_output", "state", "restrictions", "permissions", "reasons", "problems", "position_safety", "provenance", "sha256"],
+      "properties": {
+        "contract": {"const": "RiskGateResult/v1"}, "version": {"type": "integer", "const": 1},
+        "policy": {"const": "CanonicalRiskPolicy/v1"}, "input": {"$ref": "#/$defs/input"},
+        "source_output": {"type": "object"}, "state": {"enum": ["qualified", "refused"]},
+        "restrictions": {"type": "array", "uniqueItems": true, "items": {"enum": ["STOP", "NO_DIRECTION", "REDUCED_CONFIDENCE", "NO_PRECISION", "NO_NEW_RISK"]}},
+        "permissions": {"$ref": "#/$defs/permissions"},
+        "reasons": {
+          "type": "object", "additionalProperties": false,
+          "required": ["stop", "no_direction", "reduced_confidence", "no_precision", "no_new_risk"],
+          "properties": {
+            "stop": {"$ref": "#/$defs/reasonsList"}, "no_direction": {"$ref": "#/$defs/reasonsList"},
+            "reduced_confidence": {"$ref": "#/$defs/reasonsList"}, "no_precision": {"$ref": "#/$defs/reasonsList"},
+            "no_new_risk": {"$ref": "#/$defs/reasonsList"}
+          }
+        },
+        "problems": {"$ref": "#/$defs/reasonsList"},
+        "position_safety": {"type": ["object", "null"]},
+        "provenance": {
+          "type": "object", "additionalProperties": false,
+          "required": ["source", "input_sha256", "output_sha256"],
+          "properties": {"source": {"const": "runtime"}, "input_sha256": {"$ref": "#/$defs/digest"}, "output_sha256": {"$ref": "#/$defs/digest"}}
+        },
+        "sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "frozen": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "source_packet", "source_output", "original_receipt", "original_artifact", "provenance", "sha256"],
+      "properties": {
+        "contract": {"const": "RiskGateFrozen/v1"}, "version": {"type": "integer", "const": 1},
+        "source_packet": {"type": "object"}, "source_output": {"type": "object"},
+        "original_receipt": {"type": ["object", "null"]}, "original_artifact": {"type": ["object", "null"]},
+        "provenance": {"type": "object"}, "sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "replay": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contract", "version", "frozen", "requalification", "historical_receipt_matches", "permissions", "sha256"],
+      "properties": {
+        "contract": {"const": "RiskGateReplay/v1"}, "version": {"type": "integer", "const": 1},
+        "frozen": {"$ref": "#/$defs/frozen"},
+        "requalification": {"anyOf": [{"$ref": "#/$defs/result"}, {"type": "null"}]},
+        "historical_receipt_matches": {"type": ["boolean", "null"]},
+        "permissions": {"type": "object", "additionalProperties": false, "required": ["write_permissions"], "properties": {"write_permissions": {"type": "array", "const": []}}},
+        "sha256": {"$ref": "#/$defs/digest"}
+      }
+    }
+  }
+}

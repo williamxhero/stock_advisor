@@ -16,6 +16,19 @@ def execute_increment(data: dict[str, object]) -> dict[str, object]:
     return {"value": int(data["value"]) + 1}
 
 
+def execute_not_computable(_: dict[str, object]) -> dict[str, object]:
+    return {"state": "NOT_COMPUTABLE", "value": None}
+
+
+def qualify_not_computable(data: dict[str, object]) -> dict[str, object]:
+    return {"passed": data == {"state": "NOT_COMPUTABLE", "value": None}}
+
+
+def validate_not_computable(data: dict[str, object]) -> None:
+    if data != {"state": "NOT_COMPUTABLE", "value": None}:
+        raise ValueError("invalid incomputability result")
+
+
 def execute_sleep(data: dict[str, object]) -> dict[str, object]:
     import time
     time.sleep(float(data.get("seconds", 1)))
@@ -234,6 +247,25 @@ def test_engine_adapter_seam_is_read_only(tmp_path: Path) -> None:
     assert result["permissions"]["write_permissions"] == []
 
 
+def test_engine_exposes_terminal_computation_without_replacing_failed_transport(tmp_path: Path) -> None:
+    engine = CompanionEngine(CompanionStore(tmp_path / "companion.sqlite3"))
+    engine.register_adapter(adapter(execute_fail_crash))
+    result = engine.execute_adapter("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z", retries=1)
+    assert result["status"] == "failed" and result["data"] == {}
+    assert result["attempts"] == ["fixture:failed", "fixture:failed"]
+    assert result["provenance"]["computation"] == {"state": "NOT_COMPUTABLE", "value": None}
+    validate_output(result)
+    altered = copy.deepcopy(result)
+    altered["status"] = "succeeded"
+    altered["error_code"] = None
+    altered["qualification"] = {"passed": True}
+    altered["data"] = {"state": "NOT_COMPUTABLE", "value": None}
+    from ai_trading_companion.adapter_contract import sha256
+    altered["provenance"]["data_sha256"] = sha256(altered["data"])
+    with pytest.raises(ValueError, match="computation"):
+        validate_output(altered)
+
+
 def test_retry_fallback_and_idempotency() -> None:
     registry = AdapterRegistry()
     registry.register(adapter(execute_fail_crash))
@@ -243,6 +275,47 @@ def test_retry_fallback_and_idempotency() -> None:
     assert result["attempts"] == ["fixture:failed", "fixture:failed", "fallback:succeeded"]
     replay = registry.execute("fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z", retries=1, fallbacks=("fallback",), request_id="request-1")
     assert replay == result
+
+
+def test_computational_failure_remains_blocked_even_when_transport_succeeds() -> None:
+    registry = AdapterRegistry()
+    registry.register(AdapterDefinition(
+        "calculation", "v1", "Input/v1", "Output/v1", "deterministic", execute_not_computable,
+        output_validate=validate_not_computable, qualify=qualify_not_computable,
+    ))
+    result = registry.execute("calculation", {}, as_of="2026-09-20T01:00:00Z")
+    assert result["status"] == "succeeded"  # A valid unavailable result, not a computed number.
+    assert result["data"] == {"state": "NOT_COMPUTABLE", "value": None}
+    assert result["provenance"]["fallback"]["state"] == "NOT_COMPUTABLE"
+    assert result["provenance"]["fallback"]["continuation"] == "blocked"
+
+
+def test_deterministic_failure_cannot_fall_back_to_a_model_estimate() -> None:
+    registry = AdapterRegistry()
+    registry.register(adapter(execute_fail_crash))
+    registry.register(AdapterDefinition(
+        "estimate", "v1", "Input/v1", "Output/v1", "probabilistic", execute_increment,
+        validate_input_value, validate_output_value, qualify_value,
+    ))
+    result = registry.execute(
+        "fixture", {"value": 1}, as_of="2026-09-20T01:00:00Z", fallbacks=("estimate",),
+    )
+    assert result["status"] == "failed"
+    assert result["data"] == {}  # Legacy transport payload remains compatible.
+    assert result["provenance"]["computation"] == {"state": "NOT_COMPUTABLE", "value": None}
+    validate_output(result)
+    tampered = copy.deepcopy(result)
+    tampered["provenance"]["computation"]["value"] = 2
+    with pytest.raises(ValueError, match="computation"):
+        validate_output(tampered)
+    receipt = result["provenance"]["fallback"]
+    assert receipt["contract"] == "FallbackSpec/v1"
+    assert receipt["state"] == "NOT_COMPUTABLE"
+    assert receipt["substitute_value"] is None
+    assert receipt["input"]["attempts"] == ["fixture:failed", "estimate:fallback_rejected"]
+    schema_path = Path(__file__).parents[2] / "resources/contracts/fallback-spec-v1.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    assert not list(Draft202012Validator(schema).iter_errors(receipt))
 
 
 def test_adapter_replay_preserves_inputs_output_qualification_and_schema() -> None:

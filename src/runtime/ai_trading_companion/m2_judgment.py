@@ -48,7 +48,7 @@ _FORBIDDEN_KEYS = frozenset({
 _PACKET_FIELDS = frozenset({
     "schema_version", "cycle_id", "task_key", "stage", "as_of", "scheduled_for",
     "calendar_context", "mandate", "mandate_reference", "m0_observation_spec",
-    "m1_judgment_spec", "m2_synthesis_spec", "position_safety", "cycle_reference",
+    "m1_judgment_spec", "m2_synthesis_spec", "position_safety", "risk_gate_spec", "cycle_reference",
     "task_profile", "prior_opportunity_plans", "prior_opportunity_followups", "protocol",
     "risk_doctrine", "risk_constraints", "business_context", "current_position_facts",
     "frozen_m0", "frozen_h0", "frozen_m1", "frozen_public_evidence", "evidence_snapshot",

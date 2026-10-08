@@ -249,6 +249,13 @@ def test_analysis_skill_registry_is_read_only_and_versioned(tmp_path: Path) -> N
     assert execution["result"]["status"] == "succeeded"
     assert execution["result"]["data"]["value"] == "0.200000"
     assert execution["result"]["permissions"] == {"write_permissions": []}
+    missing = engine.execute_registered_analysis_skill(
+        skill.skill_id, {"formula_id": "growth", "facts": {}, "instrument": "000001", "as_of": CUTOFF},
+        as_of=CUTOFF, scope="m0_research",
+    )
+    assert missing["result"]["data"]["state"] == "NOT_COMPUTABLE"
+    assert missing["result"]["provenance"]["fallback"]["state"] == "NOT_COMPUTABLE"
+    assert missing["result"]["provenance"]["fallback"]["continuation"] == "blocked"
 
 
 def test_runtime_path_persists_qualified_calculation_before_m0(tmp_path: Path) -> None:

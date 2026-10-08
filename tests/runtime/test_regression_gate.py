@@ -265,6 +265,7 @@ def delayed_probe_success(data):
     return {"value": int(data["value"]) + 1}
 
 
+@pytest.mark.slow
 def test_adapter_recovery_probe_tolerates_fixture_startup_contention(monkeypatch):
     from ai_trading_companion import regression_probes
 

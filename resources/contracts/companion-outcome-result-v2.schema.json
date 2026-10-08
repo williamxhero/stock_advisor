@@ -39,11 +39,18 @@
       }},
     "lesson_market_states": {"type": "array", "items": {"enum": ["trend_expansion", "risk_contraction", "divergence"]}, "uniqueItems": true},
     "lesson_counterevidence_refs": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
-    "lesson_trials": {"type": "array", "items": {"type": "object", "additionalProperties": false,
-      "required": ["contract", "version", "candidate_episode_id", "baseline_episode_id", "subject"], "properties": {
-        "contract": {"const": "LessonPromotionSpec/v1"}, "version": {"const": 1},
-        "candidate_episode_id": {"type": "string", "minLength": 1}, "baseline_episode_id": {"type": "string", "minLength": 1}, "subject": {"type": "string", "minLength": 1},
-        "window_episode_id": {"type": "string", "minLength": 1}
-      }}}
+    "lesson_trials": {"type": "array", "items": {"anyOf": [
+      {"type": "object", "additionalProperties": false,
+       "required": ["contract", "version", "candidate_episode_id", "baseline_episode_id", "subject"], "properties": {
+         "contract": {"const": "LessonPromotionSpec/v1"}, "version": {"const": 1},
+         "candidate_episode_id": {"type": "string", "minLength": 1}, "baseline_episode_id": {"type": "string", "minLength": 1}, "subject": {"type": "string", "minLength": 1}
+       }},
+      {"type": "object", "additionalProperties": false,
+       "required": ["contract", "version", "candidate_episode_id", "baseline_episode_id", "subject", "window_episode_id"], "properties": {
+         "contract": {"const": "LessonPromotionSpec/v1"}, "version": {"const": 1},
+         "candidate_episode_id": {"type": "string", "minLength": 1}, "baseline_episode_id": {"type": "string", "minLength": 1}, "subject": {"type": "string", "minLength": 1},
+         "window_episode_id": {"type": "string", "minLength": 1}
+       }}
+    ]}}
   }
 }

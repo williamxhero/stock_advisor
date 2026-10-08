@@ -218,6 +218,8 @@ def install_qualification() -> dict[str, Any]:
         judgment = append(f"judgment:{label}", "judgment", text, proposed_at, {"stage": "m1_judgment"})
         snapshot = {"subjects": ["600519"], "direction": direction, "qualified": True, "benchmark": "000300",
                     "reference_at": proposed_at, "window_end": observed_at, "original_judgment_text": text}
+        if label == "candidate":
+            snapshot["lesson_candidate_id"] = candidate["decision"]["candidate_id"]
         result = {"verification_status": status, "observations": [{"subject": "600519", "mae": 0.0, "excess_return": 99.0}]}
         body = {"result": result, "reflection": {}, "judgment_snapshot": snapshot, "parent_episode_ids": [judgment]}
         outcomes.append(append(label, "outcome", canonical_json(body), observed_at, {

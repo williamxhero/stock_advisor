@@ -250,6 +250,26 @@ def test_every_candidate_revision_can_be_rolled_back_without_rewriting(revision,
         service.rollback("withdraw", target["episode_id"], reason="different reason", as_of=AT)
 
 
+def test_legacy_rollback_retry_recovers_the_original_revision() -> None:
+    from ai_trading_companion.memory_write import canonical_json, write_memory
+    memory = InMemoryMemoryAdapter()
+    service, created = candidate(memory)
+    event = {**created["decision"], "kind": "rollback", "state": "rolled_back",
+             "provenance": {"promotion_episode_id": created["episode_id"], "content_hash": created["content_hash"]},
+             "payload": {"reason": "original withdrawal", "rollback_target": "candidate"}}
+    receipt = write_memory(memory, "learning", {
+        "memory_space_id": SPACE, "source_system": "stock-advisor", "source_event_id": "lesson:rollback:legacy",
+        "episode_type": "lesson", "authority": "runtime_learning", "body": canonical_json(event),
+        "content_hash": "auto", "protocol_version": "memoryhub/v1",
+        "occurred_at": AT, "known_at": AT, "submitted_at": AT,
+        "metadata": {"lesson_promotion": event, "parent_episode_ids": [created["episode_id"]]},
+    }, semantic_type="lesson")
+    recovered = service.rollback("legacy", created["episode_id"], reason="original withdrawal", as_of=AT)
+    assert recovered == {**receipt, "decision": event}
+    with pytest.raises(MemoryUnavailable, match="immutable lesson request conflict"):
+        service.rollback("legacy", created["episode_id"], reason="changed withdrawal", as_of=AT)
+
+
 def test_dynamic_maturity_remains_fail_closed_on_a_late_ledger_sequence() -> None:
     class LateLedger(InMemoryMemoryAdapter):
         def append(self, episode):
@@ -277,6 +297,8 @@ def lessons(bundle):
     return [row["episode_id"] for row in bundle["results"] if row["retrieval"]["semantic_type"] == "lesson"]
 
 
+@pytest.mark.slow
+# 512-cycle public-ledger stress proves that model hits never become facts.
 def test_repeated_model_hits_remain_blocked_in_all_states() -> None:
     memory = InMemoryMemoryAdapter()
     service, created = candidate(memory)

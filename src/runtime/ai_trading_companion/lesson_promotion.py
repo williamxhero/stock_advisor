@@ -103,6 +103,9 @@ class LessonPromotion:
                 expected = sha256({"hypothesis": event["hypothesis"], "market_states": event["market_states"],
                                    **{key: event["provenance"][key] for key in ("evidence_episode_ids", "counterevidence_episode_ids")},
                                    "parent_episode_ids": sorted(set(event["payload"]["parent_episode_ids"])), "as_of": event["as_of"]})
+            if expected is None and event["kind"] == "rollback":
+                expected = sha256({"revision_episode_id": event["provenance"].get("revision_episode_id", event["provenance"].get("promotion_episode_id")),
+                                   "reason": event["payload"]["reason"], "as_of": event["as_of"]})
             if expected != sha256(request):
                 raise MemoryUnavailable("immutable lesson request conflict")
             return {**{key: episode[key] for key in ("episode_id", "sequence", "content_hash", "protocol_version")},
@@ -383,6 +386,8 @@ class LessonPromotion:
             for row in (good, baseline):
                 metadata = row["metadata"]
                 frozen = metadata["judgment_snapshot"]
+                if row["episode_id"] == good["episode_id"] and frozen.get("lesson_candidate_id") != candidate["candidate_id"]:
+                    raise ValueError("frozen_candidate_identity_conflict")
                 expected = {"result": metadata["outcome_result"], "reflection": metadata["reflection"],
                             "judgment_snapshot": frozen, "parent_episode_ids": metadata["parent_episode_ids"]}
                 if row["body"] != canonical_json(expected):

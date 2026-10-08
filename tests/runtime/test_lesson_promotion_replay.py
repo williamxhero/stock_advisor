@@ -160,7 +160,7 @@ def test_replay_reconstructs_factual_frozen_pair_without_trusting_recorded_trial
     from test_lesson_frozen_evidence import END, SPACE as FROZEN_SPACE, frozen_pair, proposal
     memory = InMemoryMemoryAdapter()
     service, candidate = proposal(memory)
-    pair = frozen_pair(memory)
+    pair = frozen_pair(memory, lesson_candidate_id=candidate["decision"]["candidate_id"])
     # The MemoryHub watermark is ledger-wide, while an export is space-scoped.
     write_memory(memory, "evidence", {
         "memory_space_id": "unrelated-space", "source_system": "stock-advisor", "source_event_id": "interleaved",
@@ -197,7 +197,7 @@ def test_statistically_qualified_offline_revision_replays_then_rolls_back_withou
                                 evidence_episode_ids=[supporting], counterevidence_episode_ids=[contrary], as_of=START)
     as_of = "2031-01-01T00:00:00Z"
     for index in range(256):
-        pair = frozen_pair(memory, f"independent-{index}", index=index)
+        pair = frozen_pair(memory, f"independent-{index}", index=index, lesson_candidate_id=candidate["decision"]["candidate_id"])
         promoted = service.observe_frozen_pair(f"trial-{index}", candidate["episode_id"], pair, as_of=as_of)
     assert promoted["decision"]["state"] == "promoted"
     frozen = freeze_lessons(memory, FROZEN_SPACE, as_of=as_of)

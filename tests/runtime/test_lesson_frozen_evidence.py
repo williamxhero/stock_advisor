@@ -34,7 +34,7 @@ def proposal(memory):
     return service, created
 
 
-def frozen_pair(memory, cycle="cycle-1", *, state="trend_expansion", close=110, low=99, gaps=False, private=False, index=0, snapshot_benchmark="000300", candidate_text="600519上涨"):
+def frozen_pair(memory, cycle="cycle-1", *, state="trend_expansion", close=110, low=99, gaps=False, private=False, index=0, snapshot_benchmark="000300", candidate_text="600519上涨", lesson_candidate_id="momentum"):
     start = (datetime.fromisoformat(START.replace("Z", "+00:00")) + timedelta(days=3 * index)).isoformat().replace("+00:00", "Z")
     end = (datetime.fromisoformat(END.replace("Z", "+00:00")) + timedelta(days=3 * index)).isoformat().replace("+00:00", "Z")
     outcomes = []
@@ -49,6 +49,8 @@ def frozen_pair(memory, cycle="cycle-1", *, state="trend_expansion", close=110, 
         snapshot = {"subjects": ["600519"], "direction": "bullish" if name == "candidate" else "bearish",
                     "qualified": True, "reference_at": start, "window_end": end, "benchmark": snapshot_benchmark,
                     "original_judgment_text": text}
+        if name == "candidate" and lesson_candidate_id is not None:
+            snapshot["lesson_candidate_id"] = lesson_candidate_id
         # The model reports the opposite of the raw prices. Its scores and
         # verdicts must have no authority over the deterministic calculation.
         result = {"verification_status": "incorrect" if name == "candidate" else "correct",
@@ -103,6 +105,8 @@ def test_frozen_prices_not_model_scores_determine_an_offline_attempt():
     ({}, True, "inconclusive", "missing_frozen_input"),
     ({"snapshot_benchmark": "000001"}, False, "inconclusive", "frozen_benchmark_conflict"),
     ({"candidate_text": "600519下跌；000001上涨"}, False, "inconclusive", "unsupported_frozen_direction"),
+    ({"lesson_candidate_id": "unrelated-hypothesis"}, False, "inconclusive", "frozen_candidate_identity_conflict"),
+    ({"lesson_candidate_id": None}, False, "inconclusive", "frozen_candidate_identity_conflict"),
 ])
 def test_failed_missing_and_private_frozen_inputs_are_retained_not_promoted(options, missing, expected, reason):
     memory = InMemoryMemoryAdapter()
@@ -159,7 +163,7 @@ def test_judgment_lifecycle_consumes_versioned_frozen_evidence_refs(tmp_path):
     artifact = store.append_artifact(cycle["cycle_id"], "m1", "model", "600519上涨", START,
                                      {"published_message": {"message_id": f"judgment:{cycle['cycle_id']}:candidate"}})
     lifecycle = JudgmentLifecycle(store, memory=memory, memory_space_id=SPACE)
-    captured = lifecycle.capture(artifact, "m1", "600519上涨", snapshot={"window_end": END, "benchmark": "000300"})
+    captured = lifecycle.capture(artifact, "m1", "600519上涨", snapshot={"window_end": END, "benchmark": "000300", "lesson_candidate_id": created["decision"]["candidate_id"]})
     checkpoint = store.schedule_outcome(captured["snapshot_id"], "T+1", END)
     checkpoint.update({"cycle_id": cycle["cycle_id"], "snapshot_id": captured["snapshot_id"]})
     result = {"as_of": END, "verification_status": "incorrect", "summary": "原始窗口价格已经冻结。",

@@ -219,6 +219,37 @@ def test_distinct_hypotheses_spend_separate_immutable_alpha_allocations() -> Non
     assert service.assess(first["episode_id"], as_of=AT) == before
 
 
+def test_candidate_retry_recovers_original_cutoff_after_later_writes(memory_port) -> None:
+    service, created = candidate(memory_port)
+    append_observation(memory_port, "intervening-outcome")
+    _, recovered = candidate(memory_port)
+    assert recovered == created
+    with pytest.raises(MemoryUnavailable, match="immutable lesson request conflict"):
+        service.propose("candidate-1", "changed hypothesis", market_states=["range", "trend"],
+                        evidence_episode_ids=created["decision"]["provenance"]["evidence_episode_ids"],
+                        counterevidence_episode_ids=created["decision"]["provenance"]["counterevidence_episode_ids"], as_of=AT)
+
+
+@pytest.mark.parametrize("revision", ["candidate", "inconclusive", "superseded"])
+def test_every_candidate_revision_can_be_rolled_back_without_rewriting(revision, memory_port) -> None:
+    service, created = candidate(memory_port)
+    target = created
+    if revision != "candidate":
+        outcome = append_observation(memory_port, "outcome", status="superseded" if revision == "superseded" else "unverified")
+        baseline = append_observation(memory_port, "baseline", status="incorrect")
+        target = service.observe("trial", created["episode_id"], outcome, baseline,
+                                 subject="600519", market_state="range", as_of=AT)
+    original = memory_port.export_space(SPACE)["episodes"]
+    result = service.rollback("withdraw", target["episode_id"], reason="withdraw unsupported hypothesis", as_of=AT)
+    append_observation(memory_port, "later-write")
+    assert service.rollback("withdraw", target["episode_id"], reason="withdraw unsupported hypothesis", as_of=AT) == result
+    assert memory_port.export_space(SPACE)["episodes"][:len(original)] == original
+    assert result["decision"]["provenance"]["revision_episode_id"] == target["episode_id"]
+    assert service.assess(created["episode_id"], as_of=AT)["state"] == "rolled_back"
+    with pytest.raises(MemoryUnavailable, match="immutable lesson request conflict"):
+        service.rollback("withdraw", target["episode_id"], reason="different reason", as_of=AT)
+
+
 def lessons(bundle):
     return [row["episode_id"] for row in bundle["results"] if row["retrieval"]["semantic_type"] == "lesson"]
 

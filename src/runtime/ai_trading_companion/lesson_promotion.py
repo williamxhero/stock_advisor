@@ -84,6 +84,25 @@ class LessonPromotion:
             raise ValueError("lesson identity must reference a candidate episode")
         return event
 
+    def _recover(self, request_id: str, request: dict[str, Any], episodes: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+        for episode in episodes.values():
+            if episode["source_event_id"] != f"lesson:{request_id}":
+                continue
+            event = episode["metadata"]["lesson_promotion"]
+            validate(event)
+            expected = event["provenance"].get("request_sha256")
+            # Pre-recovery candidates retain sufficient immutable inputs to
+            # recover without re-freezing their original ledger watermark.
+            if expected is None and event["kind"] == "candidate":
+                expected = sha256({"hypothesis": event["hypothesis"], "market_states": event["market_states"],
+                                   **{key: event["provenance"][key] for key in ("evidence_episode_ids", "counterevidence_episode_ids")},
+                                   "parent_episode_ids": sorted(set(event["payload"]["parent_episode_ids"])), "as_of": event["as_of"]})
+            if expected != sha256(request):
+                raise MemoryUnavailable("immutable lesson request conflict")
+            return {**{key: episode[key] for key in ("episode_id", "sequence", "content_hash", "protocol_version")},
+                    "decision": copy.deepcopy(event)}
+        return None
+
     def _append(self, request_id: str, event: dict[str, Any], parents: list[str]) -> dict[str, Any]:
         validate(event)
         metadata = {"lesson_promotion": event, "parent_episode_ids": sorted(set(parents))}
@@ -108,6 +127,13 @@ class LessonPromotion:
                 parent_episode_ids: list[str] | None = None) -> dict[str, Any]:
         snapshot, episodes = self._read(as_of)
         parents = sorted(set([*evidence_episode_ids, *counterevidence_episode_ids, *(parent_episode_ids or [])]))
+        request = {"hypothesis": hypothesis, "market_states": sorted(set(market_states)),
+                   "evidence_episode_ids": sorted(set(evidence_episode_ids)),
+                   "counterevidence_episode_ids": sorted(set(counterevidence_episode_ids)),
+                   "parent_episode_ids": sorted(set(parent_episode_ids or [])), "as_of": as_of}
+        recovered = self._recover(f"candidate:{request_id}", request, episodes)
+        if recovered is not None:
+            return recovered
         if not evidence_episode_ids:
             raise ValueError("lesson candidates require evidence references")
         for ref in parents:
@@ -120,7 +146,7 @@ class LessonPromotion:
             "contract": CONTRACT, "version": VERSION, "policy_version": POLICY["version"],
             "kind": "candidate", "candidate_id": request_id, "hypothesis": hypothesis,
             "market_states": sorted(set(market_states)), "as_of": as_of, "state": "candidate",
-            "provenance": {"evidence_episode_ids": sorted(set(evidence_episode_ids)), "counterevidence_episode_ids": sorted(set(counterevidence_episode_ids))},
+            "provenance": {"request_sha256": sha256(request), "evidence_episode_ids": sorted(set(evidence_episode_ids)), "counterevidence_episode_ids": sorted(set(counterevidence_episode_ids))},
             "payload": {"parent_episode_ids": parent_episode_ids or [],
                         "proposal_cutoff": {"as_of": as_of, "watermark": snapshot["watermark"]}},
         }
@@ -198,7 +224,14 @@ class LessonPromotion:
         trials = [event["payload"]["trial"] for episode in episodes.values()
                   if (event := episode.get("metadata", {}).get("lesson_promotion"))
                   and event.get("kind") == "attempt" and event.get("candidate_id") == candidate["candidate_id"]]
-        return self._assessment(candidate, trials, hypothesis_sequence=episodes[candidate_episode_id]["sequence"])
+        assessment = self._assessment(candidate, trials, hypothesis_sequence=episodes[candidate_episode_id]["sequence"])
+        governance = [episode for episode in episodes.values()
+                      if (event := episode.get("metadata", {}).get("lesson_promotion"))
+                      and event["candidate_id"] == candidate["candidate_id"]
+                      and event["kind"] in {"rollback", "supersede"}]
+        if governance:
+            assessment["state"] = max(governance, key=lambda episode: episode["sequence"])["metadata"]["lesson_promotion"]["state"]
+        return assessment
 
     def observe(self, request_id: str, candidate_episode_id: str, outcome_episode_id: str, baseline_episode_id: str,
                 *, subject: str, market_state: str, as_of: str) -> dict[str, Any]:
@@ -247,13 +280,19 @@ class LessonPromotion:
                             subject=value["subject"], market_state=market_state, as_of=as_of)
 
     def rollback(self, request_id: str, promotion_episode_id: str, *, reason: str, as_of: str) -> dict[str, Any]:
-        _, episodes = self._read(as_of)
+        snapshot, episodes = self._read(as_of)
+        request = {"revision_episode_id": promotion_episode_id, "reason": reason, "as_of": as_of}
+        recovered = self._recover(f"rollback:{request_id}", request, episodes)
+        if recovered is not None:
+            return recovered
         promotion = episodes[promotion_episode_id]["metadata"]["lesson_promotion"]
         validate(promotion)
-        if promotion["state"] != "promoted" or not reason.strip():
-            raise ValueError("rollback requires a promoted revision and reason")
+        qualify_episode(episodes[promotion_episode_id], snapshot, episodes.__getitem__, ancestors=frozenset({"lesson-governance"}))
+        if not reason.strip():
+            raise ValueError("rollback requires a lesson revision and reason")
         event = {**promotion, "kind": "rollback", "state": "rolled_back", "as_of": as_of,
-                 "provenance": {"promotion_episode_id": promotion_episode_id, "content_hash": episodes[promotion_episode_id]["content_hash"]},
+                 "provenance": {"request_sha256": sha256(request), "revision_episode_id": promotion_episode_id,
+                                "promotion_episode_id": promotion_episode_id, "content_hash": episodes[promotion_episode_id]["content_hash"]},
                  "payload": {"reason": reason, "rollback_target": "candidate"}}
         return self._append(f"rollback:{request_id}", event, [promotion_episode_id])
 

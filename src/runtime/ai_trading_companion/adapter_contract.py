@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from queue import Empty
 from typing import Any, Callable
 
+from .fallback_spec import build_receipt, replacement_allowed, validate_receipt
+
 CONTRACT = "AdapterContractSpec/v1"
 VERSION = 1
 RESULT_CONTRACT = "AdapterContractResult/v1"
@@ -123,6 +125,12 @@ def validate_output(value: dict[str, Any]) -> None:
         raise ValueError("failed AdapterContract output requires an error")
     if not isinstance(value["provenance"], dict) or not value["provenance"].get("input_sha256"):
         raise ValueError("AdapterContract output provenance is required")
+    if "fallback" in value["provenance"]:
+        receipt = validate_receipt(value["provenance"]["fallback"])
+        if receipt["input"]["source"]["input_sha256"] != value["provenance"]["input_sha256"] or receipt["input"]["attempts"] != value["attempts"]:
+            raise ValueError("AdapterContract fallback provenance mismatch")
+        if (receipt["continuation"] == "qualification_required") != (value["status"] == "succeeded" and value["data"].get("state") != "NOT_COMPUTABLE"):
+            raise ValueError("AdapterContract fallback status mismatch")
     for field, payload in (("output_sha256", value["raw_output"]), ("data_sha256", value["data"])):
         expected = value["provenance"].get(field)
         if expected is not None and expected != sha256(payload):
@@ -238,8 +246,15 @@ class AdapterRegistry:
             return copy.deepcopy(self._cache[cache_key])
         attempts: list[str] = []
         final: dict[str, Any] | None = None
+        requested = self.resolve(adapter_id)
         for candidate_id in candidates:
+            if candidate_id not in self._adapters:
+                attempts.append(f"{candidate_id}:unavailable")
+                continue
             adapter = self.resolve(candidate_id)
+            if not replacement_allowed(requested.declaration(), adapter.declaration()):
+                attempts.append(f"{candidate_id}:fallback_rejected")
+                continue
             for attempt in range(retries + 1):
                 try:
                     health = self.healthcheck(candidate_id)
@@ -253,15 +268,31 @@ class AdapterRegistry:
                 result["provenance"]["health"] = copy.deepcopy(health)
                 attempts.append(f"{candidate_id}:{result['status']}")
                 final = result
-                if result["status"] == "succeeded":
-                    result["attempts"] = list(attempts)
+                result["attempts"] = list(attempts)
+                self._bind_fallback(result, requested.mode)
+                if result["provenance"]["fallback"]["continuation"] == "qualification_required":
                     self._cache[cache_key] = copy.deepcopy(result)
+                    return result
+                if result["data"].get("state") == "NOT_COMPUTABLE":
                     return result
                 if result["status"] not in _RETRYABLE:
                     break
         assert final is not None
         final["attempts"] = list(attempts)
+        self._bind_fallback(final, requested.mode)
         return final
+
+    @staticmethod
+    def _bind_fallback(result: dict[str, Any], mode: str) -> None:
+        provenance = result["provenance"]
+        provenance["fallback"] = build_receipt(
+            "Adapter", result["adapter_id"],
+            status="succeeded" if result["status"] == "succeeded" and result["data"].get("state") != "NOT_COMPUTABLE" else "failed",
+            as_of=provenance["as_of"], source_contract=RESULT_CONTRACT,
+            source_version=result["adapter_version"], input_sha256=provenance["input_sha256"],
+            deterministic=mode == "deterministic", attempts=result["attempts"], cycle_id=provenance["cycle_id"],
+        )
+        validate_output(result)
 
     def _attempt(self, adapter: AdapterDefinition, inputs: dict[str, Any], *, as_of: str, timeout_seconds: float, cycle_id: str | None, request_id: str | None, attempt: int, attempts: list[str], health: dict[str, Any], retry_limit: int) -> dict[str, Any]:
         request = {

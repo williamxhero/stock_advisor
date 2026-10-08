@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any, Iterable
 
 from .cycle_contract import validate_m1_blind_packet
+from .fallback_spec import validate_receipt
 from .evidence_snapshot import build_snapshot, descriptor
 from .m0_observation import canonical_json, sha256
 from .mandate_spec import validate_mandate
@@ -45,7 +46,7 @@ _PACKET_FIELDS = frozenset({
     "mandate", "mandate_reference", "m1_judgment_spec", "position_safety", "cycle_reference", "task_profile",
     "prior_opportunity_plans", "prior_opportunity_followups", "protocol", "risk_doctrine",
     "business_context", "frozen_m0", "frozen_public_evidence", "evidence_snapshot", "evidence",
-    "research_isolation", "research_request", "research_evidence", "prior_market_understanding", "artifacts", "memories", "active_workflow_policy", "context",
+    "research_isolation", "research_request", "research_evidence", "research_fallback", "prior_market_understanding", "artifacts", "memories", "active_workflow_policy", "context",
     "verification_repair", "runtime_strategy_controls", "allowed_research_backends", "sha256",
     "agent_role_inputs", "spec_issue_states", "spec_evidence_gates", "spec95_baseline_sha256",
 })
@@ -136,6 +137,16 @@ def _validate_packet(packet: dict[str, Any]) -> None:
                 or _time(research_request["as_of"]) != cutoff
                 or research_request["market_scope"].get("stage") != "m1_judgment"):
             raise ValueError("M1 research request identity mismatch")
+    research_fallback = packet.get("research_fallback")
+    if research_fallback is not None:
+        validate_receipt(research_fallback)
+        if (research_request is None or research_fallback["input"]["component"] != "QuantResearch"
+                or research_fallback["input"]["source"]["input_sha256"] != research_request["sha256"]
+                or research_fallback["input"]["as_of"] != packet["as_of"]
+                or research_fallback["input"]["cycle_id"] != packet["cycle_id"]):
+            raise ValueError("M1 research fallback source mismatch")
+        if (research_fallback["continuation"] == "blocked") != (research_evidence is None):
+            raise ValueError("M1 research fallback cannot substitute evidence")
     if research_evidence is not None:
         if research_access is None or research_request is None:
             raise ValueError("M1 research evidence requires a QuantResearch access descriptor and request")

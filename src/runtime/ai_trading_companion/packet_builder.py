@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from .learning import WorkflowEvolution
 from .memory_port import MemoryPort, MemoryUnavailable
+from .fallback_spec import build_receipt
 from .secret_guard import assert_safe
 from .evidence_contract import EvidenceContractFactory
 from .models import TASK_POLICIES
@@ -322,7 +323,12 @@ class RuntimePacketBuilder:
                     packet["research_request"] = research_request
                     if research_evidence is _RESEARCH_EVIDENCE_UNSET:
                         research_evidence = self.quant_research_port.read(research_request)
-                    if research_evidence is not None:
+                    packet["research_fallback"] = build_receipt(
+                        "QuantResearch", "read_evidence", status="unavailable" if research_evidence is None else "succeeded",
+                        as_of=packet_as_of, source_contract=research_request["contract"], source_version="v1",
+                        input_sha256=research_request["sha256"], cycle_id=cycle["cycle_id"],
+                    )
+                    if packet["research_fallback"]["continuation"] != "blocked":
                         packet["research_evidence"] = validate_research_evidence(research_evidence)
             if stage in {"m1_judgment", "m2"} and cycle["task_key"] in {
                 "daily.execution.0945", "daily.execution.1030", "daily.execution.1430", "daily.review.1520",

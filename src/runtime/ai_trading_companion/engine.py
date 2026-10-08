@@ -13,6 +13,7 @@ from .learning import JudgmentLifecycle
 from .evidence_contract import EvidenceContractFactory
 from .message_presentation import MessageQualificationError, PresentedMessage, present_message, repair_message_draft
 from .memory_write import write_memory
+from .fallback_spec import build_receipt
 from .publication_registry import published_event_types
 from .stage_expression import normalize_stage_output
 from .models import TASK_POLICIES
@@ -2090,6 +2091,15 @@ class CompanionEngine:
         extra = dict(extra or {})
         presented = self.present_for_publication(message, occurred_at, "system_fault")
         reason_category = str(extra.get("diagnostic_code") or self._diagnostic_code(reason))
+        # Operational failure is not a judgment or an undo of committed facts.
+        # Only bounded Runtime identity enters this receipt, never H0 or provider text.
+        extra["fallback"] = build_receipt(
+            "Orchestration", event_type, status="terminated", as_of=occurred_at,
+            source_contract="companion-fault-episode/v1", source_version="v1",
+            input_sha256=sha256({"cycle_id": cycle["cycle_id"], "event_type": event_type,
+                                 "reason_category": reason_category, "as_of": cycle.get("as_of")}),
+            cycle_id=cycle["cycle_id"],
+        )
         targets = self._fault_targets(cycle, event_type, extra)
         episode_ids = [
             self.store.fault_episode_id(

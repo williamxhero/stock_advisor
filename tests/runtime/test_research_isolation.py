@@ -219,6 +219,28 @@ def test_runtime_packet_builder_binds_port_evidence_before_m1_hash(tmp_path):
     assert frozen_packet["research_evidence"] == packet["research_evidence"]
 
 
+def test_unavailable_quantresearch_is_versioned_and_cannot_supply_m1_evidence(tmp_path):
+    from test_m1_judgment import _runtime_builder_fixture
+
+    store, engine, cycle, raw_packet = _runtime_builder_fixture(tmp_path)
+    mandate = build_mandate(
+        cycle["task_key"], "m1_judgment", as_of=AS_OF,
+        memory_space_id=engine.memory_space_id, quantresearch_enabled=True,
+    )
+    with patch("ai_trading_companion.packet_builder.mandate_for_stage", return_value=mandate):
+        packet = RuntimePacketBuilder(
+            PROJECT_ROOT / "resources", store, memory=InMemoryMemoryAdapter(),
+        ).build(cycle, "m1_judgment", evidence=raw_packet["evidence"])
+    receipt = packet["research_fallback"]
+    assert receipt["state"] == "unavailable"
+    assert receipt["input"]["source"]["input_sha256"] == packet["research_request"]["sha256"]
+    assert "research_evidence" not in build_m1_input(packet)
+    packet["research_evidence"] = evidence()
+    packet["sha256"] = canonical_packet_hash({key: value for key, value in packet.items() if key != "sha256"})
+    with pytest.raises(ValueError, match="fallback"):
+        build_m1_input(packet)
+
+
 def test_frozen_replay_and_install_qualification_are_deterministic():
     first = frozen_replay(evidence())
     second = frozen_replay(copy.deepcopy(evidence()))

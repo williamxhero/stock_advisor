@@ -460,6 +460,10 @@ class ToolRunnerTests(unittest.TestCase):
             self.assertEqual(["default", "backup"], [item["provider"] for item in result.adapter_receipts])
             audit = json.loads((root / ".audit" / "resolutions.ndjson").read_text(encoding="utf-8"))
             self.assertEqual(list(result.adapter_receipts), audit["adapter_receipts"])
+            self.assertEqual("degraded", result.fallback["state"])
+            self.assertEqual("qualification_required", result.fallback["continuation"])
+            self.assertEqual(list(result.attempts), result.fallback["input"]["attempts"])
+            self.assertEqual(result.fallback, audit["fallback"])
 
     def test_deterministic_route_failure_is_audited_and_circuit_broken_per_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

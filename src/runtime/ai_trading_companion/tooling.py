@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 from .adapter_contract import CONTRACT as ADAPTER_CONTRACT, VERSION as ADAPTER_VERSION
 from .secret_guard import find_secrets
+from .fallback_spec import build_receipt
 from .tool_failures import RETRY_POLICY, TRANSIENT_ERRORS, process_error
 
 
@@ -126,6 +127,7 @@ class EvidenceResolution:
     attempts: tuple[str, ...] = ()
     route_adapter: str | None = None
     adapter_receipts: tuple[dict[str, Any], ...] = ()
+    fallback: dict[str, Any] | None = None
 
     @classmethod
     def failed(cls, capability: str, code: str, *, tool_version: str | None = None,
@@ -325,7 +327,21 @@ class ToolRunner:
             "evidence_gate": {"state": "not_evaluated", "owner": "EvidenceGate"},
             "permissions": {"write_permissions": []},
         }
-        return replace(result, route_adapter=tool.adapter, adapter_receipts=(receipt,))
+        return self._bind_fallback(request, replace(result, route_adapter=tool.adapter, adapter_receipts=(receipt,)))
+
+    @staticmethod
+    def _bind_fallback(request: FactRequest, result: EvidenceResolution) -> EvidenceResolution:
+        receipt = build_receipt(
+            "MarketHub" if request.capability.startswith(("cn_", "market_")) else "Adapter",
+            request.capability, status="succeeded" if result.succeeded else "unavailable",
+            as_of=request.required_at, source_contract="ai-trading-fact-request/v1",
+            source_version=result.tool_version or "unresolved",
+            input_sha256=hashlib.sha256(json.dumps(
+                request.to_wire(), ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
+            attempts=result.attempts, cycle_id=request.context.get("cycle_id"),
+        )
+        return replace(result, fallback=receipt)
 
     def _execute(self, request: FactRequest, tool: PublishedTool, wire_request: dict[str, Any]) -> EvidenceResolution:
         if _contains_access_restricted_url(request.inputs):
@@ -505,7 +521,7 @@ class ToolRunner:
         try:
             candidates = self._ordered_candidates(self.catalog.resolve_candidates(request.capability))
         except ToolLookupError as exc:
-            failed = EvidenceResolution.failed(request.capability, exc.code)
+            failed = self._bind_fallback(request, EvidenceResolution.failed(request.capability, exc.code))
             self._report_capability_need(request, failed)
             return failed
         attempts: list[str] = []
@@ -547,7 +563,9 @@ class ToolRunner:
                 if circuit_key is not None:
                     self._open_circuits.add(circuit_key)
             if result.succeeded:
-                resolved = replace(result, attempts=tuple(attempts), adapter_receipts=tuple(receipts))
+                resolved = self._bind_fallback(request, replace(result, attempts=tuple(attempts), adapter_receipts=tuple(receipts)))
+                if resolved.fallback["continuation"] == "blocked":
+                    continue
                 self._cache[cache_key] = copy.deepcopy(resolved)
                 self._append_audit(request, resolved)
                 if request.context.get("capability_need_on_success") is True:
@@ -568,6 +586,7 @@ class ToolRunner:
                 "tool_routes_exhausted_deterministic" if all(self._is_deterministic_failure(item) for item in failures)
                 else "tool_routes_exhausted"
             ))
+        failed = self._bind_fallback(request, failed)
         self._append_audit(request, failed)
         self._report_capability_need(request, failed)
         return failed
@@ -617,6 +636,7 @@ class ToolRunner:
             "route": {"adapter": result.route_adapter, "version": result.tool_version},
             "technical_validation": list(result.technical_validation),
             "adapter_receipts": copy.deepcopy(list(result.adapter_receipts)),
+            "fallback": copy.deepcopy(result.fallback),
         }
         with (audit_root / "resolutions.ndjson").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")

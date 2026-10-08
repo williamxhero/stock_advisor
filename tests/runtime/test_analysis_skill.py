@@ -58,6 +58,22 @@ def test_skill_failure_is_structured_and_final_judgment_is_forbidden() -> None:
         })
 
 
+@pytest.mark.parametrize("inputs", [{}, {"price": 10}])
+def test_deterministic_skill_returns_not_computable_instead_of_guessing(inputs: dict) -> None:
+    registry = SkillRegistry()
+    registry.register(AnalysisSkill(
+        "valuation", "v1", ("valuation",), ("price",), "deterministic",
+        lambda _: (_ for _ in ()).throw(ArithmeticError("sensitive provider detail")),
+    ))
+    result = registry.execute("valuation", inputs, as_of="2026-09-20T01:00:00Z")
+    assert result["status"] == "failed"
+    assert result["data"]["state"] == "NOT_COMPUTABLE"
+    assert result["data"]["value"] is None
+    receipt = result["provenance"]["fallback"]
+    assert receipt["continuation"] == "blocked"
+    assert "sensitive provider detail" not in json.dumps(result)
+
+
 def test_engine_real_runtime_seam_uses_skill_registry_without_owning_business_state(tmp_path: Path) -> None:
     engine = CompanionEngine(CompanionStore(tmp_path / "companion.sqlite3"))
     engine.register_analysis_skill(AnalysisSkill("valuation", "fixture/v1", ("valuation",), ("price",), "deterministic", lambda inputs: {"fair_value": inputs["price"] * 2}))
